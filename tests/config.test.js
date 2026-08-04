@@ -261,3 +261,98 @@ describe('loadConfig — works with Map inputs', () => {
     expect(cfg.model).toBe('glm-5.2');
   });
 });
+
+describe('loadConfig — v2 structured-review knobs', () => {
+  test('maxFindings defaults to 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings uses a provided positive value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '5' }).maxFindings).toBe(5);
+  });
+
+  test('maxFindings clamps to min 1 (0 → default 8)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings clamps to min 1 (negative → default 8)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings caps at 50 (runaway noise guard)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '999' }).maxFindings).toBe(50);
+  });
+
+  test('maxFindings NaN → default 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(8);
+  });
+
+  test('minSeverity defaults to "info"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).minSeverity).toBe('info');
+  });
+
+  test.each(['critical', 'high', 'medium', 'low', 'info'])(
+    'minSeverity accepts %s (case-insensitive)',
+    (v) => {
+      expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: v }).minSeverity).toBe(v);
+      expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: v.toUpperCase() }).minSeverity).toBe(v);
+    },
+  );
+
+  test('minSeverity invalid → falls back to "info" + core.warning', () => {
+    const warnings = [];
+    const core = { setSecret: () => {}, warning: (m) => warnings.push(m) };
+    const cfg = loadConfig(
+      { ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: 'bogus' },
+      { core },
+    );
+    expect(cfg.minSeverity).toBe('info');
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain('ZAI_MIN_SEVERITY');
+  });
+
+  test('minSeverity invalid without core → still falls back to "info" (no throw)', () => {
+    const cfg = loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: 'bogus' });
+    expect(cfg.minSeverity).toBe('info');
+  });
+
+  test('temperature defaults to 0.2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).temperature).toBe(0.2);
+  });
+
+  test('temperature parses a provided float', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '0.7' }).temperature).toBeCloseTo(0.7);
+  });
+
+  test('temperature clamps to [0, 2] — below 0 → 0', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '-1' }).temperature).toBe(0);
+  });
+
+  test('temperature clamps to [0, 2] — above 2 → 2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '5' }).temperature).toBe(2);
+  });
+
+  test('temperature NaN → default 0.2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: 'abc' }).temperature).toBeCloseTo(0.2);
+  });
+
+  test('maxTokens defaults to 4096', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens uses a provided positive value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '8192' }).maxTokens).toBe(8192);
+  });
+
+  test('maxTokens clamps to min 1 (0 → default 4096)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '0' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens clamps to min 1 (negative → default 4096)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '-5' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens NaN → default 4096', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: 'xyz' }).maxTokens).toBe(4096);
+  });
+});

@@ -20,6 +20,7 @@ import {
   validateFinding,
   normalizeFinding,
   parseFindings,
+  parseStructuredReview,
   rankAndCapFindings,
   mergeFindings,
   formatFindingsAsSummary,
@@ -657,5 +658,175 @@ describe('formatFindingsAsSummary', () => {
     ]);
     expect(out).not.toContain('undefined');
     expect(out).not.toContain('NaN');
+  });
+});
+
+describe('parseStructuredReview', () => {
+  const changedFiles = [{ filename: 'src/index.js' }];
+
+  const validPayload = JSON.stringify({
+    summary: 'Two findings: a null deref and a missing guard.',
+    findings: [
+      {
+        file: 'src/index.js',
+        line: 42,
+        severity: 'high',
+        confidence: 'medium',
+        category: 'bug',
+        title: 'Possible null dereference',
+        description: 'The variable may be null when used here.',
+        evidence: 'const x = obj.value;',
+        suggestion: 'Guard with `if (obj)`.',
+        rule: 'llm',
+      },
+    ],
+  });
+
+  it('returns {summary, findings} from a JSON object payload', () => {
+    const { summary, findings } = parseStructuredReview(validPayload, {
+      changedFiles,
+    });
+    expect(summary).toBe(
+      'Two findings: a null deref and a missing guard.',
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].file).toBe('src/index.js');
+    expect(findings[0].title).toBe('Possible null dereference');
+  });
+
+  it('delegates findings to parseFindings (anti-hallucination filter applies)', () => {
+    // A finding whose file is NOT in changedFiles is dropped.
+    const payload = JSON.stringify({
+      summary: 'hi',
+      findings: [
+        { ...validFinding(), file: 'src/changed.js' },
+        { ...validFinding(), file: 'src/hallucinated.js' },
+      ],
+    });
+    const { findings } = parseStructuredReview(payload, {
+      changedFiles: [{ filename: 'src/changed.js' }],
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].file).toBe('src/changed.js');
+  });
+
+  it('returns empty summary string when the payload omits .summary', () => {
+    const payload = JSON.stringify({
+      findings: [{ ...validFinding(), file: 'src/index.js' }],
+    });
+    const { summary, findings } = parseStructuredReview(payload, {
+      changedFiles,
+    });
+    expect(summary).toBe('');
+    expect(findings).toHaveLength(1);
+  });
+
+  it('coerces a non-string .summary to ""', () => {
+    const payload = JSON.stringify({ summary: 42, findings: [] });
+    const { summary } = parseStructuredReview(payload, { changedFiles });
+    expect(summary).toBe('');
+  });
+
+  it('falls back to treating the payload as a bare findings array', () => {
+    // If the model emits just a JSON array (no envelope), summary should be ''
+    // and findings should still parse.
+    const payload = JSON.stringify([
+      { ...validFinding(), file: 'src/index.js' },
+    ]);
+    const { summary, findings } = parseStructuredReview(payload, {
+      changedFiles,
+    });
+    expect(summary).toBe('');
+    expect(findings).toHaveLength(1);
+  });
+
+  it('returns {summary: "", findings: []} on unparseable input (never throws)', () => {
+    const { summary, findings } = parseStructuredReview(
+      'totally not json at all',
+      { changedFiles },
+    );
+    expect(summary).toBe('');
+    expect(findings).toEqual([]);
+  });
+
+  it('returns {summary: "", findings: []} on empty string', () => {
+    const { summary, findings } = parseStructuredReview('', { changedFiles });
+    expect(summary).toBe('');
+    expect(findings).toEqual([]);
+  });
+
+  it('tolerates a fenced ```json code block wrapping the object', () => {
+    const fenced = '```json\n' + validPayload + '\n```';
+    const { summary, findings } = parseStructuredReview(fenced, {
+      changedFiles,
+    });
+    expect(summary).toBe(
+      'Two findings: a null deref and a missing guard.',
+    );
+    expect(findings).toHaveLength(1);
+  });
+
+  it('tolerates a fenced ``` code block wrapping the object', () => {
+    const fenced = '```\n' + validPayload + '\n```';
+    const { findings } = parseStructuredReview(fenced, { changedFiles });
+    expect(findings).toHaveLength(1);
+  });
+
+  it('tolerates prose around the JSON object (greedy brace scan)', () => {
+    const wrapped =
+      'Here is my review:\n' + validPayload + '\nHope this helps!';
+    const { summary, findings } = parseStructuredReview(wrapped, {
+      changedFiles,
+    });
+    expect(summary).toBe(
+      'Two findings: a null deref and a missing guard.',
+    );
+    expect(findings).toHaveLength(1);
+  });
+
+  it('dedupes findings the same way parseFindings does', () => {
+    const dup = { ...validFinding(), file: 'src/index.js' };
+    const payload = JSON.stringify({
+      summary: '',
+      findings: [dup, { ...dup }],
+    });
+    const { findings } = parseStructuredReview(payload, { changedFiles });
+    expect(findings).toHaveLength(1);
+  });
+
+  it('normalizes findings (enum casing, title truncation, rule default)', () => {
+    const payload = JSON.stringify({
+      summary: '',
+      findings: [
+        {
+          file: 'src/index.js',
+          line: 1,
+          severity: 'HIGH',
+          confidence: 'Medium',
+          category: 'Bug',
+          title: 'x'.repeat(200),
+          description: 'd',
+          evidence: '',
+        },
+      ],
+    });
+    const [f] = parseStructuredReview(payload, { changedFiles }).findings;
+    expect(f.severity).toBe('high');
+    expect(f.confidence).toBe('medium');
+    expect(f.category).toBe('bug');
+    expect(f.rule).toBe('llm');
+    expect(typeof f.title).toBe('string');
+    expect(f.title.length).toBeLessThanOrEqual(120);
+  });
+
+  it('passes changedFiles through to the underlying parseFindings', () => {
+    // No changedFiles provided → anti-hallucination filter is empty → all
+    // findings dropped (the filter requires every finding's file to be listed).
+    const payload = JSON.stringify({
+      summary: 's',
+      findings: [{ ...validFinding(), file: 'src/index.js' }],
+    });
+    const { findings } = parseStructuredReview(payload);
+    expect(findings).toEqual([]);
   });
 });

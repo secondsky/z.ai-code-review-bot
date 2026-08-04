@@ -4,8 +4,8 @@
  * - With a file path: validate it's one of the PR's changed files (rejecting
  *   path traversal: any path containing `..` or starting with `/`), then build
  *   a focused review prompt for just that file's patch.
- * - Without args: reuse {@link buildAutoReviewPrompt} on the patchable changed
- *   files (capped) to review the whole-PR diff.
+ * - Without args: reuse {@link buildStructuredReviewPrompt} on the patchable
+ *   changed files (capped) to review the whole-PR diff.
  *
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws (errors → short comment + return); no `@actions/core` import; no
@@ -16,7 +16,7 @@ import {
   getChangedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
-import { buildAutoReviewPrompt } from '../prompt.js';
+import { buildStructuredReviewPrompt } from '../prompt.js';
 
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
@@ -114,7 +114,7 @@ export async function handleReviewCommand(
       await post('> No textual changes to review in this PR.');
       return;
     }
-    const prompt = buildAutoReviewPrompt(patchable, {
+    const prompt = buildStructuredReviewPrompt(patchable, {
       maxDiffChars:
         typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
           ? config.maxDiffChars

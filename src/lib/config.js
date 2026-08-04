@@ -94,6 +94,42 @@ const AUTH_LEVELS = new Set(['admin', 'maintain', 'write', 'read', 'none']);
 const AUTH_ERROR =
   'ZAI_AUTH_THRESHOLD must be one of: admin, maintain, write, read, none';
 
+const SEVERITY_LEVELS = new Set(['critical', 'high', 'medium', 'low', 'info']);
+
+/**
+ * Parse and clamp a float input to the closed range [min, max]. Returns the
+ * fallback when the value is NaN or non-finite. Used for `ZAI_TEMPERATURE`.
+ *
+ * @param {string} raw
+ * @param {number} fallback
+ * @param {number} min inclusive lower bound
+ * @param {number} max inclusive upper bound
+ * @returns {number}
+ */
+function clampFloat(raw, fallback, min, max) {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
+/**
+ * Parse and clamp a positive-integer input, then cap at `cap`. Returns the
+ * fallback on NaN/non-finite/below-min. Used for `ZAI_MAX_FINDINGS` (cap 50)
+ * and `ZAI_MAX_TOKENS` (no cap — pass Infinity).
+ *
+ * @param {string} raw
+ * @param {number} fallback
+ * @param {number} [cap=Infinity] inclusive upper bound
+ * @returns {number}
+ */
+function clampPositiveCapped(raw, fallback, cap = Number.POSITIVE_INFINITY) {
+  const n = toInt(raw);
+  if (n === null || !Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, cap);
+}
+
 /**
  * Build the validated config object.
  *
@@ -156,6 +192,33 @@ export function loadConfig(inputs = {}, options = {}) {
   const impactLabels = isTruthy(read(inputs, 'ZAI_IMPACT_LABELS'));
   const impactLabelMap = parseImpactLabelMap(read(inputs, 'ZAI_IMPACT_LABEL_MAP'));
 
+  // v2 structured-review knobs.
+  const maxFindings = clampPositiveCapped(
+    read(inputs, 'ZAI_MAX_FINDINGS'),
+    8,
+    50,
+  );
+
+  // minSeverity: validate against the allowed set; invalid → 'info' + warning.
+  const minSeverityRaw = read(inputs, 'ZAI_MIN_SEVERITY').trim().toLowerCase();
+  let minSeverity = 'info';
+  if (minSeverityRaw !== '') {
+    if (SEVERITY_LEVELS.has(minSeverityRaw)) {
+      minSeverity = minSeverityRaw;
+    } else {
+      minSeverity = 'info';
+      if (options?.core?.warning) {
+        options.core.warning(
+          `ZAI_MIN_SEVERITY "${minSeverityRaw}" is invalid; falling back to "info". ` +
+            `Allowed: critical, high, medium, low, info.`,
+        );
+      }
+    }
+  }
+
+  const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
+  const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
+
   const githubToken = read(inputs, 'GITHUB_TOKEN');
 
   const config = {
@@ -178,6 +241,10 @@ export function loadConfig(inputs = {}, options = {}) {
     describeWriteBody,
     impactLabels,
     impactLabelMap,
+    maxFindings,
+    minSeverity,
+    temperature,
+    maxTokens,
     githubToken,
   };
 

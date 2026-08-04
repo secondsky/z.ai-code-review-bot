@@ -2,7 +2,7 @@
  * Tests for src/index.js — the GitHub Action entry point + event router.
  *
  * Every external collaborator is injected: octokit, core, callApi, apiClient,
- * handlers, and the auto-review/runAutoReview override. Tests never touch the
+ * handlers, and the runStructuredReview override. Tests never touch the
  * network or GitHub. The module MUST be importable without triggering main().
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -50,6 +50,10 @@ function makeConfig(overrides = {}) {
     describeWriteBody: false,
     impactLabels: false,
     impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
+    maxFindings: 8,
+    minSeverity: 'info',
+    temperature: 0.2,
+    maxTokens: 4096,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -257,11 +261,34 @@ describe('readAllInputs', () => {
       'ZAI_COMMANDS_ENABLED',
       'ZAI_ALLOW_FORK_COMMANDS',
       'ZAI_AUTH_THRESHOLD',
+      'ZAI_SCHEDULE_ENABLED',
+      'ZAI_SCHEDULE_MAX_PRS',
+      'ZAI_DESCRIBE_WRITE_BODY',
+      'ZAI_IMPACT_LABELS',
+      'ZAI_IMPACT_LABEL_MAP',
+      'ZAI_MAX_FINDINGS',
+      'ZAI_MIN_SEVERITY',
+      'ZAI_TEMPERATURE',
+      'ZAI_MAX_TOKENS',
       'GITHUB_TOKEN',
     ]) {
       expect(seen[name]).toBe(true);
       expect(inputs[name]).toBe(`val-${name}`);
     }
+  });
+
+  it('INPUT_NAMES lists exactly the inputs readAllInputs pulls (no drift)', () => {
+    // The INPUT_NAMES export is the single source of truth for which inputs the
+    // action reads; loadConfig must accept every one. This guards against a
+    // new input being added to one but not the other.
+    expect(indexModule.INPUT_NAMES).toEqual(
+      expect.arrayContaining([
+        'ZAI_MAX_FINDINGS',
+        'ZAI_MIN_SEVERITY',
+        'ZAI_TEMPERATURE',
+        'ZAI_MAX_TOKENS',
+      ]),
+    );
   });
 
   it('returns a plain object (not a Map)', () => {
@@ -277,12 +304,19 @@ describe('readAllInputs', () => {
  * ------------------------------------------------------------------ */
 
 describe('run — pull_request auto-review', () => {
-  it('small PR: calls callApi once with the auto-review prompt then upserts', async () => {
+  it('small PR: runs the structured-review pipeline (one batch → one callApi) then upserts', async () => {
     const core = makeCore();
     const octokit = makeOctokit({
       files: [file('src/a.js'), file('src/b.js')],
     });
-    const callApi = vi.fn(async () => '## Review\nlooks good');
+    // The structured pipeline calls callApi once per batch; a small PR is one
+    // batch. Return a valid structured-review payload so findings parse.
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 'Looks good overall.',
+        findings: [],
+      }),
+    );
     const config = makeConfig();
 
     await run(prContext(), {
@@ -293,13 +327,15 @@ describe('run — pull_request auto-review', () => {
       apiClient: { call: vi.fn() },
     });
 
-    // callApi invoked exactly once with the auto-review prompt.
+    // callApi invoked exactly once (single batch for a small PR).
     expect(callApi).toHaveBeenCalledTimes(1);
     const [apiKey, model, prompt] = callApi.mock.calls[0];
     expect(apiKey).toBe('test-api-key');
     expect(model).toBe('glm-5.2');
-    expect(prompt).toContain('Please review the following pull request changes');
+    // The prompt is the structured-review prompt (no free-form header).
+    expect(prompt).toContain('Output ONLY a valid JSON');
     expect(prompt).toContain('src/a.js');
+    expect(prompt).toContain('src/b.js');
 
     // upsert created a comment (no existing marker comment in list).
     expect(octokit.__calls.createComment).toHaveLength(1);
@@ -315,7 +351,9 @@ describe('run — pull_request auto-review', () => {
       files: [file('src/a.js')],
       list: [{ id: 555, body: `## Z.ai Code Review\n\nold\n\n${marker}` }],
     });
-    const callApi = vi.fn(async () => 'new review');
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
 
     await run(prContext(), {
       config: makeConfig(),
@@ -330,15 +368,26 @@ describe('run — pull_request auto-review', () => {
     expect(octokit.__calls.createComment).toHaveLength(0);
   });
 
-  it('large PR: routes through runAutoReview instead of the small-PR path', async () => {
+  it('large PR: same structured-review path (batching handles it); runStructuredReview receives the files', async () => {
     const core = makeCore();
     // largePrFileThreshold: 1, with 2 patchable files → isLargePr true.
     const config = makeConfig({ largePrFileThreshold: 1 });
     const octokit = makeOctokit({
       files: [file('src/a.js'), file('src/b.js')],
     });
-    const callApi = vi.fn(async () => 'batch review');
-    const runAutoReviewSpy = vi.fn(async () => 'synthesized review');
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: 'structured review',
+      metadata: {
+        totalBatches: 2,
+        totalFindingsBeforeCap: 0,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+      },
+    }));
 
     await run(prContext(), {
       config,
@@ -346,21 +395,18 @@ describe('run — pull_request auto-review', () => {
       octokit,
       callApi,
       apiClient: { call: vi.fn() },
-      runAutoReview: runAutoReviewSpy,
+      runStructuredReview: runStructuredReviewSpy,
     });
 
-    expect(runAutoReviewSpy).toHaveBeenCalledTimes(1);
+    expect(runStructuredReviewSpy).toHaveBeenCalledTimes(1);
     // The spy received the patchable files, the config, and { callApi, core }.
-    const [spyFiles, spyConfig, spyDeps] = runAutoReviewSpy.mock.calls[0];
+    const [spyFiles, spyConfig, spyDeps] = runStructuredReviewSpy.mock.calls[0];
     expect(spyFiles).toHaveLength(2);
     expect(spyConfig).toBe(config);
     expect(typeof spyDeps.callApi).toBe('function');
     expect(spyDeps.core).toBe(core);
-    // Small-PR callApi path NOT used directly (runAutoReview owns it).
-    expect(callApi).not.toHaveBeenCalled();
-    // Comment still upserted with the synthesized review.
+    // Comment still upserted with the rendered summary.
     expect(octokit.__calls.createComment).toHaveLength(1);
-    expect(octokit.__calls.createComment[0].body).toContain('synthesized review');
   });
 
   it('no patchable files: short-circuits with NO callApi and NO upsert', async () => {

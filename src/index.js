@@ -49,8 +49,9 @@ import {
   filterExcludedFiles,
   filterPatchableFiles,
 } from './lib/changed-files.js';
-import { resolveSystemPrompt, buildAutoReviewPrompt } from './lib/prompt.js';
-import { runAutoReview, isLargePr } from './lib/auto-review.js';
+import { resolveSystemPrompt } from './lib/prompt.js';
+import { runStructuredReview, isLargePr } from './lib/auto-review.js';
+import { formatFindingsAsSummary } from './lib/findings.js';
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
@@ -111,6 +112,10 @@ export const INPUT_NAMES = [
   'ZAI_DESCRIBE_WRITE_BODY',
   'ZAI_IMPACT_LABELS',
   'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
   'GITHUB_TOKEN',
 ];
 
@@ -158,10 +163,10 @@ export async function run(context, deps = {}) {
     getChangedFiles: getChangedFilesFn = getChangedFiles,
     filterExcludedFiles: filterExcludedFilesFn = filterExcludedFiles,
     filterPatchableFiles: filterPatchableFilesFn = filterPatchableFiles,
-    buildAutoReviewPrompt: buildAutoReviewPromptFn = buildAutoReviewPrompt,
-    runAutoReview: runAutoReviewFn = runAutoReview,
+    runStructuredReview: runStructuredReviewFn = runStructuredReview,
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
+    formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
     parseCommand: parseCommandFn = parseCommand,
@@ -201,19 +206,28 @@ export async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
-    let review;
-    if (isLargePrFn(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
-      review = await runAutoReviewFn(patchable, config, { callApi, core: coreDep });
-    } else {
-      const prompt = buildAutoReviewPromptFn(patchable, {
-        maxDiffChars: config.maxDiffChars,
-      });
-      review = await callApi(config.apiKey, config.model, prompt);
-    }
+    // Structured review: one path for both small and large PRs. Batching
+    // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
+    // result is rendered as a structured-findings summary comment.
+    const result = await runStructuredReviewFn(patchable, config, {
+      callApi,
+      core: coreDep,
+    });
+
+    const content = formatFindingsAsSummaryFn(result.findings, {
+      reviewerName: config.reviewerName,
+      metadata: {
+        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+        truncated: Math.max(
+          0,
+          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+        ),
+      },
+    });
 
     const body = buildCommentBodyFn({
       title: config.reviewerName,
-      content: review,
+      content,
       marker: MARKER,
     });
     await upsertReviewCommentFn({
@@ -349,9 +363,9 @@ export async function run(context, deps = {}) {
       getChangedFiles: getChangedFilesFn,
       filterExcludedFiles: filterExcludedFilesFn,
       filterPatchableFiles: filterPatchableFilesFn,
-      buildAutoReviewPrompt: buildAutoReviewPromptFn,
-      runAutoReview: runAutoReviewFn,
+      runStructuredReview: runStructuredReviewFn,
       isLargePr: isLargePrFn,
+      formatFindingsAsSummary: formatFindingsAsSummaryFn,
       buildCommentBody: buildCommentBodyFn,
       upsertReviewComment: upsertReviewCommentFn,
     });

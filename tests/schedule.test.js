@@ -61,19 +61,6 @@ function makeOctokit({ prs = [], commentsByPr = {} } = {}) {
   return octokit;
 }
 
-// Minimal stubs for the pipeline helpers — they don't need to be real for
-// schedule-unit tests; we assert on whether reviewOnePr was reached.
-const stubs = {
-  getChangedFiles: vi.fn(async () => [{ filename: 'a.js', status: 'modified', patch: '@@' }]),
-  filterExcludedFiles: vi.fn((files) => files),
-  filterPatchableFiles: vi.fn((files) => files),
-  buildAutoReviewPrompt: vi.fn(() => 'prompt'),
-  runAutoReview: vi.fn(async () => 'batch review'),
-  isLargePr: vi.fn(() => false),
-  buildCommentBody: vi.fn(({ content }) => `${content}\n\n${MARKER}`),
-  upsertReviewComment: vi.fn(async () => ({ action: 'created', commentId: 1 })),
-};
-
 function makeConfig(overrides = {}) {
   return {
     apiKey: 'k',
@@ -149,6 +136,23 @@ describe('hasReviewForSha', () => {
 
 /* ---------- runScheduledReview ---------- */
 
+// Build fresh stubs per test so spy call counts don't leak across tests.
+const makeStubs = (overrides = {}) => ({
+  getChangedFiles: vi.fn(async () => [{ filename: 'a.js', status: 'modified', patch: '@@' }]),
+  filterExcludedFiles: vi.fn((files) => files),
+  filterPatchableFiles: vi.fn((files) => files),
+  runStructuredReview: vi.fn(async () => ({
+    findings: [],
+    summary: 'batch review',
+    metadata: { totalBatches: 1, totalFindingsBeforeCap: 0, deterministicFindingsCount: 0, batchMetadata: [] },
+  })),
+  isLargePr: vi.fn(() => false),
+  formatFindingsAsSummary: vi.fn(() => `## Z.ai Code Review\n\nreview\n\n${MARKER}`),
+  buildCommentBody: vi.fn(({ content }) => `${content}\n\n${MARKER}`),
+  upsertReviewComment: vi.fn(async () => ({ action: 'created', commentId: 1 })),
+  ...overrides,
+});
+
 describe('runScheduledReview', () => {
   it('reviews PRs that have no existing review for their SHA', async () => {
     const octokit = makeOctokit({
@@ -157,14 +161,15 @@ describe('runScheduledReview', () => {
     });
     const callApi = vi.fn(async () => 'review');
     const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs();
 
     const result = await runScheduledReview({
-      octokit, owner: 'o', repo: 'r', config: makeConfig(), core, callApi, ...stubs,
+      octokit, owner: 'o', repo: 'r', config: makeConfig(), core, callApi, ...s,
     });
 
     expect(result).toEqual({ reviewed: 2, skipped: 0, failed: 0 });
-    expect(callApi).toHaveBeenCalledTimes(2);
-    expect(stubs.upsertReviewComment).toHaveBeenCalledTimes(2);
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(2);
+    expect(s.upsertReviewComment).toHaveBeenCalledTimes(2);
   });
 
   it('skips drafts', async () => {
@@ -173,12 +178,13 @@ describe('runScheduledReview', () => {
       commentsByPr: {},
     });
     const callApi = vi.fn(async () => 'review');
+    const s = makeStubs();
     const result = await runScheduledReview({
-      octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...stubs,
+      octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...s,
     });
     expect(result.reviewed).toBe(1);
     expect(result.skipped).toBe(1);
-    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(1);
   });
 
   it('skips PRs already reviewed at the current head SHA (dedup)', async () => {
@@ -189,12 +195,13 @@ describe('runScheduledReview', () => {
       },
     });
     const callApi = vi.fn(async () => 'review');
+    const s = makeStubs();
     const result = await runScheduledReview({
-      octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...stubs,
+      octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...s,
     });
     expect(result.reviewed).toBe(1); // only PR #2
     expect(result.skipped).toBe(1);
-    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(1);
   });
 
   it('isolates per-PR failures: one bad PR does not stop the batch', async () => {
@@ -202,31 +209,39 @@ describe('runScheduledReview', () => {
       prs: [mkPr(1, 'sha1'), mkPr(2, 'sha2'), mkPr(3, 'sha3')],
       commentsByPr: {},
     });
-    // callApi throws for PR #2 (identified by the prompt content from stubs).
+    // runStructuredReview throws for PR #2 (the 2nd reviewed PR).
     let n = 0;
-    const callApi = vi.fn(async () => {
-      n += 1;
-      if (n === 2) throw new Error('boom');
-      return 'review';
+    const s = makeStubs({
+      runStructuredReview: vi.fn(async () => {
+        n += 1;
+        if (n === 2) throw new Error('boom');
+        return {
+          findings: [],
+          summary: 'ok',
+          metadata: { totalBatches: 1, totalFindingsBeforeCap: 0, deterministicFindingsCount: 0, batchMetadata: [] },
+        };
+      }),
     });
     const core = { info: vi.fn(), warning: vi.fn() };
     const result = await runScheduledReview({
-      octokit, owner: 'o', repo: 'r', config: makeConfig(), core, callApi, ...stubs,
+      octokit, owner: 'o', repo: 'r', config: makeConfig(), core, callApi: vi.fn(), ...s,
     });
     expect(result.reviewed).toBe(2);
     expect(result.failed).toBe(1);
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('PR #2 failed'));
   });
 
-  it('uses the large-PR path when isLargePr returns true', async () => {
+  it('uses the structured-review path when isLargePr returns true', async () => {
     const octokit = makeOctokit({ prs: [mkPr(1, 'sha1')], commentsByPr: {} });
     const callApi = vi.fn(async () => 'review');
-    const bigStubs = { ...stubs, isLargePr: vi.fn(() => true) };
+    const bigStubs = makeStubs({ isLargePr: vi.fn(() => true) });
     await runScheduledReview({
       octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...bigStubs,
     });
-    expect(bigStubs.runAutoReview).toHaveBeenCalledTimes(1);
-    expect(callApi).not.toHaveBeenCalled(); // batched path uses runAutoReview, not callApi directly
+    // The structured-review pipeline is the single path now (batching handles
+    // both small and large PRs); isLargePr is still passed through for future use.
+    expect(bigStubs.runStructuredReview).toHaveBeenCalledTimes(1);
+    expect(bigStubs.formatFindingsAsSummary).toHaveBeenCalledTimes(1);
   });
 
   it('respects scheduleMaxPrs from config', async () => {
@@ -235,10 +250,11 @@ describe('runScheduledReview', () => {
       commentsByPr: {},
     });
     const callApi = vi.fn(async () => 'r');
+    const s = makeStubs();
     const result = await runScheduledReview({
       octokit, owner: 'o', repo: 'r',
       config: makeConfig({ scheduleMaxPrs: 2 }),
-      core: { info() {}, warning() {} }, callApi, ...stubs,
+      core: { info() {}, warning() {} }, callApi, ...s,
     });
     expect(result.reviewed).toBe(2);
   });

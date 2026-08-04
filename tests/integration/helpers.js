@@ -52,6 +52,10 @@ export function makeConfig(overrides = {}) {
     describeWriteBody: false,
     impactLabels: false,
     impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
+    maxFindings: 8,
+    minSeverity: 'info',
+    temperature: 0.2,
+    maxTokens: 4096,
     githubToken: 'ghs-test-token',
     ...overrides,
   };

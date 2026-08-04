@@ -1,20 +1,26 @@
 /**
- * Integration tests: pull_request → auto-review → comment pipeline.
+ * Integration tests: pull_request → structured review → comment pipeline.
  *
  * These tests drive `run(context, deps)` from `src/index.js` end-to-end through
  * the REAL module wiring: the real `getChangedFiles`, `filterExcludedFiles`,
- * `filterPatchableFiles`, `buildAutoReviewPrompt`, `runAutoReview`, `isLargePr`,
- * `buildCommentBody`, `upsertReviewComment`, and `parseCommand` helpers — only
- * the outermost collaborators (octokit, core, callApi) are faked. This is the
- * full-stack proof that the modules COMPOSE correctly through the router.
+ * `filterPatchableFiles`, `runStructuredReview`, `isLargePr`,
+ * `formatFindingsAsSummary`, `buildCommentBody`, `upsertReviewComment`, and
+ * `parseCommand` helpers — only the outermost collaborators (octokit, core,
+ * callApi) are faked. This is the full-stack proof that the modules COMPOSE
+ * correctly through the router.
  *
- * Matrix (per task-9-brief):
- *   - small PR → callApi once, prompt contains both files' diffs, one upsert
- *   - large PR → runAutoReview path, callApi > once, final comment posted
+ * The v2 pipeline replaces the free-form synthesis approach: runStructuredReview
+ * is the single path for both small and large PRs (batching handles small PRs
+ * as 1 batch). callApi returns a structured {summary, findings} payload which
+ * formatFindingsAsSummary renders into the summary comment.
+ *
+ * Matrix:
+ *   - small PR → callApi once (1 batch), prompt contains both files, one upsert
+ *   - large PR → callApi > once (N batches), final structured comment posted
  *   - idempotent update → existing marker comment updated, not duplicated
  *   - no patchable files → NO callApi, NO upsert (short-circuit, end-to-end)
  *   - excludes applied → excluded file NOT in the review prompt
- *   - callApi failure → propagates out of run (small-PR path)
+ *   - callApi failure → propagates out of run (no synthesis fallback in v2)
  */
 import { describe, it, expect } from 'vitest';
 
@@ -29,12 +35,33 @@ import {
   file,
 } from './helpers.js';
 
+/**
+ * A valid structured-review payload the fake model returns. The findings
+ * reference files in the PR so the anti-hallucination filter keeps them.
+ */
+const structuredPayload = (summary, findings) =>
+  JSON.stringify({ summary, findings });
+
+const finding = (f, overrides = {}) => ({
+  file: f,
+  line: 1,
+  severity: 'high',
+  confidence: 'medium',
+  category: 'bug',
+  title: `Issue in ${f}`,
+  description: 'A concrete bug.',
+  evidence: '+bad = null;',
+  suggestion: 'Add a null check.',
+  rule: 'llm',
+  ...overrides,
+});
+
 /* ------------------------------------------------------------------ *
  * Small PR
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — small PR', () => {
-  it('calls callApi once with a prompt containing both files and posts ONE summary comment', async () => {
+describe('integration: pull_request structured review — small PR', () => {
+  it('calls callApi once (1 batch) with a prompt containing both files and posts ONE summary comment', async () => {
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({
       files: [
@@ -42,7 +69,9 @@ describe('integration: pull_request auto-review — small PR', () => {
         file('src/b.js', '@@ -2 +2 @@\n+const b = 2;'),
       ],
     });
-    const callApi = makeFakeCallApi('## Review\nlooks good');
+    const callApi = makeFakeCallApi(
+      structuredPayload('Two files look fine.', []),
+    );
     const config = makeConfig();
 
     await run(makePRContext(), {
@@ -50,21 +79,21 @@ describe('integration: pull_request auto-review — small PR', () => {
       core,
       octokit,
       callApi,
-      // apiClient is unused when callApi is injected directly; pass a stub so
-      // buildCallApi never tries to create a real client.
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
 
-    // callApi invoked exactly once with the auto-review prompt.
+    // callApi invoked exactly once (single batch for a small PR).
     expect(callApi).toHaveBeenCalledTimes(1);
     const [apiKey, model, prompt] = callApi.mock.calls[0];
     expect(apiKey).toBe('test-api-key');
     expect(model).toBe('glm-5.2');
-    // The prompt contains BOTH files' diffs.
+    // The structured prompt contains BOTH files' diffs.
     expect(prompt).toContain('src/a.js');
     expect(prompt).toContain('src/b.js');
     expect(prompt).toContain('const a = 1;');
     expect(prompt).toContain('const b = 2;');
+    // The prompt instructs structured JSON output.
+    expect(prompt).toContain('Output ONLY a valid JSON');
 
     // ONE summary comment was created (no existing marker comment).
     expect(octokit.__calls.createComment).toHaveLength(1);
@@ -73,13 +102,39 @@ describe('integration: pull_request auto-review — small PR', () => {
     // The body carries the reviewer name (title) and the hidden MARKER.
     expect(body).toContain('Z.ai Code Review');
     expect(body).toContain(MARKER);
-    expect(body).toContain('looks good');
+    // The structured-summary renderer emits the "No issues found" empty state.
+    expect(body).toContain('No issues found');
+  });
+
+  it('renders findings (with severity emojis) when the model returns issues', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('One issue found.', [finding('src/a.js')]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    const body = octokit.__calls.createComment[0].body;
+    // The finding is rendered with the high-severity emoji and the file path.
+    expect(body).toContain('🟠');
+    expect(body).toContain('src/a.js');
+    expect(body).toContain('Issue in src/a.js');
+    expect(body).toContain(MARKER);
   });
 
   it('lists files once and posts to the PR number from the context', async () => {
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({ files: [file('src/a.js')] });
-    const callApi = makeFakeCallApi('review');
+    const callApi = makeFakeCallApi(structuredPayload('ok', []));
     const ctx = makePRContext({ number: 77, owner: 'acme', repo: 'widget' });
 
     await run(ctx, {
@@ -90,14 +145,12 @@ describe('integration: pull_request auto-review — small PR', () => {
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
 
-    // getChangedFiles was called with the right owner/repo/pull_number.
     expect(octokit.__calls.listFiles).toHaveLength(1);
     expect(octokit.__calls.listFiles[0]).toMatchObject({
       owner: 'acme',
       repo: 'widget',
       pull_number: 77,
     });
-    // The comment was posted to the right issue (PR) number.
     expect(octokit.__calls.createComment[0]).toMatchObject({
       owner: 'acme',
       repo: 'widget',
@@ -107,27 +160,23 @@ describe('integration: pull_request auto-review — small PR', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Large PR
+ * Large PR (batched)
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — large PR', () => {
-  it('routes through runAutoReview: callApi called more than once and a comment is posted', async () => {
+describe('integration: pull_request structured review — large PR', () => {
+  it('batches: callApi called more than once and a structured comment is posted', async () => {
     const core = makeFakeCore();
-    // largePrFileThreshold: 1, with 3 patchable files → isLargePr returns true.
-    const config = makeConfig({ largePrFileThreshold: 1 });
+    // Force multiple batches via a tiny maxBatchChars.
+    const config = makeConfig({ maxBatchChars: 1500 });
     const files = [
-      file('src/a.js', '@@ -1 +1 @@\n+a'),
-      file('src/b.js', '@@ -1 +1 @@\n+b'),
-      file('src/c.js', '@@ -1 +1 @@\n+c'),
+      file('src/a.js', '@@ -1 +1 @@\n+' + 'a'.repeat(800)),
+      file('src/b.js', '@@ -1 +1 @@\n+' + 'b'.repeat(800)),
+      file('src/c.js', '@@ -1 +1 @@\n+' + 'c'.repeat(800)),
     ];
     const octokit = makeFakeOctokit({ files });
-    // The fake returns different content for per-batch vs synthesis calls so
-    // we can confirm both happened. runAutoReview calls callApi per batch,
-    // then once more for synthesis.
-    const callApi = makeFakeCallApi((_api, _model, prompt) => {
-      if (prompt.includes('senior synthesizer')) return '## Review Summary\nsynthesized';
-      return 'batch review';
-    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('Batch reviewed.', []),
+    );
 
     await run(makePRContext(), {
       config,
@@ -137,14 +186,14 @@ describe('integration: pull_request auto-review — large PR', () => {
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
 
-    // The large-PR path makes at least 2 callApi calls (per-batch + synthesis).
+    // Multiple batches → callApi called more than once.
     expect(callApi.mock.calls.length).toBeGreaterThan(1);
 
-    // The final comment was posted and carries the synthesized content + marker.
+    // The final comment was posted and carries the marker.
     expect(octokit.__calls.createComment).toHaveLength(1);
     const body = octokit.__calls.createComment[0].body;
-    expect(body).toContain('synthesized');
     expect(body).toContain(MARKER);
+    expect(body).toContain('Z.ai Code Review');
   });
 });
 
@@ -152,7 +201,7 @@ describe('integration: pull_request auto-review — large PR', () => {
  * Idempotent update
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — idempotent update', () => {
+describe('integration: pull_request structured review — idempotent update', () => {
   it('updates the existing MARKER comment instead of creating a duplicate', async () => {
     const core = makeFakeCore();
     const oldBody = `## Z.ai Code Review\n\nold review\n\n${MARKER}`;
@@ -160,7 +209,7 @@ describe('integration: pull_request auto-review — idempotent update', () => {
       files: [file('src/a.js')],
       existingComments: [{ id: 555, body: oldBody }],
     });
-    const callApi = makeFakeCallApi('fresh review');
+    const callApi = makeFakeCallApi(structuredPayload('fresh', []));
 
     await run(makePRContext(), {
       config: makeConfig(),
@@ -174,8 +223,8 @@ describe('integration: pull_request auto-review — idempotent update', () => {
     expect(octokit.__calls.updateComment).toHaveLength(1);
     expect(octokit.__calls.updateComment[0].comment_id).toBe(555);
     expect(octokit.__calls.createComment).toHaveLength(0);
-    // The updated body carries the new review content.
-    expect(octokit.__calls.updateComment[0].body).toContain('fresh review');
+    // The updated body carries the marker (re-rendered summary).
+    expect(octokit.__calls.updateComment[0].body).toContain(MARKER);
   });
 
   it('a second run on the same PR still updates (no duplicate created)', async () => {
@@ -189,7 +238,7 @@ describe('integration: pull_request auto-review — idempotent update', () => {
       config: makeConfig(),
       core,
       octokit: octokitFirst,
-      callApi: makeFakeCallApi('first'),
+      callApi: makeFakeCallApi(structuredPayload('first', [])),
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
     expect(octokitFirst.__calls.createComment).toHaveLength(1);
@@ -206,7 +255,7 @@ describe('integration: pull_request auto-review — idempotent update', () => {
       config: makeConfig(),
       core,
       octokit: octokitSecond,
-      callApi: makeFakeCallApi('second'),
+      callApi: makeFakeCallApi(structuredPayload('second', [])),
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
     expect(octokitSecond.__calls.updateComment).toHaveLength(1);
@@ -218,7 +267,7 @@ describe('integration: pull_request auto-review — idempotent update', () => {
  * No patchable files (short-circuit, end-to-end)
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — no patchable files', () => {
+describe('integration: pull_request structured review — no patchable files', () => {
   it('short-circuits: NO callApi and NO comment upsert (all binary/no-patch)', async () => {
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({
@@ -240,7 +289,6 @@ describe('integration: pull_request auto-review — no patchable files', () => {
     expect(callApi).not.toHaveBeenCalled();
     expect(octokit.__calls.createComment).toHaveLength(0);
     expect(octokit.__calls.updateComment).toHaveLength(0);
-    // The short-circuit log fired.
     expect(core.info).toHaveBeenCalledWith(
       expect.stringContaining('No patchable changes'),
     );
@@ -267,7 +315,6 @@ describe('integration: pull_request auto-review — no patchable files', () => {
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
 
-    // Everything was excluded → no patchable files → no callApi, no comment.
     expect(callApi).not.toHaveBeenCalled();
     expect(octokit.__calls.createComment).toHaveLength(0);
   });
@@ -277,7 +324,7 @@ describe('integration: pull_request auto-review — no patchable files', () => {
  * Excludes applied
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — excludes applied', () => {
+describe('integration: pull_request structured review — excludes applied', () => {
   it('an excluded file is NOT present in the review prompt', async () => {
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({
@@ -287,7 +334,7 @@ describe('integration: pull_request auto-review — excludes applied', () => {
         file('secrets.lock', '@@ -1 +1 @@\n+lock'), // excluded (*.lock)
       ],
     });
-    const callApi = makeFakeCallApi('review');
+    const callApi = makeFakeCallApi(structuredPayload('ok', []));
     const config = makeConfig({
       excludePatterns: ['*.lock', 'package-lock.json'],
     });
@@ -313,11 +360,10 @@ describe('integration: pull_request auto-review — excludes applied', () => {
  * callApi failure
  * ------------------------------------------------------------------ */
 
-describe('integration: pull_request auto-review — callApi failure', () => {
-  it('a rejecting callApi propagates out of run (small-PR path)', async () => {
-    // On the SMALL-PR path the router calls callApi directly and has no
-    // try/catch around it, so a rejection must propagate out of run() —
-    // main()'s .catch → core.setFailed handles it in production.
+describe('integration: pull_request structured review — callApi failure', () => {
+  it('a rejecting callApi propagates out of run (no synthesis fallback in v2)', async () => {
+    // The v2 pipeline has no synthesis/fallback step. A callApi rejection
+    // propagates out of runStructuredReview → run → main's .catch → setFailed.
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({ files: [file('src/a.js')] });
     const callApi = makeFakeCallApi('unused', {
@@ -337,46 +383,5 @@ describe('integration: pull_request auto-review — callApi failure', () => {
     // No comment posted (the failure happened before the upsert).
     expect(octokit.__calls.createComment).toHaveLength(0);
     expect(octokit.__calls.updateComment).toHaveLength(0);
-  });
-
-  it('large-PR synthesis failure still posts a fallback comment (runAutoReview swallows synthesis errors)', async () => {
-    // runAutoReview catches synthesis failures and returns buildFallbackReview,
-    // so the large-PR path posts a comment even when the FINAL callApi fails —
-    // as long as per-batch calls succeeded. This is the documented behavior
-    // (see src/lib/auto-review.js runAutoReview catch block).
-    const core = makeFakeCore();
-    const config = makeConfig({ largePrFileThreshold: 1 });
-    const files = [
-      file('src/a.js', '@@ -1 +1 @@\n+a'),
-      file('src/b.js', '@@ -1 +1 @@\n+b'),
-    ];
-    const octokit = makeFakeOctokit({ files });
-    // Per-batch calls succeed; the synthesis call (the one whose prompt contains
-    // 'senior synthesizer') rejects.
-    const callApi = makeFakeCallApi((_api, _model, prompt) => {
-      if (prompt.includes('senior synthesizer')) {
-        throw new Error('synthesis blew up');
-      }
-      return 'per-batch review';
-    });
-
-    await run(makePRContext(), {
-      config,
-      core,
-      octokit,
-      callApi,
-      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
-    });
-
-    // A comment was still posted (with the fallback content).
-    expect(octokit.__calls.createComment).toHaveLength(1);
-    const body = octokit.__calls.createComment[0].body;
-    expect(body).toContain(MARKER);
-    // The fallback note is present.
-    expect(body.toLowerCase()).toContain('synthesis was unavailable');
-    // runAutoReview warned about the synthesis failure.
-    expect(core.warning).toHaveBeenCalledWith(
-      expect.stringContaining('Auto-review synthesis failed'),
-    );
   });
 });

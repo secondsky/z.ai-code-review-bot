@@ -1,32 +1,36 @@
 /**
- * Auto-review pipeline: risk-scored batching + synthesis.
+ * Structured-review pipeline: risk-scored batching + structured-findings output.
  *
- * This is the fork's single best engineering idea. Instead of lossily
+ * This module is the fork's single best engineering idea. Instead of lossily
  * truncating a large PR (the upstream's only strategy), this module:
  *   1. risk-scores each changed file (size + status + path patterns),
  *   2. line-split big patches into char-budgeted chunks,
  *   3. packs the resulting entries into char+file-budgeted batches
  *      (highest-risk first),
- *   4. reviews each batch via an INJECTED `callApi`,
- *   5. synthesizes the per-batch reviews into one final review (again via
- *      the injected `callApi`), and
- *   6. on a context-overflow error from a batch, recursively halves that
+ *   4. reviews each batch via an INJECTED `callApi`, instructing the model to
+ *      emit a STRICTLY structured JSON object ({summary, findings}), and
+ *   5. on a context-overflow error from a batch, recursively halves that
  *      batch until each half fits.
  *
  * Two layers, on purpose:
  *   - PURE pipeline (`scoreFile`, `splitTextByLines`, `createReviewEntries`,
- *     `createReviewBatches`, `formatEntry`, `buildBatchPrompt`,
- *     `buildCoverageNotes`, `buildSynthesisPrompt`, `buildFallbackReview`,
- *     `isLargePr`, `isContextLimitError`). No I/O. Deterministic. Tested
- *     exhaustively.
- *   - ORCHESTRATION (`executeReviewBatch`, `runAutoReview`). Stateful, but
- *     the network is ALWAYS injected via `deps.callApi` — production wires
- *     it to api.js's client, tests pass a fake. This module never touches
- *     the network directly, which keeps it testable and makes api.js the
- *     single transport.
+ *     `createReviewBatches`, `formatEntry`, `isLargePr`,
+ *     `isContextLimitError`). No I/O. Deterministic. Tested exhaustively.
+ *   - ORCHESTRATION (`executeStructuredBatch`, `runStructuredReview`). Stateful,
+ *     but the network is ALWAYS injected via `deps.callApi` — production wires
+ *     it to api.js's client, tests pass a fake. This module never touches the
+ *     network directly, which keeps it testable and makes api.js the single
+ *     transport.
  *
  * @module src/lib/auto-review.js
  */
+
+import { buildStructuredReviewPrompt } from './prompt.js';
+import {
+  parseStructuredReview,
+  rankAndCapFindings,
+  mergeFindings,
+} from './findings.js';
 
 /* ------------------------------------------------------------------ *
  * Constants (exact values per the task brief — do not change)
@@ -44,7 +48,8 @@ export const DEFAULTS = {
   maxBatchChars: 120000,
   maxFilesPerBatch: 40,
   maxPatchChars: 18000,
-  synthesisMaxChars: 120000,
+  maxFindings: 8,
+  minSeverity: 'info',
 };
 
 /* ------------------------------------------------------------------ *
@@ -272,121 +277,6 @@ export function createReviewBatches(files, options = {}) {
 }
 
 /**
- * The per-batch review prompt. `batchNumber` is 1-indexed.
- */
-export function buildBatchPrompt(entries, options = {}) {
-  const batchNumber = options.batchNumber || 1;
-  const totalBatches = options.totalBatches || 1;
-  const totalFiles = new Set(entries.map((e) => e.filename)).size;
-  const formattedFiles = entries.map(formatEntry).join('\n\n');
-  return (
-    `Please review the following Pull Request changes based on your system instructions.\n\n` +
-    `This is batch ${batchNumber} of ${totalBatches}. Review all files in this batch thoroughly, ` +
-    `but do not assume the rest of the PR is included here. Focus on concrete bugs, security issues, ` +
-    `risky logic, and architecture mismatches visible in these diffs.\n\n` +
-    `<review_batch file_count="${totalFiles}" chunk_count="${entries.length}" ` +
-    `batch_number="${batchNumber}" total_batches="${totalBatches}">\n` +
-    `${formattedFiles}\n` +
-    `</review_batch>`
-  );
-}
-
-/**
- * Build the coverage-notes bullet lines from synthesis metadata.
- */
-export function buildCoverageNotes(metadata) {
-  const {
-    reviewedFiles = 0,
-    totalBatches = 0,
-    splitFileCount = 0,
-    limitReached = false,
-  } = metadata || {};
-  const notes = [
-    `Reviewed ${reviewedFiles} file(s) across ${totalBatches} batch(es).`,
-  ];
-  if (splitFileCount > 0) {
-    notes.push(`${splitFileCount} large file(s) were split across multiple review parts.`);
-  }
-  if (limitReached) {
-    notes.push(
-      'The total diff exceeded the configured cap; some changes may be summarized rather than reviewed line-by-line.',
-    );
-  }
-  return notes;
-}
-
-/**
- * Build the synthesis prompt. Joins per-batch reviews under `## Batch N`
- * headers (truncated to synthesisMaxChars FIRST), prepends a coverage
- * summary as bullets, and instructs the model to produce the fixed
- * markdown section structure with a Rating.
- */
-export function buildSynthesisPrompt(collectedReviews, metadata) {
-  const synthesisMaxChars = DEFAULTS.synthesisMaxChars;
-  const joined =
-    collectedReviews
-      .map((r, i) => `## Batch ${i + 1}\n\n${r.review}`)
-      .join('\n\n---\n\n') || '';
-  const truncated =
-    joined.length > synthesisMaxChars
-      ? joined.slice(0, synthesisMaxChars)
-      : joined;
-
-  const coverageBullets = buildCoverageNotes(metadata)
-    .map((n) => `- ${n}`)
-    .join('\n');
-
-  const instruction = [
-    'You are the senior synthesizer for an automated code review.',
-    'Several per-batch reviews of one pull request follow, each covering a disjoint slice of the diff.',
-    'Produce ONE coherent, deduplicated review that preserves every concrete bug, security issue, and meaningful suggestion raised across all batches — but merges overlaps and removes redundancy.',
-    '',
-    'Your response MUST use this exact markdown structure (omit any section that has no content, except for Review Summary and Final Assessment, which are always present):',
-    '',
-    '## Review Summary',
-    '<2-4 sentence high-level overview of the change quality and risk.>',
-    '',
-    '## Critical Issues & Bugs',
-    '<concrete bugs, security issues, risky logic — one bullet per issue, with file references where known. Omit if none.>',
-    '',
-    '## Suggestions & Best Practices',
-    '<non-blocking improvements — one bullet per suggestion. Omit if none.>',
-    '',
-    '## Coverage Notes',
-    '<what was and was not covered, including any files split across review parts or any cap that was reached.>',
-    '',
-    '## Final Assessment',
-    'Rating: <one of Good | Normal | Very Bad>',
-    '<one short sentence justifying the rating.>',
-  ].join('\n');
-
-  return (
-    `${instruction}\n\n` +
-    `## Coverage Summary\n${coverageBullets}\n\n` +
-    `## Per-Batch Reviews\n\n${truncated}`
-  );
-}
-
-/**
- * Build the fallback review (no API call) used when synthesis fails.
- * Concatenates per-batch reviews under `### Batch N` headers and prepends a
- * note that synthesis was unavailable.
- */
-export function buildFallbackReview(collectedReviews, metadata) {
-  const coverageBullets = buildCoverageNotes(metadata)
-    .map((n) => `- ${n}`)
-    .join('\n');
-  const perBatch = collectedReviews
-    .map((r, i) => `### Batch ${i + 1}\n\n${r.review}`)
-    .join('\n\n');
-  return (
-    `> Note: Automated synthesis was unavailable for this review, so the per-batch reviews are shown below without deduplication.\n\n` +
-    `## Coverage Notes\n${coverageBullets}\n\n` +
-    `## Per-Batch Reviews\n\n${perBatch}`
-  );
-}
-
-/**
  * True when the patchable-files array length exceeds the large-PR threshold.
  */
 export function isLargePr(patchableFiles, options = {}) {
@@ -396,7 +286,7 @@ export function isLargePr(patchableFiles, options = {}) {
 
 /**
  * Detect context-length / token-cap errors from a variety of provider
- * message shapes. Used by executeReviewBatch to decide whether to halve.
+ * message shapes. Used by executeStructuredBatch to decide whether to halve.
  */
 export function isContextLimitError(error) {
   const message = String(error?.message || '').toLowerCase();
@@ -417,35 +307,36 @@ const DEFAULT_CALL_API = () => {
 };
 
 /**
- * Review one batch of entries, recursively halving on context-overflow.
+ * Review one batch of entries via the structured prompt, recursively halving
+ * on context-overflow. Returns an array of raw model-text strings (one per
+ * successful callApi invocation — halving produces multiple).
  *
  * @param {Array} entries  - the batch's review entries
- * @param {Object} state   - { apiKey, model, batchNumber, totalBatches }
- * @param {Object} deps    - { callApi, buildBatchPrompt, core }
- * @returns {Promise<Array<{review, coverage}>>}
+ * @param {Object} state   - { apiKey, model, batchNumber, totalBatches, maxFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} deps    - { callApi, buildStructuredReviewPrompt, core }
+ * @returns {Promise<string[]>} raw model-text strings
  */
-export async function executeReviewBatch(entries, state, deps = {}) {
+export async function executeStructuredBatch(entries, state, deps = {}) {
   const callApi = deps.callApi || DEFAULT_CALL_API;
-  const buildBatch = deps.buildBatchPrompt || buildBatchPrompt;
+  const buildPrompt = deps.buildStructuredReviewPrompt || buildStructuredReviewPrompt;
   const core = deps.core;
 
-  const prompt = buildBatch(entries, {
-    batchNumber: state.batchNumber,
-    totalBatches: state.totalBatches,
-  });
+  const prompt = buildPrompt(
+    entries.map((e) => ({ filename: e.filename, status: e.status, patch: e.patch })),
+    {
+      batchNumber: state.batchNumber,
+      totalBatches: state.totalBatches,
+      maxFindings: state.maxFindings,
+      scannerContext: state.scannerContext,
+      pathInstructions: state.pathInstructions,
+      toneInstructions: state.toneInstructions,
+      maxDiffChars: state.maxDiffChars,
+    },
+  );
 
   try {
-    const review = await callApi(state.apiKey, state.model, prompt);
-    return [
-      {
-        review,
-        coverage: {
-          batchNumber: state.batchNumber,
-          entryCount: entries.length,
-          fileCount: new Set(entries.map((e) => e.filename)).size,
-        },
-      },
-    ];
+    const raw = await callApi(state.apiKey, state.model, prompt);
+    return [raw];
   } catch (error) {
     if (
       !isContextLimitError(error) ||
@@ -464,84 +355,139 @@ export async function executeReviewBatch(entries, state, deps = {}) {
       );
     }
     const [leftResults, rightResults] = await Promise.all([
-      executeReviewBatch(left, state, deps),
-      executeReviewBatch(right, state, deps),
+      executeStructuredBatch(left, state, deps),
+      executeStructuredBatch(right, state, deps),
     ]);
     return [...leftResults, ...rightResults];
   }
 }
 
 /**
- * Run the full pipeline: build batches, review each, synthesize.
+ * Run the structured review pipeline: build batches, review each batch
+ * (structured JSON output), parse findings, merge across batches, rank+cap.
  *
- * @param {Array} files    - raw changed files
- * @param {Object} config  - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, ... }
- * @param {Object} deps    - { callApi, createReviewBatches, buildSynthesisPrompt, buildFallbackReview, buildCoverageNotes, core }
- * @returns {Promise<string>} the final review text
+ * Flow:
+ *   1. createReviewBatches(files, reviewConfig) → {batches, metadata}
+ *   2. For each batch, executeStructuredBatch → raw-text strings (halving on
+ *      context overflow may produce multiple per batch).
+ *   3. parseStructuredReview(rawText, {changedFiles}) → {summary, findings}.
+ *      The last non-empty summary wins (batches are reviewed in order; the
+ *      final batch's summary is the most complete picture).
+ *   4. mergeFindings(allLLMFindings, deterministicFindings) — deterministic
+ *      scanner findings supersede LLM findings at the same file:line+title.
+ *   5. rankAndCapFindings(merged, {maxFindings, minSeverity}) → final capped.
+ *   6. Return {findings, summary, metadata}.
+ *
+ * @param {Array} files - raw changed files (each {filename, status, patch?, ...})
+ * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndCapFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
+ * @returns {Promise<{findings: Array, summary: string, metadata: Object}>}
  */
-export async function runAutoReview(files, config, deps = {}) {
+export async function runStructuredReview(files, config, deps = {}) {
   const callApi = deps.callApi || DEFAULT_CALL_API;
   const buildBatches = deps.createReviewBatches || createReviewBatches;
-  const buildSynth = deps.buildSynthesisPrompt || buildSynthesisPrompt;
-  const buildFallback = deps.buildFallbackReview || buildFallbackReview;
-  const buildNotes = deps.buildCoverageNotes || buildCoverageNotes;
+  const parseReview = deps.parseStructuredReview || parseStructuredReview;
+  const rankAndCap = deps.rankAndCapFindings || rankAndCapFindings;
+  const merge = deps.mergeFindings || mergeFindings;
+  const executeBatch = deps.executeStructuredBatch || executeStructuredBatch;
   const core = deps.core;
+
+  // Empty input short-circuit: no batches, no callApi, empty result.
+  if (!Array.isArray(files) || files.length === 0) {
+    return {
+      findings: [],
+      summary: '',
+      metadata: {
+        totalBatches: 0,
+        totalFindingsBeforeCap: 0,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+      },
+    };
+  }
 
   const reviewConfig = {
     maxBatchChars: config.maxBatchChars || DEFAULTS.maxBatchChars,
     maxFilesPerBatch: config.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch,
     maxPatchChars: config.maxPatchChars || DEFAULTS.maxPatchChars,
   };
-  const state = {
+
+  const batchState = {
     apiKey: config.apiKey,
     model: config.model,
-    reviewConfig,
-    limitReached: Boolean(config.limitReached),
+    maxFindings: config.maxFindings,
+    scannerContext: config.scannerContext,
+    pathInstructions: config.pathInstructions,
+    toneInstructions: config.toneInstructions,
+    maxDiffChars: config.maxDiffChars,
   };
 
-  const { batches, metadata } = buildBatches(files, state.reviewConfig);
+  const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
 
-  const collectedReviews = [];
+  /** @type {Record<string, unknown>[]} */
+  const allFindings = [];
+  const batchMeta = [];
+  let summary = '';
+
   for (let i = 0; i < batches.length; i++) {
     const batchNumber = i + 1;
-    const results = await executeReviewBatch(
+    const totalBatches = batches.length;
+    const rawTexts = await executeBatch(
       batches[i],
-      { apiKey: state.apiKey, model: state.model, batchNumber, totalBatches: batches.length },
-      deps,
+      { ...batchState, batchNumber, totalBatches },
+      { callApi, core },
     );
-    for (const r of results) collectedReviews.push(r);
+
+    let batchFindingCount = 0;
+    for (const raw of rawTexts) {
+      const parsed = parseReview(raw, { changedFiles: files });
+      if (parsed.summary && parsed.summary.length > 0) {
+        summary = parsed.summary;
+      }
+      for (const f of parsed.findings) {
+        allFindings.push(f);
+        batchFindingCount++;
+      }
+    }
+    batchMeta.push({
+      batchNumber,
+      rawTextCount: rawTexts.length,
+      findingCount: batchFindingCount,
+    });
   }
 
-  const reviewedFiles = new Set(
-    (files || []).filter((f) => f.patch).map((f) => f.filename),
-  ).size;
-  const synthesisMetadata = {
-    reviewedFiles,
-    totalBatches: collectedReviews.length,
-    splitFileCount: metadata.splitFileCount,
-    limitReached: state.limitReached,
+  const deterministicFindings = Array.isArray(config.deterministicFindings)
+    ? config.deterministicFindings
+    : [];
+  const merged = merge(allFindings, deterministicFindings);
+
+  const totalFindingsBeforeCap = merged.length;
+  const maxFindings =
+    typeof config.maxFindings === 'number' && config.maxFindings > 0
+      ? config.maxFindings
+      : DEFAULTS.maxFindings;
+  const minSeverity =
+    typeof config.minSeverity === 'string' && config.minSeverity.length > 0
+      ? config.minSeverity
+      : DEFAULTS.minSeverity;
+
+  const findings = rankAndCap(merged, { maxFindings, minSeverity });
+
+  if (core?.info && findings.length < totalFindingsBeforeCap) {
+    core.info(
+      `Structured review: ${totalFindingsBeforeCap - findings.length} findings truncated to cap (${findings.length}/${maxFindings}).`,
+    );
+  }
+
+  return {
+    findings,
+    summary,
+    metadata: {
+      totalBatches: batches.length,
+      totalFindingsBeforeCap,
+      deterministicFindingsCount: deterministicFindings.length,
+      batchMetadata: batchMeta,
+      splitFileCount: batchMetadata.splitFileCount,
+    },
   };
-
-  try {
-    const synthPrompt = buildSynth(collectedReviews, synthesisMetadata);
-    const synthesized = await callApi(state.apiKey, state.model, synthPrompt);
-    // Append/section the coverage notes.
-    const notes = buildNotes(synthesisMetadata);
-    if (synthesized.includes('## Coverage Notes')) {
-      const bullets = '\n' + notes.map((n) => `- ${n}`).join('\n');
-      return synthesized + bullets;
-    }
-    return (
-      synthesized +
-      '\n\n## Coverage Notes\n' +
-      notes.map((n) => `- ${n}`).join('\n')
-    );
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(
-        `Auto-review synthesis failed (${error?.message || error}); returning concatenated per-batch reviews.`,
-      );
-    }
-    return buildFallback(collectedReviews, synthesisMetadata);
-  }
 }

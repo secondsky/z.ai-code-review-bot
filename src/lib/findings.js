@@ -408,6 +408,125 @@ export function parseFindings(rawModelOutput, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// parseStructuredReview
+// ---------------------------------------------------------------------------
+
+/**
+ * Tolerant parser for the v2 structured-review envelope. The model emits a
+ * JSON object `{"summary": "...", "findings": [...]}`. This extracts the
+ * summary string and delegates the findings array to {@link parseFindings}.
+ *
+ * Strategies for the envelope (tried in order):
+ *   a. The entire trimmed text as JSON (if it starts with `{`).
+ *   b. A fenced ```json / ``` code block.
+ *   c. The substring from the first `{` to the last `}` (greedy brace scan).
+ *
+ * If none yield a JSON object, falls back to treating the text as a bare
+ * findings array (so `parseFindings` still gets a chance — summary is then
+ * the empty string).
+ *
+ * Never throws. Returns `{summary: '', findings: []}` on any non-parseable
+ * input. The summary is coerced to a string; non-string values become `''`.
+ *
+ * @param {string} rawModelOutput
+ * @param {{ changedFiles?: unknown[] }} [options]
+ * @returns {{ summary: string, findings: Record<string, unknown>[] }}
+ */
+export function parseStructuredReview(rawModelOutput, options = {}) {
+  const empty = { summary: '', findings: [] };
+  if (typeof rawModelOutput !== 'string') return empty;
+
+  const parsed = extractJsonObject(rawModelOutput);
+
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const summary =
+      typeof parsed.summary === 'string' ? parsed.summary : '';
+    const findingsRaw = Array.isArray(parsed.findings) ? parsed.findings : [];
+    const findings = parseFindings(JSON.stringify(findingsRaw), options);
+    return { summary, findings };
+  }
+
+  // Fall back: maybe the model emitted a bare findings array.
+  const findings = parseFindings(rawModelOutput, options);
+  return { summary: '', findings };
+}
+
+/**
+ * Extract a JSON OBJECT from raw model output. Mirrors {@link extractJsonArray}
+ * but requires the result to be a plain object (not an array).
+ *
+ * @param {string} text
+ * @returns {Record<string, unknown> | null}
+ */
+function extractJsonObject(text) {
+  if (typeof text !== 'string') return null;
+
+  // a. The entire text trimmed as JSON.
+  const trimmed = text.trim();
+  // If the text is a bare JSON array, it's not an object envelope — bail so
+  // the caller can delegate to parseFindings (bare-array fallback).
+  if (trimmed.startsWith('[')) return null;
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return /** @type {Record<string, unknown>} */ (parsed);
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // b. A fenced ```json (or bare ```) code block.
+  const fence = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (fence) {
+    const inner = fence[1].trim();
+    // A fenced bare array is not an object envelope.
+    if (inner.startsWith('[')) {
+      /* fall through to brace scan, but guard below */
+    } else {
+      try {
+        const parsed = JSON.parse(inner);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return /** @type {Record<string, unknown>} */ (parsed);
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+  }
+
+  // c. First `{` to last `}` (greedy).
+  // Skip when the text is clearly a bare array — the brace scan would
+  // otherwise mistake an array element's `{...}` for the envelope.
+  const firstBracket = text.indexOf('[');
+  const firstBrace = text.indexOf('{');
+  if (
+    firstBrace !== -1 &&
+    !(firstBracket !== -1 && firstBracket < firstBrace)
+  ) {
+    const lastBrace = text.lastIndexOf('}');
+    if (lastBrace !== -1 && lastBrace > firstBrace) {
+      const slice = text.slice(firstBrace, lastBrace + 1);
+      try {
+        const parsed = JSON.parse(slice);
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          !Array.isArray(parsed)
+        ) {
+          return /** @type {Record<string, unknown>} */ (parsed);
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // rankAndCapFindings
 // ---------------------------------------------------------------------------
 

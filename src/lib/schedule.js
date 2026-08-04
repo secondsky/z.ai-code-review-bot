@@ -10,9 +10,9 @@
  *   3. Skips PRs whose head SHA already has a Z.ai marker comment (dedup by
  *      SHA — only new/changed PRs get reviewed, so a stable PR is not
  *      re-reviewed on every cron tick).
- *   4. Runs the existing auto-review pipeline (small-PR single call OR the
- *      large-PR batched `runAutoReview`) and upserts the summary comment —
- *      exactly the same code path as the `pull_request` event.
+ *   4. Runs the structured-review pipeline (`runStructuredReview`) and upserts
+ *      the summary comment — exactly the same code path as the `pull_request`
+ *      event.
  *
  * Per-PR failures are logged and isolated; one bad PR never stops the batch.
  * All collaborators are INJECTED (DI-first) so tests never touch the network.
@@ -110,11 +110,10 @@ export async function hasReviewForSha({
 }
 
 /**
- * Review a single PR using the existing auto-review pipeline. Mirrors the
+ * Review a single PR using the structured-review pipeline. Mirrors the
  * `pull_request` branch of `run()` in src/index.js: fetch changed files, filter
- * excludes + patchable, short-circuit on zero patchable, then either the
- * small-PR single-call path or the large-PR batched `runAutoReview`, and upsert
- * the summary comment.
+ * excludes + patchable, short-circuit on zero patchable, run the structured
+ * review, render via formatFindingsAsSummary, and upsert the summary comment.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -133,9 +132,9 @@ export async function reviewOnePr({
   getChangedFiles,
   filterExcludedFiles,
   filterPatchableFiles,
-  buildAutoReviewPrompt,
-  runAutoReview,
+  runStructuredReview,
   isLargePr,
+  formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
 }) {
@@ -147,17 +146,22 @@ export async function reviewOnePr({
       return { ok: true, action: 'skipped-no-patchable' };
     }
 
-    let review;
-    if (isLargePr(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
-      review = await runAutoReview(patchable, config, { callApi, core });
-    } else {
-      const prompt = buildAutoReviewPrompt(patchable, { maxDiffChars: config.maxDiffChars });
-      review = await callApi(config.apiKey, config.model, prompt);
-    }
+    const result = await runStructuredReview(patchable, config, { callApi, core });
+
+    const content = formatFindingsAsSummary(result.findings, {
+      reviewerName: config.reviewerName,
+      metadata: {
+        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+        truncated: Math.max(
+          0,
+          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+        ),
+      },
+    });
 
     const body = buildCommentBody({
       title: config.reviewerName,
-      content: review,
+      content,
       marker: MARKER,
     });
     await upsertReviewComment({
@@ -191,9 +195,9 @@ export async function reviewOnePr({
  * @param {Function} args.getChangedFiles
  * @param {Function} args.filterExcludedFiles
  * @param {Function} args.filterPatchableFiles
- * @param {Function} args.buildAutoReviewPrompt
- * @param {Function} args.runAutoReview
+ * @param {Function} args.runStructuredReview
  * @param {Function} args.isLargePr
+ * @param {Function} args.formatFindingsAsSummary
  * @param {Function} args.buildCommentBody
  * @param {Function} args.upsertReviewComment
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
@@ -211,9 +215,9 @@ export async function runScheduledReview({
   getChangedFiles,
   filterExcludedFiles,
   filterPatchableFiles,
-  buildAutoReviewPrompt,
-  runAutoReview,
+  runStructuredReview,
   isLargePr,
+  formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
 }) {
@@ -256,9 +260,9 @@ export async function runScheduledReview({
       getChangedFiles,
       filterExcludedFiles,
       filterPatchableFiles,
-      buildAutoReviewPrompt,
-      runAutoReview,
+      runStructuredReview,
       isLargePr,
+      formatFindingsAsSummary,
       buildCommentBody,
       upsertReviewComment,
     });

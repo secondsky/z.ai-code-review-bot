@@ -32,13 +32,11 @@ inputs:
 
   MAX_DIFF_CHARS:
     description: |-
-      Hard cap on total diff chars sent to the model on the small-PR path
-      (≤ ZAI_LARGE_PR_FILE_THRESHOLD files). 0 = unlimited (NOT recommended —
-      a large PR can produce a huge prompt and exhaust your Z.ai quota; the
-      cap defends against cost abuse from fork PRs). Large PRs use batching
-      regardless. The model's "Rating:" field must NEVER be used as an
-      auto-merge signal — it is model-generated and can be influenced by PR
-      content.
+      Hard cap on total diff chars sent to the model per review batch. 0 =
+      unlimited (NOT recommended — a large PR can produce a huge prompt and
+      exhaust your Z.ai quota; the cap defends against cost abuse from fork
+      PRs). The structured-review pipeline batches large PRs regardless; this
+      cap limits each batch's prompt size.
     required: false
     default: '100000'
 
@@ -129,6 +127,40 @@ inputs:
     description: 'Comma-separated severity=label map for ZAI_IMPACT_LABELS.'
     required: false
     default: 'critical=zai:critical,high=zai:high,medium=zai:medium,low=zai:low'
+
+  # --- v2 structured-review knobs ---
+  ZAI_MAX_FINDINGS:
+    description: |-
+      Maximum number of findings the review will emit (after ranking + capping).
+      Findings above this cap are dropped (highest-severity first). Clamped to
+      [1, 50] — values outside that range fall back to the default.
+    required: false
+    default: '8'
+
+  ZAI_MIN_SEVERITY:
+    description: |-
+      Lowest severity to include in the review. One of: critical, high, medium,
+      low, info. Findings below this threshold are filtered out. Invalid values
+      fall back to 'info' (with a warning).
+    required: false
+    default: 'info'
+
+  ZAI_TEMPERATURE:
+    description: |-
+      Sampling temperature for the review model (0-2). Lower values are more
+      deterministic; higher values are more diverse. Clamped to [0, 2]; invalid
+      values fall back to 0.2. (Reserved for a future task that wires this into
+      the API client.)
+    required: false
+    default: '0.2'
+
+  ZAI_MAX_TOKENS:
+    description: |-
+      Maximum tokens to generate per model call. Clamped to a minimum of 1;
+      invalid values fall back to 4096. (Reserved for a future task that wires
+      this into the API client.)
+    required: false
+    default: '4096'
 
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
