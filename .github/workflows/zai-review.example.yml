@@ -1,0 +1,36 @@
+# Example workflow: automatic Z.ai code review on every pull request.
+#
+# Auto-review is repo-initiated (no user authorization needed). It uses the
+# plain `pull_request` event — safe on forks, because the Z.ai API key is only
+# used to call Z.ai server-side and is never exposed to the PR author.
+#
+# Copy this into .github/workflows/ in the consuming repo and adjust the `uses:`
+# line (point it at a version tag once you publish one, e.g.
+# <your-org>/z.ai-code-review-bot@v1).
+
+name: Z.ai Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Auto-review only needs to post one comment. Keep the token scope minimal.
+permissions:
+  pull-requests: write
+
+jobs:
+  review:
+    # Don't review draft PRs until they're marked ready (ready_for_review
+    # re-triggers this workflow once they are).
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Review with Z.ai
+        uses: <your-org>/z.ai-code-review-bot@v1
+        with:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          # Optional knobs — these are shown with their action.yml defaults:
+          # ZAI_MODEL: ${{ vars.ZAI_MODEL }}           # glm-5.2
+          # ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
+          # ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
+          # EXCLUDE_PATTERNS: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'

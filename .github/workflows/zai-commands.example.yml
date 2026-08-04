@@ -1,0 +1,58 @@
+# Example workflow: interactive /zai commands on pull request comments.
+#
+# THIS is the authorization constraint that stops "some random person with a PR"
+# from running commands and burning your Z.ai API key: the `if:` gate below runs
+# BEFORE the job starts, before any checkout, secret, or our code. It uses
+# GitHub's authoritative `author_association` to allow only trusted collaborators
+# (OWNER / MEMBER / COLLABORATOR) — repo owner, organization members, and
+# collaborators (including code owners who hold a repo role).
+#
+# Why issue_comment + author_association (and NOT pull_request_target):
+#   - /zai commands are PR comments -> they fire `issue_comment` events.
+#   - A drive-by commenter on a FORK pull request CAN trigger issue_comment, and
+#     the GITHUB_TOKEN CAN write that fork PR's conversation. Without this gate,
+#     a random person could run /zai ask and spend your Z.ai credits.
+#   - This `if:` gate blocks them before the job starts: no runner minutes, no
+#     reaction, no secret surface.
+#   - Do NOT use pull_request_target for commands — it's a secret-exfiltration
+#     footgun. Auto-review uses plain pull_request; commands use issue_comment
+#     plus this gate.
+#
+# Defense in depth: the action ALSO re-checks authorization in code
+# (ZAI_AUTH_THRESHOLD, default 'write') so a misconfigured workflow cannot let an
+# untrusted user through. Both layers must agree for a command to run.
+#
+# Copy into .github/workflows/ and set the `uses:` line to a published version.
+
+name: Z.ai Commands
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  contents: read     # bump to 'write' only if you later enable PR-body features
+
+jobs:
+  command:
+    # ── PRIMARY AUTHORIZATION GATE ──────────────────────────────────────────
+    # Only PR comments, and only from trusted collaborators. Edit the JSON list
+    # to match ZAI_AUTH_THRESHOLD:
+    #   write (default): OWNER, MEMBER, COLLABORATOR
+    #   maintain:        OWNER, MEMBER
+    #   admin:            OWNER
+    #   read:             OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR
+    if: >-
+      ${{ github.event.issue.pull_request != null
+          && contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'),
+                       github.event.comment.author_association) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run /zai command
+        uses: <your-org>/z.ai-code-review-bot@v1
+        with:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_COMMANDS_ENABLED: 'true'
+          # ZAI_AUTH_THRESHOLD: 'write'      # in-code re-check (default)
+          # ZAI_ALLOW_FORK_COMMANDS: 'false' # block fork PR commands (default)

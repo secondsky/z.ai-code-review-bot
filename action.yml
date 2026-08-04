@@ -1,0 +1,96 @@
+name: 'Z.ai Code Review'
+description: 'AI-powered pull-request code review and interactive /zai assistant using Z.ai GLM models.'
+author: 'z.ai-code-review-bot contributors'
+branding:
+  icon: 'check-circle'
+  color: 'gray-dark'
+
+inputs:
+  ZAI_API_KEY:
+    description: 'Z.ai API key. Store as a GitHub SECRET (not a variable). Required.'
+    required: true
+
+  ZAI_MODEL:
+    description: 'Z.ai model name (e.g. glm-5.2, glm-4.7).'
+    required: false
+    default: 'glm-5.2'
+
+  ZAI_SYSTEM_PROMPT:
+    description: 'System prompt for the review model. Falls back to a built-in default when empty.'
+    required: false
+    default: ''
+
+  ZAI_REVIEWER_NAME:
+    description: 'Header label shown in the review comment.'
+    required: false
+    default: 'Z.ai Code Review'
+
+  EXCLUDE_PATTERNS:
+    description: 'Comma-separated glob patterns to exclude from review.'
+    required: false
+    default: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'
+
+  MAX_DIFF_CHARS:
+    description: 'Hard cap on total diff chars for the small-PR path (0 = unlimited). Large PRs use batching instead.'
+    required: false
+    default: '0'
+
+  # --- Large-PR batching knobs ---
+  ZAI_LARGE_PR_FILE_THRESHOLD:
+    description: 'Patchable file count that triggers batched review mode.'
+    required: false
+    default: '50'
+
+  ZAI_MAX_BATCH_CHARS:
+    description: 'Character budget per review batch.'
+    required: false
+    default: '120000'
+
+  ZAI_MAX_FILES_PER_BATCH:
+    description: 'Maximum distinct files packed into a single batch.'
+    required: false
+    default: '40'
+
+  ZAI_MAX_PATCH_CHARS:
+    description: 'Max diff chars for a single file before it is split across review parts.'
+    required: false
+    default: '18000'
+
+  # --- Command surface (OFF by default; auth-gated when on) ---
+  ZAI_COMMANDS_ENABLED:
+    description: |-
+      Enable interactive /zai commands (ask, review, explain, describe, impact, help).
+      OFF by default. When enabled, authorization is MANDATORY: combine with the
+      workflow `if:` gate on author_association (see the example workflows) and
+      ZAI_AUTH_THRESHOLD. Never enable commands without the workflow gate.
+    required: false
+    default: 'false'
+
+  ZAI_AUTH_THRESHOLD:
+    description: |-
+      Minimum relationship to the repo required to use /zai commands (in-code check).
+      One of: admin | maintain | write | read | none.
+      write = OWNER + MEMBER + COLLABORATOR. `none` disables the in-code check
+      (relies entirely on the workflow `if:` gate — not recommended).
+    required: false
+    default: 'write'
+
+  ZAI_ALLOW_FORK_COMMANDS:
+    description: 'Allow /zai commands on pull requests from forks (default false). Leave false unless you trust fork contributors.'
+    required: false
+    default: 'false'
+
+  # --- Networking ---
+  ZAI_TIMEOUT_MS:
+    description: 'Z.ai request timeout in milliseconds, applied to every attempt (retries use a progressive fraction).'
+    required: false
+    default: '120000'
+
+  GITHUB_TOKEN:
+    description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
+    required: false
+    default: '${{ github.token }}'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
