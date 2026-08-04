@@ -1,0 +1,38 @@
+# Example workflow: scheduled batch re-review of open PRs.
+#
+# On a cron schedule, lists open non-draft PRs and reviews any whose head SHA
+# does not already have a Z.ai marker comment (dedup by SHA — only new/changed
+# PRs are reviewed each tick). This catches PRs that were opened or updated
+# without triggering the per-push auto-review workflow (e.g. the review workflow
+# was temporarily disabled, or the PR predates the action).
+#
+# Copy into .github/workflows/ and set the `uses:` line to a published version.
+
+name: Z.ai Scheduled Review
+
+on:
+  schedule:
+    # Weekdays 09:00 UTC — adjust to your cadence. Keep it infrequent to bound
+    # Z.ai spend (each run reviews up to ZAI_SCHEDULE_MAX_PRS PRs, default 10).
+    - cron: '0 9 * * 1-5'
+
+permissions:
+  pull-requests: write
+  contents: read
+
+# Serialize schedule runs so two overlapping cron ticks cannot race. Do NOT
+# cancel in-progress — a scheduled batch should complete once started.
+concurrency:
+  group: zai-schedule
+  cancel-in-progress: false
+
+jobs:
+  scheduled-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scheduled Z.ai review
+        uses: <your-org>/z.ai-code-review-bot@v1
+        with:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_SCHEDULE_ENABLED: 'true'
+          # ZAI_SCHEDULE_MAX_PRS: '10'  # cap per run (default 10)

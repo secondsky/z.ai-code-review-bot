@@ -53,6 +53,8 @@ import { resolveSystemPrompt, buildAutoReviewPrompt } from './lib/prompt.js';
 import { runAutoReview, isLargePr } from './lib/auto-review.js';
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
+import { getPRContext } from './lib/handlers/_shared.js';
+import { runScheduledReview } from './lib/schedule.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -104,6 +106,11 @@ export const INPUT_NAMES = [
   'ZAI_COMMANDS_ENABLED',
   'ZAI_ALLOW_FORK_COMMANDS',
   'ZAI_AUTH_THRESHOLD',
+  'ZAI_SCHEDULE_ENABLED',
+  'ZAI_SCHEDULE_MAX_PRS',
+  'ZAI_DESCRIBE_WRITE_BODY',
+  'ZAI_IMPACT_LABELS',
+  'ZAI_IMPACT_LABEL_MAP',
   'GITHUB_TOKEN',
 ];
 
@@ -160,6 +167,8 @@ export async function run(context, deps = {}) {
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
     createApiClient: createApiClientFn = createApiClient,
+    getPRContext: getPRContextFn = getPRContext,
+    runScheduledReview: runScheduledReviewFn = runScheduledReview,
   } = deps;
 
   const event = eventName(context);
@@ -221,6 +230,16 @@ export async function run(context, deps = {}) {
 
   // ---- issue_comment → command path ---------------------------------
   if (event === 'issue_comment') {
+    // Defense-in-depth: only react to `created` comments. The shipped example
+    // workflow triggers on `types: [created]`, but a consumer who broadens it
+    // to `[created, edited]` could let an authorized user re-fire commands by
+    // editing an old comment. Do not assume the workflow's types filter.
+    const action = context?.payload?.action;
+    if (action && action !== 'created') {
+      coreDep.info(`Ignoring issue_comment action: ${action}`);
+      return;
+    }
+
     if (!config.commandsEnabled) {
       coreDep.info('Commands disabled; ignoring comment.');
       return;
@@ -248,7 +267,22 @@ export async function run(context, deps = {}) {
 
     // ---- AUTH (the live gate) ----
     const commenter = getCommenter(context);
-    const isFork = isForkPullRequest(context);
+    // The issue_comment payload does NOT carry fork-ness, so isForkPullRequest
+    // is always false here. When the fork gate is active (allowForkCommands
+    // disabled), resolve fork-ness via the PR API so the in-code promise —
+    // "ZAI_ALLOW_FORK_COMMANDS:false blocks fork-PR commands" — actually holds.
+    let isFork = isForkPullRequest(context);
+    if (!isFork && config.allowForkCommands !== true) {
+      try {
+        const pr = await getPRContextFn({ octokit, context });
+        isFork = Boolean(pr?.isFork);
+      } catch (error) {
+        // If the PR lookup fails, fail CLOSED: treat as a fork so a broken API
+        // call cannot let a fork command through the gate.
+        isFork = true;
+        coreDep.info('PR lookup failed during fork check; treating as fork.');
+      }
+    }
     const authResult = authorizeFn({
       comment: context.payload?.comment,
       sender: context.payload?.sender,
@@ -291,9 +325,36 @@ export async function run(context, deps = {}) {
     return;
   }
 
-  // ---- schedule → v1 placeholder ------------------------------------
+  // ---- schedule → batch re-review of open PRs -----------------------
   if (event === 'schedule') {
-    coreDep.info('Scheduled tasks not yet implemented in v1.');
+    if (!config.scheduleEnabled) {
+      coreDep.info('Schedule disabled; nothing to do.');
+      return;
+    }
+    const { owner, repo } = context.repo;
+    const callApi = buildCallApi({
+      injectedCallApi: deps.callApi,
+      injectedApiClient: deps.apiClient,
+      createApiClientFn,
+      config,
+      resolveSystemPromptFn,
+    });
+    await runScheduledReviewFn({
+      octokit,
+      owner,
+      repo,
+      config,
+      core: coreDep,
+      callApi,
+      getChangedFiles: getChangedFilesFn,
+      filterExcludedFiles: filterExcludedFilesFn,
+      filterPatchableFiles: filterPatchableFilesFn,
+      buildAutoReviewPrompt: buildAutoReviewPromptFn,
+      runAutoReview: runAutoReviewFn,
+      isLargePr: isLargePrFn,
+      buildCommentBody: buildCommentBodyFn,
+      upsertReviewComment: upsertReviewCommentFn,
+    });
     return;
   }
 

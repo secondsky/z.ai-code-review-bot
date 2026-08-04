@@ -79,37 +79,60 @@ item if you need path-granular control.
 ### Fork pull requests
 
 By default `ZAI_ALLOW_FORK_COMMANDS: false`. Fork PRs cannot run commands even
-from authorized users. (Note: for `issue_comment` events the action cannot
-always determine fork-ness from the event payload alone; Layer 1 is the primary
-fork control. `ZAI_ALLOW_FORK_COMMANDS` is the in-code guard where fork-ness is
-known.)
+from authorized users. The `issue_comment` payload does not carry fork-ness, so
+when the fork gate is active the router resolves it via `octokit.rest.pulls.get`
+and passes the real value to `authorize()`. This makes the in-code fork gate
+enforceable on the command path under every threshold, including `none`.
 
-## Commands are read-only in v1
+## Output safety & prompt injection
 
-`/describe` posts a generated description as a comment but does **not** rewrite
-the PR body (no `pulls.update`). `/impact` posts an assessment but does **not**
-apply labels (no `issues.addLabels`). The fork this action merges from did both
-as side effects; v1 deliberately rejects them. There are dedicated tests
-asserting these calls are never made.
+Auto-review runs on plain `pull_request` with **no `author_association` gate** —
+a fork-PR author controls the diff, title, and body that reach the model. Three
+layers defend against indirect prompt injection and abusive model output:
 
-## Secret handling
+1. **Instruction hardening (prompt).** All PR content is wrapped in
+   `<untrusted_input>` tags with a preamble telling the model to treat it as
+   data and never obey instructions inside it. Filenames and diff close-tags
+   are escaped so they cannot break the structural boundary. A non-disclosure
+   clause is appended to the system prompt to resist instruction-leakage.
+2. **Output sanitization (`src/lib/sanitize-output.js`).** Every model response
+   is sanitized before it is posted as a GitHub comment: `@mentions` are
+   neutralized (breaks notification spam), and GitHub alert banners
+   (`> [!WARNING]`) are neutralized (blocks callout-banner forgery). Links,
+   images, code, and HTML are deliberately left intact so legitimate reviews
+   render normally.
+3. **`MAX_DIFF_CHARS` cap.** Defaults to `100000` to bound prompt size and
+   cost. `0` means unlimited (not recommended — a large fork PR can exhaust
+   your Z.ai quota).
 
-- `ZAI_API_KEY` and `GITHUB_TOKEN` are masked in logs via `core.setSecret` at
-  startup.
-- The Z.ai client (`src/lib/api.js`) never logs the API key. Error messages are
-  run through `sanitizeErrorMessage`, which redacts `Bearer …`, `api_key=…`,
-  `Authorization: …`, credential URLs, and JSON blobs containing
-  `api_key`/`token`/`secret`/`password`/`credential`, then truncates to 500
-  chars.
-- Store `ZAI_API_KEY` as a GitHub **secret**, not a variable. Non-secret
-  configuration (model, reviewer name, system prompt) may use `vars.*`.
+**The model's `Rating:` field must NEVER be used as an auto-merge signal.** It
+is model-generated and can be influenced by PR content. The action itself never
+merges; if your workflow auto-merges on a clean review, do not trust the rating.
 
-## Rate limiting (not implemented in v1)
+## Commands are read-only by default (opt-in mutations)
 
-The fork *claimed* per-user/per-PR rate limits but never implemented them (a
-doc-vs-code drift we explicitly reject). v1 does not ship rate-limit inputs. The
-authorization gate + fork guard stop the abuse that matters (a random person
-spending your credits). Per-user/per-PR budgets are a roadmap item.
+`/describe` posts a generated description as a comment; `/impact` posts an
+assessment. By default neither mutates the PR. Two opt-in features override
+this (each defaults to OFF and requires its own token scope):
+
+- `ZAI_DESCRIBE_WRITE_BODY: true` — `/describe` upserts a marked
+  `<!-- zai-description -->` block into the PR body via `pulls.update`. Only the
+  marked block is ever mutated; the rest of the body is preserved. Requires
+  `pull-requests: write` (already the default).
+- `ZAI_IMPACT_LABELS: true` — `/impact` applies a `zai:`-prefixed label based on
+  the severity the model emits. Only `zai:` labels are managed (added/removed);
+  human labels are never touched. Requires `issues: write` (add it to your
+  workflow `permissions:` when enabling).
+
+## Concurrency & rate limiting
+
+Per-PR serialization is provided via GitHub Actions `concurrency:` groups in the
+example workflows (`zai-review-<sha>` for auto-review, `zai-commands-pr-<n>`
+for commands). Copy them into your workflow to prevent the cost-amplification
+and duplicate-summary race that rapid force-pushes or rapid commands would
+otherwise trigger. The authorization gate + fork guard stop the abuse that
+matters (a random person spending your credits); per-user/per-PR budgets beyond
+the concurrency group are a roadmap item.
 
 ## Reporting a vulnerability
 

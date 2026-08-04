@@ -26,6 +26,41 @@ const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 const MAX_CONTEXT_CHARS = 8000;
 
 /**
+ * Emoji → severity-key map, matching the prompt's requested severity prefix
+ * (buildImpactPrompt asks for `🔴 critical`, `🟠 high`, `🟡 medium`, `🟢 low`).
+ * Used by parseSeverity when ZAI_IMPACT_LABELS is enabled.
+ */
+const SEVERITY_KEYS = {
+  '🔴': 'critical',
+  '🟠': 'high',
+  '🟡': 'medium',
+  '🟢': 'low',
+  // Word-form fallback (in case the model emits the word without the emoji).
+  critical: 'critical',
+  high: 'high',
+  medium: 'medium',
+  low: 'low',
+};
+
+/**
+ * Extract the severity from the model's impact assessment. The prompt asks for
+ * a severity level on its own first line; this parses the first severity
+ * keyword or emoji found in the first ~200 chars. Pure (exported for testing).
+ *
+ * @param {string} text  The model's assessment output.
+ * @returns {'critical'|'high'|'medium'|'low'|null}
+ */
+export function parseSeverity(text) {
+  const t = String(text ?? '').toLowerCase();
+  // Check emoji + word forms in priority order (critical first).
+  for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
+    const mapped = SEVERITY_KEYS[key];
+    if (mapped && t.includes(key.toLowerCase())) return mapped;
+  }
+  return null;
+}
+
+/**
  * Build the diff context block from patchable files, capped to a char budget.
  * Pure (exported for testing).
  *
@@ -70,12 +105,57 @@ export function buildImpactPrompt(files) {
 }
 
 /**
- * Handle `/zai impact`. READ-ONLY: posts a comment, never applies labels.
+ * Apply (or replace) the `zai:`-scoped severity label on the issue. Only labels
+ * with the configured prefix (`zai:` by default via the label map) are managed:
+ * existing `zai:*` labels are removed and the new one is set, so re-runs are
+ * idempotent and human labels are never touched.
+ *
+ * Injected via deps so tests never touch the GitHub API.
+ *
+ * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
+ * @returns {Promise<boolean>} true if a label was applied, false if unmappable.
+ */
+async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
+  if (!severity) return false;
+  const targetLabel = labelMap?.[severity];
+  if (!targetLabel) return false;
+
+  // Fetch current labels and remove any existing zai:* labels (idempotent).
+  const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
+    owner,
+    repo,
+    issue_number: issueNumber,
+  });
+  const zaiPrefix = (targetLabel.split(':')[0] + ':').toLowerCase();
+  for (const label of current) {
+    const name = label?.name ?? '';
+    if (name.toLowerCase().startsWith(zaiPrefix) && name !== targetLabel) {
+      try {
+        await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
+      } catch {
+        // A label may already be gone; ignore.
+      }
+    }
+  }
+  await octokit.rest.issues.addLabels({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    labels: [targetLabel],
+  });
+  return true;
+}
+
+/**
+ * Handle `/zai impact`. READ-ONLY by default: posts a comment, never applies
+ * labels. When ZAI_IMPACT_LABELS is true (opt-in), applies a `zai:`-scoped
+ * severity label based on the model's assessment.
  *
  * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
  * @param {object} [deps={}]
  * @param {(o: object) => Promise<*>} [deps.post]
  * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
+ * @param {(o: object) => Promise<boolean>} [deps.applyLabel]
  * @returns {Promise<void>}
  */
 export async function handleImpactCommand(
@@ -85,6 +165,7 @@ export async function handleImpactCommand(
   const {
     post = (body) => postComment({ octokit, context, body }),
     getChangedFiles: getFiles = (o) => getChangedFiles(o),
+    applyLabel = (o) => defaultApplyLabel(o),
   } = deps;
 
   const owner = context?.repo?.owner;
@@ -99,7 +180,19 @@ export async function handleImpactCommand(
     const prompt = buildImpactPrompt(files || []);
     const assessment = await callApi(config.apiKey, config.model, prompt);
     await post(assessment);
-    // READ-ONLY: deliberately no `octokit.rest.issues.addLabels` here.
+    // OPT-IN mutation: when ZAI_IMPACT_LABELS is true, apply a scoped zai:
+    // severity label (removing prior zai: labels for idempotency).
+    if (config.impactLabels && typeof pullNumber === 'number') {
+      const severity = parseSeverity(assessment);
+      await applyLabel({
+        octokit,
+        owner,
+        repo,
+        issueNumber: pullNumber,
+        severity,
+        labelMap: config.impactLabelMap,
+      });
+    }
   } catch (error) {
     if (core?.warning) {
       core.warning(`impact handler failed: ${error?.message ?? error}`);

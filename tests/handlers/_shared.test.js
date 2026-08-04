@@ -84,6 +84,28 @@ describe('postComment', () => {
     expect(result).toBeNull();
     expect(octokit.__calls.createComment).toHaveLength(0);
   });
+
+  it('sanitizes the body before posting (neutralizes @mentions)', async () => {
+    const octokit = makeOctokit();
+    const context = makeContext();
+    await postComment({ octokit, context, body: 'Hey @spammer look' });
+    expect(octokit.__calls.createComment[0].body).toBe('Hey @\u200bspammer look');
+  });
+
+  it('sanitizes the body before posting (neutralizes GitHub alert banners)', async () => {
+    const octokit = makeOctokit();
+    const context = makeContext();
+    await postComment({ octokit, context, body: '> [!WARNING]\n> pre-approved' });
+    expect(octokit.__calls.createComment[0].body).not.toContain('[!WARNING]');
+  });
+
+  it('leaves clean review text unchanged', async () => {
+    const octokit = makeOctokit();
+    const context = makeContext();
+    const clean = '## Summary\n\nLooks good. Minor nit on `a.js`.';
+    await postComment({ octokit, context, body: clean });
+    expect(octokit.__calls.createComment[0].body).toBe(clean);
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -95,7 +117,7 @@ describe('getPRContext', () => {
     const pr = {
       title: 'Add feature',
       body: 'This adds X',
-      head: { ref: 'feature-x', sha: 'sha-head-123' },
+      head: { ref: 'feature-x', sha: 'sha-head-123', repo: { fork: false } },
       base: { ref: 'main' },
     };
     const octokit = makeOctokit({ pr });
@@ -112,7 +134,21 @@ describe('getPRContext', () => {
       headBranch: 'feature-x',
       baseBranch: 'main',
       headSha: 'sha-head-123',
+      isFork: false,
     });
+  });
+
+  it('resolves isFork=true when head.repo.fork is true', async () => {
+    const pr = {
+      title: 'T',
+      body: '',
+      head: { ref: 'f', sha: 's', repo: { fork: true } },
+      base: { ref: 'main' },
+    };
+    const octokit = makeOctokit({ pr });
+    const context = makeContext();
+    const result = await getPRContext({ octokit, context });
+    expect(result.isFork).toBe(true);
   });
 
   it('tolerates a missing PR body (null) and missing ref fields', async () => {
@@ -128,6 +164,7 @@ describe('getPRContext', () => {
       headBranch: '',
       baseBranch: '',
       headSha: '',
+      isFork: false,
     });
   });
 

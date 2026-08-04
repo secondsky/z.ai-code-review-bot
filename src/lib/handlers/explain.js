@@ -22,6 +22,11 @@ const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 const USAGE_COMMENT =
   '> Usage: `/zai explain <start>-<end> [file]`\n> \n> Example: `/zai explain 10-20 src/index.js`';
 
+/** Cap on the number of lines extracted into the explain prompt (cost guard). */
+const MAX_WINDOW_LINES = 400;
+/** Cap on the total chars of the extracted window (cost guard). */
+const MAX_WINDOW_CHARS = 16000;
+
 /** Separators accepted in a range token. */
 const RANGE_SEPARATORS = ['-', ':', '..'];
 
@@ -223,11 +228,18 @@ export async function handleExplainCommand(
     }
 
     const content = await fetch({ octokit, owner, repo, path: target, ref });
-    const window = extractLineWindow(content, range.start, range.end);
+    // Clamp the requested range to a sane window so a `/zai explain 1-50000`
+    // on a huge file cannot build a giant prompt (cost/quota guard). The
+    // visible range reported to the model reflects the clamp.
+    const clampedEnd = Math.min(range.end, range.start + MAX_WINDOW_LINES - 1);
+    let window = extractLineWindow(content, range.start, clampedEnd);
+    if (window.length > MAX_WINDOW_CHARS) {
+      window = window.slice(0, MAX_WINDOW_CHARS);
+    }
     const prompt = buildExplainPrompt({
       file: target,
       start: range.start,
-      end: range.end,
+      end: clampedEnd,
       window,
     });
     const explanation = await callApi(config.apiKey, config.model, prompt);

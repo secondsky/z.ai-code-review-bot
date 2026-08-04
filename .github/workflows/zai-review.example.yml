@@ -18,6 +18,14 @@ on:
 permissions:
   pull-requests: write
 
+# Serialize reviews per head SHA: a new push supersedes the in-flight review of
+# the old SHA (cancel-in-progress: true), and two runs for the same SHA are
+# deduped. This prevents the cost-amplification + duplicate-summary race that
+# rapid force-pushes would otherwise trigger.
+concurrency:
+  group: zai-review-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
 jobs:
   review:
     # Don't review draft PRs until they're marked ready (ready_for_review

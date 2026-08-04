@@ -10,8 +10,10 @@
  * injected `callApi(apiKey, model, userPrompt)`, and never import
  * `@actions/core` or hit the network directly.
  *
- * v1 is READ-ONLY: `describe` does NOT mutate the PR body; `impact` does NOT
- * apply labels.
+ * READ-ONLY by default. `describe` and `impact` have OPT-IN mutations, each
+ * gated by an action input that defaults to OFF:
+ *   - `ZAI_DESCRIBE_WRITE_BODY: true`  → describe upserts a marked PR-body block.
+ *   - `ZAI_IMPACT_LABELS: true`         → impact applies a zai: severity label.
  */
 import { handleAskCommand } from './ask.js';
 import { handleHelpCommand } from './help.js';

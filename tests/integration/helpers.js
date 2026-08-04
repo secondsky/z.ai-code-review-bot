@@ -47,6 +47,11 @@ export function makeConfig(overrides = {}) {
     authThreshold: 'write',
     allowForkCommands: false,
     timeoutMs: 120000,
+    scheduleEnabled: false,
+    scheduleMaxPrs: 10,
+    describeWriteBody: false,
+    impactLabels: false,
+    impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
     githubToken: 'ghs-test-token',
     ...overrides,
   };

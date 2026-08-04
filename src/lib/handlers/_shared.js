@@ -14,12 +14,27 @@
  * No handler imports `@actions/core` or hits the network directly.
  */
 
+import { sanitizeModelOutput } from '../sanitize-output.js';
+
+/**
+ * Markers delimiting the upserted PR-description block. The block is the ONLY
+ * region of the PR body that Z.ai ever mutates (when ZAI_DESCRIBE_WRITE_BODY is
+ * enabled). Everything outside the markers is preserved verbatim.
+ */
+export const DESCRIBE_MARKER_START = '<!-- zai-description -->';
+export const DESCRIBE_MARKER_END = '<!-- /zai-description -->';
+
 /**
  * Post a command-response comment on the PR/issue.
  *
  * Uses `octokit.rest.issues.createComment` (a PLAIN create, NOT the marker
  * upsert from comments.js — each command gets its OWN comment, distinct from
  * the auto-review summary marker).
+ *
+ * The `body` is run through `sanitizeModelOutput` before posting so an
+ * indirect prompt-injection cannot coax the bot into emitting @mention spam or
+ * forged GitHub alert banners under its trusted identity. Static/usage text
+ * (e.g. the help table) is untouched by the sanitizer.
  *
  * `owner`/`repo` come from `context.repo`; `issue_number` from
  * `context.payload.issue.number` (issue_comment events carry the issue number
@@ -28,7 +43,7 @@
  * @param {object} args
  * @param {object} args.octokit   Octokit instance.
  * @param {object} args.context   @actions/github context (or same shape).
- * @param {string} args.body      Comment body.
+ * @param {string} args.body      Comment body (will be sanitized before posting).
  * @returns {Promise<object|null>}  The created comment data, or `null` if the
  *   context was missing the fields needed to post (defensive no-op).
  */
@@ -39,11 +54,12 @@ export async function postComment({ octokit, context, body }) {
   if (!owner || !repo || typeof issueNumber !== 'number') {
     return null;
   }
+  const safeBody = sanitizeModelOutput(body);
   const { data } = await octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: issueNumber,
-    body,
+    body: safeBody,
   });
   return data;
 }
@@ -87,5 +103,63 @@ export async function getPRContext({ octokit, context }) {
     headBranch: data?.head?.ref ?? '',
     baseBranch: data?.base?.ref ?? '',
     headSha: data?.head?.sha ?? '',
+    // Fork status is exposed so the router can resolve fork-ness on the
+    // issue_comment command path (where the payload does NOT carry it).
+    isFork: data?.head?.repo?.fork === true,
   };
+}
+
+/**
+ * Upsert a marked description block into the PR body via `pulls.update`.
+ *
+ * - If a `<!-- zai-description -->` … `<!-- /zai-description -->` block already
+ *   exists, its CONTENTS are replaced; everything outside the markers is
+ *   preserved verbatim (never destroys human-written body text).
+ * - Otherwise the marked block is appended to the existing body.
+ *
+ * This is the opt-in mutation behind `ZAI_DESCRIBE_WRITE_BODY` (default off).
+ * Requires `pull-requests: write`.
+ *
+ * @param {object} args `{ octokit, owner, repo, pullNumber, description }`
+ * @param {object} [deps]
+ * @param {Function} [deps.getPr]  Injected `pulls.get` (default: real).
+ * @param {Function} [deps.updatePr]  Injected `pulls.update` (default: real).
+ * @returns {Promise<{updated: boolean}>}
+ */
+export async function upsertPrDescription(
+  { octokit, owner, repo, pullNumber, description },
+  deps = {},
+) {
+  const getPr =
+    deps.getPr ||
+    ((o) => octokit.rest.pulls.get(o).then((r) => r.data));
+  const updatePr =
+    deps.updatePr ||
+    ((o) => octokit.rest.pulls.update(o));
+
+  const pr = await getPr({ owner, repo, pull_number: pullNumber });
+  const currentBody = typeof pr?.body === 'string' ? pr.body : '';
+  const block = `${DESCRIBE_MARKER_START}\n${description}\n${DESCRIBE_MARKER_END}`;
+
+  let newBody;
+  const startIdx = currentBody.indexOf(DESCRIBE_MARKER_START);
+  if (startIdx !== -1) {
+    const endIdx = currentBody.indexOf(DESCRIBE_MARKER_END, startIdx);
+    if (endIdx !== -1) {
+      // Replace the existing block's contents; preserve text before & after.
+      newBody =
+        currentBody.slice(0, startIdx) +
+        block +
+        currentBody.slice(endIdx + DESCRIBE_MARKER_END.length);
+    } else {
+      // Malformed (start without end): replace from start to end of body.
+      newBody = currentBody.slice(0, startIdx) + block;
+    }
+  } else {
+    // No existing block: append.
+    newBody = currentBody ? `${currentBody}\n\n${block}` : block;
+  }
+
+  await updatePr({ owner, repo, pull_number: pullNumber, body: newBody });
+  return { updated: true };
 }

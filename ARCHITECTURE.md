@@ -48,10 +48,12 @@ Auto-review is repo-initiated (no user auth). Commands are user-initiated and
 | `src/lib/glob.js` | `matchesAnyPattern` — picomatch-based exclude matching (path OR basename). |
 | `src/lib/auth.js` | `authorize()` — association-based authorization gate (the security centerpiece). Pure, never throws. |
 | `src/lib/api.js` | The **single** Z.ai client: retry, exponential backoff + jitter, progressive timeouts, error categorization, secret-aware error sanitization. |
-| `src/lib/comments.js` | `upsertReviewComment` — idempotent summary comment via a hidden marker. |
+| `src/lib/comments.js` | `upsertReviewComment` — idempotent summary comment via a hidden marker (fully paginated). |
 | `src/lib/changed-files.js` | Paginated `pulls.listFiles`; `filterPatchableFiles`, `filterExcludedFiles`. |
-| `src/lib/prompt.js` | Centralized prompts: `DEFAULT_SYSTEM_PROMPT`, `resolveSystemPrompt`, `buildAutoReviewPrompt`. |
-| `src/lib/auto-review.js` | Risk-scored batching + synthesis pipeline: `scoreFile`, `splitTextByLines`, `createReviewBatches`, recursive halving on context overflow, synthesis + fallback. |
+| `src/lib/sanitize-output.js` | Conservative model-output sanitizer: length cap, `@mention` neutralization, GitHub alert-banner neutralization. Applied before every comment post. |
+| `src/lib/prompt.js` | Centralized prompts: `DEFAULT_SYSTEM_PROMPT`, `resolveSystemPrompt` (with non-disclosure clause), `buildAutoReviewPrompt` (with `<untrusted_input>` hardening + escapers). |
+| `src/lib/auto-review.js` | Risk-scored batching + synthesis pipeline: `scoreFile`, `splitTextByLines` (guarded against non-positive `maxChars`), `createReviewBatches`, recursive halving on context overflow, synthesis + fallback. |
+| `src/lib/schedule.js` | Scheduled batch re-review: `runScheduledReview`, `listOpenPrs`, `hasReviewForSha`, `reviewOnePr`. Opt-in via `ZAI_SCHEDULE_ENABLED`. |
 | `src/lib/commands.js` | `/zai` parser + `ALLOWED_COMMANDS`. |
 | `src/lib/handlers/*.js` | The six command handlers (`ask`, `review`, `explain`, `describe`, `impact`, `help`) + `HANDLERS` registry + shared helpers. |
 

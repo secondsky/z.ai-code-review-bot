@@ -31,9 +31,16 @@ inputs:
     default: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'
 
   MAX_DIFF_CHARS:
-    description: 'Hard cap on total diff chars for the small-PR path (0 = unlimited). Large PRs use batching instead.'
+    description: |-
+      Hard cap on total diff chars sent to the model on the small-PR path
+      (≤ ZAI_LARGE_PR_FILE_THRESHOLD files). 0 = unlimited (NOT recommended —
+      a large PR can produce a huge prompt and exhaust your Z.ai quota; the
+      cap defends against cost abuse from fork PRs). Large PRs use batching
+      regardless. The model's "Rating:" field must NEVER be used as an
+      auto-merge signal — it is model-generated and can be influenced by PR
+      content.
     required: false
-    default: '0'
+    default: '100000'
 
   # --- Large-PR batching knobs ---
   ZAI_LARGE_PR_FILE_THRESHOLD:
@@ -85,6 +92,43 @@ inputs:
     description: 'Z.ai request timeout in milliseconds, applied to every attempt (retries use a progressive fraction).'
     required: false
     default: '120000'
+
+  # --- Scheduled batch review (opt-in, OFF by default) ---
+  ZAI_SCHEDULE_ENABLED:
+    description: |-
+      Enable scheduled batch re-review of open PRs (the `schedule` event). OFF
+      by default. When enabled, a schedule trigger lists open non-draft PRs and
+      reviews any whose head SHA does not already have a Z.ai marker comment
+      (dedup by SHA — only new/changed PRs are reviewed each tick).
+    required: false
+    default: 'false'
+
+  ZAI_SCHEDULE_MAX_PRS:
+    description: 'Maximum number of PRs to review per scheduled run.'
+    required: false
+    default: '10'
+
+  # --- describe/impact opt-in mutations (OFF by default; v1 stays read-only) ---
+  ZAI_DESCRIBE_WRITE_BODY:
+    description: |-
+      When true, /zai describe upserts a marked <!-- zai-description --> block
+      into the PR body via pulls.update (only the marked block is mutated).
+      Requires pull-requests: write. OFF by default.
+    required: false
+    default: 'false'
+
+  ZAI_IMPACT_LABELS:
+    description: |-
+      When true, /zai impact applies a zai:-prefixed label based on the severity
+      the model emits. Only zai: labels are managed; human labels are untouched.
+      Requires issues: write. OFF by default.
+    required: false
+    default: 'false'
+
+  ZAI_IMPACT_LABEL_MAP:
+    description: 'Comma-separated severity=label map for ZAI_IMPACT_LABELS.'
+    required: false
+    default: 'critical=zai:critical,high=zai:high,medium=zai:medium,low=zai:low'
 
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
