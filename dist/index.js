@@ -40076,6 +40076,955 @@ function parseCommand(text) {
   return { command, args, raw: text, error: null };
 }
 
+;// CONCATENATED MODULE: ./src/lib/handlers/_shared.js
+/**
+ * Shared helpers used by every `/zai` command handler.
+ *
+ * Two small, defensive wrappers around the injected octokit:
+ *   - `postComment`     → create an issue comment (command response).
+ *   - `getPRContext`    → fetch minimal PR metadata for prompt-building.
+ *
+ * Both are defensive on a missing/malformed `context`: they return a sane
+ * sentinel (`null`) rather than throwing, so a handler that calls them can
+ * decide how to degrade (typically: post a short guidance/error comment and
+ * return). Octokit is ALWAYS a parameter — never imported — so this module
+ * stays pure and unit-testable.
+ *
+ * No handler imports `@actions/core` or hits the network directly.
+ */
+
+/**
+ * Post a command-response comment on the PR/issue.
+ *
+ * Uses `octokit.rest.issues.createComment` (a PLAIN create, NOT the marker
+ * upsert from comments.js — each command gets its OWN comment, distinct from
+ * the auto-review summary marker).
+ *
+ * `owner`/`repo` come from `context.repo`; `issue_number` from
+ * `context.payload.issue.number` (issue_comment events carry the issue number
+ * which equals the PR number).
+ *
+ * @param {object} args
+ * @param {object} args.octokit   Octokit instance.
+ * @param {object} args.context   @actions/github context (or same shape).
+ * @param {string} args.body      Comment body.
+ * @returns {Promise<object|null>}  The created comment data, or `null` if the
+ *   context was missing the fields needed to post (defensive no-op).
+ */
+async function postComment({ octokit, context, body }) {
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const issueNumber = context?.payload?.issue?.number;
+  if (!owner || !repo || typeof issueNumber !== 'number') {
+    return null;
+  }
+  const { data } = await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    body,
+  });
+  return data;
+}
+
+/**
+ * Fetch minimal PR metadata for prompt-building.
+ *
+ * Returns `{ title, body, headBranch, baseBranch, headSha }` via
+ * `octokit.rest.pulls.get({ owner, repo, pull_number })` where `pull_number`
+ * is `context.payload.issue.number`. Keeps the payload minimal on purpose —
+ * per-file fetching is the caller's job (each handler fetches what it needs).
+ *
+ * `headSha` is exposed so handlers can fetch a stable file snapshot via
+ * `repos.getContent` without trusting the `issue_comment` payload, which does
+ * NOT carry the PR head SHA (only `payload.issue.pull_request`, a minimal
+ * reference with no `head.sha`).
+ *
+ * Defensive: returns `null` (and fetches nothing) when context is missing the
+ * owner/repo/issue-number fields.
+ *
+ * @param {object} args
+ * @param {object} args.octokit
+ * @param {object} args.context
+ * @returns {Promise<{title: string, body: string, headBranch: string, baseBranch: string, headSha: string}|null>}
+ */
+async function getPRContext({ octokit, context }) {
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+  if (!owner || !repo || typeof pullNumber !== 'number') {
+    return null;
+  }
+  const { data } = await octokit.rest.pulls.get({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+  return {
+    title: typeof data?.title === 'string' ? data.title : '',
+    body: typeof data?.body === 'string' ? data.body : '',
+    headBranch: data?.head?.ref ?? '',
+    baseBranch: data?.base?.ref ?? '',
+    headSha: data?.head?.sha ?? '',
+  };
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/ask.js
+/**
+ * `/zai ask <question>` — answer a question about the PR.
+ *
+ * Builds a USER prompt from the PR context (title/body + the changed files'
+ * patches, capped) plus the user's question, calls the injected `callApi`
+ * (which already applies the system prompt), and posts the answer as a
+ * comment.
+ *
+ * Contract invariants (shared by all six handlers):
+ *   - Same `deps = {}` DI seam; same injected `callApi(apiKey, model, userPrompt)`.
+ *   - NEVER throws — errors become a short comment + return.
+ *   - No `@actions/core` import; no direct network (callApi + injected octokit).
+ *   - callApi rejection → a fixed short error comment (NOT the raw error).
+ */
+
+
+
+/** Soft cap on the diff context bundled into the prompt. */
+const MAX_CONTEXT_CHARS = 8000;
+
+/** Fixed error comment (no raw error leakage). */
+const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/** Guidance when the user issues `/zai ask` with no question. */
+const EMPTY_ARGS_COMMENT =
+  '> Please provide a question: `/zai ask <question>`';
+
+/**
+ * Build the diff context block from patchable files, capped to a char budget.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {Array<{filename: string, patch?: string}>} files
+ * @param {number} [maxChars]
+ * @returns {string}
+ */
+function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
+  const patchable = filterPatchableFiles(files || []);
+  if (patchable.length === 0) return '(no textual diffs available)';
+  const lines = [];
+  let used = 0;
+  for (const f of patchable) {
+    const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    if (used + entry.length > maxChars) break;
+    lines.push(entry);
+    used += entry.length + 2; // +2 for the '\n\n' joiner
+  }
+  if (lines.length === 0) return '(no textual diffs available)';
+  return lines.join('\n\n');
+}
+
+/**
+ * Build the ask USER prompt. Pure (exported for testing).
+ *
+ * @param {object} p
+ * @param {string} p.question
+ * @param {string} p.commenterLogin
+ * @param {{title?: string, body?: string}} p.pr
+ * @param {Array<{filename: string, patch?: string}>} p.files
+ * @returns {string}
+ */
+function buildAskPrompt({ question, commenterLogin, pr, files }) {
+  const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
+  const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
+  return [
+    `Question from @${commenterLogin || 'unknown'}: ${question}`,
+    '',
+    'PR context:',
+    `${title}${body}`,
+    buildDiffContext(files),
+  ].join('\n');
+}
+
+/**
+ * Handle `/zai ask`.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(o: object) => Promise<*>} [deps.post]
+ * @param {(o: object) => Promise<*>} [deps.getPRContext]
+ * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
+ * @returns {Promise<void>}
+ */
+async function handleAskCommand(
+  { octokit, context, config = {}, core, commenter, args, callApi } = {},
+  deps = {},
+) {
+  const {
+    post = (body) => postComment({ octokit, context, body }),
+    getPRContext: getCtx = (o) => getPRContext(o),
+    getChangedFiles: getFiles = (o) => getChangedFiles(o),
+  } = deps;
+
+  const question = typeof args === 'string' ? args.trim() : '';
+  if (question === '') {
+    await post(EMPTY_ARGS_COMMENT);
+    return;
+  }
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+
+  try {
+    const [pr, files] = await Promise.all([
+      getCtx({ octokit, context }),
+      typeof pullNumber === 'number'
+        ? getFiles({ octokit, owner, repo, pullNumber })
+        : Promise.resolve([]),
+    ]);
+
+    const prompt = buildAskPrompt({
+      question,
+      commenterLogin: commenter?.login,
+      pr: pr || {},
+      files: files || [],
+    });
+
+    const answer = await callApi(config.apiKey, config.model, prompt);
+    await post(answer);
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`ask handler failed: ${error?.message ?? error}`);
+    }
+    try {
+      await post(ERROR_COMMENT);
+    } catch {
+      /* last-resort: nothing more we can do; never throw. */
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/help.js
+/**
+ * `/zai help` — static help text.
+ *
+ * Simplest handler: no callApi, no PR context, no network beyond posting one
+ * comment. Renders a markdown table of the commands from {@link ALLOWED_COMMANDS}
+ * with one-line descriptions.
+ *
+ * Like every handler, it uses the shared `deps = {}` DI seam and NEVER throws
+ * (errors become a short comment + return, logged via `core.warning` if core
+ * is present). No `@actions/core` import; no direct network.
+ */
+
+
+
+/** One-line description per command (verbatim from the task brief). */
+const DESCRIPTIONS = {
+  ask: 'Ask a question about the PR',
+  review: 'Review a specific file (or the whole PR if no arg)',
+  explain: 'Explain a line range (e.g. /zai explain 10-20)',
+  describe: 'Generate a PR description',
+  impact: "Assess the change's impact/risk",
+  help: 'Show this help',
+};
+
+/**
+ * Build the help-text comment body: a markdown table of commands.
+ *
+ * Pure (exported for testing). Iterates {@link ALLOWED_COMMANDS} so the table
+ * stays in sync with the parser's allowlist.
+ *
+ * @returns {string}
+ */
+function buildHelpBody() {
+  const header = '| Command | Description |\n| --- | --- |';
+  const rows = ALLOWED_COMMANDS.map(
+    (c) => `| \`/zai ${c}\` | ${DESCRIPTIONS[c] ?? ''} |`,
+  ).join('\n');
+  return `## Z.ai Commands\n\n${header}\n${rows}`;
+}
+
+/**
+ * Handle `/zai help`: post the static command table as a comment.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(body: string) => Promise<*>} [deps.post]
+ * @returns {Promise<void>}
+ */
+async function handleHelpCommand(
+  { octokit, context, core } = {},
+  deps = {},
+) {
+  const { post = (body) => postComment({ octokit, context, body }) } = deps;
+  try {
+    await post(buildHelpBody());
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`help handler failed: ${error?.message ?? error}`);
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/review.js
+/**
+ * `/zai review [file]` — review a specific file (or the whole PR).
+ *
+ * - With a file path: validate it's one of the PR's changed files (rejecting
+ *   path traversal: any path containing `..` or starting with `/`), then build
+ *   a focused review prompt for just that file's patch.
+ * - Without args: reuse {@link buildAutoReviewPrompt} on the patchable changed
+ *   files (capped) to review the whole-PR diff.
+ *
+ * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
+ * throws (errors → short comment + return); no `@actions/core` import; no
+ * direct network.
+ */
+
+
+
+
+/** Fixed error comment (no raw error leakage). */
+const review_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/** Cap on whole-PR diff size passed to callApi. */
+const MAX_WHOLE_PR_DIFF_CHARS = 8000;
+
+/**
+ * Reject path-traversal: any path containing `..` or starting with `/`.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isUnsafePath(path) {
+  if (typeof path !== 'string' || path === '') return true;
+  if (path.startsWith('/')) return true;
+  if (path.includes('..')) return true;
+  return false;
+}
+
+/**
+ * Build the focused single-file review USER prompt. Pure (exported for testing).
+ *
+ * @param {{filename: string, status?: string, patch?: string}} file
+ * @returns {string}
+ */
+function buildFileReviewPrompt(file) {
+  return [
+    'Please review the following file change from this pull request.',
+    'Focus on concrete bugs, security issues, risky logic, and architecture',
+    'mismatches visible in this diff. Skip trivial style comments.',
+    '',
+    `### ${file.filename} (${file.status || 'modified'})`,
+    '```diff',
+    file.patch || '(no textual diff available)',
+    '```',
+  ].join('\n');
+}
+
+/**
+ * Handle `/zai review`.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(o: object) => Promise<*>} [deps.post]
+ * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
+ * @returns {Promise<void>}
+ */
+async function handleReviewCommand(
+  { octokit, context, config = {}, core, commenter, args, callApi } = {},
+  deps = {},
+) {
+  const {
+    post = (body) => postComment({ octokit, context, body }),
+    getChangedFiles: getFiles = (o) => getChangedFiles(o),
+  } = deps;
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+
+  try {
+    const files =
+      typeof pullNumber === 'number'
+        ? await getFiles({ octokit, owner, repo, pullNumber })
+        : [];
+
+    const target = typeof args === 'string' ? args.trim() : '';
+
+    // ---- specific-file path ----
+    if (target !== '') {
+      if (isUnsafePath(target)) {
+        await post(`> \`${target}\` is not a valid file path.`);
+        return;
+      }
+      const match = (files || []).find((f) => f?.filename === target);
+      if (!match) {
+        await post(`> File \`${target}\` is not part of this PR.`);
+        return;
+      }
+      const review = await callApi(
+        config.apiKey,
+        config.model,
+        buildFileReviewPrompt(match),
+      );
+      await post(review);
+      return;
+    }
+
+    // ---- whole-PR path ----
+    const patchable = filterPatchableFiles(files || []);
+    if (patchable.length === 0) {
+      await post('> No textual changes to review in this PR.');
+      return;
+    }
+    const prompt = buildAutoReviewPrompt(patchable, {
+      maxDiffChars:
+        typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
+          ? config.maxDiffChars
+          : MAX_WHOLE_PR_DIFF_CHARS,
+    });
+    const review = await callApi(config.apiKey, config.model, prompt);
+    await post(review);
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`review handler failed: ${error?.message ?? error}`);
+    }
+    try {
+      await post(review_ERROR_COMMENT);
+    } catch {
+      /* last-resort: never throw out of the handler. */
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/explain.js
+/**
+ * `/zai explain <range> [file]` — explain a line range.
+ *
+ * `args` is a line range like `10-20`, `10:20`, `10..20`, or a single `N`
+ * (start=end=N), optionally followed by a file path. If no file is given, the
+ * first changed file is used (or a usage comment if there are none).
+ *
+ * The requested line window is extracted from the file content at the PR head
+ * (via `octokit.rest.repos.getContent`) and an "explain these lines" prompt is
+ * sent to the injected `callApi`.
+ *
+ * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
+ * throws; no `@actions/core` import; no direct network.
+ */
+
+
+
+/** Fixed error comment (no raw error leakage). */
+const explain_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/** Usage guidance. */
+const USAGE_COMMENT =
+  '> Usage: `/zai explain <start>-<end> [file]`\n> \n> Example: `/zai explain 10-20 src/index.js`';
+
+/** Separators accepted in a range token. */
+const RANGE_SEPARATORS = ['-', ':', '..'];
+
+/**
+ * Parse a range token into `{ start, end }`.
+ *
+ * Accepts `N-M`, `N:M`, `N..M`; a single `N` → `{ start: N, end: N }`.
+ * Returns `null` for non-numeric input, `end < start`, or empty input.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} token
+ * @returns {{start: number, end: number}|null}
+ */
+function parseRange(token) {
+  if (typeof token !== 'string') return null;
+  const t = token.trim();
+  if (t === '') return null;
+
+  for (const sep of RANGE_SEPARATORS) {
+    if (t.includes(sep)) {
+      const idx = t.indexOf(sep);
+      const left = t.slice(0, idx);
+      const right =
+        sep === '..' ? t.slice(idx + 2) : t.slice(idx + sep.length);
+      const start = Number(left);
+      const end = Number(right);
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+      if (start < 1 || end < 1 || end < start) return null;
+      return { start, end };
+    }
+  }
+
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 1) return null;
+  return { start: n, end: n };
+}
+
+/**
+ * Parse the full `/zai explain` args into `{ range, file }`.
+ *
+ * The first whitespace-delimited token is the range; if a second token exists,
+ * it is the file path. Returns `{ range: null, file: null }` when the args are
+ * empty or the range is invalid. Pure (exported for testing).
+ *
+ * @param {string} args
+ * @returns {{range: {start: number, end: number}|null, file: string|null}}
+ */
+function parseExplainArgs(args) {
+  const trimmed = typeof args === 'string' ? args.trim() : '';
+  if (trimmed === '') return { range: null, file: null };
+  const parts = trimmed.split(/\s+/);
+  const range = parseRange(parts[0]);
+  if (!range) return { range: null, file: null };
+  const file = parts.length > 1 ? parts.slice(1).join(' ') : null;
+  return { range, file };
+}
+
+/**
+ * Extract a 1-indexed line window `[start, end]` from `content`.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} content
+ * @param {number} start  1-indexed inclusive.
+ * @param {number} end    1-indexed inclusive.
+ * @returns {string}  the numbered lines in the window.
+ */
+function extractLineWindow(content, start, end) {
+  const text = typeof content === 'string' ? content : '';
+  const lines = text.split('\n');
+  const out = [];
+  for (let i = start; i <= end; i++) {
+    const line = lines[i - 1];
+    if (line === undefined) break;
+    out.push(`${i}: ${line}`);
+  }
+  return out.join('\n');
+}
+
+/**
+ * Build the explain USER prompt. Pure (exported for testing).
+ *
+ * @param {object} p
+ * @param {string} p.file
+ * @param {number} p.start
+ * @param {number} p.end
+ * @param {string} p.window
+ * @returns {string}
+ */
+function buildExplainPrompt({ file, start, end, window }) {
+  return [
+    `Explain lines ${start}-${end} of \`${file}\` in this pull request.`,
+    'Describe what this code does, why it is there, and any concerns a',
+    'reviewer should know about. Be concise.',
+    '',
+    '```',
+    window,
+    '```',
+  ].join('\n');
+}
+
+/**
+ * Fetch a file's text content at the PR head ref. Decodes base64 when the API
+ * returns `content` (the typical shape); returns `''` defensively.
+ *
+ * @param {object} args  `{ octokit, owner, repo, path, ref }`
+ * @returns {Promise<string>}
+ */
+async function fetchFileContent({ octokit, owner, repo, path, ref }) {
+  const { data } = await octokit.rest.repos.getContent({
+    owner,
+    repo,
+    path,
+    ref,
+  });
+  if (typeof data?.content === 'string') {
+    // GitHub returns base64-encoded content with newlines every 76 chars.
+    try {
+      return Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString(
+        'utf8',
+      );
+    } catch {
+      return data.content;
+    }
+  }
+  if (typeof data === 'string') return data;
+  return '';
+}
+
+/**
+ * Handle `/zai explain`.
+ *
+ * The PR head SHA is fetched via {@link getPRContext} (which calls
+ * `octokit.rest.pulls.get`) rather than read from the `issue_comment` payload:
+ * that payload has NO top-level `pull_request`, only the minimal
+ * `payload.issue.pull_request` reference (no `head.sha`). Reading the payload
+ * would always yield `undefined` and the handler would fall through to the
+ * usage comment — so `/zai explain` would never reach `callApi`.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(o: object) => Promise<*>} [deps.post]
+ * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
+ * @param {(o: object) => Promise<string>} [deps.fetchFileContent]
+ * @param {(o: object) => Promise<{headSha?: string}|null>} [deps.getPRContext]
+ * @returns {Promise<void>}
+ */
+async function handleExplainCommand(
+  { octokit, context, config = {}, core, commenter, args, callApi } = {},
+  deps = {},
+) {
+  const {
+    post = (body) => postComment({ octokit, context, body }),
+    getChangedFiles: getFiles = (o) => getChangedFiles(o),
+    fetchFileContent: fetch = (o) => fetchFileContent(o),
+    getPRContext: getCtx = (o) => getPRContext(o),
+  } = deps;
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+
+  const { range, file } = parseExplainArgs(args);
+  if (!range) {
+    await post(USAGE_COMMENT);
+    return;
+  }
+
+  try {
+    const files =
+      typeof pullNumber === 'number'
+        ? await getFiles({ octokit, owner, repo, pullNumber })
+        : [];
+    const filenames = (files || [])
+      .map((f) => f?.filename)
+      .filter((f) => typeof f === 'string');
+
+    let target = file;
+    if (!target) {
+      target = filenames[0];
+      if (!target) {
+        await post(USAGE_COMMENT);
+        return;
+      }
+    } else if (!filenames.includes(target)) {
+      await post(`> File \`${target}\` is not part of this PR.`);
+      return;
+    }
+
+    // Fetch the head SHA via the API: the issue_comment payload does NOT carry
+    // it (no top-level pull_request.head.sha).
+    const pr = await getCtx({ octokit, context });
+    const ref = pr?.headSha;
+    if (typeof ref !== 'string' || ref === '') {
+      // Without the head sha we can't fetch a stable file snapshot.
+      await post(USAGE_COMMENT);
+      return;
+    }
+
+    const content = await fetch({ octokit, owner, repo, path: target, ref });
+    const window = extractLineWindow(content, range.start, range.end);
+    const prompt = buildExplainPrompt({
+      file: target,
+      start: range.start,
+      end: range.end,
+      window,
+    });
+    const explanation = await callApi(config.apiKey, config.model, prompt);
+    await post(explanation);
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`explain handler failed: ${error?.message ?? error}`);
+    }
+    try {
+      await post(explain_ERROR_COMMENT);
+    } catch {
+      /* last-resort: never throw out of the handler. */
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/describe.js
+/**
+ * `/zai describe` — generate a PR description.
+ *
+ * Fetches the PR's commits (up to ~30) and changed files, builds a prompt
+ * asking for a structured description (Overview / Features / Bug Fixes /
+ * Refactoring / Infra), and posts the result as a COMMENT.
+ *
+ * v1 READ-ONLY INVARIANT: this handler does NOT mutate the PR body. The fork
+ * did (via `pulls.update`) — that is a side effect we deliberately reject for
+ * v1. The generated description is posted as a comment only; a human can copy
+ * it into the PR body if they choose. No `pulls.update` is ever called here.
+ *
+ * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
+ * throws; no `@actions/core` import; no direct network.
+ */
+
+
+/** Fixed error comment (no raw error leakage). */
+const describe_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/** Cap on the number of commits fetched for the prompt. */
+const MAX_COMMITS = 30;
+
+/**
+ * Build the describe USER prompt. Pure (exported for testing).
+ *
+ * @param {object} p
+ * @param {Array<{commit?: {message?: string}, sha?: string}>} p.commits
+ * @param {Array<{filename: string, status?: string}>} p.files
+ * @returns {string}
+ */
+function buildDescribePrompt({ commits, files }) {
+  const commitLines = (commits || [])
+    .slice(0, MAX_COMMITS)
+    .map((c) => `- ${c?.commit?.message ?? c?.sha ?? '(no message)'}`)
+    .join('\n');
+  const fileLines = (files || [])
+    .map((f) => `- ${f.filename} (${f.status || 'modified'})`)
+    .join('\n');
+  return [
+    'Generate a clear, structured pull-request description from the following',
+    'commits and changed files. Use these sections (omit any that are empty):',
+    'Overview, Features, Bug Fixes, Refactoring, Infrastructure. Do not',
+    'include a section header for changes that did not happen.',
+    '',
+    '## Commits',
+    commitLines || '(none)',
+    '',
+    '## Changed files',
+    fileLines || '(none)',
+  ].join('\n');
+}
+
+/**
+ * Fetch up to {@link MAX_COMMITS} commits for a PR.
+ *
+ * @param {object} args `{ octokit, owner, repo, pullNumber }`
+ * @returns {Promise<Array>}
+ */
+async function defaultListCommits({ octokit, owner, repo, pullNumber }) {
+  const { data } = await octokit.rest.pulls.listCommits({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    per_page: MAX_COMMITS,
+  });
+  return data;
+}
+
+/**
+ * Fetch the changed files for a PR (single page is enough for the description).
+ *
+ * @param {object} args `{ octokit, owner, repo, pullNumber }`
+ * @returns {Promise<Array>}
+ */
+async function defaultListFiles({ octokit, owner, repo, pullNumber }) {
+  const { data } = await octokit.rest.pulls.listFiles({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    per_page: 100,
+  });
+  return data;
+}
+
+/**
+ * Handle `/zai describe`. READ-ONLY: posts a comment, never mutates the PR.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(o: object) => Promise<*>} [deps.post]
+ * @param {(o: object) => Promise<Array>} [deps.listCommits]
+ * @param {(o: object) => Promise<Array>} [deps.listFiles]
+ * @returns {Promise<void>}
+ */
+async function handleDescribeCommand(
+  { octokit, context, config = {}, core, commenter, args, callApi } = {},
+  deps = {},
+) {
+  const {
+    post = (body) => postComment({ octokit, context, body }),
+    listCommits = (o) => defaultListCommits(o),
+    listFiles = (o) => defaultListFiles(o),
+  } = deps;
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+
+  try {
+    const [commits, files] =
+      typeof pullNumber === 'number'
+        ? await Promise.all([
+            listCommits({ octokit, owner, repo, pullNumber }),
+            listFiles({ octokit, owner, repo, pullNumber }),
+          ])
+        : [[], []];
+
+    const prompt = buildDescribePrompt({ commits, files });
+    const description = await callApi(config.apiKey, config.model, prompt);
+    await post(description);
+    // READ-ONLY: deliberately no `octokit.rest.pulls.update` here.
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`describe handler failed: ${error?.message ?? error}`);
+    }
+    try {
+      await post(describe_ERROR_COMMENT);
+    } catch {
+      /* last-resort: never throw out of the handler. */
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/impact.js
+/**
+ * `/zai impact` — assess the change's impact/risk.
+ *
+ * Fetches the changed files (+patches, capped), builds a prompt asking for a
+ * risk assessment with a severity level (🟢 low / 🟡 medium / 🟠 high / 🔴
+ * critical) and rationale, and posts the result as a COMMENT.
+ *
+ * v1 READ-ONLY INVARIANT: this handler does NOT apply labels. The fork did
+ * (via `issues.addLabels`) — that is a side effect we deliberately reject for
+ * v1. The assessment is posted as a comment only; a human can act on it. No
+ * `issues.addLabels` is ever called here.
+ *
+ * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
+ * throws; no `@actions/core` import; no direct network.
+ */
+
+
+
+/** Fixed error comment (no raw error leakage). */
+const impact_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/** Cap on the diff context bundled into the prompt. */
+const impact_MAX_CONTEXT_CHARS = 8000;
+
+/**
+ * Build the diff context block from patchable files, capped to a char budget.
+ * Pure (exported for testing).
+ *
+ * @param {Array<{filename: string, patch?: string}>} files
+ * @param {number} [maxChars]
+ * @returns {string}
+ */
+function impact_buildDiffContext(files, maxChars = impact_MAX_CONTEXT_CHARS) {
+  const patchable = filterPatchableFiles(files || []);
+  if (patchable.length === 0) return '(no textual diffs available)';
+  const lines = [];
+  let used = 0;
+  for (const f of patchable) {
+    const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    if (used + entry.length > maxChars) break;
+    lines.push(entry);
+    used += entry.length + 2;
+  }
+  if (lines.length === 0) return '(no textual diffs available)';
+  return lines.join('\n\n');
+}
+
+/**
+ * Build the impact USER prompt. Pure (exported for testing).
+ *
+ * @param {Array<{filename: string, patch?: string}>} files
+ * @returns {string}
+ */
+function buildImpactPrompt(files) {
+  return [
+    'Assess the impact and risk of the following pull-request changes.',
+    'Begin your response with a severity level on its own first line, using',
+    'one of: 🟢 low, 🟡 medium, 🟠 high, 🔴 critical.',
+    '',
+    'Then give a short rationale covering: blast radius, likely regressions,',
+    'security/auth/data-loss concerns, and anything a reviewer should verify.',
+    'Be concise and concrete; cite filenames where relevant.',
+    '',
+    '## Changes under review',
+    impact_buildDiffContext(files),
+  ].join('\n');
+}
+
+/**
+ * Handle `/zai impact`. READ-ONLY: posts a comment, never applies labels.
+ *
+ * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
+ * @param {object} [deps={}]
+ * @param {(o: object) => Promise<*>} [deps.post]
+ * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
+ * @returns {Promise<void>}
+ */
+async function handleImpactCommand(
+  { octokit, context, config = {}, core, commenter, args, callApi } = {},
+  deps = {},
+) {
+  const {
+    post = (body) => postComment({ octokit, context, body }),
+    getChangedFiles: getFiles = (o) => getChangedFiles(o),
+  } = deps;
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.issue?.number;
+
+  try {
+    const files =
+      typeof pullNumber === 'number'
+        ? await getFiles({ octokit, owner, repo, pullNumber })
+        : [];
+    const prompt = buildImpactPrompt(files || []);
+    const assessment = await callApi(config.apiKey, config.model, prompt);
+    await post(assessment);
+    // READ-ONLY: deliberately no `octokit.rest.issues.addLabels` here.
+  } catch (error) {
+    if (core?.warning) {
+      core.warning(`impact handler failed: ${error?.message ?? error}`);
+    }
+    try {
+      await post(impact_ERROR_COMMENT);
+    } catch {
+      /* last-resort: never throw out of the handler. */
+    }
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/handlers/index.js
+/**
+ * Handler registry: the map of `/zai` command → handler function.
+ *
+ * This is the single object the router (src/index.js) injects as
+ * `deps.handlers` (Task 9). Each handler shares the same contract:
+ *
+ *   `handler({ octokit, context, config, core, commenter, args, callApi }, deps = {})`
+ *
+ * Handlers NEVER throw (errors become a short comment + return), use the same
+ * injected `callApi(apiKey, model, userPrompt)`, and never import
+ * `@actions/core` or hit the network directly.
+ *
+ * v1 is READ-ONLY: `describe` does NOT mutate the PR body; `impact` does NOT
+ * apply labels.
+ */
+
+
+
+
+
+
+
+const HANDLERS = {
+  ask: handleAskCommand,
+  help: handleHelpCommand,
+  review: handleReviewCommand,
+  explain: handleExplainCommand,
+  describe: handleDescribeCommand,
+  impact: handleImpactCommand,
+};
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -40105,6 +41054,7 @@ function parseCommand(text) {
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
 
 
 
@@ -40214,7 +41164,7 @@ async function run(context, deps = {}) {
     octokit,
     callApi: injectedCallApi,
     apiClient: injectedApiClient,
-    handlers = {},
+    handlers = HANDLERS,
     // Module-helper overrides (tests inject spies; production uses the real fns).
     getChangedFiles: getChangedFilesFn = getChangedFiles,
     filterExcludedFiles: filterExcludedFilesFn = filterExcludedFiles,

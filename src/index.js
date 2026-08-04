@@ -52,6 +52,7 @@ import {
 import { resolveSystemPrompt, buildAutoReviewPrompt } from './lib/prompt.js';
 import { runAutoReview, isLargePr } from './lib/auto-review.js';
 import { parseCommand } from './lib/commands.js';
+import { HANDLERS } from './lib/handlers/index.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -145,7 +146,7 @@ export async function run(context, deps = {}) {
     octokit,
     callApi: injectedCallApi,
     apiClient: injectedApiClient,
-    handlers = {},
+    handlers = HANDLERS,
     // Module-helper overrides (tests inject spies; production uses the real fns).
     getChangedFiles: getChangedFilesFn = getChangedFiles,
     filterExcludedFiles: filterExcludedFilesFn = filterExcludedFiles,
