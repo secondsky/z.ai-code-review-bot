@@ -219,6 +219,18 @@ export function loadConfig(inputs = {}, options = {}) {
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
   const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
 
+  // v2 deterministic-scanner knobs (Phase 4). The master switch defaults to
+  // TRUE — the action.yml input also defaults to 'true', but loadConfig
+  // applies the same default so direct callers (e.g. tests, programmatic
+  // users) get the same behavior. The master switch is an action input (only
+  // the action can turn scanning ON); per-scanner DISABLE toggles live in
+  // repo-level .zai.yml (Phase 3) and can only turn a scanner OFF.
+  const scannersEnabledRaw = read(inputs, 'ZAI_SCANNERS_ENABLED').trim().toLowerCase();
+  const scannersEnabled =
+    scannersEnabledRaw === '' ? true : isTruthy(scannersEnabledRaw);
+  const scannersCacheDir =
+    read(inputs, 'ZAI_SCANNERS_CACHE_DIR').trim() || '~/.zai-cache/scanners';
+
   const githubToken = read(inputs, 'GITHUB_TOKEN');
 
   const config = {
@@ -245,6 +257,8 @@ export function loadConfig(inputs = {}, options = {}) {
     minSeverity,
     temperature,
     maxTokens,
+    scannersEnabled,
+    scannersCacheDir,
     githubToken,
   };
 

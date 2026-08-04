@@ -56,6 +56,12 @@ export function makeConfig(overrides = {}) {
     minSeverity: 'info',
     temperature: 0.2,
     maxTokens: 4096,
+    // Phase 4: scanner layer. Integration tests DISABLE the master switch by
+    // default so the real runScanners (which would attempt to download
+    // gitleaks/ast-grep) is short-circuited. Tests that want to exercise
+    // scanning pass { scannersEnabled: true } and (typically) a fake runScanners.
+    scannersEnabled: false,
+    scannersCacheDir: '/tmp/zai-cache-scanners-test',
     githubToken: 'ghs-test-token',
     ...overrides,
   };

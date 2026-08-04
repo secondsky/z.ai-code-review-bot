@@ -29,6 +29,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { homedir } from 'node:os';
 
 import core from '@actions/core';
 import github from '@actions/github';
@@ -56,6 +57,7 @@ import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
 import { runScheduledReview } from './lib/schedule.js';
+import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -88,6 +90,25 @@ export function isMainEntry() {
  * readAllInputs
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Expand a leading `~` to the user's home directory. Returns the input
+ * unchanged for non-tilde paths or non-strings. Used to resolve the
+ * ZAI_SCANNERS_CACHE_DIR default (`~/.zai-cache/scanners`) at runtime.
+ *
+ * @param {string} p
+ * @returns {string}
+ */
+export function expandHome(p) {
+  if (typeof p !== 'string' || p.length === 0) return p;
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
+  return p;
+}
+
 /**
  * The complete list of action input names, in the order loadConfig reads them.
  * Exported so the test can assert coverage. Keep in sync with config.js.
@@ -116,6 +137,8 @@ export const INPUT_NAMES = [
   'ZAI_MIN_SEVERITY',
   'ZAI_TEMPERATURE',
   'ZAI_MAX_TOKENS',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
   'GITHUB_TOKEN',
 ];
 
@@ -167,6 +190,8 @@ export async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    runScanners: runScannersFn = runScanners,
+    formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
     parseCommand: parseCommandFn = parseCommand,
@@ -206,13 +231,48 @@ export async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
+    // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
+    // become high-confidence findings directly (merged over LLM findings at
+    // the same file:line+title) and are injected into the LLM prompt as
+    // "already detected, don't re-report" context. Scanners NEVER fail the
+    // review — on any error they log a warning and contribute [] findings.
+    const cacheDir = expandHome(config.scannersCacheDir);
+    const scannerResult = await runScannersFn(
+      {
+        files: patchable,
+        repoPath: process.cwd(),
+        cacheDir,
+        config: { scannersEnabled: config.scannersEnabled },
+        repoConfig: deps.repoConfig,
+      },
+      { core: coreDep },
+    );
+    const scannerContext = formatScannerContextFn(
+      scannerResult.findings,
+      scannerResult.metrics,
+    );
+    if (scannerResult.scannerNames.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Scanners: ${scannerResult.findings.length} finding(s) from ` +
+          `${scannerResult.scannerNames.join(', ')}.`,
+      );
+    }
+
     // Structured review: one path for both small and large PRs. Batching
     // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
     // result is rendered as a structured-findings summary comment.
-    const result = await runStructuredReviewFn(patchable, config, {
-      callApi,
-      core: coreDep,
-    });
+    const result = await runStructuredReviewFn(
+      patchable,
+      {
+        ...config,
+        deterministicFindings: scannerResult.findings,
+        scannerContext,
+      },
+      {
+        callApi,
+        core: coreDep,
+      },
+    );
 
     const content = formatFindingsAsSummaryFn(result.findings, {
       reviewerName: config.reviewerName,

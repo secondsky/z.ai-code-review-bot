@@ -356,3 +356,40 @@ describe('loadConfig — v2 structured-review knobs', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: 'xyz' }).maxTokens).toBe(4096);
   });
 });
+
+describe('scanner knobs (Phase 4)', () => {
+  test('scannersEnabled defaults to true', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersEnabled=true (truthy)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'true' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '1' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'yes' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersEnabled=false on explicit non-truthy values', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'false' }).scannersEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '0' }).scannersEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'no' }).scannersEnabled).toBe(false);
+  });
+
+  test('scannersEnabled=true on empty (default true)', () => {
+    // An empty input means "use the default" → true (per the action.yml
+    // default and the brief).
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '   ' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersCacheDir defaults to ~/.zai-cache/scanners', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scannersCacheDir).toBe('~/.zai-cache/scanners');
+  });
+
+  test('scannersCacheDir uses a provided value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_CACHE_DIR: '/tmp/cache' }).scannersCacheDir).toBe('/tmp/cache');
+  });
+
+  test('scannersCacheDir trims whitespace', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_CACHE_DIR: '  /tmp/x  ' }).scannersCacheDir).toBe('/tmp/x');
+  });
+});

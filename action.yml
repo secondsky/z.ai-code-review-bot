@@ -162,6 +162,27 @@ inputs:
     required: false
     default: '4096'
 
+  # --- v2 deterministic scanner layer (Phase 4) ---
+  ZAI_SCANNERS_ENABLED:
+    description: |-
+      Master switch for the deterministic scanner layer. When true (default),
+      secrets + code-pattern + metrics scanners run BEFORE the LLM review and
+      their findings are (a) surfaced as high-confidence findings directly and
+      (b) injected into the LLM prompt as "already detected" context so the
+      model doesn't re-report them. When false, no scanners run at all. A
+      repo-level .zai.yml can DISABLE individual scanners (secrets, patterns,
+      metrics) but cannot enable one the action turned off.
+    required: false
+    default: 'true'
+
+  ZAI_SCANNERS_CACHE_DIR:
+    description: |-
+      Directory where scanner binaries (gitleaks, ast-grep) are cached after
+      download + SHA256 verification. Defaults to ~/.zai-cache/scanners. The
+      directory is created on first use.
+    required: false
+    default: '~/.zai-cache/scanners'
+
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
     required: false

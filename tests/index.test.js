@@ -54,6 +54,10 @@ function makeConfig(overrides = {}) {
     minSeverity: 'info',
     temperature: 0.2,
     maxTokens: 4096,
+    // Phase 4: scanner master switch OFF in tests by default so the real
+    // runScanners (which would download gitleaks/ast-grep) is short-circuited.
+    scannersEnabled: false,
+    scannersCacheDir: '/tmp/zai-cache-scanners-test',
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -399,10 +403,16 @@ describe('run — pull_request auto-review', () => {
     });
 
     expect(runStructuredReviewSpy).toHaveBeenCalledTimes(1);
-    // The spy received the patchable files, the config, and { callApi, core }.
+    // The spy received the patchable files, the config (spread with scanner
+    // findings/context per Phase 4), and { callApi, core }.
     const [spyFiles, spyConfig, spyDeps] = runStructuredReviewSpy.mock.calls[0];
     expect(spyFiles).toHaveLength(2);
-    expect(spyConfig).toBe(config);
+    // Phase 4 wiring spreads the original config and injects deterministic
+    // findings + scanner context. The base config keys are still present.
+    expect(spyConfig.apiKey).toBe(config.apiKey);
+    expect(spyConfig.model).toBe(config.model);
+    expect(Array.isArray(spyConfig.deterministicFindings)).toBe(true);
+    expect(typeof spyConfig.scannerContext).toBe('string');
     expect(typeof spyDeps.callApi).toBe('function');
     expect(spyDeps.core).toBe(core);
     // Comment still upserted with the rendered summary.
@@ -460,6 +470,97 @@ describe('run — pull_request auto-review', () => {
     expect(prompt).toContain('src/a.js');
     expect(prompt).not.toContain('package-lock.json');
     expect(prompt).not.toContain('foo.lock');
+  });
+
+  it('scannersEnabled: runs runScanners and injects findings + scannerContext into the prompt', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const fakeFindings = [
+      {
+        file: 'src/a.js',
+        line: 1,
+        severity: 'critical',
+        confidence: 'high',
+        category: 'security',
+        title: 'AWS access key',
+        description: 'detected',
+        evidence: 'AKIA…LE',
+        suggestion: null,
+        rule: 'gitleaks:aws-access-key',
+      },
+    ];
+    const fakeScanner = vi.fn(async () => ({
+      findings: fakeFindings,
+      metrics: {
+        filesChanged: 1,
+        additions: 5,
+        deletions: 0,
+        testFiles: 0,
+        sourceFiles: 1,
+        testToSourceRatio: 0,
+        largeFiles: [],
+        generatedFiles: [],
+        todoCount: 0,
+        byStatus: { modified: 1 },
+      },
+      scannerNames: ['secrets:gitleaks'],
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ scannersEnabled: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runScanners: fakeScanner,
+    });
+
+    // Scanner was called with the patchable files + scannersEnabled config.
+    expect(fakeScanner).toHaveBeenCalledTimes(1);
+    const scannerCall = fakeScanner.mock.calls[0];
+    expect(scannerCall[0].files).toHaveLength(1);
+    expect(scannerCall[0].config.scannersEnabled).toBe(true);
+
+    // The LLM prompt received the "do not re-report" context block.
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('Already detected by automated scanners');
+    expect(prompt).toContain('gitleaks:aws-access-key');
+
+    // The structured-review summary mentions the deterministic count.
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('Scanners found 1 deterministic issues.');
+  });
+
+  it('scannersEnabled=false: runScanners is still called (returns []) but no findings surfaced', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const fakeScanner = vi.fn(async () => ({
+      findings: [],
+      metrics: { filesChanged: 1, additions: 0, deletions: 0, testFiles: 0, sourceFiles: 0, testToSourceRatio: 0, largeFiles: [], generatedFiles: [], todoCount: 0, byStatus: { modified: 1 } },
+      scannerNames: [],
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ scannersEnabled: false }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runScanners: fakeScanner,
+    });
+
+    expect(fakeScanner).toHaveBeenCalledTimes(1);
+    // No "do not re-report" block in the prompt (empty findings).
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).not.toContain('Already detected by automated scanners');
   });
 
   it('setFails when getPullNumber is null on a pull_request event', async () => {

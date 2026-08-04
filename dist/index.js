@@ -38307,6 +38307,7 @@ var __webpack_exports__ = {};
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
   Qh: () => (/* binding */ INPUT_NAMES),
+  kc: () => (/* binding */ expandHome),
   gT: () => (/* binding */ isMainEntry),
   iW: () => (/* binding */ main),
   vv: () => (/* binding */ readAllInputs),
@@ -38317,6 +38318,8 @@ __nccwpck_require__.d(__webpack_exports__, {
 var external_node_url_ = __nccwpck_require__(3136);
 ;// CONCATENATED MODULE: external "node:path"
 const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
+;// CONCATENATED MODULE: external "node:os"
+const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:os");
 // EXTERNAL MODULE: ./node_modules/@actions/core/lib/core.js
 var core = __nccwpck_require__(7484);
 // EXTERNAL MODULE: ./node_modules/@actions/github/lib/github.js
@@ -38632,6 +38635,18 @@ function loadConfig(inputs = {}, options = {}) {
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
   const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
 
+  // v2 deterministic-scanner knobs (Phase 4). The master switch defaults to
+  // TRUE — the action.yml input also defaults to 'true', but loadConfig
+  // applies the same default so direct callers (e.g. tests, programmatic
+  // users) get the same behavior. The master switch is an action input (only
+  // the action can turn scanning ON); per-scanner DISABLE toggles live in
+  // repo-level .zai.yml (Phase 3) and can only turn a scanner OFF.
+  const scannersEnabledRaw = read(inputs, 'ZAI_SCANNERS_ENABLED').trim().toLowerCase();
+  const scannersEnabled =
+    scannersEnabledRaw === '' ? true : isTruthy(scannersEnabledRaw);
+  const scannersCacheDir =
+    read(inputs, 'ZAI_SCANNERS_CACHE_DIR').trim() || '~/.zai-cache/scanners';
+
   const githubToken = read(inputs, 'GITHUB_TOKEN');
 
   const config = {
@@ -38658,6 +38673,8 @@ function loadConfig(inputs = {}, options = {}) {
     minSeverity,
     temperature,
     maxTokens,
+    scannersEnabled,
+    scannersCacheDir,
     githubToken,
   };
 
@@ -42796,6 +42813,1732 @@ async function runScheduledReview({
   return { reviewed, skipped, failed };
 }
 
+;// CONCATENATED MODULE: ./src/lib/scanners/_patch.js
+/**
+ * Shared unified-diff parsing helpers used by both the secrets and patterns
+ * scanners. Pure (no I/O) — fully unit-testable.
+ *
+ * The two scanners need to enumerate ADDED lines (those starting with `+`,
+ * excluding the `+++` file header) AND know their absolute (new) line number
+ * in the post-patch file. `parseAddedLines` does exactly that, walking the
+ * `@@ -a,b +c,d @@` hunk headers to track the running line count.
+ *
+ * @module src/lib/scanners/_patch.js
+ */
+
+/**
+ * Parse a `@@ -a,b +c,d @@ optional_section_header` line and return the new-
+ * file starting line (`c`). Returns null on a non-matching line.
+ *
+ * @param {string} line
+ * @returns {number | null}
+ */
+function parseHunkHeader(line) {
+  if (typeof line !== 'string' || !line.startsWith('@@')) return null;
+  // Capture the +c,d portion. Be tolerant of `,d` being absent (single-line hunks).
+  const m = line.match(/\+(\d+)(?:,(\d+))?/);
+  if (!m) return null;
+  const start = parseInt(m[1], 10);
+  return Number.isFinite(start) && start >= 1 ? start : null;
+}
+
+/**
+ * Enumerate the ADDED lines in a unified-diff patch along with their absolute
+ * line numbers in the new (post-patch) file.
+ *
+ * Returns an array of `{ line, text }` where:
+ *   - `line` is the 1-based absolute line number in the new file
+ *   - `text` is the added-line CONTENT (the leading `+` stripped)
+ *
+ * Walks the patch line-by-line, tracking the current new-file line counter:
+ *   - Hunk header `@@ -a,b +c,d @@` resets the counter to `c`.
+ *   - A line starting with `+` (and not `+++`) is an addition; emit it and
+ *     increment the counter.
+ *   - A line starting with `-` (and not `---`) is a removal; counter unchanged.
+ *   - A line starting with `\` (e.g. `\ No newline at end of file`) is metadata;
+ *     counter unchanged.
+ *   - Any other line (context, or before the first hunk) is context; emit
+ *     nothing but still increment the counter if we're inside a hunk.
+ *
+ * For patches with no hunk header, the line counter starts at 1 (best-effort —
+ * real GitHub patches always include a hunk header).
+ *
+ * @param {string} patch
+ * @returns {Array<{ line: number, text: string }>}
+ */
+function parseAddedLines(patch) {
+  if (typeof patch !== 'string' || patch.length === 0) return [];
+  const out = [];
+  let newLine = 1; // updated by hunk header
+  let inHunk = false;
+  for (const raw of patch.split('\n')) {
+    if (raw.startsWith('@@')) {
+      const start = parseHunkHeader(raw);
+      if (start !== null) {
+        newLine = start;
+        inHunk = true;
+      }
+      continue;
+    }
+    if (!inHunk) {
+      // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
+      continue;
+    }
+    if (raw.startsWith('+++')) {
+      // File header — not an addition. Skip.
+      continue;
+    }
+    if (raw.startsWith('+')) {
+      out.push({ line: newLine, text: raw.slice(1) });
+      newLine++;
+      continue;
+    }
+    if (raw.startsWith('---')) {
+      continue;
+    }
+    if (raw.startsWith('-')) {
+      // Removal — counter unchanged.
+      continue;
+    }
+    if (raw.startsWith('\\')) {
+      // "\ No newline at end of file" — metadata, counter unchanged.
+      continue;
+    }
+    // Context line.
+    newLine++;
+  }
+  return out;
+}
+
+// EXTERNAL MODULE: external "node:crypto"
+var external_node_crypto_ = __nccwpck_require__(7598);
+;// CONCATENATED MODULE: ./src/lib/scanners/ensure-binary.js
+/**
+ * Shared fetch-cache-verify helper for runtime-downloaded scanner binaries
+ * (gitleaks, ast-grep).
+ *
+ * Architecture — the injection seam:
+ *   Every external collaborator is passed via `deps` so tests never touch the
+ *   network or filesystem. Production wires real Node builtins (`https`,
+ *   `fs/promises`, `crypto`) — see `createDefaultDeps()`. Tests inject fakes
+ *   that return canned bytes / lie about `stat`.
+ *
+ * The flow is deliberately small:
+ *   1. Resolve the cache path: `${cacheDir}/${name}/${version}/${name}${ext}`.
+ *   2. Cache hit: `deps.stat(path)` resolves → return path (no fetch).
+ *   3. Cache miss: `deps.fetch(url)` → bytes → SHA256-verify → `writeFile` →
+ *      `chmod 0o755` → return path.
+ *
+ * Extraction (gitleaks ships as .tar.gz; ast-grep is a raw binary on Linux/
+ * macOS and a .zip on Windows) is delegated to the caller via the
+ * `extractor` hook on the spec. When `spec.extractor` is set, the bytes are
+ * written to a temp tarball/zip, `extractor(tempPath, destPath, deps)` is
+ * invoked, and the temp file is deleted. The default `extractor` simply moves
+ * the bytes into place (the no-extraction case for raw binaries).
+ *
+ * @module src/lib/scanners/ensure-binary.js
+ */
+
+
+
+
+
+/**
+ * Compute the SHA-256 hex digest of a Buffer/string using Node's crypto.
+ *
+ * @param {Buffer | string} bytes
+ * @returns {string} lowercase hex digest
+ */
+function sha256Hex(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * Resolve the cache path for a binary. Pure (no I/O).
+ *
+ *   `${cacheDir}/${name}/${version}/${name}${ext}`
+ *
+ * @param {{ cacheDir: string, name: string, version: string, ext?: string }} spec
+ * @returns {string}
+ */
+function resolveCachePath(spec) {
+  const cacheDir = spec?.cacheDir;
+  const name = spec?.name;
+  const version = spec?.version;
+  const ext = typeof spec?.ext === 'string' ? spec.ext : '';
+  if (typeof cacheDir !== 'string' || !cacheDir) {
+    throw new Error('ensureBinary: cacheDir is required');
+  }
+  if (typeof name !== 'string' || !name) {
+    throw new Error('ensureBinary: name is required');
+  }
+  if (typeof version !== 'string' || !version) {
+    throw new Error('ensureBinary: version is required');
+  }
+  return join(cacheDir, name, version, `${name}${ext}`);
+}
+
+/**
+ * Default `extractor` for raw binaries: writes the bytes to `destPath` and
+ * returns `destPath`. Used when no tarball/zip extraction is needed.
+ *
+ * @param {Buffer} bytes
+ * @param {string} destPath
+ * @param {{ writeFile: (path: string, bytes: Buffer) => Promise<void>, chmod?: (path: string, mode: number) => Promise<void> }} deps
+ * @returns {Promise<string>}
+ */
+async function defaultExtractor(bytes, destPath, deps) {
+  await deps.writeFile(destPath, bytes);
+  if (typeof deps.chmod === 'function') {
+    await deps.chmod(destPath, 0o755);
+  }
+  return destPath;
+}
+
+/**
+ * Ensure a binary is available in the cache dir, fetching + verifying if not.
+ *
+ * All I/O is injected via `deps` so this is fully testable without network.
+ *
+ * @param {{
+ *   name: string,
+ *   version: string,
+ *   url: string,
+ *   checksumSha256: string,
+ *   cacheDir: string,
+ *   ext?: string,
+ *   extractor?: (bytes: Buffer, destPath: string, deps: Object) => Promise<string>,
+ * }} opts
+ * @param {{
+ *   fetch?: (url: string) => Promise<Buffer>,
+ *   writeFile?: (path: string, bytes: Buffer) => Promise<void>,
+ *   chmod?: (path: string, mode: number) => Promise<void>,
+ *   stat?: (path: string) => Promise<{ size: number }>,
+ *   platform?: string,
+ *   arch?: string,
+ * }} [deps]
+ * @returns {Promise<string>} the absolute path to the verified binary
+ * @throws {Error} on checksum mismatch (`${name}: checksum mismatch`) or fetch failure.
+ */
+async function ensureBinary(opts, deps = {}) {
+  const spec = opts || {};
+  const name = spec.name;
+  const version = spec.version;
+  const expectedChecksum = spec.checksumSha256;
+  const url = spec.url;
+
+  if (typeof name !== 'string' || !name) {
+    throw new Error('ensureBinary: name is required');
+  }
+  if (typeof version !== 'string' || !version) {
+    throw new Error('ensureBinary: version is required');
+  }
+  if (typeof url !== 'string' || !url) {
+    throw new Error('ensureBinary: url is required');
+  }
+  if (typeof expectedChecksum !== 'string' || expectedChecksum.length !== 64) {
+    throw new Error(`ensureBinary: ${name}: checksumSha256 must be a 64-char hex string`);
+  }
+
+  const cachePath = resolveCachePath(spec);
+  const stat = deps.stat;
+  if (typeof stat === 'function') {
+    try {
+      await stat(cachePath);
+      // Cache hit — file exists. No fetch, no verify.
+      return cachePath;
+    } catch {
+      // File doesn't exist → fall through to fetch.
+    }
+  }
+
+  if (typeof deps.fetch !== 'function') {
+    throw new Error(`ensureBinary: ${name}: fetch is required (no cache hit)`);
+  }
+
+  let bytes;
+  try {
+    bytes = await deps.fetch(url);
+  } catch (err) {
+    throw new Error(`ensureBinary: ${name}: fetch failed: ${err?.message ?? String(err)}`);
+  }
+
+  if (!Buffer.isBuffer(bytes)) {
+    // Accept string responses by coercing to Buffer (defensive).
+    bytes = Buffer.from(/** @type {any} */ (bytes));
+  }
+
+  const actual = sha256Hex(bytes);
+  if (actual.toLowerCase() !== expectedChecksum.toLowerCase()) {
+    throw new Error(
+      `ensureBinary: ${name}: checksum mismatch (expected ${expectedChecksum}, got ${actual})`,
+    );
+  }
+
+  const extractor =
+    typeof spec.extractor === 'function' ? spec.extractor : defaultExtractor;
+
+  if (typeof deps.writeFile !== 'function') {
+    throw new Error(`ensureBinary: ${name}: writeFile is required`);
+  }
+
+  // For raw binaries we go straight to writeFile via the default extractor.
+  // For tarball/zip archives, the caller-provided extractor handles extraction
+  // to destPath and is responsible for chmod-ing the resulting binary.
+  await extractor(bytes, cachePath, deps);
+  return cachePath;
+}
+
+/**
+ * Pick the right release URL + checksum for the current `platform_arch` tuple
+ * from a `urls` / `checksums` map (keyed like `darwin_arm64`).
+ *
+ * Returns `{ url, checksumSha256 }` or `null` if the tuple is unsupported.
+ *
+ * @param {{
+ *   urls: Record<string, string>,
+ *   checksums: Record<string, string>,
+ * }} spec
+ * @param {{ platform?: string, arch?: string }} [deps]
+ * @returns {{ url: string, checksumSha256: string } | null}
+ */
+function selectPlatformAsset(spec, deps = {}) {
+  const platform = deps.platform || '';
+  const arch = deps.arch || '';
+  const key = `${platform}_${arch}`;
+  const url = spec?.urls?.[key];
+  const checksumSha256 = spec?.checksums?.[key];
+  if (typeof url !== 'string' || !url) return null;
+  if (typeof checksumSha256 !== 'string' || checksumSha256.length !== 64) return null;
+  return { url, checksumSha256 };
+}
+
+/**
+ * Build a unique temp path inside the OS tmpdir for a given archive name.
+ * Used by tarball extractors. Pure (no I/O).
+ *
+ * @param {string} archiveName
+ * @returns {string}
+ */
+function tempPathFor(archiveName) {
+  // Suffix with pid + random to avoid collisions across concurrent calls.
+  const nonce = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  return join(tmpdir(), `zaibot-${nonce}-${archiveName}`);
+}
+
+;// CONCATENATED MODULE: ./src/lib/scanners/secrets.js
+/**
+ * Secret detection: gitleaks (preferred) + a hand-rolled regex fallback.
+ *
+ * Architecture — the injection seam:
+ *   - `deps.runBinary(args, opts)` shells out to the real gitleaks binary in
+ *     production; tests inject a fake that returns canned JSON.
+ *   - `deps.ensureBinary(spec, deps)` fetches+verifies+cache the gitleaks
+ *     binary in production; tests inject a fake that returns a fake path.
+ *   - On ANY error (binary unavailable, exec failure, parse failure), the
+ *     scanner falls back to `scanSecretsRegex(files)` (pure, no I/O) and
+ *     warns via `deps.core.warning`.
+ *
+ * The regex fallback is exported for direct testing — it's the high-value
+ * pure logic, fully unit-testable without any binaries.
+ *
+ * @module src/lib/scanners/secrets.js
+ */
+
+
+
+
+
+/* ------------------------------------------------------------------ *
+ * Shannon entropy helper (used to suppress low-entropy false positives)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Compute Shannon entropy (base-2) of a string. Higher = more random.
+ *
+ * @param {string} s
+ * @returns {number}
+ */
+function shannonEntropy(s) {
+  if (typeof s !== 'string' || s.length === 0) return 0;
+  const counts = new Map();
+  for (const ch of s) counts.set(ch, (counts.get(ch) || 0) + 1);
+  const len = s.length;
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / len;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+/* ------------------------------------------------------------------ *
+ * Regex fallback
+ * ------------------------------------------------------------------ */
+
+/**
+ * The hand-rolled secret patterns. Each entry: `{ name, regex, severity?, confidence?,
+ * category?, title?, description?, suggestion?, captureGroup?, minEntropy? }`.
+ *
+ * The `value` mapped into the finding's `evidence` is the matched substring by
+ * default, or the capture group at index `captureGroup` if set. When
+ * `minEntropy` is set, the value's Shannon entropy must be ≥ that threshold or
+ * the match is dropped (false-positive suppression).
+ *
+ * @type {Array<Object>}
+ */
+const SECRET_PATTERNS = [
+  {
+    name: 'aws-access-key-id',
+    regex: /\bAKIA[0-9A-Z]{16}\b/,
+    title: 'AWS access key ID detected',
+    description: 'An AWS access key ID (AKIA...) was found in the diff.',
+    suggestion: 'Remove the key and rotate it in the AWS console immediately.',
+  },
+  {
+    name: 'github-pat',
+    regex: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/,
+    title: 'GitHub personal access token detected',
+    description: 'A GitHub PAT (ghp_/gho_/ghu_/ghs_/ghr_) was found in the diff.',
+    suggestion: 'Remove the token and revoke it at github.com/settings/tokens.',
+  },
+  {
+    name: 'private-key-block',
+    regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----/,
+    title: 'Private key block detected',
+    description: 'A PEM-encoded private key block was found in the diff.',
+    suggestion: 'Remove the key and rotate any credentials it protected.',
+  },
+  {
+    name: 'slack-token',
+    regex: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/,
+    title: 'Slack token detected',
+    description: 'A Slack token (xox[baprs]-...) was found in the diff.',
+    suggestion: 'Remove the token and revoke it at api.slack.com/...',
+  },
+  {
+    name: 'jwt',
+    regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+    title: 'JWT detected',
+    description: 'A JSON Web Token was found in the diff. JWTs may carry secrets.',
+    suggestion: 'Avoid embedding JWTs in source; load from a secret manager.',
+  },
+  {
+    name: 'db-connection-string',
+    regex: /\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis):\/\/[^\s'"`<>:]+:[^\s'"`<>@]+@[^\s'"`<>]+/i,
+    title: 'Database connection string with credentials',
+    description: 'A DB connection string with an embedded password was found.',
+    suggestion: 'Use environment variables / a secret manager for DB credentials.',
+  },
+  {
+    name: 'generic-assignment',
+    // Match: api_key/apikey/api-key/secret/password/passwd/token/auth followed
+    // by an assignment and a quoted value of length >= 8. Capture group 1 is
+    // the value, on which we run an entropy check (≥ 3.5 Shannon) to suppress
+    // false positives like `password = "password"`.
+    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-.]{8,})['"]/i,
+    captureGroup: 1,
+    minEntropy: 3.5,
+    title: 'Hardcoded credential assigned to a key',
+    description: 'A value assigned to a credential-like key looks like a secret.',
+    suggestion: 'Load credentials from environment variables or a secret manager.',
+  },
+  {
+    name: 'high-entropy-string',
+    // A base64-ish token ≥ 32 chars with Shannon entropy ≥ 4.5 — very
+    // conservative, only flags obvious secrets. The regex captures the candidate
+    // (alphanumeric + /+=); the entropy check filters out non-secret strings.
+    regex: /\b([A-Za-z0-9+/]{32,}={0,2})\b/,
+    captureGroup: 1,
+    minEntropy: 4.5,
+    title: 'High-entropy string (possible secret)',
+    description:
+      'A long, high-entropy string was found in the diff. This often indicates an ' +
+      'embedded API key, token, or other secret.',
+    suggestion:
+      'Confirm whether this value is a secret. If so, remove it and rotate; otherwise ignore.',
+  },
+];
+
+/**
+ * Map a regex match to a finding object. Centralizes the finding shape so both
+ * the regex fallback and the high-entropy heuristic produce consistent output.
+ *
+ * @param {{ file: string, line: number, value: string, pattern: object }} args
+ * @returns {Record<string, unknown>}
+ */
+function buildFinding({ file, line, value, pattern }) {
+  return {
+    file,
+    line,
+    severity: pattern.severity || 'critical',
+    confidence: pattern.confidence || 'high',
+    category: pattern.category || 'security',
+    title: pattern.title,
+    description: pattern.description,
+    evidence: value,
+    suggestion: pattern.suggestion ?? null,
+    rule: `regex:${pattern.name}`,
+  };
+}
+
+/**
+ * Mask a secret value for the `evidence` field, keeping the first 4 and last 2
+ * chars visible and replacing the middle with `…`. Short values are masked
+ * entirely (first char + `…`). Used so the evidence field doesn't re-leak the
+ * full secret in the review comment.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function maskSecret(value) {
+  if (typeof value !== 'string') return '';
+  if (value.length <= 8) return value.length > 0 ? `${value[0]}…` : '';
+  return `${value.slice(0, 4)}…${value.slice(-2)}`;
+}
+
+/**
+ * Pure regex-based secret scanner. Walks the ADDED lines of each file's patch
+ * and tests each SECRET_PATTERN against the line text. Returns findings keyed
+ * to absolute (new-file) line numbers. NEVER throws.
+ *
+ * @param {Array<{filename?: string, patch?: string}>} files
+ * @returns {Array<Record<string, unknown>>}
+ */
+function scanSecretsRegex(files) {
+  if (!Array.isArray(files)) return [];
+  /** @type {Record<string, unknown>[]} */
+  const out = [];
+  for (const f of files || []) {
+    if (!f || typeof f !== 'object') continue;
+    const file = typeof f.filename === 'string' ? f.filename : '';
+    if (!file) continue;
+    const patch = typeof f.patch === 'string' ? f.patch : '';
+    if (!patch) continue;
+
+    const addedLines = parseAddedLines(patch);
+    for (const { line, text } of addedLines) {
+      for (const pattern of SECRET_PATTERNS) {
+        pattern.regex.lastIndex = 0; // defense in depth for stateful regexes
+        const match = pattern.regex.exec(text);
+        if (!match) continue;
+
+        // Resolve the value used for evidence + entropy check.
+        const groupIdx = typeof pattern.captureGroup === 'number' ? pattern.captureGroup : 0;
+        const value = match[groupIdx] || match[0];
+
+        if (typeof pattern.minEntropy === 'number') {
+          const ent = shannonEntropy(value);
+          if (ent < pattern.minEntropy) continue;
+        }
+
+        out.push(
+          buildFinding({
+            file,
+            line,
+            // Mask the secret in evidence so we don't re-leak it in the comment.
+            value: maskSecret(value),
+            pattern,
+          }),
+        );
+      }
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Gitleaks integration
+ * ------------------------------------------------------------------ */
+
+/**
+ * Spec for the gitleaks binary. URLs and SHA256 checksums are PLACEHOLDERS —
+ * TODO: verify checksums against the official gitleaks release manifest before
+ * shipping. The fetch path is fully exercised in tests via injected deps; the
+ * real values only matter at production runtime.
+ *
+ * NOTE: gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows.
+ * Extraction is handled via an `extractor` hook on the spec (see
+ * `ensure-binary.js`).
+ *
+ * @type {Object}
+ */
+const GITLEAKS_SPEC = {
+  name: 'gitleaks',
+  version: '8.21.2',
+  ext: '', // the extracted binary has no extension
+  urls: {
+    darwin_arm64:
+      'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_darwin_arm64.tar.gz',
+    darwin_x64:
+      'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_darwin_x64.tar.gz',
+    linux_arm64:
+      'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_arm64.tar.gz',
+    linux_x64:
+      'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz',
+    win32_x64:
+      'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_windows_x64.zip',
+  },
+  // PLACEHOLDER checksums — replace with real values from the release's
+  // checksums.txt before shipping. The hex strings below are syntactically
+  // valid (64 chars, lowercase hex) so they pass shape validation; they WILL
+  // fail the actual SHA256 verification at fetch time, which is the intended
+  // fail-closed behavior until the real checksums are looked up.
+  checksums: {
+    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
+    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
+    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
+    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
+    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+  },
+};
+
+/**
+ * Map a parsed gitleaks finding (one element of the `findings` array in the
+ * gitleaks JSON report) to our normalized finding schema.
+ *
+ * Gitleaks finding shape (v8.x):
+ *   {
+ *     "RuleID": "aws-access-token",
+ *     "Description": "...",
+ *     "Match": "AKIA...",          // the matched secret value (FULL — mask it!)
+ *     "Secret": "AKIA...",
+ *     "File": "src/foo.js",
+ *     "StartLine": 42,
+ *     "EndLine": 42,
+ *     "StartColumn": 7,
+ *     "EndColumn": 27,
+ *     "Fingerprint": "src/foo.js:aws-access-token:42",
+ *     "Entropy": 3.78
+ *   }
+ *
+ * @param {object} gitleaksFinding
+ * @returns {Record<string, unknown> | null}
+ */
+function mapGitleaksFinding(gitleaksFinding) {
+  if (!gitleaksFinding || typeof gitleaksFinding !== 'object') return null;
+  const f = /** @type {Record<string, unknown>} */ (gitleaksFinding);
+  const file = typeof f.File === 'string' ? f.File : '';
+  if (!file) return null;
+
+  const startLine = Number.isFinite(f.StartLine) && f.StartLine >= 1
+    ? Math.floor(/** @type {number} */ (f.StartLine))
+    : null;
+  const ruleId = typeof f.RuleID === 'string' && f.RuleID ? f.RuleID : 'unknown';
+  const secretValue = typeof f.Secret === 'string' && f.Secret ? f.Secret : String(f.Match || '');
+  const description =
+    typeof f.Description === 'string' && f.Description.length > 0
+      ? f.Description
+      : `gitleaks rule "${ruleId}" matched.`;
+
+  return {
+    file,
+    line: startLine,
+    severity: 'critical',
+    confidence: 'high',
+    category: 'security',
+    title: `Secret detected by gitleaks: ${ruleId}`,
+    description,
+    // Mask the secret in evidence so we don't re-leak it in the review comment.
+    evidence: maskSecret(secretValue),
+    suggestion: 'Remove the secret and rotate it immediately.',
+    rule: `gitleaks:${ruleId}`,
+  };
+}
+
+/**
+ * Parse the JSON output of `gitleaks detect --report-format json` into an array
+ * of normalized findings. Returns `[]` on any parse failure (never throws).
+ *
+ * Gitleaks emits either `[]` (no findings) or `[{...}, {...}]` at the top
+ * level — NOT wrapped in `{findings: [...]}`.
+ *
+ * @param {string} jsonText
+ * @returns {Array<Record<string, unknown>>}
+ */
+function parseGitleaksJson(jsonText) {
+  if (typeof jsonText !== 'string' || jsonText.trim().length === 0) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  /** @type {Record<string, unknown>[]} */
+  const out = [];
+  for (const element of parsed) {
+    const mapped = mapGitleaksFinding(element);
+    if (mapped) out.push(mapped);
+  }
+  return out;
+}
+
+/**
+ * Scan added lines for secrets. Tries gitleaks first (via ensureBinary +
+ * deps.runBinary); on ANY error warns via `deps.core.warning` and falls back
+ * to `scanSecretsRegex(files)`. NEVER throws — the orchestrator relies on this
+ * contract.
+ *
+ * @param {{ files: Array, repoPath: string, cacheDir?: string }} opts
+ * @param {{
+ *   ensureBinary?: Function,
+ *   runBinary?: Function,
+ *   platform?: string,
+ *   arch?: string,
+ *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
+ * }} [deps]
+ * @returns {Promise<{ findings: Array, scanner: 'gitleaks' | 'regex-fallback' }>}
+ */
+async function scanSecrets(opts, deps = {}) {
+  const files = Array.isArray(opts?.files) ? opts.files : [];
+  const core = deps.core;
+  const platform = deps.platform || external_node_os_namespaceObject.platform();
+  const arch = deps.arch || external_node_os_namespaceObject.arch();
+
+  // Always compute the regex fallback up front so it's ready on any error path.
+  const regexFindings = scanSecretsRegex(files);
+
+  // No binary deps → fallback now (common in tests and when disabled).
+  if (typeof deps.ensureBinary !== 'function' || typeof deps.runBinary !== 'function') {
+    return { findings: regexFindings, scanner: 'regex-fallback' };
+  }
+
+  try {
+    const asset = selectPlatformAsset(GITLEAKS_SPEC, { platform, arch });
+    if (!asset) {
+      throw new Error(
+        `gitleaks: no asset for platform=${platform || '?'} arch=${arch || '?'}`,
+      );
+    }
+    const binaryPath = await deps.ensureBinary(
+      { ...GITLEAKS_SPEC, ...asset, cacheDir: opts.cacheDir },
+      { platform, arch },
+    );
+    const source = opts.repoPath || process.cwd();
+    // `--no-banner` suppresses the ASCII banner; `--report-format json` emits
+    // a top-level array of findings to stdout; `--exit-code 0` (gitleaks uses
+    // exit code 1 for "leaks found") is the trick — without it, finding-leaks
+    // exits non-zero and runBinary may throw.
+    const args = [
+      'detect',
+      '--source', source,
+      '--report-format', 'json',
+      '--no-banner',
+      '--exit-code', '0',
+      '--redact', // gitleaks redacts the matched secret in its output
+    ];
+    const result = await deps.runBinary(binaryPath, args, {
+      cwd: source,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    const stdout = typeof result === 'string' ? result : String(result?.stdout ?? '');
+    const findings = parseGitleaksJson(stdout);
+    if (core?.info) {
+      core.info(`gitleaks: ${findings.length} secret finding(s).`);
+    }
+    return { findings, scanner: 'gitleaks' };
+  } catch (err) {
+    if (core?.warning) {
+      core.warning(
+        `gitleaks unavailable, using regex fallback: ${err?.message ?? String(err)}`,
+      );
+    }
+    return { findings: regexFindings, scanner: 'regex-fallback' };
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/scanners/patterns.js
+/**
+ * Code-pattern detection: ast-grep (preferred) + a line-based regex fallback.
+ *
+ * Architecture — the injection seam:
+ *   - `deps.runBinary(args, opts)` shells out to the real `ast-grep` binary in
+ *     production; tests inject a fake that returns canned JSON.
+ *   - `deps.ensureBinary(spec, deps)` fetches+verifies+caches the ast-grep
+ *     binary in production; tests inject a fake that returns a fake path.
+ *   - On ANY error (binary unavailable, exec failure, parse failure), the
+ *     scanner falls back to `scanPatternsRegex(files, rules)` (pure, no I/O)
+ *     and warns via `deps.core.warning`.
+ *
+ * The regex fallback is exported for direct testing — it's the high-value
+ * pure logic, fully unit-testable without any binaries.
+ *
+ * @module src/lib/scanners/patterns.js
+ */
+
+
+
+
+
+/* ------------------------------------------------------------------ *
+ * Default curated rules
+ * ------------------------------------------------------------------ */
+
+/**
+ * The default ast-grep rule set. Each rule: `{ id, pattern, severity, category,
+ * languages, title, description?, suggestion? }`.
+ *
+ * - `pattern` is an ast-grep pattern (`$$$` = multi-node wildcard, `$X` =
+ *   single-node wildcard). For the regex fallback, the pattern is converted to
+ *   a substring/regex match (less precise).
+ * - `languages` is the ast-grep language hint; `'*'` means "any language"
+ *   (line-based match in the fallback).
+ *
+ * @type {Array<Object>}
+ */
+const DEFAULT_PATTERN_RULES = [
+  {
+    id: 'eval',
+    pattern: 'eval($$$ARGS)',
+    severity: 'high',
+    category: 'security',
+    languages: ['js', 'ts', 'jsx', 'tsx'],
+    title: 'Use of eval()',
+    description: '`eval()` executes arbitrary strings as code, enabling injection attacks.',
+    suggestion: 'Avoid eval(); parse with JSON.parse or use a safe expression evaluator.',
+  },
+  {
+    id: 'innerHTML',
+    pattern: 'innerHTML = $VALUE',
+    severity: 'medium',
+    category: 'security',
+    languages: ['js', 'ts', 'jsx', 'tsx'],
+    title: 'innerHTML assignment (XSS risk)',
+    description:
+      'Assigning to innerHTML with untrusted content can execute injected scripts (XSS).',
+    suggestion: 'Use textContent or sanitize the input before assigning to innerHTML.',
+  },
+  {
+    id: 'dangerouslySetInnerHTML',
+    // The brief wrote `{$$$` (truncated); using `{$$$}` — a multi-node wildcard
+    // inside the JSX expression braces — which catches `={{__html: x}}` and
+    // `{x}` alike.
+    pattern: 'dangerouslySetInnerHTML={$$$}',
+    severity: 'medium',
+    category: 'security',
+    languages: ['jsx', 'tsx'],
+    title: 'dangerouslySetInnerHTML usage',
+    description:
+      'React\'s dangerouslySetInnerHTML bypasses escaping; only safe with sanitized input.',
+    suggestion: 'Sanitize the HTML with DOMPurify before rendering.',
+  },
+  {
+    id: 'exec',
+    pattern: 'child_process.exec($CMD)',
+    severity: 'high',
+    category: 'security',
+    languages: ['js', 'ts'],
+    title: 'child_process.exec with possible user input',
+    description:
+      'child_process.exec runs through a shell, allowing shell-injection when the ' +
+      'command includes untrusted input.',
+    suggestion:
+      'Use child_process.execFile (no shell) or shell-escape the input with a lib like shell-quote.',
+  },
+  {
+    id: 'tls-reject-unauthorized',
+    pattern: 'rejectUnauthorized: false',
+    severity: 'high',
+    category: 'security',
+    languages: ['js', 'ts'],
+    title: 'TLS certificate verification disabled',
+    description:
+      'Setting rejectUnauthorized:false disables TLS verification, enabling MITM attacks.',
+    suggestion: 'Remove rejectUnauthorized:false or pin a custom CA bundle instead.',
+  },
+  {
+    id: 'sql-concat',
+    pattern: '$CONN.query("$$$" + $VAR)',
+    severity: 'high',
+    category: 'security',
+    languages: ['js', 'ts'],
+    title: 'SQL query via string concatenation (injection risk)',
+    description:
+      'Concatenating variables into a SQL query string allows SQL injection.',
+    suggestion: 'Use parameterized queries / prepared statements.',
+  },
+  {
+    id: 'todo-in-code',
+    pattern: 'TODO',
+    severity: 'info',
+    category: 'maintainability',
+    languages: ['*'],
+    title: 'TODO left in code',
+    description: 'A TODO marker was added in the diff.',
+    suggestion: 'Resolve the TODO or track it in an issue.',
+  },
+  {
+    id: 'fixme-in-code',
+    pattern: 'FIXME',
+    severity: 'info',
+    category: 'maintainability',
+    languages: ['*'],
+    title: 'FIXME left in code',
+    description: 'A FIXME marker was added in the diff.',
+    suggestion: 'Resolve the FIXME or track it in an issue.',
+  },
+  {
+    id: 'console-log',
+    pattern: 'console.log($$$ARGS)',
+    severity: 'low',
+    category: 'maintainability',
+    languages: ['js', 'ts', 'jsx', 'tsx'],
+    title: 'console.log left in code',
+    description:
+      'A console.log statement was added; debug logging shouldn\'t ship to production.',
+    suggestion: 'Remove the console.log or route through a leveled logger.',
+  },
+];
+
+/* ------------------------------------------------------------------ *
+ * Pure regex fallback
+ * ------------------------------------------------------------------ */
+
+/**
+ * Convert an ast-grep rule `pattern` into a regex for line-based matching.
+ * The translation is intentionally simple:
+ *   - `$$$ARGS`, `$$$`, `$VALUE`, `$X`, `$VAR`, etc. → `.*?` (non-greedy any)
+ *   - regex metacharacters in the literal portions are escaped, EXCEPT for
+ *     `{`, `}`, `(`, `)`, which are common structural chars in ast-grep
+ *     patterns (e.g. `eval($$$ARGS)`, `dangerouslySetInnerHTML={$$$}`) and
+ *     behave identically escaped-or-not in modern JS regex when not forming
+ *     a quantifier.
+ *
+ * Implementation note: the wildcard tokens are replaced with placeholder
+ * strings BEFORE escaping (so the inserted `.`, `*`, `?` don't get escaped),
+ * then the placeholders are turned into `.*?` AFTER escaping. This avoids
+ * double-handling of the wildcard chars.
+ *
+ * This is much less precise than a real AST walk — it only catches the obvious
+ * cases — but it works on any text file without a parser and never throws.
+ *
+ * Returns a RegExp (case-sensitive) or `null` if the pattern cannot be
+ * translated.
+ *
+ * @param {string} pattern
+ * @returns {RegExp | null}
+ */
+function astGrepPatternToRegex(pattern) {
+  if (typeof pattern !== 'string' || pattern.length === 0) return null;
+  // Step 1: replace wildcard tokens with an unlikely placeholder.
+  const PLACEHOLDER = '\u0000WILD\u0000';
+  let translated = pattern
+    .replace(/\$\$\$[A-Z]*/g, PLACEHOLDER) // $$$ARGS, $$$
+    .replace(/\$[A-Z]+/g, PLACEHOLDER); // $VALUE, $X
+  // Step 2: escape regex metacharacters in the literal portions. We leave
+  // `{`, `}`, `(`, `)` UN-ESCAPED: in ast-grep patterns these are structural
+  // syntax that should match literally, and JS regex treats literal `{`, `}`,
+  // `(`, `)` that aren't part of a quantifier/group as literal characters.
+  translated = translated.replace(/[.*+?^$|[\]\\]/g, '\\$&');
+  // Step 3: replace the placeholder with the actual `.*?` wildcard.
+  // The placeholder contains \u0000 which is not a regex metachar, so the
+  // escape step left it alone.
+  translated = translated.split(PLACEHOLDER).join('.*?');
+  try {
+    return new RegExp(translated);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Determine whether a filename matches a rule's language set.
+ *
+ * - `'*'` in `languages` → matches anything
+ * - otherwise, the file's extension (lowercased, no dot) must be in the
+ *   language set (with the conventional mappings: js → js/mjs/cjs, ts → ts,
+ *   jsx → jsx, tsx → tsx)
+ *
+ * @param {string} filename
+ * @param {string[]} languages
+ * @returns {boolean}
+ */
+function fileMatchesLanguages(filename, languages) {
+  if (!Array.isArray(languages) || languages.length === 0) return true;
+  if (languages.includes('*')) return true;
+  if (typeof filename !== 'string') return false;
+  const base = filename.split('/').pop() || filename;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return false;
+  const ext = base.slice(dot + 1).toLowerCase();
+  const extToLang = {
+    js: 'js',
+    mjs: 'js',
+    cjs: 'js',
+    ts: 'ts',
+    jsx: 'jsx',
+    tsx: 'tsx',
+  };
+  const lang = extToLang[ext];
+  return lang ? languages.includes(lang) : false;
+}
+
+/**
+ * Pure line-based pattern scanner. Walks the ADDED lines of each file's patch,
+ * testing each rule's translated pattern against the line text. Returns
+ * findings keyed to absolute (new-file) line numbers. NEVER throws.
+ *
+ * @param {Array<{filename?: string, patch?: string}>} files
+ * @param {Array<object>} [rules] - rules to apply; defaults to DEFAULT_PATTERN_RULES.
+ * @returns {Array<Record<string, unknown>>}
+ */
+function scanPatternsRegex(files, rules = DEFAULT_PATTERN_RULES) {
+  if (!Array.isArray(files)) return [];
+  if (!Array.isArray(rules)) rules = DEFAULT_PATTERN_RULES;
+  /** @type {Record<string, unknown>[]} */
+  const out = [];
+  for (const f of files || []) {
+    if (!f || typeof f !== 'object') continue;
+    const file = typeof f.filename === 'string' ? f.filename : '';
+    if (!file) continue;
+    const patch = typeof f.patch === 'string' ? f.patch : '';
+    if (!patch) continue;
+
+    // Pre-compile a regex per applicable rule (filter by language once per file).
+    /** @type {Array<{rule: object, regex: RegExp}>} */
+    const applicable = [];
+    for (const rule of rules) {
+      if (!rule || typeof rule !== 'object') continue;
+      if (!fileMatchesLanguages(file, rule.languages)) continue;
+      const regex = astGrepPatternToRegex(rule.pattern);
+      if (!regex) continue;
+      applicable.push({ rule, regex });
+    }
+    if (applicable.length === 0) continue;
+
+    const addedLines = parseAddedLines(patch);
+    for (const { line, text } of addedLines) {
+      for (const { rule, regex } of applicable) {
+        regex.lastIndex = 0;
+        if (!regex.test(text)) continue;
+        out.push({
+          file,
+          line,
+          severity: rule.severity || 'medium',
+          confidence: 'high',
+          category: rule.category || 'maintainability',
+          title: rule.title || rule.id || 'pattern',
+          description:
+            rule.description || `Pattern "${rule.pattern}" matched in the diff.`,
+          evidence: text.trim(),
+          suggestion: rule.suggestion ?? null,
+          rule: `astgrep:${rule.id}`,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * ast-grep integration
+ * ------------------------------------------------------------------ */
+
+/**
+ * Spec for the ast-grep binary. URLs and SHA256 checksums are PLACEHOLDERS —
+ * TODO: verify checksums against the official ast-grep release manifest before
+ * shipping.
+ *
+ * ast-grep ships as a raw binary on macOS/Linux and a .zip on Windows. On
+ * macOS arm64 the asset is `astgrep-aarch64-apple-darwin`. The default
+ * `extractor` (no extraction) handles raw binaries; Windows .zip needs a
+ * caller-provided extractor.
+ *
+ * @type {Object}
+ */
+const AST_GREP_SPEC = {
+  name: 'ast-grep',
+  version: '0.34.3',
+  ext: '',
+  urls: {
+    darwin_arm64:
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-apple-darwin',
+    darwin_x64:
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-apple-darwin',
+    linux_arm64:
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-unknown-linux-gnu',
+    linux_x64:
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-unknown-linux-gnu',
+    win32_x64:
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-pc-windows-msvc.zip',
+  },
+  // PLACEHOLDER checksums — replace with real values from the release manifest
+  // before shipping. These pass the 64-char lowercase-hex shape check but
+  // WILL fail real SHA256 verification (fail-closed).
+  checksums: {
+    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
+    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
+    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
+    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
+    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+  },
+};
+
+/**
+ * Map one ast-grep JSON match to our normalized finding schema.
+ *
+ * ast-grep `--json` emits an array of objects with at least:
+ *   {
+ *     "text": "eval('...')",     // the matched text
+ *     "file": "src/foo.js",
+ *     "lines": { "start": 42, "end": 42 },
+ *     "column": { "start": 5, "end": 14 },
+ *     "replacement": null,
+ *     "matchedPattern": "...",    // present when --pattern, absent on --scan
+ *     "ruleId": "eval",           // present when scanning with a rule YAML
+ *   }
+ *
+ * @param {object} match
+ * @param {Map<string, object>} [ruleIndex] - ruleId → rule object (for title/desc lookup)
+ * @returns {Record<string, unknown> | null}
+ */
+function mapAstGrepFinding(match, ruleIndex) {
+  if (!match || typeof match !== 'object') return null;
+  const m = /** @type {Record<string, any>} */ (match);
+  const file = typeof m.file === 'string' ? m.file : '';
+  if (!file) return null;
+
+  const startLine =
+    m.lines && Number.isFinite(m.lines.start) && m.lines.start >= 1
+      ? Math.floor(m.lines.start)
+      : null;
+  const text = typeof m.text === 'string' ? m.text : '';
+  const ruleId = typeof m.ruleId === 'string' && m.ruleId ? m.ruleId : 'match';
+  const ruleObj = ruleIndex && ruleIndex.get(ruleId);
+  const title = ruleObj?.title || `ast-grep rule "${ruleId}" matched`;
+  const description =
+    ruleObj?.description || `ast-grep rule "${ruleId}" matched in the diff.`;
+  const suggestion = ruleObj?.suggestion ?? null;
+  const severity = ruleObj?.severity || 'medium';
+  const category = ruleObj?.category || 'maintainability';
+
+  return {
+    file,
+    line: startLine,
+    severity,
+    confidence: 'high',
+    category,
+    title,
+    description,
+    evidence: text.trim(),
+    suggestion,
+    rule: `astgrep:${ruleId}`,
+  };
+}
+
+/**
+ * Parse the JSON output of `ast-grep scan --json` (or `run --json`) into an
+ * array of normalized findings. Returns `[]` on any parse failure (never
+ * throws). `ruleIndex` (ruleId → rule object) is used to enrich findings with
+ * title/description/severity from the originating rule.
+ *
+ * @param {string} jsonText
+ * @param {Map<string, object>} [ruleIndex]
+ * @returns {Array<Record<string, unknown>>}
+ */
+function parseAstGrepJson(jsonText, ruleIndex) {
+  if (typeof jsonText !== 'string' || jsonText.trim().length === 0) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  /** @type {Record<string, unknown>[]} */
+  const out = [];
+  for (const element of parsed) {
+    const mapped = mapAstGrepFinding(element, ruleIndex);
+    if (mapped) out.push(mapped);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * scanPatterns — async orchestration
+ * ------------------------------------------------------------------ */
+
+/**
+ * Scan for risky code patterns. Tries ast-grep first (via ensureBinary +
+ * deps.runBinary); on ANY error warns via `deps.core.warning` and falls back
+ * to `scanPatternsRegex(files, rules)`. NEVER throws.
+ *
+ * @param {{ files: Array, repoPath: string, cacheDir?: string, rules?: Array }} opts
+ * @param {{
+ *   ensureBinary?: Function,
+ *   runBinary?: Function,
+ *   platform?: string,
+ *   arch?: string,
+ *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
+ * }} [deps]
+ * @returns {Promise<{ findings: Array, scanner: 'ast-grep' | 'regex-fallback' }>}
+ */
+async function scanPatterns(opts, deps = {}) {
+  const files = Array.isArray(opts?.files) ? opts.files : [];
+  const rules = Array.isArray(opts?.rules) ? opts.rules : DEFAULT_PATTERN_RULES;
+  const core = deps.core;
+  const platform = deps.platform || external_node_os_namespaceObject.platform();
+  const arch = deps.arch || external_node_os_namespaceObject.arch();
+
+  const regexFindings = scanPatternsRegex(files, rules);
+
+  if (typeof deps.ensureBinary !== 'function' || typeof deps.runBinary !== 'function') {
+    return { findings: regexFindings, scanner: 'regex-fallback' };
+  }
+
+  try {
+    const asset = selectPlatformAsset(AST_GREP_SPEC, { platform, arch });
+    if (!asset) {
+      throw new Error(
+        `ast-grep: no asset for platform=${platform || '?'} arch=${arch || '?'}`,
+      );
+    }
+    const binaryPath = await deps.ensureBinary(
+      { ...AST_GREP_SPEC, ...asset, cacheDir: opts.cacheDir },
+      { platform, arch },
+    );
+    const source = opts.repoPath || process.cwd();
+    // Run each rule via `ast-grep run --pattern <PATTERN> --json`. We do one
+    // rule at a time to keep the JSON output shape simple (and to attribute
+    // findings back to a specific rule via the ruleIndex lookup).
+    /** @type {Record<string, unknown>[]} */
+    const allFindings = [];
+    const ruleIndex = new Map(rules.map((r) => [r.id, r]));
+    for (const rule of rules) {
+      if (!rule || !rule.id || !rule.pattern) continue;
+      // `--lang '*'` rules (TODO/FIXME) — ast-grep `run` requires a specific
+      // language; skip `*`-language rules in the ast-grep path and rely on
+      // the regex fallback to catch them.
+      if (
+        Array.isArray(rule.languages) &&
+        rule.languages.length > 0 &&
+        !rule.languages.includes('*')
+      ) {
+        // Use the first language hint (ast-grep takes a single --lang).
+        const lang = rule.languages[0];
+        const args = [
+          'run',
+          '--pattern', rule.pattern,
+          '--lang', lang,
+          '--json',
+          source,
+        ];
+        const result = await deps.runBinary(binaryPath, args, {
+          cwd: source,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        const stdout = typeof result === 'string' ? result : String(result?.stdout ?? '');
+        // ast-grep's JSON doesn't include the ruleId on `run`, so attach it
+        // manually before mapping.
+        const enriched = parseAstGrepJson(stdout).map((f) => ({
+          ...f,
+          rule: `astgrep:${rule.id}`,
+          title: rule.title || f.title,
+          description: rule.description || f.description,
+          severity: rule.severity || f.severity,
+          category: rule.category || f.category,
+          suggestion: rule.suggestion ?? f.suggestion,
+        }));
+        for (const f of enriched) allFindings.push(f);
+      }
+    }
+    if (core?.info) {
+      core.info(`ast-grep: ${allFindings.length} pattern finding(s).`);
+    }
+    return { findings: allFindings, scanner: 'ast-grep' };
+  } catch (err) {
+    if (core?.warning) {
+      core.warning(
+        `ast-grep unavailable, using regex fallback: ${err?.message ?? String(err)}`,
+      );
+    }
+    return { findings: regexFindings, scanner: 'regex-fallback' };
+  }
+}
+
+;// CONCATENATED MODULE: ./src/lib/scanners/metrics.js
+/**
+ * Deterministic diff metrics (PURE — no I/O, no deps).
+ *
+ * Computes a small set of high-signal metrics about a PR's changed-files array:
+ * counts, additions/deletions, test-vs-source classification, large/generated
+ * file heuristics, and a TODO/FIXME counter over ADDED diff lines. These feed
+ * two consumers:
+ *   1. `metricsToFindings` surfaces large/generated files as low-severity
+ *      deterministic findings (consumed by the LLM-merge path).
+ *   2. `formatMetricsForPrompt` renders a compact "PR metrics" block that is
+ *      injected into the LLM prompt as context.
+ *
+ * The input shape matches the GitHub PR `files` payload: each entry has
+ * `{filename, status, additions?, deletions?, changes?, patch?}`. Only
+ * `filename` is required; everything else is best-effort.
+ *
+ * @module src/lib/scanners/metrics.js
+ */
+
+/** Source-code extensions used to classify a file as a source file. */
+const SOURCE_EXTENSIONS = new Set([
+  'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte', 'astro',
+  'py', 'rb', 'go', 'rs', 'java', 'kt', 'scala',
+  'c', 'cc', 'cpp', 'cxx', 'h', 'hpp', 'hxx',
+  'cs', 'fs', 'vb',
+  'php', 'pl', 'pm',
+  'swift', 'm', 'mm',
+  'sh', 'bash', 'zsh', 'fish',
+  'sql', 'graphql', 'gql',
+  'yml', 'yaml',
+  'json', 'toml', 'ini', 'cfg',
+]);
+
+/** Glob-style test-file patterns. A filename matching any → test file. */
+const TEST_PATTERNS = [
+  /\.test\.[^.]+$/, // foo.test.js
+  /\.spec\.[^.]+$/, // foo.spec.ts
+  /(^|\/)__tests__\//, // __tests__/foo.js
+  /(^|\/)tests?\//, // tests/foo.js, test/foo.js
+  /(^|\/)__mocks__\//, // __mocks__/foo.js
+  /(^|\/)fixtures\//, // fixtures/foo.js
+];
+
+/** Glob-style generated-file patterns. */
+const GENERATED_PATTERNS = [
+  /\.lock$/, // any .lock file
+  /(^|\/)package-lock\.json$/,
+  /(^|\/)yarn\.lock$/,
+  /(^|\/)pnpm-lock\.yaml$/,
+  /\.generated\.[^.]+$/, // foo.generated.js
+  /(^|\/)dist\//, // dist/*
+  /(^|\/)build\//, // build/*
+  /\.min\.[^.]+$/, // foo.min.js
+];
+
+/** Threshold (in changed lines) above which a file is "large". */
+const LARGE_FILE_THRESHOLD = 300;
+
+/** Markers counted in added diff lines for the TODO/FIXME/etc. tally. */
+const TODO_MARKERS = ['TODO', 'FIXME', 'HACK', 'XXX'];
+
+/**
+ * Extract the file extension (lowercased, no dot) from a filename.
+ * Returns `''` for dotfiles / no extension.
+ *
+ * @param {string} filename
+ * @returns {string}
+ */
+function extOf(filename) {
+  if (typeof filename !== 'string' || filename.length === 0) return '';
+  const base = filename.split('/').pop() || filename;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return ''; // dotfiles (.eslintrc) have no ext
+  return base.slice(dot + 1).toLowerCase();
+}
+
+/**
+ * Is this filename a test file? (matches TEST_PATTERNS)
+ *
+ * @param {string} filename
+ * @returns {boolean}
+ */
+function isTestFile(filename) {
+  if (typeof filename !== 'string') return false;
+  return TEST_PATTERNS.some((re) => re.test(filename));
+}
+
+/**
+ * Is this filename a source file? (recognized source extension AND not a test)
+ *
+ * @param {string} filename
+ * @returns {boolean}
+ */
+function isSourceFile(filename) {
+  if (typeof filename !== 'string') return false;
+  if (isTestFile(filename)) return false;
+  return SOURCE_EXTENSIONS.has(extOf(filename));
+}
+
+/**
+ * Is this filename a generated/lockfile?
+ *
+ * @param {string} filename
+ * @returns {boolean}
+ */
+function isGeneratedFile(filename) {
+  if (typeof filename !== 'string') return false;
+  return GENERATED_PATTERNS.some((re) => re.test(filename));
+}
+
+/**
+ * Count TODO/FIXME/HACK/XXX markers in the ADDED lines of a unified diff patch.
+ * Added lines start with `+` (and the `+++` file header is skipped). Markers
+ * are matched as substrings; an added line with multiple markers counts once.
+ *
+ * Returns 0 for non-string / empty patches.
+ *
+ * @param {string} patch
+ * @returns {number}
+ */
+function countTodosInPatch(patch) {
+  if (typeof patch !== 'string' || patch.length === 0) return 0;
+  let count = 0;
+  for (const line of patch.split('\n')) {
+    if (!line.startsWith('+') || line.startsWith('+++')) continue;
+    if (TODO_MARKERS.some((m) => line.includes(m))) count++;
+  }
+  return count;
+}
+
+/**
+ * Compute deterministic diff metrics over a PR's changed-files array.
+ *
+ * Each input entry: `{filename, status, additions?, deletions?, changes?, patch?}`.
+ * Only `filename` is required; the numeric fields default to 0 when absent or
+ * non-finite; the patch is used only for the TODO tally (best-effort).
+ *
+ * @param {Array<{filename?: string, status?: string, additions?: number, deletions?: number, changes?: number, patch?: string}>} files
+ * @returns {{
+ *   filesChanged: number,
+ *   additions: number,
+ *   deletions: number,
+ *   testFiles: number,
+ *   sourceFiles: number,
+ *   testToSourceRatio: number,
+ *   largeFiles: string[],
+ *   generatedFiles: string[],
+ *   todoCount: number,
+ *   byStatus: Record<string, number>,
+ * }}
+ */
+function computeMetrics(files) {
+  const out = {
+    filesChanged: 0,
+    additions: 0,
+    deletions: 0,
+    testFiles: 0,
+    sourceFiles: 0,
+    testToSourceRatio: 0,
+    largeFiles: [],
+    generatedFiles: [],
+    todoCount: 0,
+    byStatus: {},
+  };
+  if (!Array.isArray(files)) return out;
+
+  for (const f of files || []) {
+    if (!f || typeof f !== 'object') continue;
+    const filename = typeof f.filename === 'string' ? f.filename : '';
+    if (!filename) continue;
+    out.filesChanged += 1;
+
+    const additions = Number.isFinite(f.additions) ? Math.max(0, Math.floor(f.additions)) : 0;
+    const deletions = Number.isFinite(f.deletions) ? Math.max(0, Math.floor(f.deletions)) : 0;
+    const changes = Number.isFinite(f.changes) ? Math.max(0, Math.floor(f.changes)) : additions + deletions;
+
+    out.additions += additions;
+    out.deletions += deletions;
+
+    if (isTestFile(filename)) out.testFiles += 1;
+    else if (isSourceFile(filename)) out.sourceFiles += 1;
+
+    if (changes > LARGE_FILE_THRESHOLD) out.largeFiles.push(filename);
+    if (isGeneratedFile(filename)) out.generatedFiles.push(filename);
+
+    out.todoCount += countTodosInPatch(typeof f.patch === 'string' ? f.patch : '');
+
+    const status = typeof f.status === 'string' && f.status.length > 0 ? f.status : 'modified';
+    out.byStatus[status] = (out.byStatus[status] || 0) + 1;
+  }
+
+  out.testToSourceRatio = out.sourceFiles > 0 ? out.testFiles / out.sourceFiles : 0;
+  return out;
+}
+
+/**
+ * Render a compact one-line "PR metrics" string for prompt injection.
+ *
+ * Example: `12 files (+340 -89), test-to-source ratio 0.30, 2 large files, 4 TODOs.`
+ *
+ * @param {ReturnType<typeof computeMetrics>} metrics
+ * @returns {string}
+ */
+function formatMetricsForPrompt(metrics) {
+  if (!metrics || typeof metrics !== 'object') return '';
+  const files = metrics.filesChanged || 0;
+  const adds = metrics.additions || 0;
+  const dels = metrics.deletions || 0;
+  const ratio = Number.isFinite(metrics.testToSourceRatio)
+    ? metrics.testToSourceRatio
+    : 0;
+  const large = (metrics.largeFiles || []).length;
+  const todos = metrics.todoCount || 0;
+  return (
+    `${files} files (+${adds} -${dels}), ` +
+    `test-to-source ratio ${ratio.toFixed(2)}, ` +
+    `${large} large file${large === 1 ? '' : 's'}, ` +
+    `${todos} TODO${todos === 1 ? '' : 's'}.`
+  );
+}
+
+/**
+ * Surface large/generated files as low-severity findings. The LLM merge path
+ * dedups against model findings at the same file+line+title, so these are
+ * strictly additive context.
+ *
+ * Each finding:
+ *   - large file  → severity 'info', category 'maintainability'
+ *   - generated file → severity 'info', category 'maintainability'
+ *
+ * Returns an empty array when no large/generated files were detected.
+ *
+ * @param {ReturnType<typeof computeMetrics>} metrics
+ * @returns {Array<Record<string, unknown>>}
+ */
+function metricsToFindings(metrics) {
+  if (!metrics || typeof metrics !== 'object') return [];
+  /** @type {Record<string, unknown>[]} */
+  const out = [];
+  for (const filename of metrics.largeFiles || []) {
+    out.push({
+      file: filename,
+      line: null,
+      severity: 'info',
+      confidence: 'high',
+      category: 'maintainability',
+      title: 'Large file change',
+      description:
+        'This file has a large diff (>300 changed lines). Consider splitting into smaller reviews.',
+      evidence: '',
+      suggestion: 'Break the change into smaller, independently reviewable commits.',
+      rule: 'metrics:large-file',
+    });
+  }
+  for (const filename of metrics.generatedFiles || []) {
+    out.push({
+      file: filename,
+      line: null,
+      severity: 'info',
+      confidence: 'high',
+      category: 'maintainability',
+      title: 'Generated/lock file modified',
+      description:
+        'This file is typically generated (lockfile, build output, or .generated. file). ' +
+        'Reviewing it line-by-line is rarely useful.',
+      evidence: '',
+      suggestion: null,
+      rule: 'metrics:generated-file',
+    });
+  }
+  return out;
+}
+
+;// CONCATENATED MODULE: ./src/lib/scanners/index.js
+/**
+ * Scanner orchestrator — runs every enabled scanner and merges results.
+ *
+ * Architecture — the injection seam:
+ *   Each scanner (`scanSecrets`, `scanPatterns`, `computeMetrics`) is injected
+ *   via `deps` so tests can substitute fakes. The orchestrator itself does NO
+ *   I/O and NEVER throws — a scanner failure logs a warning and contributes an
+ *   empty findings array.
+ *
+ * Flow:
+ *   1. Filter by the master switch (`config.scannersEnabled`, default true).
+ *   2. Filter by per-scanner repo toggles (`repoConfig.scanners.{name}` can
+ *      DISABLE a scanner; it cannot enable one the master switch turned off).
+ *   3. Run `scanSecrets` and `scanPatterns` concurrently via `Promise.all`.
+ *   4. Run `computeMetrics` (sync).
+ *   5. Surface `metricsToFindings(metrics)` as low-severity findings.
+ *   6. Merge all findings; dedup by `${file}:${line}:${rule}`.
+ *   7. Return `{ findings, metrics, scannerNames }`.
+ *
+ * @module src/lib/scanners/index.js
+ */
+
+
+
+
+
+/**
+ * Build a dedup key for a finding: `${file}:${line}:${rule}`.
+ *
+ * @param {Record<string, unknown>} f
+ * @returns {string}
+ */
+function dedupKey(f) {
+  const file = typeof f.file === 'string' ? f.file : '';
+  const line = f.line === null || f.line === undefined ? 'null' : f.line;
+  const rule = typeof f.rule === 'string' ? f.rule : '';
+  return `${file}:${line}:${rule}`;
+}
+
+/**
+ * Format the deterministic scanner findings + metrics as a compact context
+ * block for the LLM prompt. The prompt instructs the model NOT to re-report
+ * these.
+ *
+ * Output shape:
+ * ```
+ * Already detected by automated scanners (do NOT re-report these):
+ * - src/auth.js:42 [gitleaks:aws-access-key] AWS access key ID detected
+ * - src/db.js:18 [astgrep:sql-concat] SQL query via string concatenation
+ *
+ * PR metrics: 12 files (+340 -89), test-to-source ratio 0.30, 2 large files, 4 TODOs.
+ * ```
+ *
+ * Empty findings + empty metrics → '' (so the prompt-builder omits the block).
+ *
+ * @param {Array<Record<string, unknown>>} findings
+ * @param {ReturnType<typeof computeMetrics>} metrics
+ * @returns {string}
+ */
+function formatScannerContext(findings, metrics) {
+  /** @type {string[]} */
+  const lines = [];
+  if (Array.isArray(findings) && findings.length > 0) {
+    lines.push('Already detected by automated scanners (do NOT re-report these):');
+    for (const f of findings) {
+      const file = typeof f.file === 'string' ? f.file : '';
+      const line = typeof f.line === 'number' && f.line > 0 ? `:${f.line}` : '';
+      const rule = typeof f.rule === 'string' && f.rule ? `[${f.rule}]` : '';
+      const title = typeof f.title === 'string' ? f.title : '';
+      lines.push(`- ${file}${line} ${rule} ${title}`.trim());
+    }
+  }
+  if (metrics && typeof metrics === 'object') {
+    const m = formatMetricsForPrompt(metrics);
+    if (m) {
+      if (lines.length > 0) lines.push('');
+      lines.push(`PR metrics: ${m}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Run all enabled scanners. Each scanner is injected via deps for testability.
+ *
+ * @param {{
+ *   files: Array,
+ *   repoPath?: string,
+ *   cacheDir?: string,
+ *   config?: { scannersEnabled?: boolean },
+ *   repoConfig?: { scanners?: { secrets?: boolean, patterns?: boolean, metrics?: boolean } },
+ * }} opts
+ * @param {{
+ *   scanSecrets?: Function,
+ *   scanPatterns?: Function,
+ *   computeMetrics?: Function,
+ *   metricsToFindings?: Function,
+ *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
+ * }} [deps]
+ * @returns {Promise<{ findings: Array, metrics: Object, scannerNames: string[] }>}
+ */
+async function runScanners(opts, deps = {}) {
+  const files = Array.isArray(opts?.files) ? opts.files : [];
+  const config = opts?.config && typeof opts?.config === 'object' ? opts.config : {};
+  const repoConfig =
+    opts?.repoConfig && typeof opts?.repoConfig === 'object' ? opts.repoConfig : {};
+  const repoScanners = repoConfig.scanners && typeof repoConfig.scanners === 'object'
+    ? repoConfig.scanners
+    : {};
+  const core = deps.core;
+
+  const doComputeMetrics =
+    typeof deps.computeMetrics === 'function' ? deps.computeMetrics : computeMetrics;
+  // Metrics are always computed — they're cheap and pure and feed the prompt
+  // context block even when scanning is disabled.
+  const metrics = doComputeMetrics(files);
+
+  const masterEnabled = config.scannersEnabled !== false; // default true
+  if (!masterEnabled) {
+    return { findings: [], metrics, scannerNames: [] };
+  }
+
+  const doScanSecrets = typeof deps.scanSecrets === 'function' ? deps.scanSecrets : scanSecrets;
+  const doScanPatterns = typeof deps.scanPatterns === 'function' ? deps.scanPatterns : scanPatterns;
+  const doMetricsToFindings =
+    typeof deps.metricsToFindings === 'function' ? deps.metricsToFindings : metricsToFindings;
+
+  // Per-scanner repo toggles: a repo can DISABLE (explicit false) but not enable.
+  const secretsEnabled = repoScanners.secrets !== false;
+  const patternsEnabled = repoScanners.patterns !== false;
+  // metrics scanner is cheap and pure — always run unless explicitly disabled.
+  const metricsEnabled = repoScanners.metrics !== false;
+
+  const scannerNames = [];
+  /** @type {Array<Record<string, unknown>>} */
+  let findings = [];
+
+  // Run secrets + patterns concurrently.
+  /** @type {Array<Promise<{ findings: Array, scanner: string }>>} */
+  const promises = [];
+  if (secretsEnabled) {
+    promises.push(
+      doScanSecrets(
+        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
+        { core },
+      ).catch((err) => {
+        if (core?.warning) {
+          core.warning(`secrets scanner failed: ${err?.message ?? String(err)}`);
+        }
+        return { findings: [], scanner: 'regex-fallback' };
+      }),
+    );
+  }
+  if (patternsEnabled) {
+    promises.push(
+      doScanPatterns(
+        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
+        { core },
+      ).catch((err) => {
+        if (core?.warning) {
+          core.warning(`patterns scanner failed: ${err?.message ?? String(err)}`);
+        }
+        return { findings: [], scanner: 'regex-fallback' };
+      }),
+    );
+  }
+  const results = await Promise.all(promises);
+
+  // Track provenance.
+  if (secretsEnabled) {
+    const r = results.shift();
+    if (r) {
+      scannerNames.push(`secrets:${r.scanner}`);
+      findings = findings.concat(r.findings);
+    }
+  }
+  if (patternsEnabled) {
+    const r = results.shift();
+    if (r) {
+      scannerNames.push(`patterns:${r.scanner}`);
+      findings = findings.concat(r.findings);
+    }
+  }
+
+  // Surface metrics-driven findings (large/generated files).
+  if (metricsEnabled) {
+    const mFindings = doMetricsToFindings(metrics);
+    if (mFindings.length > 0) {
+      scannerNames.push('metrics:info');
+      findings = findings.concat(mFindings);
+    }
+  }
+
+  // Dedup by file+line+rule (first wins).
+  const seen = new Set();
+  /** @type {Array<Record<string, unknown>>} */
+  const deduped = [];
+  for (const f of findings) {
+    const key = dedupKey(f);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(f);
+  }
+
+  return { findings: deduped, metrics, scannerNames };
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -42825,6 +44568,8 @@ async function runScheduledReview({
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
+
 
 
 
@@ -42877,6 +44622,25 @@ function isMainEntry() {
  * readAllInputs
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Expand a leading `~` to the user's home directory. Returns the input
+ * unchanged for non-tilde paths or non-strings. Used to resolve the
+ * ZAI_SCANNERS_CACHE_DIR default (`~/.zai-cache/scanners`) at runtime.
+ *
+ * @param {string} p
+ * @returns {string}
+ */
+function expandHome(p) {
+  if (typeof p !== 'string' || p.length === 0) return p;
+  if (p === '~') return (0,external_node_os_namespaceObject.homedir)();
+  if (p.startsWith('~/')) return `${(0,external_node_os_namespaceObject.homedir)()}${p.slice(1)}`;
+  return p;
+}
+
 /**
  * The complete list of action input names, in the order loadConfig reads them.
  * Exported so the test can assert coverage. Keep in sync with config.js.
@@ -42905,6 +44669,8 @@ const INPUT_NAMES = [
   'ZAI_MIN_SEVERITY',
   'ZAI_TEMPERATURE',
   'ZAI_MAX_TOKENS',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
   'GITHUB_TOKEN',
 ];
 
@@ -42956,6 +44722,8 @@ async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    runScanners: runScannersFn = runScanners,
+    formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
     parseCommand: parseCommandFn = parseCommand,
@@ -42995,13 +44763,48 @@ async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
+    // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
+    // become high-confidence findings directly (merged over LLM findings at
+    // the same file:line+title) and are injected into the LLM prompt as
+    // "already detected, don't re-report" context. Scanners NEVER fail the
+    // review — on any error they log a warning and contribute [] findings.
+    const cacheDir = expandHome(config.scannersCacheDir);
+    const scannerResult = await runScannersFn(
+      {
+        files: patchable,
+        repoPath: process.cwd(),
+        cacheDir,
+        config: { scannersEnabled: config.scannersEnabled },
+        repoConfig: deps.repoConfig,
+      },
+      { core: coreDep },
+    );
+    const scannerContext = formatScannerContextFn(
+      scannerResult.findings,
+      scannerResult.metrics,
+    );
+    if (scannerResult.scannerNames.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Scanners: ${scannerResult.findings.length} finding(s) from ` +
+          `${scannerResult.scannerNames.join(', ')}.`,
+      );
+    }
+
     // Structured review: one path for both small and large PRs. Batching
     // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
     // result is rendered as a structured-findings summary comment.
-    const result = await runStructuredReviewFn(patchable, config, {
-      callApi,
-      core: coreDep,
-    });
+    const result = await runStructuredReviewFn(
+      patchable,
+      {
+        ...config,
+        deterministicFindings: scannerResult.findings,
+        scannerContext,
+      },
+      {
+        callApi,
+        core: coreDep,
+      },
+    );
 
     const content = formatFindingsAsSummaryFn(result.findings, {
       reviewerName: config.reviewerName,
@@ -43227,8 +45030,9 @@ if (isMainEntry()) {
 }
 
 var __webpack_exports__INPUT_NAMES = __webpack_exports__.Qh;
+var __webpack_exports__expandHome = __webpack_exports__.kc;
 var __webpack_exports__isMainEntry = __webpack_exports__.gT;
 var __webpack_exports__main = __webpack_exports__.iW;
 var __webpack_exports__readAllInputs = __webpack_exports__.vv;
 var __webpack_exports__run = __webpack_exports__.eF;
-export { __webpack_exports__INPUT_NAMES as INPUT_NAMES, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };
+export { __webpack_exports__INPUT_NAMES as INPUT_NAMES, __webpack_exports__expandHome as expandHome, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };
