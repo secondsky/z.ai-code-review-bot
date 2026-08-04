@@ -79,8 +79,8 @@ describe('authorize — association gate (default threshold "write")', () => {
         comment: { author_association: 'FIRST_TIMER' },
         isFork: false,
         config: {},
-      }).authorized,
-    ).toBe(false);
+      }),
+    ).toMatchObject({ authorized: false, silent: true, reason: 'untrusted_association' });
   });
 
   test('FIRST_TIME_CONTRIBUTOR is blocked', () => {
@@ -89,8 +89,8 @@ describe('authorize — association gate (default threshold "write")', () => {
         comment: { author_association: 'FIRST_TIME_CONTRIBUTOR' },
         isFork: false,
         config: {},
-      }).authorized,
-    ).toBe(false);
+      }),
+    ).toMatchObject({ authorized: false, silent: true, reason: 'untrusted_association' });
   });
 
   test('MANNEQUIN is blocked', () => {
@@ -99,8 +99,8 @@ describe('authorize — association gate (default threshold "write")', () => {
         comment: { author_association: 'MANNEQUIN' },
         isFork: false,
         config: {},
-      }).authorized,
-    ).toBe(false);
+      }),
+    ).toMatchObject({ authorized: false, silent: true, reason: 'untrusted_association' });
   });
 });
 
