@@ -12,7 +12,7 @@
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
-import { postComment } from './_shared.js';
+import { postComment, getPRContext } from './_shared.js';
 import { getChangedFiles } from '../changed-files.js';
 
 /** Fixed error comment (no raw error leakage). */
@@ -155,11 +155,19 @@ async function fetchFileContent({ octokit, owner, repo, path, ref }) {
 /**
  * Handle `/zai explain`.
  *
+ * The PR head SHA is fetched via {@link getPRContext} (which calls
+ * `octokit.rest.pulls.get`) rather than read from the `issue_comment` payload:
+ * that payload has NO top-level `pull_request`, only the minimal
+ * `payload.issue.pull_request` reference (no `head.sha`). Reading the payload
+ * would always yield `undefined` and the handler would fall through to the
+ * usage comment — so `/zai explain` would never reach `callApi`.
+ *
  * @param {object} args  `{ octokit, context, config, core, commenter, args, callApi }`
  * @param {object} [deps={}]
  * @param {(o: object) => Promise<*>} [deps.post]
  * @param {(o: object) => Promise<Array>} [deps.getChangedFiles]
  * @param {(o: object) => Promise<string>} [deps.fetchFileContent]
+ * @param {(o: object) => Promise<{headSha?: string}|null>} [deps.getPRContext]
  * @returns {Promise<void>}
  */
 export async function handleExplainCommand(
@@ -170,12 +178,12 @@ export async function handleExplainCommand(
     post = (body) => postComment({ octokit, context, body }),
     getChangedFiles: getFiles = (o) => getChangedFiles(o),
     fetchFileContent: fetch = (o) => fetchFileContent(o),
+    getPRContext: getCtx = (o) => getPRContext(o),
   } = deps;
 
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
-  const ref = context?.payload?.pull_request?.head?.sha;
 
   const { range, file } = parseExplainArgs(args);
   if (!range) {
@@ -204,7 +212,11 @@ export async function handleExplainCommand(
       return;
     }
 
-    if (typeof ref !== 'string') {
+    // Fetch the head SHA via the API: the issue_comment payload does NOT carry
+    // it (no top-level pull_request.head.sha).
+    const pr = await getCtx({ octokit, context });
+    const ref = pr?.headSha;
+    if (typeof ref !== 'string' || ref === '') {
       // Without the head sha we can't fetch a stable file snapshot.
       await post(USAGE_COMMENT);
       return;

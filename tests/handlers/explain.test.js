@@ -24,8 +24,9 @@ function b64(text) {
 function makeOctokit({
   files = [{ filename: 'src/a.js', status: 'modified', patch: '+a\n+b\n+c' }],
   content = { content: b64('line1\nline2\nline3\nline4\nline5') },
+  headSha = 'sha-head',
 } = {}) {
-  const calls = { createComment: [], listFiles: [], getContent: [] };
+  const calls = { createComment: [], listFiles: [], getContent: [], pullsGet: [] };
   const octokit = {
     rest: {
       issues: {
@@ -38,6 +39,17 @@ function makeOctokit({
         async listFiles(params) {
           calls.listFiles.push(params);
           return { data: files };
+        },
+        async get(params) {
+          calls.pullsGet.push(params);
+          return {
+            data: {
+              title: 'Test PR',
+              body: '',
+              head: { ref: 'feature', sha: headSha },
+              base: { ref: 'main' },
+            },
+          };
         },
       },
       repos: {
@@ -52,10 +64,22 @@ function makeOctokit({
   return octokit;
 }
 
-function makeContext({ number = 42, headSha = 'sha-head' } = {}) {
+// Real `issue_comment` payload shape: there is NO top-level pull_request, only
+// the minimal `payload.issue.pull_request` reference (which carries a `url`
+// but no `head.sha`). The head SHA is supplied via the mocked pulls.get.
+function makeContext({ number = 42 } = {}) {
   return {
     repo: { owner: 'owner', repo: 'repo' },
-    payload: { issue: { number }, pull_request: { head: { sha: headSha } } },
+    payload: {
+      issue: {
+        number,
+        title: 'Test PR',
+        body: '',
+        pull_request: { url: `https://api.github.com/repos/owner/repo/pulls/${number}` },
+      },
+      comment: { id: 100, body: '', user: { login: 'a' }, author_association: 'COLLABORATOR' },
+      sender: { login: 'a', author_association: 'COLLABORATOR' },
+    },
   };
 }
 
@@ -177,7 +201,14 @@ describe('handleExplainCommand — success', () => {
     // No out-of-window lines leaked in.
     expect(prompt).not.toContain('l5');
     expect(octokit.__calls.createComment[0].body).toContain('EXPLANATION');
-    // Fetched at the PR head sha.
+    // The head SHA was fetched via pulls.get (NOT read from the payload, which
+    // does not carry it for issue_comment events).
+    expect(octokit.__calls.pullsGet[0]).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      pull_number: 42,
+    });
+    // Fetched at the PR head sha returned by pulls.get.
     expect(octokit.__calls.getContent[0]).toMatchObject({
       owner: 'owner',
       repo: 'repo',

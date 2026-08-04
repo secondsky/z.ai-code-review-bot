@@ -101,7 +101,7 @@ describe('upsertReviewComment', () => {
     expect(calls.createComment).toHaveLength(0);
   });
 
-  test('listComments called with owner/repo/issue_number', async () => {
+  test('listComments called with owner/repo/issue_number and per_page:100 (v1 mitigation for >30 comments)', async () => {
     const { octokit, calls } = makeOctokit({ list: [] });
     await upsertReviewComment({ ...base, octokit });
     expect(calls.listComments).toHaveLength(1);
@@ -109,6 +109,7 @@ describe('upsertReviewComment', () => {
       owner: 'o',
       repo: 'r',
       issue_number: 42,
+      per_page: 100,
     });
   });
 

@@ -95,7 +95,7 @@ describe('getPRContext', () => {
     const pr = {
       title: 'Add feature',
       body: 'This adds X',
-      head: { ref: 'feature-x' },
+      head: { ref: 'feature-x', sha: 'sha-head-123' },
       base: { ref: 'main' },
     };
     const octokit = makeOctokit({ pr });
@@ -111,6 +111,7 @@ describe('getPRContext', () => {
       body: 'This adds X',
       headBranch: 'feature-x',
       baseBranch: 'main',
+      headSha: 'sha-head-123',
     });
   });
 
@@ -126,6 +127,7 @@ describe('getPRContext', () => {
       body: '',
       headBranch: '',
       baseBranch: '',
+      headSha: '',
     });
   });
 

@@ -51,10 +51,15 @@ export async function postComment({ octokit, context, body }) {
 /**
  * Fetch minimal PR metadata for prompt-building.
  *
- * Returns `{ title, body, headBranch, baseBranch }` via
+ * Returns `{ title, body, headBranch, baseBranch, headSha }` via
  * `octokit.rest.pulls.get({ owner, repo, pull_number })` where `pull_number`
  * is `context.payload.issue.number`. Keeps the payload minimal on purpose —
  * per-file fetching is the caller's job (each handler fetches what it needs).
+ *
+ * `headSha` is exposed so handlers can fetch a stable file snapshot via
+ * `repos.getContent` without trusting the `issue_comment` payload, which does
+ * NOT carry the PR head SHA (only `payload.issue.pull_request`, a minimal
+ * reference with no `head.sha`).
  *
  * Defensive: returns `null` (and fetches nothing) when context is missing the
  * owner/repo/issue-number fields.
@@ -62,7 +67,7 @@ export async function postComment({ octokit, context, body }) {
  * @param {object} args
  * @param {object} args.octokit
  * @param {object} args.context
- * @returns {Promise<{title: string, body: string, headBranch: string, baseBranch: string}|null>}
+ * @returns {Promise<{title: string, body: string, headBranch: string, baseBranch: string, headSha: string}|null>}
  */
 export async function getPRContext({ octokit, context }) {
   const owner = context?.repo?.owner;
@@ -81,5 +86,6 @@ export async function getPRContext({ octokit, context }) {
     body: typeof data?.body === 'string' ? data.body : '',
     headBranch: data?.head?.ref ?? '',
     baseBranch: data?.base?.ref ?? '',
+    headSha: data?.head?.sha ?? '',
   };
 }

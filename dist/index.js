@@ -39190,7 +39190,9 @@ function buildCommentBody({ title, content, marker }) {
 /**
  * Upsert the single summary review comment on a PR.
  *
- * 1. List issue comments.
+ * 1. List issue comments (with `per_page: 100` so the marker lookup inspects
+ *    the first 100 comments, not just GitHub's default 30 — a v1 mitigation
+ *    against duplicate summary comments on PRs with >30 comments).
  * 2. Find the first whose body contains `marker` (default {@link MARKER}).
  * 3. Update it if found, otherwise create a new comment.
  *
@@ -39219,6 +39221,7 @@ async function upsertReviewComment({
     owner,
     repo,
     issue_number: issueNumber,
+    per_page: 100,
   });
 
   const existing = comments.find((c) => typeof c?.body === 'string' && c.body.includes(marker));

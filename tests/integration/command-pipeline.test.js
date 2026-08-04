@@ -229,6 +229,66 @@ describe('integration: issue_comment pipeline — authorized /zai help', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Authorized /zai explain <range> [file]  (regression: head SHA from API)
+ * ------------------------------------------------------------------ */
+
+describe('integration: issue_comment pipeline — authorized /zai explain <range> [file]', () => {
+  // REGRESSION GUARD (Finding 1): the real `issue_comment` payload has NO
+  // top-level `pull_request`, only the minimal `payload.issue.pull_request`
+  // reference (no `head.sha`). Previously the handler read the head SHA from
+  // `payload.pull_request.head.sha`, which is always undefined for an
+  // issue_comment event, so /zai explain silently fell through to a usage
+  // comment and NEVER reached callApi. This test drives the full pipeline with
+  // REAL HANDLERS and a realistic payload shape (makeCommentContext produces
+  // NO top-level pull_request) to prove the handler now fetches the head SHA
+  // via the API (pulls.get through getPRContext) and reaches callApi.
+
+  it('a COLLABORATOR issuing /zai explain 1-5 on a PR gets an explanation (head SHA fetched via the API, not the payload)', async () => {
+    const core = makeFakeCore();
+    // PR fixture carries the head SHA that getPRContext → pulls.get returns.
+    // The content fixture is base64 (what repos.getContent returns).
+    const fileContent = Buffer.from('l1\nl2\nl3\nl4\nl5\n').toString('base64');
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = 1;')],
+      pr: { title: 'Add a', body: 'adds const a', head: { ref: 'feat', sha: 'sha-head-abc' }, base: { ref: 'main' } },
+      content: { content: fileContent, encoding: 'base64' },
+    });
+    const callApi = makeFakeCallApi('line-by-line explanation');
+    // makeCommentContext produces the REAL issue_comment shape: NO top-level
+    // pull_request, only payload.issue.pull_request: {} (a minimal reference
+    // with no head.sha). This is the shape that exposed the bug.
+    const ctx = makeCommentContext({
+      body: '/zai explain 1-5 src/a.js',
+      association: 'COLLABORATOR',
+      login: 'alice',
+    });
+
+    await run(ctx, wiredDeps({ core, octokit, callApi }));
+
+    // The real explain handler reached callApi (it did NOT fall through to the
+    // usage comment — that was the bug).
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/a.js');
+    expect(prompt).toContain('1-5');
+    // The explanation was posted as a command-response comment.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createComment[0].body).toBe('line-by-line explanation');
+    // The head SHA was fetched via the API (pulls.get), and the file snapshot
+    // was fetched at that SHA via repos.getContent.
+    expect(octokit.__calls.get).toHaveLength(1);
+    expect(octokit.__calls.get[0]).toMatchObject({ owner: 'owner', repo: 'repo', pull_number: 42 });
+    expect(octokit.__calls.getContent).toHaveLength(1);
+    expect(octokit.__calls.getContent[0]).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      path: 'src/a.js',
+      ref: 'sha-head-abc',
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * Authorized /zai review <file>
  * ------------------------------------------------------------------ */
 
