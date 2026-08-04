@@ -1,4 +1,3 @@
-import { describe, test, expect } from 'vitest';
 import { loadConfig } from '../src/lib/config.js';
 
 // Helper: build an inputs object from a plain object (only defined keys).
