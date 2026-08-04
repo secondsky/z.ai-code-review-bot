@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+.superpowers/
+# dist/ is committed on purpose: it's the runtime entry point the action runs.
+# CI enforces that committed dist/ matches src/ (no drift).
