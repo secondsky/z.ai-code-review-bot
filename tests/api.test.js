@@ -57,8 +57,15 @@ function buildFakeRes(chunks = [], { statusCode = 200 } = {}) {
  */
 function makeFakeRequest(behavior) {
   const calls = [];
-  const request = (options) => {
-    const captured = { options, headers: options.headers || {}, calls };
+  const request = (url, options) => {
+    // Node's `https.request(url, options)` passes the URL as arg 0; capture it
+    // so tests can assert the transport was aimed at ZAI_API_URL.
+    const captured = {
+      url,
+      options,
+      headers: options?.headers || {},
+      calls,
+    };
     calls.push(captured);
     const { res } = behavior(captured);
 
@@ -273,12 +280,12 @@ describe('sanitizeErrorMessage', () => {
     expect(out).not.toContain('{"error"');
   });
 
-  test('extracts top-level error.message from trailing JSON', () => {
-    const msg = 'Z.ai API error 400: {"error.message":"flat bad"}';
-    // Note: the regex keys are error.message || error.error.message; the
-    // top-level "error.message" key (literal dot) is the first alternative.
+  test('extracts top-level message from trailing JSON', () => {
+    const msg = 'Z.ai API error 400: {"message":"flat bad"}';
     const out = sanitizeErrorMessage(msg);
     expect(out).toContain('flat bad');
+    // The JSON blob must be gone after extraction.
+    expect(out).not.toContain('{');
   });
 
   test('returns fallback for null/undefined', () => {
@@ -444,6 +451,13 @@ describe('makeApiRequest', () => {
     // Authorization header must be Bearer <apiKey>
     const auth = captured.options.headers['Authorization'] || captured.options.headers['authorization'];
     expect(auth).toBe('Bearer secret-key');
+    // The transport must have been aimed at ZAI_API_URL (host api.z.ai, path
+    // /api/coding/paas/v4/chat/completions) — without this, production would
+    // POST to localhost.
+    expect(captured.url).toBe(ZAI_API_URL);
+    const parsedUrl = new URL(captured.url);
+    expect(parsedUrl.host).toBe('api.z.ai');
+    expect(parsedUrl.pathname).toBe('/api/coding/paas/v4/chat/completions');
   });
 });
 

@@ -125,7 +125,9 @@ export function sanitizeErrorMessage(error) {
     try {
       const parsed = JSON.parse(jsonMatch[1]);
       const inner =
-        parsed?.error?.message || parsed?.message || parsed?.error?.error?.message;
+        parsed?.error?.message ||
+        parsed?.error?.error?.message ||
+        parsed?.message;
       if (inner) {
         message = message.slice(0, jsonMatch.index) + ': ' + inner;
       }
@@ -213,7 +215,11 @@ export function makeApiRequest(params, deps = {}) {
       },
     };
 
-    const req = request(options);
+    // Node's `https.request(url, options)` signature accepts a URL string as
+    // the first arg; passing ZAI_API_URL here ensures the production transport
+    // actually POSTs to Z.ai. Fake transports receive the URL as arg 0 and the
+    // options object as arg 1.
+    const req = request(ZAI_API_URL, options);
 
     let responseBody = '';
     let destroyed = false;
@@ -409,20 +415,8 @@ export async function callWithRetry(fn, options = {}) {
     }
   }
 
-  // Unreachable in practice (loop returns on every path), but keeps the
-  // function's return shape total for the type checker.
-  return {
-    success: false,
-    data: null,
-    error: {
-      category: 'internal',
-      message: 'exhausted retries',
-      retryable: false,
-      attempts: maxRetries + 1,
-      totalDuration: Date.now() - startTime,
-    },
-    usedFallback,
-  };
+  // Unreachable in practice (loop returns on every path).
+  throw new Error('unreachable: callWithRetry loop exited unexpectedly');
 }
 
 /* ------------------------------------------------------------------ *
