@@ -2,6 +2,7 @@
   "name": "z.ai-code-review-bot",
   "version": "1.0.0",
   "description": "AI-powered pull-request code review and interactive /zai assistant using Z.ai GLM models.",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.js -o dist --license licenses.txt",
