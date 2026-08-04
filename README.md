@@ -102,7 +102,7 @@ this matters, especially for fork PRs.
 | `ZAI_SYSTEM_PROMPT` | *(built-in)* | System prompt; empty falls back to the built-in default. |
 | `ZAI_REVIEWER_NAME` | `Z.ai Code Review` | Header label on the review comment. |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated globs to exclude. |
-| `MAX_DIFF_CHARS` | `0` | Hard cap on diff chars for the small-PR path (0 = unlimited). |
+| `MAX_DIFF_CHARS` | `100000` | Hard cap on diff chars for the small-PR path (0 = unlimited, discouraged). |
 | `ZAI_LARGE_PR_FILE_THRESHOLD` | `50` | File count that triggers batched review. |
 | `ZAI_MAX_BATCH_CHARS` | `120000` | Character budget per batch. |
 | `ZAI_MAX_FILES_PER_BATCH` | `40` | Max distinct files per batch. |
@@ -111,13 +111,18 @@ this matters, especially for fork PRs.
 | `ZAI_AUTH_THRESHOLD` | `write` | Min relationship for commands: `admin\|maintain\|write\|read\|none`. |
 | `ZAI_ALLOW_FORK_COMMANDS` | `false` | Allow commands on fork PRs. |
 | `ZAI_TIMEOUT_MS` | `120000` | Per-attempt Z.ai request timeout (ms). |
+| `ZAI_SCHEDULE_ENABLED` | `false` | Re-review open PRs on a schedule. |
+| `ZAI_SCHEDULE_MAX_PRS` | `10` | Cap on PRs reviewed per scheduled run. |
+| `ZAI_DESCRIBE_WRITE_BODY` | `false` | `/zai describe` writes a marked block into the PR body. |
+| `ZAI_IMPACT_LABELS` | `false` | `/zai impact` applies a `zai:`-scoped severity label. |
+| `ZAI_IMPACT_LABEL_MAP` | `critical=zai:critical,…` | Severity → label map. |
 | `GITHUB_TOKEN` | `github.token` | GitHub token (auto-provided). |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (407 tests)
+npm test            # vitest suite (507 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 ```
