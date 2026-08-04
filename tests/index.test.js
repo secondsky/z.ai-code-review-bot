@@ -45,6 +45,11 @@ function makeConfig(overrides = {}) {
     authThreshold: 'write',
     allowForkCommands: false,
     timeoutMs: 120000,
+    scheduleEnabled: false,
+    scheduleMaxPrs: 10,
+    describeWriteBody: false,
+    impactLabels: false,
+    impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -56,12 +61,19 @@ function file(filename, patch = '@@ diff @@', status = 'modified') {
 }
 
 /** Build a fake octokit with the rest methods the router calls. */
-function makeOctokit({ files = [], list = [] } = {}) {
+function makeOctokit({ files = [], list = [], pr = null } = {}) {
   const calls = {
     listFiles: [],
     listComments: [],
     createComment: [],
     updateComment: [],
+    get: [],
+  };
+  const defaultPr = {
+    title: 'T',
+    body: 'B',
+    head: { ref: 'r', sha: 's', repo: { fork: false } },
+    base: { ref: 'main' },
   };
   const octokit = {
     rest: {
@@ -69,6 +81,10 @@ function makeOctokit({ files = [], list = [] } = {}) {
         async listFiles(params) {
           calls.listFiles.push(params);
           return { data: files };
+        },
+        async get(params) {
+          calls.get.push(params);
+          return { data: pr ?? defaultPr };
         },
       },
       issues: {
@@ -445,6 +461,51 @@ describe('run — issue_comment routing', () => {
     );
   });
 
+  it('payload.action=edited: returns early (defense-in-depth against edited triggers), no dispatch', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit();
+    const handler = vi.fn();
+    const config = makeConfig();
+
+    const ctx = commentContext({ body: '/zai ask hi', association: 'COLLABORATOR' });
+    ctx.payload.action = 'edited';
+
+    await run(ctx, {
+      config,
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      handlers: { ask: handler },
+    });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring issue_comment action: edited'),
+    );
+  });
+
+  it('payload.action=created: dispatches normally (the only allowed action)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit();
+    const handler = vi.fn(async () => {});
+    const config = makeConfig();
+
+    const ctx = commentContext({ body: '/zai ask hi', association: 'COLLABORATOR' });
+    ctx.payload.action = 'created';
+
+    await run(ctx, {
+      config,
+      core,
+      octokit,
+      callApi: vi.fn(async () => 'a'),
+      apiClient: { call: vi.fn() },
+      handlers: { ask: handler },
+    });
+
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
   it('bot comment: returns early (anti-loop), no dispatch', async () => {
     const core = makeCore();
     const octokit = makeOctokit();
@@ -664,7 +725,7 @@ describe('run — issue_comment routing', () => {
  * ------------------------------------------------------------------ */
 
 describe('run — schedule + unknown events', () => {
-  it('schedule: graceful no-op', async () => {
+  it('schedule: disabled by default → graceful no-op', async () => {
     const core = makeCore();
     const octokit = makeOctokit();
     const callApi = vi.fn();
@@ -672,7 +733,7 @@ describe('run — schedule + unknown events', () => {
     await run(
       { eventName: 'schedule', repo: { owner: 'o', repo: 'r' }, payload: {} },
       {
-        config: makeConfig(),
+        config: makeConfig(), // scheduleEnabled defaults to false
         core,
         octokit,
         callApi,
@@ -682,8 +743,35 @@ describe('run — schedule + unknown events', () => {
 
     expect(callApi).not.toHaveBeenCalled();
     expect(core.info).toHaveBeenCalledWith(
-      expect.stringContaining('Scheduled tasks not yet implemented'),
+      expect.stringContaining('Schedule disabled'),
     );
+  });
+
+  it('schedule: enabled → dispatches runScheduledReview with the pipeline helpers', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit();
+    const callApi = vi.fn(async () => 'review');
+    const runScheduledReview = vi.fn(async () => ({ reviewed: 0, skipped: 0, failed: 0 }));
+
+    await run(
+      { eventName: 'schedule', repo: { owner: 'o', repo: 'r' }, payload: {} },
+      {
+        config: makeConfig({ scheduleEnabled: true }),
+        core,
+        octokit,
+        callApi,
+        apiClient: { call: vi.fn() },
+        runScheduledReview,
+      },
+    );
+
+    expect(runScheduledReview).toHaveBeenCalledTimes(1);
+    expect(runScheduledReview.mock.calls[0][0]).toMatchObject({
+      owner: 'o',
+      repo: 'r',
+    });
+    // The pipeline helpers were wired through.
+    expect(runScheduledReview.mock.calls[0][0].callApi).toBeTypeOf('function');
   });
 
   it('unknown event: graceful no-op', async () => {

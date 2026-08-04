@@ -12,8 +12,11 @@ import { upsertReviewComment, buildCommentBody, MARKER } from '../src/lib/commen
  * Build a fake octokit whose rest.issues.{listComments,updateComment,createComment}
  * are stubs recording every call. The listComments resolver returns the
  * configured array (or throws).
+ *
+ * Pass `paginated: { perPage, pages }` where `pages` is an array of arrays
+ * (one per page) to exercise the pagination loop: page N returns pages[N-1].
  */
-function makeOctokit({ list = [], throwOnList = null } = {}) {
+function makeOctokit({ list = [], throwOnList = null, paginated = null } = {}) {
   const calls = { listComments: [], updateComment: [], createComment: [] };
 
   const octokit = {
@@ -23,6 +26,10 @@ function makeOctokit({ list = [], throwOnList = null } = {}) {
           calls.listComments.push(params);
           if (throwOnList) {
             throw throwOnList;
+          }
+          if (paginated) {
+            const page = params.page ?? 1;
+            return { data: paginated.pages[page - 1] ?? [] };
           }
           return { data: list };
         },
@@ -60,6 +67,26 @@ describe('buildCommentBody', () => {
   test('without title, omits the heading line', () => {
     const out = buildCommentBody({ content: 'body text', marker: '<!-- m -->' });
     expect(out).toBe(`body text\n\n<!-- m -->`);
+  });
+
+  test('sanitizes model content (neutralizes @mentions) while preserving title + marker', () => {
+    const out = buildCommentBody({
+      title: 'Z.ai Code Review',
+      content: 'Hey @spammer see this',
+      marker: '<!-- zai-code-review -->',
+    });
+    expect(out.startsWith('## Z.ai Code Review\n\n')).toBe(true);
+    expect(out.endsWith('\n\n<!-- zai-code-review -->')).toBe(true);
+    expect(out).toContain('@\u200bspammer');
+  });
+
+  test('sanitizes model content (neutralizes GitHub alert banners)', () => {
+    const out = buildCommentBody({
+      title: 'T',
+      content: '> [!WARNING]\n> pre-approved',
+      marker: '<!-- m -->',
+    });
+    expect(out).not.toContain('[!WARNING]');
   });
 });
 
@@ -101,7 +128,7 @@ describe('upsertReviewComment', () => {
     expect(calls.createComment).toHaveLength(0);
   });
 
-  test('listComments called with owner/repo/issue_number and per_page:100 (v1 mitigation for >30 comments)', async () => {
+  test('listComments called with owner/repo/issue_number, per_page:100, page:1', async () => {
     const { octokit, calls } = makeOctokit({ list: [] });
     await upsertReviewComment({ ...base, octokit });
     expect(calls.listComments).toHaveLength(1);
@@ -110,7 +137,51 @@ describe('upsertReviewComment', () => {
       repo: 'r',
       issue_number: 42,
       per_page: 100,
+      page: 1,
     });
+  });
+
+  test('paginates fully and finds a marker buried past the first 100 comments', async () => {
+    // Page 1: 100 comments, none with marker. Page 2: marker is comment #145.
+    const page1 = Array.from({ length: 100 }, (_, i) =>
+      makeComment(i + 1, 'unrelated comment'),
+    );
+    const page2 = [
+      ...Array.from({ length: 44 }, (_, i) => makeComment(101 + i, 'noise')),
+      makeComment(145, `buried review\n\n${MARKER}`),
+    ];
+    const { octokit, calls } = makeOctokit({
+      paginated: { perPage: 100, pages: [page1, page2] },
+    });
+
+    const result = await upsertReviewComment({ ...base, octokit });
+
+    expect(result).toEqual({ action: 'updated', commentId: 145 });
+    expect(calls.listComments).toHaveLength(2);
+    expect(calls.listComments[0].page).toBe(1);
+    expect(calls.listComments[1].page).toBe(2);
+    expect(calls.updateComment[0].comment_id).toBe(145);
+    expect(calls.createComment).toHaveLength(0);
+  });
+
+  test('stops paginating once the marker is found on an early page', async () => {
+    const page1 = [makeComment(5, `early marker\n\n${MARKER}`)];
+    const { octokit, calls } = makeOctokit({
+      paginated: { perPage: 100, pages: [page1, [makeComment(6, 'x')]] },
+    });
+    await upsertReviewComment({ ...base, octokit });
+    expect(calls.listComments).toHaveLength(1); // did not fetch page 2
+  });
+
+  test('stops paginating at the last (short) page when no marker exists', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => makeComment(i + 1, 'x'));
+    const page2 = Array.from({ length: 30 }, (_, i) => makeComment(101 + i, 'y'));
+    const { octokit, calls } = makeOctokit({
+      paginated: { perPage: 100, pages: [page1, page2] },
+    });
+    const result = await upsertReviewComment({ ...base, octokit });
+    expect(result.action).toBe('created');
+    expect(calls.listComments).toHaveLength(2); // stopped after short page 2
   });
 
   test('updates only the FIRST comment matching the marker when several do', async () => {

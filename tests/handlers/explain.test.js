@@ -266,6 +266,34 @@ describe('handleExplainCommand — success', () => {
     expect(callApi).not.toHaveBeenCalled();
     expect(octokit.__calls.createComment[0].body).toContain('Usage');
   });
+
+  it('clamps a huge range to the MAX_WINDOW_LINES cap (cost guard)', async () => {
+    // A 10000-line file with a `/zai explain 1-10000` request. Without the cap
+    // the whole file would go into the prompt; the cap limits the window.
+    const lines = Array.from({ length: 10000 }, (_, i) => `line${i + 1}`);
+    const octokit = makeOctokit({
+      content: { content: b64(lines.join('\n')) },
+    });
+    const callApi = vi.fn(async () => 'EX');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-10000 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    // The first 400 lines are within the window; line 401 is NOT.
+    expect(prompt).toContain('line1');
+    expect(prompt).toContain('line400');
+    expect(prompt).not.toContain('line401');
+    // The reported range reflects the clamp.
+    expect(prompt).toContain('1-400');
+  });
 });
 
 describe('handleExplainCommand — error path', () => {

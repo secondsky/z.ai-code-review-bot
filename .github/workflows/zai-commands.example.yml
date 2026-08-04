@@ -34,6 +34,15 @@ permissions:
   pull-requests: write
   contents: read     # bump to 'write' only if you later enable PR-body features
 
+# Serialize commands per PR so two rapid /zai comments don't race. We do NOT
+# cancel in-progress (cancel-in-progress: false): a queued /zai ask should not
+# be dropped just because another command is running. This is the primary
+# rate-limit / cost-abuse control; combine with ZAI_AUTH_THRESHOLD to limit who
+# can trigger commands at all.
+concurrency:
+  group: zai-commands-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   command:
     # ── PRIMARY AUTHORIZATION GATE ──────────────────────────────────────────

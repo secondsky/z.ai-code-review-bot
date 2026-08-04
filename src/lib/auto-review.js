@@ -92,6 +92,11 @@ export function compareByPriority(a, b) {
  */
 export function splitTextByLines(text, maxChars) {
   const source = typeof text === 'string' ? text : '';
+  // Defense-in-depth: a non-positive maxChars would make the inner
+  // `for (i += maxChars)` loop never terminate (i += 0) or run backwards
+  // (i += negative). Config validation clamps these, but guard here too so a
+  // future caller cannot trigger the hang. Treat bad input as "no chunking".
+  if (!Number.isFinite(maxChars) || maxChars < 1) return [source];
   if (!source || source.length <= maxChars) return [source];
 
   const lines = source.split('\n');
@@ -159,14 +164,41 @@ export function createReviewEntries(files, options = {}) {
 }
 
 /**
- * Format one entry as the XML-ish block the prompt expects.
+ * Escape a string for an XML attribute value (`name="…"`). Neutralizes `"`,
+ * `&`, `<`, `>` so a hostile filename cannot break out of the attribute or
+ * inject tag structure into the prompt.
+ */
+function escapeXmlAttribute(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Escape structural XML close-tags inside patch bodies so an attacker cannot
+ * inject `</diff>`, `</file>`, or `</review_batch>` to break out of the
+ * wrapping boundary the prompt relies on for structure.
+ */
+function escapeStructuralTags(s) {
+  return String(s ?? '').replace(/<\/(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
+}
+
+/**
+ * Format one entry as the XML-ish block the prompt expects. The filename is
+ * attribute-escaped and the patch body has its structural close-tags escaped so
+ * a hostile filename/diff cannot break the prompt's structural boundary.
  */
 export function formatEntry(entry) {
   const chunkLabel =
     entry.chunkCount > 1 ? ` part="${entry.chunkIndex}/${entry.chunkCount}"` : '';
+  const safeName = escapeXmlAttribute(entry.filename);
+  const safeStatus = escapeXmlAttribute(entry.status);
+  const safePatch = escapeStructuralTags(entry.patch);
   return (
-    `<file name="${entry.filename}" status="${entry.status}"${chunkLabel}>\n` +
-    `<diff>\n${entry.patch}\n</diff>\n` +
+    `<file name="${safeName}" status="${safeStatus}"${chunkLabel}>\n` +
+    `<diff>\n${safePatch}\n</diff>\n` +
     `</file>`
   );
 }

@@ -63,11 +63,13 @@ describe('loadConfig — excludePatterns', () => {
 });
 
 describe('loadConfig — numeric fields & defaults', () => {
-  test('maxDiffChars: parseInt base 10, NaN->0', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(0);
+  test('maxDiffChars: default 100000; 0 means unlimited; NaN/negative -> default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(100000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(0);
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(0); // unlimited
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(12);
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(100000); // negative->default
   });
 
   test('largePrFileThreshold default 50', () => {
@@ -96,6 +98,48 @@ describe('loadConfig — numeric fields & defaults', () => {
   });
 });
 
+describe('loadConfig — numeric validation (negatives/zero clamped to safe defaults)', () => {
+  // These inputs drive loops/batching; a non-positive value would hang
+  // (splitTextByLines infinite loop) or blow up cost (one-entry-per-batch).
+  test('ZAI_MAX_PATCH_CHARS=0 falls back to default (prevents infinite loop)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_PATCH_CHARS: '0' }).maxPatchChars).toBe(18000);
+  });
+  test('ZAI_MAX_PATCH_CHARS=-1 falls back to default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_PATCH_CHARS: '-1' }).maxPatchChars).toBe(18000);
+  });
+  test('ZAI_MAX_BATCH_CHARS=0 falls back to default (prevents batch degeneracy)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '0' }).maxBatchChars).toBe(120000);
+  });
+  test('ZAI_MAX_FILES_PER_BATCH=0 falls back to default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FILES_PER_BATCH: '0' }).maxFilesPerBatch).toBe(40);
+  });
+  test('ZAI_LARGE_PR_FILE_THRESHOLD=0 falls back to default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LARGE_PR_FILE_THRESHOLD: '0' }).largePrFileThreshold).toBe(50);
+  });
+  test('ZAI_TIMEOUT_MS=0 falls back to default (min 1000)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TIMEOUT_MS: '0' }).timeoutMs).toBe(120000);
+  });
+  test('ZAI_TIMEOUT_MS below 1000 clamps to 120000 default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TIMEOUT_MS: '500' }).timeoutMs).toBe(120000);
+  });
+  test('non-numeric "0x10" -> default (parseInt base 10 = 0, clamped)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_PATCH_CHARS: '0x10' }).maxPatchChars).toBe(18000);
+  });
+  test('valid positive values are passed through', () => {
+    const cfg = loadConfig({
+      ZAI_API_KEY: 'k',
+      ZAI_MAX_PATCH_CHARS: '5000',
+      ZAI_MAX_BATCH_CHARS: '80000',
+      ZAI_MAX_FILES_PER_BATCH: '10',
+      ZAI_TIMEOUT_MS: '60000',
+    });
+    expect(cfg.maxPatchChars).toBe(5000);
+    expect(cfg.maxBatchChars).toBe(80000);
+    expect(cfg.maxFilesPerBatch).toBe(10);
+    expect(cfg.timeoutMs).toBe(60000);
+  });
+});
+
 describe('loadConfig — boolean fields', () => {
   const truthy = ['true', 'True', 'TRUE', '1', 'yes', 'YES', 'Yes'];
   const falsy = ['false', '0', 'no', '', 'maybe', 'random'];
@@ -115,6 +159,42 @@ describe('loadConfig — boolean fields', () => {
   });
   test('allowForkCommands truthy for "yes"', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_ALLOW_FORK_COMMANDS: 'yes' }).allowForkCommands).toBe(true);
+  });
+
+  test('scheduleEnabled defaults false', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scheduleEnabled).toBe(false);
+  });
+  test('scheduleEnabled truthy for "true"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCHEDULE_ENABLED: 'true' }).scheduleEnabled).toBe(true);
+  });
+  test('scheduleMaxPrs defaults 10, clamped positive', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scheduleMaxPrs).toBe(10);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCHEDULE_MAX_PRS: '5' }).scheduleMaxPrs).toBe(5);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCHEDULE_MAX_PRS: '0' }).scheduleMaxPrs).toBe(10);
+  });
+
+  test('describeWriteBody defaults false', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).describeWriteBody).toBe(false);
+  });
+  test('impactLabels defaults false', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).impactLabels).toBe(false);
+  });
+  test('impactLabelMap defaults to the zai: map', () => {
+    const cfg = loadConfig({ ZAI_API_KEY: 'k' });
+    expect(cfg.impactLabelMap).toEqual({
+      critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low',
+    });
+  });
+  test('impactLabelMap parses a custom map and merges over defaults', () => {
+    const cfg = loadConfig({
+      ZAI_API_KEY: 'k',
+      ZAI_IMPACT_LABEL_MAP: 'critical=severity:critical,low=lowpri',
+    });
+    expect(cfg.impactLabelMap.critical).toBe('severity:critical');
+    expect(cfg.impactLabelMap.low).toBe('lowpri');
+    // Unspecified severities keep their defaults.
+    expect(cfg.impactLabelMap.high).toBe('zai:high');
+    expect(cfg.impactLabelMap.medium).toBe('zai:medium');
   });
 });
 

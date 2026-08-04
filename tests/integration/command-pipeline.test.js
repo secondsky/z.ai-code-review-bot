@@ -275,8 +275,10 @@ describe('integration: issue_comment pipeline — authorized /zai explain <range
     expect(octokit.__calls.createComment).toHaveLength(1);
     expect(octokit.__calls.createComment[0].body).toBe('line-by-line explanation');
     // The head SHA was fetched via the API (pulls.get), and the file snapshot
-    // was fetched at that SHA via repos.getContent.
-    expect(octokit.__calls.get).toHaveLength(1);
+    // was fetched at that SHA via repos.getContent. Note: pulls.get is called
+    // at least once for the router's fork-check and once by the explain
+    // handler's getPRContext — both are expected.
+    expect(octokit.__calls.get.length).toBeGreaterThanOrEqual(1);
     expect(octokit.__calls.get[0]).toMatchObject({ owner: 'owner', repo: 'repo', pull_number: 42 });
     expect(octokit.__calls.getContent).toHaveLength(1);
     expect(octokit.__calls.getContent[0]).toMatchObject({
@@ -502,33 +504,19 @@ describe('integration: issue_comment pipeline — @zai alias', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Fork gate (documented limitation)
+ * Fork gate (resolved via API on the command path)
  * ------------------------------------------------------------------ */
 
-describe('integration: issue_comment pipeline — fork gate (documented limitation)', () => {
-  // NOTE ON THE FORK GATE (accepted v1 boundary):
-  //
+describe('integration: issue_comment pipeline — fork gate (resolved via API)', () => {
   // The fork gate in src/lib/auth.js blocks when `isFork === true` AND
-  // `allowForkCommands !== true`. However, `isForkPullRequest(context)` in
-  // src/lib/events.js returns `false` for issue_comment events BY DESIGN —
-  // the comment payload alone does not carry enough information to determine
-  // fork-ness (it would require a separate PR fetch, which the v1 router does
-  // not perform). The router therefore passes `isFork = false` to `authorize`
-  // for every issue_comment event.
-  //
-  // This means the fork gate CANNOT be exercised end-to-end through `run()`
-  // at this layer — the workflow-level `if:` gate (documented in the example
-  // workflows) is the PRIMARY fork protection for issue_comment events, and
-  // that is an accepted v1 boundary per the task brief.
-  //
-  // Below we prove the fork gate itself works at the auth unit level (so the
-  // gate is known-good; it simply isn't reachable from run() for comments),
-  // and we confirm run() does not crash on a PR-comment context whose
-  // underlying PR happens to be a fork (the router just can't see it).
+  // `allowForkCommands !== true`. The issue_comment payload does NOT carry
+  // fork-ness, so when the fork gate is active the router resolves it via
+  // octokit.rest.pulls.get (getPRContext) and passes the real isFork to
+  // authorize(). This makes the in-code promise — "ZAI_ALLOW_FORK_COMMANDS:false
+  // blocks fork-PR commands" — actually hold, including under
+  // ZAI_AUTH_THRESHOLD:none where the association gate is disabled.
 
   it('authorize() blocks a fork comment when allowForkCommands is false (gate proven at unit level)', () => {
-    // Direct proof that the gate works — it just isn't reachable from run()
-    // for issue_comment events because isForkPullRequest() returns false there.
     const result = authorize({
       comment: { author_association: 'COLLABORATOR' },
       sender: { author_association: 'COLLABORATOR' },
@@ -550,17 +538,19 @@ describe('integration: issue_comment pipeline — fork gate (documented limitati
     expect(result.authorized).toBe(true);
   });
 
-  it('run() cannot see fork-ness from an issue_comment context — a COLLABORATOR on a fork-PR comment still dispatches (documented v1 boundary)', async () => {
-    // The underlying PR is a fork (head.repo.fork would be true), but the
-    // issue_comment payload doesn't expose that, so run()'s isForkPullRequest
-    // returns false and the fork gate does not fire. The workflow `if:` gate
-    // is the real fork protection. This test documents the boundary: the
-    // command dispatches because run() can't see fork-ness.
+  it('a COLLABORATOR on a FORK PR is BLOCKED when allowForkCommands is false (router resolves fork-ness via API)', async () => {
+    // The PR is a fork: pulls.get returns head.repo.fork === true.
     const core = makeFakeCore();
     const octokit = makeFakeOctokit({
       files: [file('src/a.js', '@@ diff @@')],
+      pr: {
+        title: 'Fork PR',
+        body: '',
+        head: { repo: { fork: true }, ref: 'f', sha: 's' },
+        base: { ref: 'main' },
+      },
     });
-    const callApi = makeFakeCallApi('fork answer');
+    const callApi = makeFakeCallApi('should not be called');
     const ctx = makeCommentContext({
       body: '/zai ask hi',
       association: 'COLLABORATOR',
@@ -569,10 +559,104 @@ describe('integration: issue_comment pipeline — fork gate (documented limitati
 
     await run(ctx, wiredDeps({ core, octokit, callApi }));
 
-    // Documented boundary: run() dispatched the command (the in-code fork gate
-    // is not reachable from issue_comment context). The workflow `if:` gate is
-    // the primary fork control.
+    // Blocked: no callApi, no comment, and pulls.get was called once for the
+    // fork check.
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(0);
+    expect(octokit.__calls.get).toHaveLength(1);
+  });
+
+  it('GAP-CLOSING: a fork-PR commenter is blocked under authThreshold:none + allowForkCommands:false', async () => {
+    // Under none, the association gate is disabled — previously a fork commenter
+    // with NONE association could slip through because the fork gate couldn't
+    // see fork-ness. Now the router resolves it via the API and blocks.
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ diff @@')],
+      pr: {
+        title: 'Fork PR',
+        body: '',
+        head: { repo: { fork: true }, ref: 'f', sha: 's' },
+        base: { ref: 'main' },
+      },
+    });
+    const callApi = makeFakeCallApi('should not be called');
+    const ctx = makeCommentContext({
+      body: '/zai ask hi',
+      association: 'NONE',
+      login: 'driveby',
+    });
+
+    await run(
+      ctx,
+      wiredDeps({
+        core,
+        octokit,
+        callApi,
+        config: makeConfig({ authThreshold: 'none', allowForkCommands: false }),
+      }),
+    );
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(0);
+  });
+
+  it('a COLLABORATOR on a fork PR is ALLOWED when allowForkCommands is true', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ diff @@')],
+      pr: {
+        title: 'Fork PR',
+        body: '',
+        head: { repo: { fork: true }, ref: 'f', sha: 's' },
+        base: { ref: 'main' },
+      },
+    });
+    const callApi = makeFakeCallApi('fork answer');
+    const ctx = makeCommentContext({
+      body: '/zai ask hi',
+      association: 'COLLABORATOR',
+      login: 'alice',
+    });
+
+    await run(
+      ctx,
+      wiredDeps({
+        core,
+        octokit,
+        callApi,
+        config: makeConfig({ allowForkCommands: true }),
+      }),
+    );
+
     expect(callApi).toHaveBeenCalledTimes(1);
     expect(octokit.__calls.createComment).toHaveLength(1);
+    // No fork-check API call, but the ask handler calls getPRContext once.
+    expect(octokit.__calls.get).toHaveLength(1);
+  });
+
+  it('a COLLABORATOR on a NON-fork PR is allowed (fork-check resolves false)', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ diff @@')],
+      pr: {
+        title: 'Regular PR',
+        body: '',
+        head: { repo: { fork: false }, ref: 'f', sha: 's' },
+        base: { ref: 'main' },
+      },
+    });
+    const callApi = makeFakeCallApi('answer');
+    const ctx = makeCommentContext({
+      body: '/zai ask hi',
+      association: 'COLLABORATOR',
+      login: 'alice',
+    });
+
+    await run(ctx, wiredDeps({ core, octokit, callApi }));
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    // One fork-check call + one ask-handler getPRContext call.
+    expect(octokit.__calls.get).toHaveLength(2);
   });
 });

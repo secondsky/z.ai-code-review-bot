@@ -36,6 +36,24 @@ function toInt(v) {
 }
 
 /**
+ * Parse a numeric input and clamp it to a positive minimum. Returns the
+ * fallback when the parsed value is NaN, non-finite, or below `min`. This is
+ * the defense against operator misconfiguration (e.g. ZAI_MAX_PATCH_CHARS=0)
+ * that would otherwise break downstream invariants (infinite loops, degenerate
+ * batching, etc.).
+ *
+ * @param {string} raw
+ * @param {number} fallback
+ * @param {number} [min=1] inclusive lower bound
+ * @returns {number}
+ */
+function clampPositive(raw, fallback, min = 1) {
+  const n = toInt(raw);
+  if (n === null || !Number.isFinite(n) || n < min) return fallback;
+  return n;
+}
+
+/**
  * Validate that `value` is one of the allowed `allowed` set; throw with the
  * given message otherwise.
  */
@@ -44,6 +62,32 @@ function validateEnum(value, allowed, message) {
     throw new Error(message);
   }
   return value;
+}
+
+/**
+ * Parse the ZAI_IMPACT_LABEL_MAP input (`critical=zai:critical,high=zai:high,...`)
+ * into a {severity: label} object. Malformed entries are skipped silently.
+ * @param {string} raw
+ * @returns {{[severity: string]: string}}
+ */
+function parseImpactLabelMap(raw) {
+  const def = {
+    critical: 'zai:critical',
+    high: 'zai:high',
+    medium: 'zai:medium',
+    low: 'zai:low',
+  };
+  if (typeof raw !== 'string' || raw.trim() === '') return def;
+  const out = {};
+  for (const pair of raw.split(',')) {
+    const idx = pair.indexOf('=');
+    if (idx <= 0) continue;
+    const sev = pair.slice(0, idx).trim().toLowerCase();
+    const label = pair.slice(idx + 1).trim();
+    if (sev && label) out[sev] = label;
+  }
+  // Merge over defaults so a partial map still covers all severities.
+  return { ...def, ...out };
 }
 
 const AUTH_LEVELS = new Set(['admin', 'maintain', 'write', 'read', 'none']);
@@ -76,13 +120,24 @@ export function loadConfig(inputs = {}, options = {}) {
           .map((p) => p.trim())
           .filter((p) => p !== '');
 
-  // maxDiffChars: parseInt base 10, NaN -> 0 (0 = unlimited); default is 0.
-  const maxDiffChars = toInt(read(inputs, 'MAX_DIFF_CHARS')) ?? 0;
-  const largePrFileThreshold = toInt(read(inputs, 'ZAI_LARGE_PR_FILE_THRESHOLD')) ?? 50;
-  const maxBatchChars = toInt(read(inputs, 'ZAI_MAX_BATCH_CHARS')) ?? 120000;
-  const maxFilesPerBatch = toInt(read(inputs, 'ZAI_MAX_FILES_PER_BATCH')) ?? 40;
-  const maxPatchChars = toInt(read(inputs, 'ZAI_MAX_PATCH_CHARS')) ?? 18000;
-  const timeoutMs = toInt(read(inputs, 'ZAI_TIMEOUT_MS')) ?? 120000;
+  // maxDiffChars: parseInt base 10, NaN -> default. 0 means "unlimited"
+  // (documented); negatives are treated as 0 (unlimited) for safety. The
+  // DEFAULT is a sane cap (set in action.yml); operators who want unlimited
+  // set MAX_DIFF_CHARS=0 explicitly.
+  const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
+  const maxDiffChars =
+    maxDiffCharsRaw === null || maxDiffCharsRaw < 0 ? 100000 : maxDiffCharsRaw;
+
+  // Numeric knobs that drive loops/batching must be positive; clamp to a safe
+  // default on any non-finite/negative/zero value to prevent infinite loops
+  // (splitTextByLines) and degenerate one-entry-per-batch cost blow-ups.
+  const largePrFileThreshold = clampPositive(
+    read(inputs, 'ZAI_LARGE_PR_FILE_THRESHOLD'), 50,
+  );
+  const maxBatchChars = clampPositive(read(inputs, 'ZAI_MAX_BATCH_CHARS'), 120000);
+  const maxFilesPerBatch = clampPositive(read(inputs, 'ZAI_MAX_FILES_PER_BATCH'), 40);
+  const maxPatchChars = clampPositive(read(inputs, 'ZAI_MAX_PATCH_CHARS'), 18000);
+  const timeoutMs = clampPositive(read(inputs, 'ZAI_TIMEOUT_MS'), 120000, 1000);
 
   const commandsEnabled = isTruthy(read(inputs, 'ZAI_COMMANDS_ENABLED'));
   const allowForkCommands = isTruthy(read(inputs, 'ZAI_ALLOW_FORK_COMMANDS'));
@@ -90,6 +145,16 @@ export function loadConfig(inputs = {}, options = {}) {
   const authThreshold =
     read(inputs, 'ZAI_AUTH_THRESHOLD').trim() || 'write';
   validateEnum(authThreshold, AUTH_LEVELS, AUTH_ERROR);
+
+  // Schedule feature (opt-in, off by default).
+  const scheduleEnabled = isTruthy(read(inputs, 'ZAI_SCHEDULE_ENABLED'));
+  const scheduleMaxPrs = clampPositive(read(inputs, 'ZAI_SCHEDULE_MAX_PRS'), 10);
+
+  // describe/impact opt-in mutation features (off by default — v1 stays
+  // read-only unless the operator explicitly enables them).
+  const describeWriteBody = isTruthy(read(inputs, 'ZAI_DESCRIBE_WRITE_BODY'));
+  const impactLabels = isTruthy(read(inputs, 'ZAI_IMPACT_LABELS'));
+  const impactLabelMap = parseImpactLabelMap(read(inputs, 'ZAI_IMPACT_LABEL_MAP'));
 
   const githubToken = read(inputs, 'GITHUB_TOKEN');
 
@@ -108,6 +173,11 @@ export function loadConfig(inputs = {}, options = {}) {
     authThreshold,
     allowForkCommands,
     timeoutMs,
+    scheduleEnabled,
+    scheduleMaxPrs,
+    describeWriteBody,
+    impactLabels,
+    impactLabelMap,
     githubToken,
   };
 

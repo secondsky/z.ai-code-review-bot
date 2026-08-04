@@ -13,7 +13,8 @@
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
-import { postComment } from './_shared.js';
+import { postComment, upsertPrDescription } from './_shared.js';
+import { getChangedFiles } from '../changed-files.js';
 
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
@@ -68,19 +69,16 @@ async function defaultListCommits({ octokit, owner, repo, pullNumber }) {
 }
 
 /**
- * Fetch the changed files for a PR (single page is enough for the description).
+ * Fetch ALL changed files for a PR (paginated), reusing the shared
+ * `getChangedFiles` helper so a >100-file PR is fully covered rather than
+ * silently truncated. (Previously this used a single-page fetch that dropped
+ * files past page 1, producing a misleading description.)
  *
  * @param {object} args `{ octokit, owner, repo, pullNumber }`
  * @returns {Promise<Array>}
  */
 async function defaultListFiles({ octokit, owner, repo, pullNumber }) {
-  const { data } = await octokit.rest.pulls.listFiles({
-    owner,
-    repo,
-    pull_number: pullNumber,
-    per_page: 100,
-  });
-  return data;
+  return getChangedFiles({ octokit, owner, repo, pullNumber });
 }
 
 /**
@@ -101,6 +99,7 @@ export async function handleDescribeCommand(
     post = (body) => postComment({ octokit, context, body }),
     listCommits = (o) => defaultListCommits(o),
     listFiles = (o) => defaultListFiles(o),
+    upsertDescription = (o) => upsertPrDescription(o),
   } = deps;
 
   const owner = context?.repo?.owner;
@@ -119,7 +118,11 @@ export async function handleDescribeCommand(
     const prompt = buildDescribePrompt({ commits, files });
     const description = await callApi(config.apiKey, config.model, prompt);
     await post(description);
-    // READ-ONLY: deliberately no `octokit.rest.pulls.update` here.
+    // OPT-IN mutation: when ZAI_DESCRIBE_WRITE_BODY is true, upsert a marked
+    // description block into the PR body. Only the marked block is mutated.
+    if (config.describeWriteBody && typeof pullNumber === 'number') {
+      await upsertDescription({ octokit, owner, repo, pullNumber, description });
+    }
   } catch (error) {
     if (core?.warning) {
       core.warning(`describe handler failed: ${error?.message ?? error}`);
