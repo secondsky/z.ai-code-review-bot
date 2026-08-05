@@ -1192,7 +1192,9 @@ describe('run — pull_request CODEOWNERS reviewer suggestions (Phase 8.1)', () 
     expect(octokit.__calls.createReview).toHaveLength(1);
     expect(octokit.__calls.createComment).toHaveLength(0);
     expect(octokit.__calls.createReview[0].body).toContain('Suggested reviewers');
-    expect(octokit.__calls.createReview[0].body).toContain('@alice');
+    // The review body is sanitized (C1 fix): @mentions get a zero-width space
+    // break so they can't spam notifications. Assert the sanitized form.
+    expect(octokit.__calls.createReview[0].body).toMatch(/@\u200balice/);
   });
 
   it('suggestReviewers ON with a loadCodeowners injection override (bypasses fetch)', async () => {

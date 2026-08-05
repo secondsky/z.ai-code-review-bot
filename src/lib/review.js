@@ -20,7 +20,7 @@
  */
 
 import { MARKER } from './comments.js';
-import { sanitizeModelOutput } from './sanitize-output.js';
+import { sanitizeModelOutput, sanitizeCommentBody } from './sanitize-output.js';
 import { postComment } from './handlers/_shared.js';
 import { formatWalkthroughSummary } from './walkthrough.js';
 
@@ -140,7 +140,12 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
   }
 
   lines.push(MARKER);
-  return lines.join('\n');
+  // Sanitize the assembled body: the model's `summary` prose and the
+  // summary-only finding titles are untrusted model output that could carry
+  // @mention spam or GitHub alert banners. sanitizeCommentBody preserves the
+  // leading `## Title` header and the trailing byte-exact MARKER while
+  // neutralizing @mentions and alert banners in the content between them.
+  return sanitizeCommentBody(lines.join('\n'));
 }
 
 /**
