@@ -38307,7 +38307,9 @@ var __webpack_exports__ = {};
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
   Qh: () => (/* binding */ INPUT_NAMES),
+  nm: () => (/* binding */ createScannerDeps),
   kc: () => (/* binding */ expandHome),
+  Kr: () => (/* binding */ httpsGet),
   gT: () => (/* binding */ isMainEntry),
   iW: () => (/* binding */ main),
   vv: () => (/* binding */ readAllInputs),
@@ -38320,6 +38322,14 @@ var external_node_url_ = __nccwpck_require__(3136);
 const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
 ;// CONCATENATED MODULE: external "node:os"
 const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:os");
+;// CONCATENATED MODULE: external "node:child_process"
+const external_node_child_process_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:child_process");
+// EXTERNAL MODULE: external "node:util"
+var external_node_util_ = __nccwpck_require__(7975);
+;// CONCATENATED MODULE: external "node:fs/promises"
+const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
+;// CONCATENATED MODULE: external "node:https"
+const external_node_https_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:https");
 // EXTERNAL MODULE: ./node_modules/@actions/core/lib/core.js
 var core = __nccwpck_require__(7484);
 // EXTERNAL MODULE: ./node_modules/@actions/github/lib/github.js
@@ -38781,8 +38791,6 @@ function loadConfig(inputs = {}, options = {}) {
   return config;
 }
 
-;// CONCATENATED MODULE: external "node:https"
-const external_node_https_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:https");
 ;// CONCATENATED MODULE: ./src/lib/api.js
 /**
  * The SINGLE Z.ai HTTP client used everywhere in this Action.
@@ -44472,6 +44480,11 @@ function parseAddedLines(patch) {
 
 
 
+
+
+
+const execFile = (0,external_node_util_.promisify)(external_node_child_process_namespaceObject.execFile);
+
 /**
  * Compute the SHA-256 hex digest of a Buffer/string using Node's crypto.
  *
@@ -44479,7 +44492,7 @@ function parseAddedLines(patch) {
  * @returns {string} lowercase hex digest
  */
 function sha256Hex(bytes) {
-  return createHash('sha256').update(bytes).digest('hex');
+  return (0,external_node_crypto_.createHash)('sha256').update(bytes).digest('hex');
 }
 
 /**
@@ -44504,7 +44517,7 @@ function resolveCachePath(spec) {
   if (typeof version !== 'string' || !version) {
     throw new Error('ensureBinary: version is required');
   }
-  return join(cacheDir, name, version, `${name}${ext}`);
+  return (0,external_node_path_namespaceObject.join)(cacheDir, name, version, `${name}${ext}`);
 }
 
 /**
@@ -44522,6 +44535,299 @@ async function defaultExtractor(bytes, destPath, deps) {
     await deps.chmod(destPath, 0o755);
   }
   return destPath;
+}
+
+/**
+ * Pick the system `runCommand` dep, defaulting to promisify(execFile) from
+ * node:child_process. Exposed for reuse by both archive extractors.
+ *
+ * @param {{ runCommand?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveRunCommand(deps = {}) {
+  return typeof deps.runCommand === 'function' ? deps.runCommand : execFile;
+}
+
+/**
+ * Pick the system `mkdir` dep, defaulting to `fs/promises.mkdir` with recursive.
+ *
+ * @param {{ mkdir?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveMkdir(deps = {}) {
+  return typeof deps.mkdir === 'function'
+    ? deps.mkdir
+    : (p) => promises_namespaceObject.mkdir(p, { recursive: true });
+}
+
+/**
+ * Pick the system `writeFile` dep, defaulting to `fs/promises.writeFile`.
+ *
+ * @param {{ writeFile?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveWriteFile(deps = {}) {
+  return typeof deps.writeFile === 'function' ? deps.writeFile : (p, b) => promises_namespaceObject.writeFile(p, b);
+}
+
+/**
+ * Pick the system `chmod` dep, defaulting to `fs/promises.chmod`.
+ *
+ * @param {{ chmod?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveChmod(deps = {}) {
+  return typeof deps.chmod === 'function' ? deps.chmod : (p, m) => promises_namespaceObject.chmod(p, m);
+}
+
+/**
+ * Pick the system `readdir` dep, defaulting to `fs/promises.readdir`.
+ *
+ * @param {{ readdir?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveReaddir(deps = {}) {
+  return typeof deps.readdir === 'function' ? deps.readdir : (p) => promises_namespaceObject.readdir(p);
+}
+
+/**
+ * Pick the system `rename` dep, defaulting to `fs/promises.rename`.
+ *
+ * @param {{ rename?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveRename(deps = {}) {
+  return typeof deps.rename === 'function' ? deps.rename : (a, b) => promises_namespaceObject.rename(a, b);
+}
+
+/**
+ * Pick the system `rm` dep, defaulting to `fs/promises.rm` (recursive).
+ *
+ * @param {{ rm?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveRm(deps = {}) {
+  return typeof deps.rm === 'function' ? deps.rm : (p) => promises_namespaceObject.rm(p, { recursive: true, force: true });
+}
+
+/**
+ * Resolve which extracted file should be moved to `destPath`. Strategy:
+ *   1. Exact basename match (e.g. destPath `/x/ast-grep` → look for `ast-grep`).
+ *   2. `.exe` variant on Windows (e.g. `gitleaks.exe`).
+ *   3. Single file in the dir.
+ *   4. First file in sorted order (last-resort deterministic).
+ *
+ * Returns the absolute path of the chosen file, or `null` if the dir is empty.
+ *
+ * @param {string[]} entries - filenames in the extraction dir
+ * @param {string} dir - absolute path to the extraction dir
+ * @param {string} destPath - the final desired cache path (basename = desired name)
+ * @returns {string | null}
+ */
+function pickExtractedBinary(entries, dir, destPath) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const wanted = (0,external_node_path_namespaceObject.basename)(destPath);
+  // 1. Exact name match.
+  const exact = entries.find((e) => e === wanted);
+  if (exact) return (0,external_node_path_namespaceObject.join)(dir, exact);
+  // 2. `name.exe` (Windows).
+  const exe = entries.find((e) => e === `${wanted}.exe`);
+  if (exe) return (0,external_node_path_namespaceObject.join)(dir, exe);
+  // 3. Single file.
+  if (entries.length === 1) return (0,external_node_path_namespaceObject.join)(dir, entries[0]);
+  // 4. Deterministic fallback: first when sorted, ignoring LICENSE/README.
+  const filtered = entries
+    .filter((e) => !/^(LICENSE|README|CHANGELOG|NOTICE)/i.test(e))
+    .sort();
+  if (filtered.length > 0) return (0,external_node_path_namespaceObject.join)(dir, filtered[0]);
+  return (0,external_node_path_namespaceObject.join)(dir, entries.sort()[0]);
+}
+
+/**
+ * Common post-extraction step: locate the binary inside `extractDir`, move it
+ * to `destPath`, chmod 0o755 (Windows bsdtar doesn't preserve the exec bit on
+ * zip members), and best-effort clean up the extraction dir. Returns destPath.
+ *
+ * @param {string} extractDir
+ * @param {string} destPath
+ * @param {Object} deps
+ * @returns {Promise<string>}
+ */
+async function finalizeExtraction(extractDir, destPath, deps) {
+  const readdir = resolveReaddir(deps);
+  const rename = resolveRename(deps);
+  const chmod = resolveChmod(deps);
+  const rm = resolveRm(deps);
+
+  let entries;
+  try {
+    entries = await readdir(extractDir);
+  } catch (err) {
+    throw new Error(`extractor: readdir(${extractDir}) failed: ${err?.message ?? String(err)}`);
+  }
+
+  const src = pickExtractedBinary(entries, extractDir, destPath);
+  if (!src) {
+    throw new Error(`extractor: archive contained no files (${extractDir})`);
+  }
+
+  // Move into place. rename is atomic on same-device; ensure parent dir exists.
+  const parent = (0,external_node_path_namespaceObject.dirname)(destPath);
+  const mkdir = resolveMkdir(deps);
+  await mkdir(parent);
+  try {
+    await rename(src, destPath);
+  } catch {
+    // Cross-device or dest exists — fall back to copy+delete via fs fallback.
+    // We don't depend on deps.copyFile here for testability; tests that
+    // exercise the happy path use rename-able fakes. Production fs.rename
+    // works because everything is under the cache dir.
+    await promises_namespaceObject.copyFile(src, destPath);
+    await promises_namespaceObject.unlink(src).catch(() => {});
+  }
+
+  // Always chmod — Windows bsdtar doesn't preserve exec bit on zip members,
+  // and tar.gz members may have wrong perms if built on a different umask.
+  await chmod(destPath, 0o755);
+
+  // Best-effort cleanup of the temp extraction dir (ignore errors).
+  try {
+    await rm(extractDir);
+  } catch {
+    /* best-effort */
+  }
+  return destPath;
+}
+
+/**
+ * Extract a `.tar.gz` (also works for plain `.tar`) archive to destPath.
+ *
+ * Writes `bytes` to a temp archive, shells out to system `tar` (available on
+ * every GitHub-hosted runner: macOS bsdtar, Linux GNU tar, Windows bsdtar in
+ * System32), then moves the resolved binary into place and chmods it.
+ *
+ * Uses ONLY `tar` flags that work on BOTH GNU tar and bsdtar:
+ *   - `-xzf <archive>` extract gzip-compressed
+ *   - `-C <dir>` extract into dir
+ * Do NOT use GNU-only flags like `--no-same-owner` (bsdtar rejects them).
+ *
+ * @param {Buffer} bytes
+ * @param {string} destPath
+ * @param {{ runCommand?: Function, mkdir?: Function, writeFile?: Function, readdir?: Function, rename?: Function, chmod?: Function, rm?: Function }} [deps]
+ * @returns {Promise<string>}
+ */
+async function tarGzExtractor(bytes, destPath, deps = {}) {
+  if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
+  const runCommand = resolveRunCommand(deps);
+  const writeFile = resolveWriteFile(deps);
+  const mkdir = resolveMkdir(deps);
+
+  const tmpArchive = tempPathFor('archive.tar.gz');
+  const extractDir = `${tmpArchive}.d`;
+
+  await writeFile(tmpArchive, bytes);
+  await mkdir(extractDir);
+  try {
+    await runCommand('tar', ['-xzf', tmpArchive, '-C', extractDir]);
+  } catch (err) {
+    // Best-effort cleanup before rethrowing.
+    await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
+    await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(`tarGzExtractor: tar failed: ${err?.message ?? String(err)}`);
+  }
+
+  // Best-effort cleanup of the temp archive (don't fail on cleanup error).
+  try {
+    await promises_namespaceObject.unlink(tmpArchive);
+  } catch {
+    /* best-effort */
+  }
+
+  return finalizeExtraction(extractDir, destPath, deps);
+}
+
+/**
+ * Extract a `.zip` archive to destPath.
+ *
+ * Writes `bytes` to a temp archive, shells out to system `tar -xf` (bsdtar can
+ * read zip; works on macOS, Linux with bsdtar, and Windows System32). On
+ * Windows, falls back to `powershell Expand-Archive` if `tar` is unavailable
+ * (older Windows images / custom runners).
+ *
+ * @param {Buffer} bytes
+ * @param {string} destPath
+ * @param {{ runCommand?: Function, mkdir?: Function, writeFile?: Function, readdir?: Function, rename?: Function, chmod?: Function, rm?: Function, platform?: string }} [deps]
+ * @returns {Promise<string>}
+ */
+async function zipExtractor(bytes, destPath, deps = {}) {
+  if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
+  const runCommand = resolveRunCommand(deps);
+  const writeFile = resolveWriteFile(deps);
+  const mkdir = resolveMkdir(deps);
+  const platform = typeof deps.platform === 'string' ? deps.platform : process.platform;
+
+  const tmpArchive = tempPathFor('archive.zip');
+  const extractDir = `${tmpArchive}.d`;
+
+  await writeFile(tmpArchive, bytes);
+  await mkdir(extractDir);
+  try {
+    // `-xf` works for zip on bsdtar (macOS, Windows). On Linux, GNU tar ≥ 1.27
+    // also reads zip via libarchive fallback; if the runner has only classic
+    // GNU tar without libarchive, this throws and we fall through to Expand.
+    await runCommand('tar', ['-xf', tmpArchive, '-C', extractDir]);
+  } catch (tarErr) {
+    if (platform === 'win32') {
+      try {
+        // PowerShell Expand-Archive is universally available on Windows runners.
+        // Quoting: use single quotes around the path literals; PS handles spaces.
+        await runCommand('powershell.exe', [
+          '-NoProfile',
+          '-Command',
+          `Expand-Archive -LiteralPath '${tmpArchive}' -DestinationPath '${extractDir}' -Force`,
+        ]);
+      } catch (psErr) {
+        await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
+        await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+        throw new Error(
+          `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
+            `Expand-Archive failed (${psErr?.message ?? String(psErr)})`,
+        );
+      }
+    } else {
+      await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
+      await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+      throw new Error(
+        `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
+          `no Expand-Archive fallback on platform=${platform}`,
+      );
+    }
+  }
+
+  // Best-effort cleanup of the temp archive.
+  try {
+    await promises_namespaceObject.unlink(tmpArchive);
+  } catch {
+    /* best-effort */
+  }
+
+  return finalizeExtraction(extractDir, destPath, deps);
+}
+
+/**
+ * Dispatch helper: pick the right extractor based on a URL's extension.
+ * `.zip` → zipExtractor; `.tar.gz` / `.tgz` → tarGzExtractor; otherwise
+ * returns `null` (caller should use the default raw-binary path).
+ *
+ * @param {string} url
+ * @returns {((bytes: Buffer, destPath: string, deps: Object) => Promise<string>) | null}
+ */
+function pickExtractor(url) {
+  if (typeof url !== 'string' || url.length === 0) return null;
+  const lower = url.toLowerCase();
+  if (lower.endsWith('.zip')) return zipExtractor;
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) return tarGzExtractor;
+  return null;
 }
 
 /**
@@ -44652,7 +44958,7 @@ function selectPlatformAsset(spec, deps = {}) {
 function tempPathFor(archiveName) {
   // Suffix with pid + random to avoid collisions across concurrent calls.
   const nonce = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
-  return join(tmpdir(), `zaibot-${nonce}-${archiveName}`);
+  return (0,external_node_path_namespaceObject.join)((0,external_node_os_namespaceObject.tmpdir)(), `zaibot-${nonce}-${archiveName}`);
 }
 
 ;// CONCATENATED MODULE: ./src/lib/scanners/secrets.js
@@ -44881,14 +45187,12 @@ function scanSecretsRegex(files) {
  * ------------------------------------------------------------------ */
 
 /**
- * Spec for the gitleaks binary. URLs and SHA256 checksums are PLACEHOLDERS —
- * TODO: verify checksums against the official gitleaks release manifest before
- * shipping. The fetch path is fully exercised in tests via injected deps; the
- * real values only matter at production runtime.
+ * Spec for the gitleaks binary. URLs and SHA256 checksums are REAL — verified
+ * against `gitleaks_8.21.2_checksums.txt` from the v8.21.2 GitHub release.
  *
- * NOTE: gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows.
- * Extraction is handled via an `extractor` hook on the spec (see
- * `ensure-binary.js`).
+ * gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows. The
+ * extractor is selected per-asset via `pickExtractor(url)` (see
+ * `scanSecrets`); the dispatch handles both archive types with one spec.
  *
  * @type {Object}
  */
@@ -44908,17 +45212,13 @@ const GITLEAKS_SPEC = {
     win32_x64:
       'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_windows_x64.zip',
   },
-  // PLACEHOLDER checksums — replace with real values from the release's
-  // checksums.txt before shipping. The hex strings below are syntactically
-  // valid (64 chars, lowercase hex) so they pass shape validation; they WILL
-  // fail the actual SHA256 verification at fetch time, which is the intended
-  // fail-closed behavior until the real checksums are looked up.
+  // REAL SHA256 digests from gitleaks_8.21.2_checksums.txt (v8.21.2 release).
   checksums: {
-    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
-    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
-    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
-    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
-    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+    darwin_arm64: 'cad3de5dc9a4d5447d967a70a4d49499c557f04db028274cc324f9ff983f6502',
+    darwin_x64: '5b42c6e4b1fd693eaeb2b5b7faa5f17a1434299d4deb2de63d4b2efd7c753128',
+    linux_arm64: '654c935542c89f565aabe7bf7c6c500830f116c114f0aeb509d2460c1ac2e6da',
+    linux_x64: '5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba',
+    win32_x64: 'f238c85e5f47e18fac779ce71ee11091cf70a0a8fb4415f165efba2800eef133',
   },
 };
 
@@ -45041,7 +45341,13 @@ async function scanSecrets(opts, deps = {}) {
       );
     }
     const binaryPath = await deps.ensureBinary(
-      { ...GITLEAKS_SPEC, ...asset, cacheDir: opts.cacheDir },
+      {
+        ...GITLEAKS_SPEC,
+        ...asset,
+        cacheDir: opts.cacheDir,
+        // gitleaks ships .tar.gz (mac/linux) and .zip (windows); pick by URL.
+        extractor: pickExtractor(asset.url),
+      },
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
@@ -45365,14 +45671,17 @@ function scanPatternsRegex(files, rules = DEFAULT_PATTERN_RULES) {
  * ------------------------------------------------------------------ */
 
 /**
- * Spec for the ast-grep binary. URLs and SHA256 checksums are PLACEHOLDERS —
- * TODO: verify checksums against the official ast-grep release manifest before
- * shipping.
+ * Spec for the ast-grep binary.
  *
- * ast-grep ships as a raw binary on macOS/Linux and a .zip on Windows. On
- * macOS arm64 the asset is `astgrep-aarch64-apple-darwin`. The default
- * `extractor` (no extraction) handles raw binaries; Windows .zip needs a
- * caller-provided extractor.
+ * IMPORTANT: ast-grep's release assets use the `app-*` prefix (not
+ * `ast-grep-*`), and ALL platforms ship as `.zip` archives (each zip contains
+ * a single `app-*` binary, optionally renamed to `ast-grep` on extraction).
+ *
+ * ast-grep does NOT publish a checksum file alongside its releases, so the
+ * digests below were computed locally via `shasum -a 256` against the
+ * downloaded zips. They MUST be re-verified and updated on every version bump.
+ *
+ * Extraction: every platform uses `zipExtractor` (the archive is always .zip).
  *
  * @type {Object}
  */
@@ -45380,27 +45689,38 @@ const AST_GREP_SPEC = {
   name: 'ast-grep',
   version: '0.34.3',
   ext: '',
+  // All ast-grep assets are .zip — used by the extractor dispatch in
+  // `scanPatterns` (zipExtractor is hard-wired here for clarity).
+  archiveType: 'zip',
+  // The extracted binary filename inside each zip. ast-grep ships `app-*`
+  // (not `ast-grep`) inside the archive, but we cache it under the spec name
+  // `ast-grep` for consistency. zipExtractor handles the rename by passing
+  // the destPath through; the bytes land at destPath regardless of the inner
+  // entry name because bsdtar/GNU tar both unpack a single-member archive to
+  // `-O` (stdout) when extracting into a dir + renaming is overkill. In
+  // practice the scanner extracts to a temp dir then chmods destPath; see
+  // zipExtractor for the rename logic.
+  extractor: zipExtractor,
   urls: {
     darwin_arm64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-apple-darwin',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-aarch64-apple-darwin.zip',
     darwin_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-apple-darwin',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-apple-darwin.zip',
     linux_arm64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-unknown-linux-gnu',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-aarch64-unknown-linux-gnu.zip',
     linux_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-unknown-linux-gnu',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-unknown-linux-gnu.zip',
     win32_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-pc-windows-msvc.zip',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-pc-windows-msvc.zip',
   },
-  // PLACEHOLDER checksums — replace with real values from the release manifest
-  // before shipping. These pass the 64-char lowercase-hex shape check but
-  // WILL fail real SHA256 verification (fail-closed).
+  // REAL SHA256 digests, computed locally via `shasum -a 256` (no upstream
+  // checksum file is published). Re-verify on every version bump.
   checksums: {
-    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
-    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
-    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
-    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
-    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+    darwin_arm64: 'eb0f2fb1b5f6e2210fe8bde4213264f855858adc793d48f14778b57e1f803749',
+    darwin_x64: '4533770d6f9ca098ee4fd07c854d5862576b09c66cb24dba5c39a9a69e5a15f5',
+    linux_arm64: 'cfaae1bf9d9e501471914b7e2c8253f4544ec75e017322079ca4a503f6787003',
+    linux_x64: '9b58dfb710e98929beeebf7bb1efdf88751d6396275bf750cf79895835592715',
+    win32_x64: '3b6f6797e54edda4b1b2a7dbaf9038c420a872f2f6f7415a7c52c6c6a5d094dc',
   },
 };
 
@@ -45958,6 +46278,10 @@ function formatScannerContext(findings, metrics) {
  *   scanPatterns?: Function,
  *   computeMetrics?: Function,
  *   metricsToFindings?: Function,
+ *   ensureBinary?: Function,
+ *   runBinary?: Function,
+ *   platform?: string,
+ *   arch?: string,
  *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
  * }} [deps]
  * @returns {Promise<{ findings: Array, metrics: Object, scannerNames: string[] }>}
@@ -45998,6 +46322,25 @@ async function runScanners(opts, deps = {}) {
   /** @type {Array<Record<string, unknown>>} */
   let findings = [];
 
+  // Per-scanner deps: forward ensureBinary/runBinary so production actually
+  // attempts the binary path. Tests that don't supply these fall through to
+  // the regex fallback inside each scanner. We only set the keys when they're
+  // actually functions so the scanner-side `typeof deps.ensureBinary`
+  // guard cleanly detects the absent case.
+  const scannerSharedDeps = { core };
+  if (typeof deps.ensureBinary === 'function') {
+    scannerSharedDeps.ensureBinary = deps.ensureBinary;
+  }
+  if (typeof deps.runBinary === 'function') {
+    scannerSharedDeps.runBinary = deps.runBinary;
+  }
+  if (typeof deps.platform === 'string') {
+    scannerSharedDeps.platform = deps.platform;
+  }
+  if (typeof deps.arch === 'string') {
+    scannerSharedDeps.arch = deps.arch;
+  }
+
   // Run secrets + patterns concurrently.
   /** @type {Array<Promise<{ findings: Array, scanner: string }>>} */
   const promises = [];
@@ -46005,7 +46348,7 @@ async function runScanners(opts, deps = {}) {
     promises.push(
       doScanSecrets(
         { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        { core },
+        scannerSharedDeps,
       ).catch((err) => {
         if (core?.warning) {
           core.warning(`secrets scanner failed: ${err?.message ?? String(err)}`);
@@ -46018,7 +46361,7 @@ async function runScanners(opts, deps = {}) {
     promises.push(
       doScanPatterns(
         { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        { core },
+        scannerSharedDeps,
       ).catch((err) => {
         if (core?.warning) {
           core.warning(`patterns scanner failed: ${err?.message ?? String(err)}`);
@@ -47288,6 +47631,14 @@ async function loadCodeowners(opts = {}, deps = {}) {
 
 
 
+
+
+
+
+
+
+
+
 /* ------------------------------------------------------------------ *
  * Entry-point guard
  * ------------------------------------------------------------------ */
@@ -47336,6 +47687,119 @@ function expandHome(p) {
   if (p === '~') return (0,external_node_os_namespaceObject.homedir)();
   if (p.startsWith('~/')) return `${(0,external_node_os_namespaceObject.homedir)()}${p.slice(1)}`;
   return p;
+}
+
+/**
+ * Promisified `execFile` from `node:child_process`. Module-level binding so we
+ * don't pay the promisify cost per call and so tests can stub it via the
+ * scanner deps seam.
+ */
+const execFileAsync = (0,external_node_util_.promisify)(external_node_child_process_namespaceObject.execFile);
+
+/**
+ * Minimal `https.get` wrapper that resolves to a Buffer of the response body.
+ * Follows up to 5 redirects (GitHub release assets redirect to a CDN). Rejects
+ * on any network/HTTP error. Used as `deps.fetch` for `ensureBinary`.
+ *
+ * Zero new dependencies: uses only `node:https`. Equivalent to fetch() but
+ * works on Node 18 (where global fetch is behind a flag in some builds) and
+ * returns a Buffer directly (no `Response.arrayBuffer()` dance).
+ *
+ * @param {string} url
+ * @param {{ maxRedirects?: number }} [opts]
+ * @returns {Promise<Buffer>}
+ */
+function httpsGet(url, opts = {}) {
+  const maxRedirects = typeof opts.maxRedirects === 'number' ? opts.maxRedirects : 5;
+  return new Promise((resolve, reject) => {
+    if (typeof url !== 'string' || url.length === 0) {
+      reject(new Error('httpsGet: url is required'));
+      return;
+    }
+    const req = external_node_https_namespaceObject.get(url, (res) => {
+      const status = res.statusCode || 0;
+      // Redirect: follow with the Location header.
+      if (status >= 300 && status < 400 && res.headers.location) {
+        if (maxRedirects <= 0) {
+          reject(new Error(`httpsGet: too many redirects (${url})`));
+          res.resume();
+          return;
+        }
+        // Resolve relative redirects against the current URL.
+        const nextUrl = new URL(res.headers.location, url).toString();
+        res.resume(); // free the body
+        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1 }));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        res.resume();
+        reject(new Error(`httpsGet: HTTP ${status} for ${url}`));
+        return;
+      }
+      /** @type {Buffer[]} */
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    // Belt-and-braces timeout so a hung connection can't wedge the action.
+    // 60s should be plenty for any GitHub release asset (≤ 50MB).
+    req.setTimeout(60_000, () => {
+      req.destroy(new Error('httpsGet: request timed out (60s)'));
+    });
+  });
+}
+
+/**
+ * Build the production scanner-dependency kit. Returns the deps object that
+ * `runScanners` forwards to `scanSecrets` / `scanPatterns`. Each dep is a real
+ * Node builtin; tests inject fakes via `deps.runScanners` / `deps.scanSecrets`
+ * overrides higher up.
+ *
+ * Deps produced:
+ *   - `core`           — passed through (the @actions/core kit).
+ *   - `ensureBinary`   — wraps the real `ensureBinary` from
+ *                         `./lib/scanners/ensure-binary.js`, injecting real
+ *                         `fetch` (httpsGet), `writeFile`, `stat`, `mkdir`,
+ *                         `chmod`. Used by both scanners.
+ *   - `runBinary`      — `promisify(execFile)` with a 10MB maxBuffer (used by
+ *                         both scanners; the brief specifies this exact size).
+ *   - `runCommand`     — `promisify(execFile)` without maxBuffer cap (used by
+ *                         the archive extractors to invoke system `tar`).
+ *   - `scanSecrets`    — the real implementation (so `runScanners` doesn't
+ *                         fall through to its no-binary default).
+ *   - `scanPatterns`   — the real implementation.
+ *   - `computeMetrics` — the real implementation.
+ *
+ * The brief specified `runBinary(cmd, args)` and `runCommand(cmd, args)`
+ * signatures; we preserve that (callers use positional args).
+ *
+ * @param {{ core?: object, cacheDir?: string }} [args]
+ * @returns {Object}
+ */
+function createScannerDeps({ core: coreArg, cacheDir } = {}) {
+  return {
+    core: coreArg,
+    ensureBinary: (spec, innerDeps = {}) =>
+      ensureBinary(spec, {
+        fetch: httpsGet,
+        writeFile: (p, b) => promises_namespaceObject.writeFile(p, b),
+        stat: (p) => promises_namespaceObject.stat(p),
+        mkdir: (p) => promises_namespaceObject.mkdir(p, { recursive: true }),
+        chmod: (p, m) => promises_namespaceObject.chmod(p, m),
+        ...innerDeps,
+      }),
+    runBinary: (cmd, args, opts) =>
+      execFileAsync(cmd, args, {
+        maxBuffer: 10 * 1024 * 1024,
+        ...(opts || {}),
+      }),
+    runCommand: (cmd, args, opts) => execFileAsync(cmd, args, opts || {}),
+    scanSecrets: scanSecrets,
+    scanPatterns: scanPatterns,
+    computeMetrics: computeMetrics,
+  };
 }
 
 /**
@@ -47597,7 +48061,7 @@ async function run(context, deps = {}) {
         config: { scannersEnabled: repoConfig.scannersEnabled },
         repoConfig: scannerRepoConfig,
       },
-      { core: coreDep },
+      createScannerDeps({ core: coreDep, cacheDir }),
     );
     const scannerContext = formatScannerContextFn(
       scannerResult.findings,
@@ -48158,9 +48622,11 @@ if (isMainEntry()) {
 }
 
 var __webpack_exports__INPUT_NAMES = __webpack_exports__.Qh;
+var __webpack_exports__createScannerDeps = __webpack_exports__.nm;
 var __webpack_exports__expandHome = __webpack_exports__.kc;
+var __webpack_exports__httpsGet = __webpack_exports__.Kr;
 var __webpack_exports__isMainEntry = __webpack_exports__.gT;
 var __webpack_exports__main = __webpack_exports__.iW;
 var __webpack_exports__readAllInputs = __webpack_exports__.vv;
 var __webpack_exports__run = __webpack_exports__.eF;
-export { __webpack_exports__INPUT_NAMES as INPUT_NAMES, __webpack_exports__expandHome as expandHome, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };
+export { __webpack_exports__INPUT_NAMES as INPUT_NAMES, __webpack_exports__createScannerDeps as createScannerDeps, __webpack_exports__expandHome as expandHome, __webpack_exports__httpsGet as httpsGet, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };

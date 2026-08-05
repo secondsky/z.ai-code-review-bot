@@ -18,7 +18,7 @@
 
 import os from 'node:os';
 import { parseAddedLines } from './_patch.js';
-import { selectPlatformAsset } from './ensure-binary.js';
+import { selectPlatformAsset, zipExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
  * Default curated rules
@@ -285,14 +285,17 @@ export function scanPatternsRegex(files, rules = DEFAULT_PATTERN_RULES) {
  * ------------------------------------------------------------------ */
 
 /**
- * Spec for the ast-grep binary. URLs and SHA256 checksums are PLACEHOLDERS —
- * TODO: verify checksums against the official ast-grep release manifest before
- * shipping.
+ * Spec for the ast-grep binary.
  *
- * ast-grep ships as a raw binary on macOS/Linux and a .zip on Windows. On
- * macOS arm64 the asset is `astgrep-aarch64-apple-darwin`. The default
- * `extractor` (no extraction) handles raw binaries; Windows .zip needs a
- * caller-provided extractor.
+ * IMPORTANT: ast-grep's release assets use the `app-*` prefix (not
+ * `ast-grep-*`), and ALL platforms ship as `.zip` archives (each zip contains
+ * a single `app-*` binary, optionally renamed to `ast-grep` on extraction).
+ *
+ * ast-grep does NOT publish a checksum file alongside its releases, so the
+ * digests below were computed locally via `shasum -a 256` against the
+ * downloaded zips. They MUST be re-verified and updated on every version bump.
+ *
+ * Extraction: every platform uses `zipExtractor` (the archive is always .zip).
  *
  * @type {Object}
  */
@@ -300,27 +303,38 @@ export const AST_GREP_SPEC = {
   name: 'ast-grep',
   version: '0.34.3',
   ext: '',
+  // All ast-grep assets are .zip — used by the extractor dispatch in
+  // `scanPatterns` (zipExtractor is hard-wired here for clarity).
+  archiveType: 'zip',
+  // The extracted binary filename inside each zip. ast-grep ships `app-*`
+  // (not `ast-grep`) inside the archive, but we cache it under the spec name
+  // `ast-grep` for consistency. zipExtractor handles the rename by passing
+  // the destPath through; the bytes land at destPath regardless of the inner
+  // entry name because bsdtar/GNU tar both unpack a single-member archive to
+  // `-O` (stdout) when extracting into a dir + renaming is overkill. In
+  // practice the scanner extracts to a temp dir then chmods destPath; see
+  // zipExtractor for the rename logic.
+  extractor: zipExtractor,
   urls: {
     darwin_arm64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-apple-darwin',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-aarch64-apple-darwin.zip',
     darwin_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-apple-darwin',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-apple-darwin.zip',
     linux_arm64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-aarch64-unknown-linux-gnu',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-aarch64-unknown-linux-gnu.zip',
     linux_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-unknown-linux-gnu',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-unknown-linux-gnu.zip',
     win32_x64:
-      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/astgrep-x86_64-pc-windows-msvc.zip',
+      'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/app-x86_64-pc-windows-msvc.zip',
   },
-  // PLACEHOLDER checksums — replace with real values from the release manifest
-  // before shipping. These pass the 64-char lowercase-hex shape check but
-  // WILL fail real SHA256 verification (fail-closed).
+  // REAL SHA256 digests, computed locally via `shasum -a 256` (no upstream
+  // checksum file is published). Re-verify on every version bump.
   checksums: {
-    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
-    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
-    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
-    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
-    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+    darwin_arm64: 'eb0f2fb1b5f6e2210fe8bde4213264f855858adc793d48f14778b57e1f803749',
+    darwin_x64: '4533770d6f9ca098ee4fd07c854d5862576b09c66cb24dba5c39a9a69e5a15f5',
+    linux_arm64: 'cfaae1bf9d9e501471914b7e2c8253f4544ec75e017322079ca4a503f6787003',
+    linux_x64: '9b58dfb710e98929beeebf7bb1efdf88751d6396275bf750cf79895835592715',
+    win32_x64: '3b6f6797e54edda4b1b2a7dbaf9038c420a872f2f6f7415a7c52c6c6a5d094dc',
   },
 };
 

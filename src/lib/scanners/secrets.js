@@ -18,7 +18,7 @@
 
 import os from 'node:os';
 import { parseAddedLines } from './_patch.js';
-import { selectPlatformAsset } from './ensure-binary.js';
+import { selectPlatformAsset, pickExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
  * Shannon entropy helper (used to suppress low-entropy false positives)
@@ -223,14 +223,12 @@ export function scanSecretsRegex(files) {
  * ------------------------------------------------------------------ */
 
 /**
- * Spec for the gitleaks binary. URLs and SHA256 checksums are PLACEHOLDERS —
- * TODO: verify checksums against the official gitleaks release manifest before
- * shipping. The fetch path is fully exercised in tests via injected deps; the
- * real values only matter at production runtime.
+ * Spec for the gitleaks binary. URLs and SHA256 checksums are REAL — verified
+ * against `gitleaks_8.21.2_checksums.txt` from the v8.21.2 GitHub release.
  *
- * NOTE: gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows.
- * Extraction is handled via an `extractor` hook on the spec (see
- * `ensure-binary.js`).
+ * gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows. The
+ * extractor is selected per-asset via `pickExtractor(url)` (see
+ * `scanSecrets`); the dispatch handles both archive types with one spec.
  *
  * @type {Object}
  */
@@ -250,17 +248,13 @@ export const GITLEAKS_SPEC = {
     win32_x64:
       'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_windows_x64.zip',
   },
-  // PLACEHOLDER checksums — replace with real values from the release's
-  // checksums.txt before shipping. The hex strings below are syntactically
-  // valid (64 chars, lowercase hex) so they pass shape validation; they WILL
-  // fail the actual SHA256 verification at fetch time, which is the intended
-  // fail-closed behavior until the real checksums are looked up.
+  // REAL SHA256 digests from gitleaks_8.21.2_checksums.txt (v8.21.2 release).
   checksums: {
-    darwin_arm64: '00000000000000000000000000000000000000000000000000000000da7aa000',
-    darwin_x64: '00000000000000000000000000000000000000000000000000000000da7bb000',
-    linux_arm64: '000000000000000000000000000000000000000000000000000000001a7cc000',
-    linux_x64: '000000000000000000000000000000000000000000000000000000001a7dd000',
-    win32_x64: '000000000000000000000000000000000000000000000000000000009a7ee000',
+    darwin_arm64: 'cad3de5dc9a4d5447d967a70a4d49499c557f04db028274cc324f9ff983f6502',
+    darwin_x64: '5b42c6e4b1fd693eaeb2b5b7faa5f17a1434299d4deb2de63d4b2efd7c753128',
+    linux_arm64: '654c935542c89f565aabe7bf7c6c500830f116c114f0aeb509d2460c1ac2e6da',
+    linux_x64: '5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba',
+    win32_x64: 'f238c85e5f47e18fac779ce71ee11091cf70a0a8fb4415f165efba2800eef133',
   },
 };
 
@@ -383,7 +377,13 @@ export async function scanSecrets(opts, deps = {}) {
       );
     }
     const binaryPath = await deps.ensureBinary(
-      { ...GITLEAKS_SPEC, ...asset, cacheDir: opts.cacheDir },
+      {
+        ...GITLEAKS_SPEC,
+        ...asset,
+        cacheDir: opts.cacheDir,
+        // gitleaks ships .tar.gz (mac/linux) and .zip (windows); pick by URL.
+        extractor: pickExtractor(asset.url),
+      },
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();

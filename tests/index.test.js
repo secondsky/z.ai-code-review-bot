@@ -11,7 +11,7 @@ import { hashFinding } from '../src/lib/findings.js';
 // Dynamic import so we can assert import-safety AFTER spying on core.setFailed.
 // We re-import per test group where side effects matter.
 const indexModule = await import('../src/index.js');
-const { run, readAllInputs, isMainEntry } = indexModule;
+const { run, readAllInputs, isMainEntry, createScannerDeps, httpsGet } = indexModule;
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -2226,5 +2226,96 @@ describe('main() — failure commit-status wiring (Phase 5)', () => {
     // the error propagated — proving the run-level wiring main relies on.
     expect(out).toContain('THREW:hard boom');
     expect(out).toMatch(/STATUSCALLS:\["pending:sha-x"\]/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * createScannerDeps — production scanner-dep factory (blocker-task-1)
+ *
+ * This is the wiring that lets the deterministic scanners actually invoke
+ * gitleaks / ast-grep in production (downloading + verifying + extracting
+ * on first use, then caching). The shape contract: every property must be a
+ * function (so `runScanners` forwards it and the scanners take the binary
+ * path instead of falling back to regex).
+ * ------------------------------------------------------------------ */
+
+describe('createScannerDeps', () => {
+  it('returns an object with function values for every expected key', () => {
+    const deps = createScannerDeps({ core: { info: () => {} }, cacheDir: '/tmp/x' });
+    expect(deps).toBeTruthy();
+    // Every one of these MUST be a function — if any is undefined, the
+    // scanners fall back to regex and the binary path is dead.
+    expect(typeof deps.ensureBinary).toBe('function');
+    expect(typeof deps.runBinary).toBe('function');
+    expect(typeof deps.runCommand).toBe('function');
+    expect(typeof deps.scanSecrets).toBe('function');
+    expect(typeof deps.scanPatterns).toBe('function');
+    expect(typeof deps.computeMetrics).toBe('function');
+  });
+
+  it('passes `core` through unchanged', () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const deps = createScannerDeps({ core, cacheDir: '/tmp/x' });
+    expect(deps.core).toBe(core);
+  });
+
+  it('ensureBinary wires real fetch/writeFile/stat/mkdir/chmod (functions, not undefined)', async () => {
+    const deps = createScannerDeps({ core: {}, cacheDir: '/tmp/x' });
+    // Drive ensureBinary with a spec that hits the cache-miss path. We inject
+    // fakes via the second arg (the inner-deps merge), proving the production
+    // wrapper accepts overrides AND supplies defaults for everything not
+    // overridden. The injected fetch returns bytes whose SHA matches the spec
+    // checksum, so the happy path runs to completion.
+    const { sha256Hex } = await import('../src/lib/scanners/ensure-binary.js');
+    const bytes = Buffer.from('hello\n');
+    const checksum = sha256Hex(bytes);
+    const fakeFetch = vi.fn(async () => bytes);
+    const fakeWriteFile = vi.fn(async () => {});
+    const fakeStat = vi.fn(async () => {
+      throw new Error('ENOENT');
+    });
+    const fakeChmod = vi.fn(async () => {});
+    const path = await deps.ensureBinary(
+      {
+        name: 'gitleaks',
+        version: '8.21.2',
+        url: 'https://example.com/gitleaks.tar.gz',
+        checksumSha256: checksum,
+        cacheDir: '/cache',
+      },
+      {
+        fetch: fakeFetch,
+        writeFile: fakeWriteFile,
+        stat: fakeStat,
+        chmod: fakeChmod,
+      },
+    );
+    expect(path.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+    expect(fakeWriteFile).toHaveBeenCalledTimes(1);
+    expect(fakeChmod).toHaveBeenCalledTimes(1);
+  });
+
+  it('runBinary returns { stdout, stderr }-shaped result (execFile promisify contract)', async () => {
+    const deps = createScannerDeps({ core: {}, cacheDir: '/tmp/x' });
+    // Echo is universally available on every test runner. Run it via runBinary
+    // to verify the function actually delegates to execFile (not undefined).
+    const result = await deps.runBinary('echo', ['hello']);
+    expect(typeof result).toBe('object');
+    expect(String(result.stdout).trim()).toBe('hello');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * httpsGet — production fetch wrapper
+ * ------------------------------------------------------------------ */
+
+describe('httpsGet', () => {
+  it('is a function', () => {
+    expect(typeof httpsGet).toBe('function');
+  });
+
+  it('rejects on empty / non-string url', async () => {
+    await expect(httpsGet('')).rejects.toThrow(/url is required/);
   });
 });

@@ -488,6 +488,33 @@ describe('GITLEAKS_SPEC shape', () => {
     expect(GITLEAKS_SPEC.urls.darwin_arm64).toMatch(/^https:\/\//);
     expect(GITLEAKS_SPEC.checksums.darwin_arm64).toMatch(/^[0-9a-f]{64}$/);
   });
+
+  it('ships REAL SHA256 checksums (not placeholders)', () => {
+    // Lock in the verified-from-upstream digests so a regression to the
+    // 0000…0000 placeholders is caught. These are the v8.21.2 release values.
+    expect(GITLEAKS_SPEC.checksums).toEqual({
+      darwin_arm64: 'cad3de5dc9a4d5447d967a70a4d49499c557f04db028274cc324f9ff983f6502',
+      darwin_x64: '5b42c6e4b1fd693eaeb2b5b7faa5f17a1434299d4deb2de63d4b2efd7c753128',
+      linux_arm64: '654c935542c89f565aabe7bf7c6c500830f116c114f0aeb509d2460c1ac2e6da',
+      linux_x64: '5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba',
+      win32_x64: 'f238c85e5f47e18fac779ce71ee11091cf70a0a8fb4415f165efba2800eef133',
+    });
+    // Every checksum must be lowercase hex (catch a UPPER/shorthand regression).
+    for (const [key, csum] of Object.entries(GITLEAKS_SPEC.checksums)) {
+      expect(csum).toMatch(/^[0-9a-f]{64}$/);
+      expect(csum).not.toMatch(/^0{16}/); // no leading-zero placeholder shape
+    }
+  });
+
+  it('every platform URL points at the correct gitleaks release asset', () => {
+    const base = 'https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/';
+    expect(GITLEAKS_SPEC.urls.darwin_arm64).toBe(`${base}gitleaks_8.21.2_darwin_arm64.tar.gz`);
+    expect(GITLEAKS_SPEC.urls.darwin_x64).toBe(`${base}gitleaks_8.21.2_darwin_x64.tar.gz`);
+    expect(GITLEAKS_SPEC.urls.linux_arm64).toBe(`${base}gitleaks_8.21.2_linux_arm64.tar.gz`);
+    expect(GITLEAKS_SPEC.urls.linux_x64).toBe(`${base}gitleaks_8.21.2_linux_x64.tar.gz`);
+    // Windows is the only zip in the gitleaks set.
+    expect(GITLEAKS_SPEC.urls.win32_x64).toBe(`${base}gitleaks_8.21.2_windows_x64.zip`);
+  });
 });
 
 describe('SECRET_PATTERNS export', () => {

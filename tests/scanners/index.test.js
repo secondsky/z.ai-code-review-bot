@@ -343,3 +343,49 @@ describe('runScanners — robustness', () => {
     expect(r.scannerNames).toEqual(['secrets:gitleaks', 'patterns:ast-grep']);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * runScanners — production-deps forwarding (blocker-task-1)
+ * ------------------------------------------------------------------ */
+
+describe('runScanners — ensureBinary/runBinary forwarding', () => {
+  it('forwards deps.ensureBinary and deps.runBinary to each scanner', async () => {
+    const secrets = vi.fn().mockResolvedValue({ findings: [], scanner: 'gitleaks' });
+    const patterns = vi.fn().mockResolvedValue({ findings: [], scanner: 'ast-grep' });
+    const ensureBinary = vi.fn();
+    const runBinary = vi.fn();
+    await runScanners(baseOpts(), {
+      scanSecrets: secrets,
+      scanPatterns: patterns,
+      ensureBinary,
+      runBinary,
+      platform: 'linux',
+      arch: 'x64',
+    });
+    expect(secrets).toHaveBeenCalledTimes(1);
+    expect(patterns).toHaveBeenCalledTimes(1);
+    // Both scanners receive ensureBinary + runBinary in their deps object.
+    const secretsDeps = secrets.mock.calls[0][1];
+    const patternsDeps = patterns.mock.calls[0][1];
+    expect(secretsDeps.ensureBinary).toBe(ensureBinary);
+    expect(secretsDeps.runBinary).toBe(runBinary);
+    expect(patternsDeps.ensureBinary).toBe(ensureBinary);
+    expect(patternsDeps.runBinary).toBe(runBinary);
+    // Platform/arch are forwarded too (used by selectPlatformAsset).
+    expect(secretsDeps.platform).toBe('linux');
+    expect(secretsDeps.arch).toBe('x64');
+  });
+
+  it('omits ensureBinary/runBinary from scanner deps when not supplied (regex fallback)', async () => {
+    // Without these, each scanner's internal `typeof deps.ensureBinary !== 'function'`
+    // check fires and it falls back to regex. We assert the orchestrator does
+    // NOT inject `undefined`-valued keys (which would pass that typeof check
+    // anyway, but cleaner to omit).
+    const secrets = vi.fn().mockResolvedValue({ findings: [], scanner: 'regex-fallback' });
+    const patterns = vi.fn().mockResolvedValue({ findings: [], scanner: 'regex-fallback' });
+    await runScanners(baseOpts(), { scanSecrets: secrets, scanPatterns: patterns });
+    const secretsDeps = secrets.mock.calls[0][1];
+    expect(secretsDeps).not.toHaveProperty('ensureBinary');
+    expect(secretsDeps).not.toHaveProperty('runBinary');
+  });
+});

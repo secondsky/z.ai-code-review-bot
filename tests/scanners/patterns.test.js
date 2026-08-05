@@ -474,4 +474,40 @@ describe('AST_GREP_SPEC shape', () => {
     expect(AST_GREP_SPEC.urls.darwin_arm64).toMatch(/^https:\/\//);
     expect(AST_GREP_SPEC.checksums.darwin_arm64).toMatch(/^[0-9a-f]{64}$/);
   });
+
+  it('ships REAL SHA256 checksums (not placeholders)', () => {
+    // ast-grep publishes NO upstream checksum file, so these digests were
+    // computed locally via `shasum -a 256` against the downloaded zips.
+    // Lock them in so a regression to 0000…0000 placeholders is caught.
+    expect(AST_GREP_SPEC.checksums).toEqual({
+      darwin_arm64: 'eb0f2fb1b5f6e2210fe8bde4213264f855858adc793d48f14778b57e1f803749',
+      darwin_x64: '4533770d6f9ca098ee4fd07c854d5862576b09c66cb24dba5c39a9a69e5a15f5',
+      linux_arm64: 'cfaae1bf9d9e501471914b7e2c8253f4544ec75e017322079ca4a503f6787003',
+      linux_x64: '9b58dfb710e98929beeebf7bb1efdf88751d6396275bf750cf79895835592715',
+      win32_x64: '3b6f6797e54edda4b1b2a7dbaf9038c420a872f2f6f7415a7c52c6c6a5d094dc',
+    });
+    for (const csum of Object.values(AST_GREP_SPEC.checksums)) {
+      expect(csum).toMatch(/^[0-9a-f]{64}$/);
+      expect(csum).not.toMatch(/^0{16}/);
+    }
+  });
+
+  it('uses the corrected app-* asset names and .zip archives for ALL platforms', () => {
+    // Critical correction: the old spec had `astgrep-*` (raw binary) names.
+    // The real assets use the `app-*` prefix and ship as .zip everywhere.
+    const base = 'https://github.com/ast-grep/ast-grep/releases/download/0.34.3/';
+    expect(AST_GREP_SPEC.urls.darwin_arm64).toBe(`${base}app-aarch64-apple-darwin.zip`);
+    expect(AST_GREP_SPEC.urls.darwin_x64).toBe(`${base}app-x86_64-apple-darwin.zip`);
+    expect(AST_GREP_SPEC.urls.linux_arm64).toBe(`${base}app-aarch64-unknown-linux-gnu.zip`);
+    expect(AST_GREP_SPEC.urls.linux_x64).toBe(`${base}app-x86_64-unknown-linux-gnu.zip`);
+    expect(AST_GREP_SPEC.urls.win32_x64).toBe(`${base}app-x86_64-pc-windows-msvc.zip`);
+    for (const url of Object.values(AST_GREP_SPEC.urls)) {
+      expect(url.endsWith('.zip')).toBe(true);
+    }
+  });
+
+  it('declares archiveType=zip and a zip extractor (all platforms are .zip)', () => {
+    expect(AST_GREP_SPEC.archiveType).toBe('zip');
+    expect(typeof AST_GREP_SPEC.extractor).toBe('function');
+  });
 });

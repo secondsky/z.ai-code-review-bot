@@ -12,6 +12,9 @@ import {
   resolveCachePath,
   selectPlatformAsset,
   tempPathFor,
+  tarGzExtractor,
+  zipExtractor,
+  pickExtractor,
 } from '../../src/lib/scanners/ensure-binary.js';
 
 // A 6-byte payload with a known SHA256 (computed via the same helper, so this
@@ -251,5 +254,314 @@ describe('ensureBinary — custom extractor', () => {
     expect(extractorCalls).toHaveLength(1);
     expect(extractorCalls[0].destPath.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
     expect(deps.calls.writeFile).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * pickExtractor — URL-extension dispatch
+ * ------------------------------------------------------------------ */
+
+describe('pickExtractor', () => {
+  it('returns zipExtractor for .zip URLs', () => {
+    expect(pickExtractor('https://example.com/asset.zip')).toBe(zipExtractor);
+  });
+
+  it('returns tarGzExtractor for .tar.gz URLs', () => {
+    expect(pickExtractor('https://example.com/asset.tar.gz')).toBe(tarGzExtractor);
+  });
+
+  it('returns tarGzExtractor for .tgz URLs', () => {
+    expect(pickExtractor('https://example.com/asset.tgz')).toBe(tarGzExtractor);
+  });
+
+  it('returns null for raw-binary URLs (no archive extension)', () => {
+    expect(pickExtractor('https://example.com/astgrep-binary')).toBeNull();
+  });
+
+  it('is case-insensitive on the extension', () => {
+    expect(pickExtractor('https://example.com/ASSET.ZIP')).toBe(zipExtractor);
+  });
+
+  it('returns null for empty / non-string input', () => {
+    expect(pickExtractor('')).toBeNull();
+    expect(pickExtractor(/** @type {any} */ (undefined))).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * tarGzExtractor — system-tar flow
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build a fake-deps kit suitable for the archive extractors: tracks every
+ * `runCommand` / `mkdir` / `readdir` / `rename` / `chmod` / `rm` / `writeFile`
+ * call, and simulates an extraction by "producing" the named entries in the
+ * extract dir for `readdir`.
+ *
+ * @param {Object} [opts]
+ * @param {string[]} [opts.entries] - filenames the fake `readdir` returns
+ * @param {string} [opts.platform]
+ * @param {Error|null} [opts.tarError] - if set, the first tar call rejects
+ * @param {Error|null} [opts.psError] - if set, the powershell fallback rejects
+ * @returns {Object}
+ */
+function fakeArchiveDeps(opts = {}) {
+  const calls = {
+    runCommand: [],
+    writeFile: [],
+    mkdir: [],
+    readdir: [],
+    rename: [],
+    chmod: [],
+    rm: [],
+  };
+  const entries = Array.isArray(opts.entries) ? opts.entries : ['gitleaks'];
+  let tarCallCount = 0;
+  let psCallCount = 0;
+  return {
+    calls,
+    platform: opts.platform ?? 'linux',
+    runCommand: async (cmd, args) => {
+      calls.runCommand.push({ cmd, args });
+      if (cmd === 'tar') {
+        tarCallCount++;
+        if (opts.tarError && tarCallCount === 1) throw opts.tarError;
+        return { stdout: '', stderr: '' };
+      }
+      if (cmd === 'powershell.exe' || cmd === 'pwsh') {
+        psCallCount++;
+        if (opts.psError) throw opts.psError;
+        return { stdout: '', stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    },
+    writeFile: async (p, b) => {
+      calls.writeFile.push({ path: p, bytesLen: Buffer.isBuffer(b) ? b.length : b.length });
+    },
+    mkdir: async (p) => {
+      calls.mkdir.push({ path: p });
+    },
+    readdir: async (p) => {
+      calls.readdir.push({ path: p });
+      return entries.slice();
+    },
+    rename: async (a, b) => {
+      calls.rename.push({ from: a, to: b });
+    },
+    chmod: async (p, m) => {
+      calls.chmod.push({ path: p, mode: m });
+    },
+    rm: async (p) => {
+      calls.rm.push({ path: p });
+    },
+  };
+}
+
+describe('tarGzExtractor', () => {
+  it('writes bytes to a temp archive, extracts via tar -xzf, moves + chmods', async () => {
+    const deps = fakeArchiveDeps({ entries: ['gitleaks'] });
+    const bytes = Buffer.from('fake-tar-bytes');
+    const destPath = '/cache/gitleaks/8.21.2/gitleaks';
+
+    const out = await tarGzExtractor(bytes, destPath, deps);
+
+    expect(out).toBe(destPath);
+
+    // 1. Wrote the archive to a temp path.
+    expect(deps.calls.writeFile).toHaveLength(1);
+    expect(deps.calls.writeFile[0].path).toMatch(/archive\.tar\.gz$/);
+
+    // 2. Created an extraction dir, then ensured destPath's parent exists.
+    expect(deps.calls.mkdir).toHaveLength(2);
+    expect(deps.calls.mkdir[0].path).toMatch(/\.d$/);
+    expect(deps.calls.mkdir[1].path).toBe('/cache/gitleaks/8.21.2');
+
+    // 3. Invoked tar with -xzf and -C.
+    expect(deps.calls.runCommand).toHaveLength(1);
+    const { cmd, args } = deps.calls.runCommand[0];
+    expect(cmd).toBe('tar');
+    expect(args[0]).toBe('-xzf');
+    expect(args).toContain('-C');
+    // The archive path passed to tar must match what was written.
+    expect(args[1]).toBe(deps.calls.writeFile[0].path);
+    expect(args[args.indexOf('-C') + 1]).toBe(deps.calls.mkdir[0].path);
+
+    // 4. Picked the binary from the extract dir (basename match) + moved it.
+    expect(deps.calls.rename).toHaveLength(1);
+    expect(deps.calls.rename[0].to).toBe(destPath);
+
+    // 5. Chmodded destPath 0o755 (Windows bsdtar doesn't preserve exec bit).
+    expect(deps.calls.chmod).toHaveLength(1);
+    expect(deps.calls.chmod[0]).toEqual({ path: destPath, mode: 0o755 });
+
+    // 6. Best-effort cleanup of the extract dir.
+    expect(deps.calls.rm).toHaveLength(1);
+    expect(deps.calls.rm[0].path).toBe(deps.calls.mkdir[0].path);
+  });
+
+  it('uses GNU/bsdtar-compatible flags only (no --no-same-owner)', async () => {
+    const deps = fakeArchiveDeps({ entries: ['gitleaks'] });
+    await tarGzExtractor(Buffer.from('x'), '/d/gitleaks', deps);
+    const args = deps.calls.runCommand[0].args;
+    for (const a of args) {
+      // Reject any GNU-only flag we know bsdtar rejects.
+      expect(a).not.toMatch(/^--no-same-owner/);
+      expect(a).not.toMatch(/^--hard-dereference/);
+      expect(a).not.toMatch(/^--force-local/);
+    }
+  });
+
+  it('throws a wrapped error when tar fails and cleans up', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['gitleaks'],
+      tarError: new Error('tar: invalid magic'),
+    });
+    await expect(
+      tarGzExtractor(Buffer.from('bad'), '/d/gitleaks', deps),
+    ).rejects.toThrow(/tarGzExtractor: tar failed/);
+    // Should NOT have chmodded or renamed anything.
+    expect(deps.calls.rename).toHaveLength(0);
+    expect(deps.calls.chmod).toHaveLength(0);
+  });
+
+  it('prefers an exact-name match when archive contains multiple files', async () => {
+    // gitleaks tarballs contain LICENSE, README.md, gitleaks — we want gitleaks.
+    const deps = fakeArchiveDeps({ entries: ['LICENSE', 'README.md', 'gitleaks'] });
+    const destPath = '/cache/gitleaks/8.21.2/gitleaks';
+    await tarGzExtractor(Buffer.from('x'), destPath, deps);
+    expect(deps.calls.rename[0].from).toMatch(/gitleaks$/);
+    expect(deps.calls.rename[0].from).not.toMatch(/LICENSE|README/);
+  });
+
+  it('coerces a string bytes argument to Buffer', async () => {
+    const deps = fakeArchiveDeps({ entries: ['gitleaks'] });
+    // Pass a string — should not throw.
+    await tarGzExtractor('string-bytes', '/d/gitleaks', deps);
+    expect(deps.calls.runCommand).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * zipExtractor — system-tar flow + Windows Expand-Archive fallback
+ * ------------------------------------------------------------------ */
+
+describe('zipExtractor', () => {
+  it('extracts via tar -xf on non-Windows (single binary inside)', async () => {
+    const deps = fakeArchiveDeps({ entries: ['ast-grep'], platform: 'linux' });
+    const bytes = Buffer.from('fake-zip-bytes');
+    const destPath = '/cache/ast-grep/0.34.3/ast-grep';
+
+    const out = await zipExtractor(bytes, destPath, deps);
+
+    expect(out).toBe(destPath);
+
+    // 1. Wrote the archive to a temp .zip.
+    expect(deps.calls.writeFile).toHaveLength(1);
+    expect(deps.calls.writeFile[0].path).toMatch(/archive\.zip$/);
+
+    // 2. tar -xf (NOT -xzf — it's a zip, not gzipped).
+    expect(deps.calls.runCommand).toHaveLength(1);
+    const { cmd, args } = deps.calls.runCommand[0];
+    expect(cmd).toBe('tar');
+    expect(args[0]).toBe('-xf');
+
+    // 3. Moved + chmodded.
+    expect(deps.calls.rename[0].to).toBe(destPath);
+    expect(deps.calls.chmod[0]).toEqual({ path: destPath, mode: 0o755 });
+  });
+
+  it('picks ast-grep out of an archive that also contains sg (real ast-grep shape)', async () => {
+    // ast-grep 0.34.3 zips contain BOTH `sg` (CLI alias) and `ast-grep`.
+    const deps = fakeArchiveDeps({ entries: ['sg', 'ast-grep'], platform: 'darwin' });
+    const destPath = '/cache/ast-grep/0.34.3/ast-grep';
+    await zipExtractor(Buffer.from('x'), destPath, deps);
+    expect(deps.calls.rename[0].from).toMatch(/ast-grep$/);
+    expect(deps.calls.rename[0].from).not.toMatch(/\/sg$/);
+  });
+
+  it('falls back to powershell.exe Expand-Archive on Windows when tar fails', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['gitleaks.exe'],
+      platform: 'win32',
+      tarError: new Error('tar: zip not supported'),
+    });
+    const destPath = '/cache/gitleaks/8.21.2/gitleaks';
+    // Note: destPath basename is "gitleaks"; the archive contains
+    // "gitleaks.exe" — the picker falls through to the .exe variant.
+    await zipExtractor(Buffer.from('x'), destPath, deps);
+
+    // Both calls happened: tar (failed) then powershell.exe (succeeded).
+    expect(deps.calls.runCommand).toHaveLength(2);
+    expect(deps.calls.runCommand[0].cmd).toBe('tar');
+    expect(deps.calls.runCommand[1].cmd).toBe('powershell.exe');
+    const psArgs = deps.calls.runCommand[1].args;
+    expect(psArgs).toContain('-NoProfile');
+    expect(psArgs).toContain('-Command');
+    // The Expand-Archive command references both paths.
+    const psCmd = psArgs[psArgs.indexOf('-Command') + 1];
+    expect(psCmd).toMatch(/Expand-Archive/);
+    expect(psCmd).toMatch(/-Force/);
+
+    // The .exe variant was picked and moved into place.
+    expect(deps.calls.rename[0].from).toMatch(/gitleaks\.exe$/);
+    expect(deps.calls.rename[0].to).toBe(destPath);
+  });
+
+  it('throws a combined error when both tar and Expand-Archive fail on Windows', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['gitleaks.exe'],
+      platform: 'win32',
+      tarError: new Error('tar: boom'),
+      psError: new Error('Expand-Archive: bad zip'),
+    });
+    await expect(
+      zipExtractor(Buffer.from('x'), '/d/gitleaks', deps),
+    ).rejects.toThrow(/Expand-Archive failed/);
+    expect(deps.calls.rename).toHaveLength(0);
+  });
+
+  it('throws (no fallback) when tar fails on non-Windows', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['ast-grep'],
+      platform: 'linux',
+      tarError: new Error('tar: zip not supported'),
+    });
+    await expect(
+      zipExtractor(Buffer.from('x'), '/d/ast-grep', deps),
+    ).rejects.toThrow(/no Expand-Archive fallback on platform=linux/);
+  });
+
+  it('uses -xf (NOT -xzf) — zips are not gzip-compressed', async () => {
+    const deps = fakeArchiveDeps({ entries: ['ast-grep'], platform: 'darwin' });
+    await zipExtractor(Buffer.from('x'), '/d/ast-grep', deps);
+    expect(deps.calls.runCommand[0].args[0]).toBe('-xf');
+  });
+
+  it('throws when the archive contains no files', async () => {
+    const deps = fakeArchiveDeps({ entries: [], platform: 'linux' });
+    await expect(
+      zipExtractor(Buffer.from('x'), '/d/ast-grep', deps),
+    ).rejects.toThrow(/archive contained no files/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * End-to-end: ensureBinary + custom extractor (the spec wiring)
+ * ------------------------------------------------------------------ */
+
+describe('ensureBinary — integration with tarGzExtractor', () => {
+  it('invokes spec.extractor in place of defaultExtractor and returns the cache path', async () => {
+    const extractorCalls = [];
+    const fakeExtractor = async (bytes, destPath, d) => {
+      extractorCalls.push({ bytesLen: bytes.length, destPath });
+      // Mimic what tarGzExtractor would do at the contract level.
+      if (typeof d.chmod === 'function') await d.chmod(destPath, 0o755);
+      return destPath;
+    };
+    const deps = fakeDeps();
+    const path = await ensureBinary(baseSpec({ extractor: fakeExtractor }), deps);
+    expect(path.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
+    expect(extractorCalls).toHaveLength(1);
+    expect(deps.calls.chmod).toBe(1);
   });
 });

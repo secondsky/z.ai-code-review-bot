@@ -99,6 +99,10 @@ export function formatScannerContext(findings, metrics) {
  *   scanPatterns?: Function,
  *   computeMetrics?: Function,
  *   metricsToFindings?: Function,
+ *   ensureBinary?: Function,
+ *   runBinary?: Function,
+ *   platform?: string,
+ *   arch?: string,
  *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
  * }} [deps]
  * @returns {Promise<{ findings: Array, metrics: Object, scannerNames: string[] }>}
@@ -139,6 +143,25 @@ export async function runScanners(opts, deps = {}) {
   /** @type {Array<Record<string, unknown>>} */
   let findings = [];
 
+  // Per-scanner deps: forward ensureBinary/runBinary so production actually
+  // attempts the binary path. Tests that don't supply these fall through to
+  // the regex fallback inside each scanner. We only set the keys when they're
+  // actually functions so the scanner-side `typeof deps.ensureBinary`
+  // guard cleanly detects the absent case.
+  const scannerSharedDeps = { core };
+  if (typeof deps.ensureBinary === 'function') {
+    scannerSharedDeps.ensureBinary = deps.ensureBinary;
+  }
+  if (typeof deps.runBinary === 'function') {
+    scannerSharedDeps.runBinary = deps.runBinary;
+  }
+  if (typeof deps.platform === 'string') {
+    scannerSharedDeps.platform = deps.platform;
+  }
+  if (typeof deps.arch === 'string') {
+    scannerSharedDeps.arch = deps.arch;
+  }
+
   // Run secrets + patterns concurrently.
   /** @type {Array<Promise<{ findings: Array, scanner: string }>>} */
   const promises = [];
@@ -146,7 +169,7 @@ export async function runScanners(opts, deps = {}) {
     promises.push(
       doScanSecrets(
         { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        { core },
+        scannerSharedDeps,
       ).catch((err) => {
         if (core?.warning) {
           core.warning(`secrets scanner failed: ${err?.message ?? String(err)}`);
@@ -159,7 +182,7 @@ export async function runScanners(opts, deps = {}) {
     promises.push(
       doScanPatterns(
         { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        { core },
+        scannerSharedDeps,
       ).catch((err) => {
         if (core?.warning) {
           core.warning(`patterns scanner failed: ${err?.message ?? String(err)}`);

@@ -30,6 +30,10 @@
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as fs from 'node:fs/promises';
+import * as https from 'node:https';
 
 import core from '@actions/core';
 import github from '@actions/github';
@@ -74,6 +78,10 @@ import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
 import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
+import { ensureBinary } from './lib/scanners/ensure-binary.js';
+import { scanSecrets } from './lib/scanners/secrets.js';
+import { scanPatterns } from './lib/scanners/patterns.js';
+import { computeMetrics } from './lib/scanners/metrics.js';
 import { setReviewStatus, buildStatusDescription } from './lib/status.js';
 import { loadRepoConfig, mergeRepoConfig } from './lib/repo-config.js';
 import {
@@ -131,6 +139,119 @@ export function expandHome(p) {
   if (p === '~') return homedir();
   if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
   return p;
+}
+
+/**
+ * Promisified `execFile` from `node:child_process`. Module-level binding so we
+ * don't pay the promisify cost per call and so tests can stub it via the
+ * scanner deps seam.
+ */
+const execFileAsync = promisify(execFileCb);
+
+/**
+ * Minimal `https.get` wrapper that resolves to a Buffer of the response body.
+ * Follows up to 5 redirects (GitHub release assets redirect to a CDN). Rejects
+ * on any network/HTTP error. Used as `deps.fetch` for `ensureBinary`.
+ *
+ * Zero new dependencies: uses only `node:https`. Equivalent to fetch() but
+ * works on Node 18 (where global fetch is behind a flag in some builds) and
+ * returns a Buffer directly (no `Response.arrayBuffer()` dance).
+ *
+ * @param {string} url
+ * @param {{ maxRedirects?: number }} [opts]
+ * @returns {Promise<Buffer>}
+ */
+export function httpsGet(url, opts = {}) {
+  const maxRedirects = typeof opts.maxRedirects === 'number' ? opts.maxRedirects : 5;
+  return new Promise((resolve, reject) => {
+    if (typeof url !== 'string' || url.length === 0) {
+      reject(new Error('httpsGet: url is required'));
+      return;
+    }
+    const req = https.get(url, (res) => {
+      const status = res.statusCode || 0;
+      // Redirect: follow with the Location header.
+      if (status >= 300 && status < 400 && res.headers.location) {
+        if (maxRedirects <= 0) {
+          reject(new Error(`httpsGet: too many redirects (${url})`));
+          res.resume();
+          return;
+        }
+        // Resolve relative redirects against the current URL.
+        const nextUrl = new URL(res.headers.location, url).toString();
+        res.resume(); // free the body
+        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1 }));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        res.resume();
+        reject(new Error(`httpsGet: HTTP ${status} for ${url}`));
+        return;
+      }
+      /** @type {Buffer[]} */
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    // Belt-and-braces timeout so a hung connection can't wedge the action.
+    // 60s should be plenty for any GitHub release asset (≤ 50MB).
+    req.setTimeout(60_000, () => {
+      req.destroy(new Error('httpsGet: request timed out (60s)'));
+    });
+  });
+}
+
+/**
+ * Build the production scanner-dependency kit. Returns the deps object that
+ * `runScanners` forwards to `scanSecrets` / `scanPatterns`. Each dep is a real
+ * Node builtin; tests inject fakes via `deps.runScanners` / `deps.scanSecrets`
+ * overrides higher up.
+ *
+ * Deps produced:
+ *   - `core`           — passed through (the @actions/core kit).
+ *   - `ensureBinary`   — wraps the real `ensureBinary` from
+ *                         `./lib/scanners/ensure-binary.js`, injecting real
+ *                         `fetch` (httpsGet), `writeFile`, `stat`, `mkdir`,
+ *                         `chmod`. Used by both scanners.
+ *   - `runBinary`      — `promisify(execFile)` with a 10MB maxBuffer (used by
+ *                         both scanners; the brief specifies this exact size).
+ *   - `runCommand`     — `promisify(execFile)` without maxBuffer cap (used by
+ *                         the archive extractors to invoke system `tar`).
+ *   - `scanSecrets`    — the real implementation (so `runScanners` doesn't
+ *                         fall through to its no-binary default).
+ *   - `scanPatterns`   — the real implementation.
+ *   - `computeMetrics` — the real implementation.
+ *
+ * The brief specified `runBinary(cmd, args)` and `runCommand(cmd, args)`
+ * signatures; we preserve that (callers use positional args).
+ *
+ * @param {{ core?: object, cacheDir?: string }} [args]
+ * @returns {Object}
+ */
+export function createScannerDeps({ core: coreArg, cacheDir } = {}) {
+  return {
+    core: coreArg,
+    ensureBinary: (spec, innerDeps = {}) =>
+      ensureBinary(spec, {
+        fetch: httpsGet,
+        writeFile: (p, b) => fs.writeFile(p, b),
+        stat: (p) => fs.stat(p),
+        mkdir: (p) => fs.mkdir(p, { recursive: true }),
+        chmod: (p, m) => fs.chmod(p, m),
+        ...innerDeps,
+      }),
+    runBinary: (cmd, args, opts) =>
+      execFileAsync(cmd, args, {
+        maxBuffer: 10 * 1024 * 1024,
+        ...(opts || {}),
+      }),
+    runCommand: (cmd, args, opts) => execFileAsync(cmd, args, opts || {}),
+    scanSecrets,
+    scanPatterns,
+    computeMetrics,
+  };
 }
 
 /**
@@ -392,7 +513,7 @@ export async function run(context, deps = {}) {
         config: { scannersEnabled: repoConfig.scannersEnabled },
         repoConfig: scannerRepoConfig,
       },
-      { core: coreDep },
+      createScannerDeps({ core: coreDep, cacheDir }),
     );
     const scannerContext = formatScannerContextFn(
       scannerResult.findings,
