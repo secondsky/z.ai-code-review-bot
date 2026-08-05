@@ -38743,6 +38743,17 @@ function loadConfig(inputs = {}, options = {}) {
   const suggestReviewers = isTruthy(read(inputs, 'ZAI_SUGGEST_REVIEWERS'));
   const autoAssignReviewers = isTruthy(read(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS'));
 
+  // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The master switch
+  // defaults to FALSE — opt-in — because the learnings file is a NEW trust
+  // surface (attacker-controllable in fork PRs): a malicious contributor could
+  // commit a learnings entry that suppresses a real security finding. When
+  // enabled, the bot fetches `.zai/learnings.yml` from the PR head SHA, treats
+  // it as UNTRUSTED, and suppresses findings whose (file, title/description)
+  // clearly match a recorded "previously-reviewed / won't-fix" pattern. The
+  // suppression is conservative (glob + case-insensitive substring on BOTH
+  // axes); the prompt also carries the accepted patterns as additive context.
+  const learningsEnabled = isTruthy(read(inputs, 'ZAI_LEARNINGS_ENABLED'));
+
   const config = {
     apiKey,
     model,
@@ -38778,6 +38789,7 @@ function loadConfig(inputs = {}, options = {}) {
     strictMode,
     suggestReviewers,
     autoAssignReviewers,
+    learningsEnabled,
     githubToken,
   };
 
@@ -40017,7 +40029,7 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
  * Otherwise the body is emitted flat.
  *
  * @param {Array<{filename: string, status: string, patch?: string}>} [files]
- * @param {{maxDiffChars?: number, maxFindings?: number, scannerContext?: string, pathInstructions?: Array<{path: string, instructions: string}>, toneInstructions?: string, batchNumber?: number, totalBatches?: number}} [options]
+ * @param {{maxDiffChars?: number, maxFindings?: number, scannerContext?: string, pathInstructions?: Array<{path: string, instructions: string}>, toneInstructions?: string, batchNumber?: number, totalBatches?: number, learningsContext?: string}} [options]
  * @returns {string}
  */
 function buildStructuredReviewPrompt(files, options = {}) {
@@ -40054,7 +40066,16 @@ function buildStructuredReviewPrompt(files, options = {}) {
       ? `\n\n<untrusted_input source="repo-config" kind="tone">Tone: ${escapeDiffFence(options.toneInstructions)}</untrusted_input>`
       : '';
 
-  const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}`;
+  // Phase 8.2: optional learnings context (from .zai/learnings.yml — UNTRUSTED,
+  // wrapped). The pre-rendered block already lists the accepted patterns; we
+  // fence-escape the whole block so an attacker cannot close the wrapping tag
+  // or inject instructions via the file/pattern strings.
+  const learningsBlock =
+    typeof options.learningsContext === 'string' && options.learningsContext.length > 0
+      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeDiffFence(options.learningsContext)}\n</untrusted_input>`
+      : '';
+
+  const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}${learningsBlock}`;
 
   if (!Array.isArray(files) || files.length === 0) {
     return header;
@@ -41454,7 +41475,7 @@ async function runWithConcurrency(items, concurrency, fn) {
  * successful callApi invocation — halving produces multiple).
  *
  * @param {Array} entries  - the batch's review entries
- * @param {Object} state   - { apiKey, model, batchNumber, totalBatches, maxFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} state   - { apiKey, model, batchNumber, totalBatches, maxFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
  * @param {Object} deps    - { callApi, buildStructuredReviewPrompt, core }
  * @returns {Promise<string[]>} raw model-text strings
  */
@@ -41473,6 +41494,7 @@ async function executeStructuredBatch(entries, state, deps = {}) {
       pathInstructions: state.pathInstructions,
       toneInstructions: state.toneInstructions,
       maxDiffChars: state.maxDiffChars,
+      learningsContext: state.learningsContext,
     },
   );
 
@@ -41521,7 +41543,7 @@ async function executeStructuredBatch(entries, state, deps = {}) {
  *   6. Return {findings, summary, metadata}.
  *
  * @param {Array} files - raw changed files (each {filename, status, patch?, ...})
- * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
  * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndCapFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
  * @returns {Promise<{findings: Array, summary: string, metadata: Object}>}
  */
@@ -41562,6 +41584,7 @@ async function runStructuredReview(files, config, deps = {}) {
     pathInstructions: config.pathInstructions,
     toneInstructions: config.toneInstructions,
     maxDiffChars: config.maxDiffChars,
+    learningsContext: config.learningsContext,
   };
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
@@ -44076,9 +44099,11 @@ const HANDLERS = {
  *   3. Skips PRs whose head SHA already has a Z.ai marker comment (dedup by
  *      SHA — only new/changed PRs get reviewed, so a stable PR is not
  *      re-reviewed on every cron tick).
- *   4. Runs the structured-review pipeline (`runStructuredReview`) and upserts
- *      the summary comment — exactly the same code path as the `pull_request`
- *      event.
+ *   4. Runs the structured-review pipeline (`runStructuredReview`) and posts via
+ *      the v2 inline-review path (`partitionFindings` → `buildReviewBody`/
+ *      `buildReviewComments` → `upsertReview`) when findings map to diff lines,
+ *      falling back to the summary comment when no finding is line-mappable —
+ *      exactly the same code path as the `pull_request` event.
  *
  * Per-PR failures are logged and isolated; one bad PR never stops the batch.
  * All collaborators are INJECTED (DI-first) so tests never touch the network.
@@ -44179,7 +44204,12 @@ async function hasReviewForSha({
  * Review a single PR using the structured-review pipeline. Mirrors the
  * `pull_request` branch of `run()` in src/index.js: fetch changed files, filter
  * excludes + patchable, short-circuit on zero patchable, run the structured
- * review, render via formatFindingsAsSummary, and upsert the summary comment.
+ * review, then post via the v2 inline-review pipeline (partition findings →
+ * buildReviewBody/buildReviewComments → upsertReview) when at least one finding
+ * maps to a diff line. Falls back to the legacy single summary comment when no
+ * finding is line-mappable (all file-level or unmappable), and again to
+ * postFallbackComment if the review submission itself fails — the review is
+ * never silently lost.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -44203,6 +44233,13 @@ async function reviewOnePr({
   formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
+  // v2 inline-review pipeline deps.
+  partitionFindings,
+  buildReviewBody,
+  buildReviewComments,
+  upsertReview,
+  postFallbackComment,
+  resolveReviewEvent,
 }) {
   try {
     let files = await getChangedFiles({ octokit, owner, repo, pullNumber: pr.number });
@@ -44214,6 +44251,60 @@ async function reviewOnePr({
 
     const result = await runStructuredReview(patchable, config, { callApi, core });
 
+    // Synthetic @actions/github-like context. upsertReview reads
+    // context.payload.pull_request.number; postFallbackComment delegates to the
+    // shared postComment helper, which reads context.payload.issue.number — so
+    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
+    const ctx = {
+      repo: { owner, repo },
+      payload: {
+        pull_request: { number: pr.number, head: { sha: pr.headSha } },
+        issue: { number: pr.number },
+      },
+    };
+
+    const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
+
+    if (inline.length > 0) {
+      const body = buildReviewBody(result.summary, summaryOnly, {
+        reviewerName: config.reviewerName,
+        walkthrough: config.walkthrough === true,
+        files: patchable,
+        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+        truncated: Math.max(
+          0,
+          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+        ),
+      });
+      const comments = buildReviewComments(inline);
+      const event = resolveReviewEvent(result.findings, config);
+      try {
+        await upsertReview({
+          octokit,
+          context: ctx,
+          marker: MARKER,
+          sha: pr.headSha,
+          body,
+          comments,
+          event,
+          core,
+        });
+      } catch (reviewError) {
+        // NEVER silently lose the review. Fall back to a single issue comment
+        // carrying the review body + every inline comment body as text.
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review submission failed for PR #${pr.number} (${reviewError?.message ?? String(reviewError)}); posting fallback comment.`,
+          );
+        }
+        const fallbackBody = `${body}\n\n${comments.map((c) => c.body).join('\n\n')}`;
+        await postFallbackComment({ octokit, context: ctx, body: fallbackBody });
+      }
+      return { ok: true, action: 'reviewed' };
+    }
+
+    // No inline-mappable findings: post the whole summary as an issue comment
+    // via the existing marker-upsert path (legacy summary comment).
     const content = formatFindingsAsSummary(result.findings, {
       reviewerName: config.reviewerName,
       metadata: {
@@ -44266,6 +44357,12 @@ async function reviewOnePr({
  * @param {Function} args.formatFindingsAsSummary
  * @param {Function} args.buildCommentBody
  * @param {Function} args.upsertReviewComment
+ * @param {Function} args.partitionFindings
+ * @param {Function} args.buildReviewBody
+ * @param {Function} args.buildReviewComments
+ * @param {Function} args.upsertReview
+ * @param {Function} args.postFallbackComment
+ * @param {Function} args.resolveReviewEvent
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 async function runScheduledReview({
@@ -44286,6 +44383,12 @@ async function runScheduledReview({
   formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
+  partitionFindings,
+  buildReviewBody,
+  buildReviewComments,
+  upsertReview,
+  postFallbackComment,
+  resolveReviewEvent,
 }) {
   const cap =
     typeof config?.scheduleMaxPrs === 'number' && config.scheduleMaxPrs > 0
@@ -44331,6 +44434,12 @@ async function runScheduledReview({
       formatFindingsAsSummary,
       buildCommentBody,
       upsertReviewComment,
+      partitionFindings,
+      buildReviewBody,
+      buildReviewComments,
+      upsertReview,
+      postFallbackComment,
+      resolveReviewEvent,
     });
 
     if (result.ok) {
@@ -47573,6 +47682,510 @@ async function loadCodeowners(opts = {}, deps = {}) {
   return parsed;
 }
 
+;// CONCATENATED MODULE: ./src/lib/learnings.js
+/**
+ * `.zai/learnings.yml` — previously-reviewed / won't-fix memory.
+ *
+ * A `.zai/learnings.yml` committed in the repo records "this pattern is
+ * acceptable here" / "this was resolved as won't-fix" so the bot doesn't
+ * re-raise the SAME finding on every run (a common annoyance with deterministic
+ * review bots). The file lives in the repository, so it is ATTACKER-CONTROLLABLE
+ * in fork PRs: this module treats it as UNTRUSTED throughout.
+ *
+ *   - The parser is hand-rolled (no js-yaml dependency to attack the surface),
+ *     tolerant of malformed input, and never throws.
+ *   - `validateLearning` coerces types and DROPS every entry missing a string
+ *     `file` or string `pattern`; `reason` is optional but, when present, must
+ *     be a string.
+ *   - `loadLearnings` wraps fetch + decode + parse in a single NEVER-throw
+ *     boundary: any failure (404, parse error, oversized, missing SHA) → `[]`
+ *     + a `core.warning`. The feature is OPT-IN (ZAI_LEARNINGS_ENABLED) because
+ *     it is a new trust surface.
+ *   - `matchesLearning` is conservative: the pattern must appear (case-
+ *     insensitively) as a substring of `finding.title` OR `finding.description`,
+ *     AND the finding's file must match the learning's glob. Only a CLEAR match
+ *     suppresses — partial/garbled patterns never suppress.
+ *
+ * Re the YAML parser: `parseZaiYml` in `./repo-config.js` recognizes only the
+ * `reviews` and `scanners` top-level keys, so it would silently drop a
+ * `learnings:` key. Rather than widen that shared parser's surface (and risk a
+ * regression for repo-config), this module ships a tiny subset parser that only
+ * understands the learnings shape. It reuses the same comment-strip + unquote
+ * idioms so the dialect matches `.zai.yml`.
+ *
+ * No `@actions/core` import; `core` is injected via `deps`.
+ *
+ * @module src/lib/learnings.js
+ */
+
+
+
+/** Hard cap on the size of a `.zai/learnings.yml` we will parse (cost/DoS guard). */
+const MAX_LEARNINGS_BYTES = 64 * 1024; // 64 KiB
+
+/** Maximum number of learning entries we keep (defense against a huge list). */
+const MAX_LEARNINGS_ENTRIES = 500;
+
+/** Maximum length of any single `file` / `pattern` / `reason` string. */
+const MAX_FIELD_CHARS = 1000;
+
+/* ------------------------------------------------------------------ *
+ * Minimal YAML subset parser (learnings-only)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
+ * single- or double-quoted string. Mirrors `stripComment` in repo-config.js so
+ * the dialect matches.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+function learnings_stripComment(line) {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if (ch === '#' && !inSingle && !inDouble) {
+      const prev = i > 0 ? line[i - 1] : '';
+      if (i === 0 || /\s/.test(prev)) {
+        return line.slice(0, i);
+      }
+    }
+  }
+  return line;
+}
+
+/**
+ * Unquote a YAML scalar value: strips matching surrounding single or double
+ * quotes. Returns the input unchanged when not quoted.
+ *
+ * @param {string} v
+ * @returns {string}
+ */
+function learnings_unquote(v) {
+  if (typeof v !== 'string' || v.length < 2) return v;
+  if (
+    (v[0] === '"' && v[v.length - 1] === '"') ||
+    (v[0] === "'" && v[v.length - 1] === "'")
+  ) {
+    return v.slice(1, -1);
+  }
+  return v;
+}
+
+/**
+ * Parse a minimal YAML subset into `{ learnings: Array<{file, pattern, reason?}> }`.
+ *
+ * Supports exactly the structure of `.zai/learnings.yml`:
+ *   - a top-level `learnings:` key
+ *   - arrays of objects (`- key: value` on consecutive lines, 2-space indented)
+ *   - quoted or unquoted scalar values
+ *   - `#` comments (line and inline, quote-aware)
+ *
+ * Unknown top-level keys are skipped. Malformed input never throws: the
+ * offending line is skipped and parsing continues. The result is the parsed
+ * (but NOT yet validated) array; {@link parseLearnings} runs validation.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} text
+ * @returns {Array<Record<string, string>>}
+ */
+function parseLearningsYml(text) {
+  /** @type {Array<Record<string, string>>} */
+  const entries = [];
+  if (typeof text !== 'string' || text.length === 0) return entries;
+
+  const lines = text.split(/\r?\n/);
+  let inLearnings = false;
+  /** @type {Record<string, string> | null} */
+  let pending = null;
+
+  const flush = () => {
+    if (pending !== null) {
+      entries.push(pending);
+      pending = null;
+    }
+  };
+
+  for (const raw of lines) {
+    const lineNoComment = learnings_stripComment(raw);
+    const line = lineNoComment.replace(/\s+$/, '');
+    const indent = line.length - line.replace(/^\s+/, '').length;
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+
+    // Top-level key (indent 0).
+    if (indent === 0) {
+      flush();
+      const m = trimmed.match(/^([A-Za-z0-9_]+):\s*$/);
+      if (!m) {
+        inLearnings = false;
+        continue;
+      }
+      inLearnings = m[1] === 'learnings';
+      continue;
+    }
+
+    if (!inLearnings) continue; // indented line outside learnings — skip
+
+    // Array item: a line beginning with `- `.
+    if (/^-\s+/.test(trimmed) || trimmed === '-') {
+      flush();
+      const body = trimmed.replace(/^-\s+/, '');
+      // First field of a new object: `- key: value` (or bare `- `).
+      const km = body.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+      if (km) {
+        pending = { [km[1]]: learnings_unquote(km[2]).trim() };
+      } else {
+        pending = {};
+      }
+      continue;
+    }
+
+    // Continuation key inside the current object: `  key: value` at indent >= 2.
+    const km = trimmed.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+    if (km && pending !== null) {
+      pending[km[1]] = learnings_unquote(km[2]).trim();
+      continue;
+    }
+    // Otherwise: stray indented line — ignore.
+  }
+  flush();
+  return entries;
+}
+
+/* ------------------------------------------------------------------ *
+ * parseLearnings
+ * ------------------------------------------------------------------ */
+
+/**
+ * Clamp a string field to {@link MAX_FIELD_CHARS}; returns the input unchanged
+ * for non-strings.
+ *
+ * @param {unknown} v
+ * @returns {string}
+ */
+function clampField(v) {
+  if (typeof v !== 'string') return '';
+  return v.length > MAX_FIELD_CHARS ? v.slice(0, MAX_FIELD_CHARS) : v;
+}
+
+/**
+ * Validate one parsed entry: keep only string `file` + string `pattern`, plus an
+ * optional string `reason`. Drop unknown keys. Returns `null` when the entry is
+ * missing a required field.
+ *
+ * @param {unknown} entry
+ * @returns {{file: string, pattern: string, reason?: string} | null}
+ */
+function validateLearning(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const e = /** @type {Record<string, unknown>} */ (entry);
+  const file = clampField(e.file);
+  const pattern = clampField(e.pattern);
+  if (typeof file !== 'string' || file.trim() === '') return null;
+  if (typeof pattern !== 'string' || pattern.trim() === '') return null;
+  const out = { file, pattern };
+  const reason = clampField(e.reason);
+  if (typeof reason === 'string' && reason.trim() !== '') {
+    out.reason = reason;
+  }
+  return out;
+}
+
+/**
+ * Parse a `.zai/learnings.yml` document into a validated array of learnings.
+ *
+ * Each entry is normalized to `{file, pattern, reason?}`:
+ *   - `file` (required, non-empty string) — a glob matched against finding paths.
+ *   - `pattern` (required, non-empty string) — a case-insensitive substring
+ *     matched against `finding.title` OR `finding.description`.
+ *   - `reason` (optional string) — human context, never used for matching.
+ *
+ * Invalid entries are dropped. The parser never throws. Empty / missing
+ * `learnings:` key yields `[]`.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} text
+ * @returns {Array<{file: string, pattern: string, reason?: string}>}
+ */
+function parseLearnings(text) {
+  const parsed = parseLearningsYml(text);
+  /** @type {Array<{file: string, pattern: string, reason?: string}>} */
+  const out = [];
+  for (const entry of parsed) {
+    const validated = validateLearning(entry);
+    if (validated === null) continue;
+    out.push(validated);
+    if (out.length >= MAX_LEARNINGS_ENTRIES) break;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * matchesLearning
+ * ------------------------------------------------------------------ */
+
+/**
+ * Check if a finding matches a learning (i.e. should be suppressed).
+ *
+ * Match logic (conservative — only a CLEAR match suppresses):
+ *   1. `learning.file` is a glob; `finding.file` must match it (full path OR
+ *      basename — same semantics as `matchesAnyPattern` in glob.js).
+ *   2. `learning.pattern` is a case-insensitive substring of `finding.title`
+ *      OR `finding.description`.
+ *
+ * Non-string / missing fields never match. Never throws.
+ *
+ * @param {{file?: string, title?: string, description?: string}} finding
+ * @param {{file?: string, pattern?: string}} learning
+ * @returns {boolean}
+ */
+function matchesLearning(finding, learning) {
+  if (!finding || typeof finding !== 'object') return false;
+  if (!learning || typeof learning !== 'object') return false;
+  const fFile = typeof finding.file === 'string' ? finding.file : '';
+  const lFile = typeof learning.file === 'string' ? learning.file : '';
+  const lPattern = typeof learning.pattern === 'string' ? learning.pattern : '';
+  if (fFile === '' || lFile === '' || lPattern === '') return false;
+
+  // Glob match on the file.
+  if (!matchesAnyPattern(fFile, [lFile])) return false;
+
+  // Case-insensitive substring match on title OR description.
+  const needle = lPattern.toLowerCase();
+  const title = typeof finding.title === 'string' ? finding.title.toLowerCase() : '';
+  const description =
+    typeof finding.description === 'string' ? finding.description.toLowerCase() : '';
+  return title.includes(needle) || description.includes(needle);
+}
+
+/* ------------------------------------------------------------------ *
+ * filterFindingsByLearnings
+ * ------------------------------------------------------------------ */
+
+/**
+ * Filter out findings that match ANY learning.
+ *
+ * A finding is suppressed when at least one learning matches it via
+ * {@link matchesLearning}. Findings with no matching learning are kept.
+ * Non-array inputs yield `{ kept: [], suppressed: 0 }`. An empty / non-array
+ * learnings list keeps everything (the common case: no learnings file).
+ *
+ * The result preserves the input order of `findings`.
+ *
+ * @param {Array} findings
+ * @param {Array} learnings
+ * @returns {{ kept: Array, suppressed: number }}
+ */
+function filterFindingsByLearnings(findings, learnings) {
+  const list = Array.isArray(findings) ? findings : [];
+  const rules = Array.isArray(learnings) ? learnings : [];
+  if (rules.length === 0) {
+    return { kept: [...list], suppressed: 0 };
+  }
+  /** @type {unknown[]} */
+  const kept = [];
+  let suppressed = 0;
+  for (const f of list) {
+    let isMatch = false;
+    for (const learning of rules) {
+      if (matchesLearning(f, learning)) {
+        isMatch = true;
+        break;
+      }
+    }
+    if (isMatch) {
+      suppressed += 1;
+    } else {
+      kept.push(f);
+    }
+  }
+  return { kept, suppressed };
+}
+
+/* ------------------------------------------------------------------ *
+ * formatLearningsForPrompt
+ * ------------------------------------------------------------------ */
+
+/**
+ * Format learnings as prompt context so the model knows which patterns were
+ * previously accepted and should NOT be re-flagged.
+ *
+ * Renders nothing for an empty / non-array learnings list (so an opt-in repo
+ * with no file pays no prompt cost). Otherwise:
+ *
+ *   The following patterns have been previously reviewed and accepted — do not flag them:
+ *   - <file>: <pattern>
+ *   - ...
+ *
+ * The caller wraps this string in `<untrusted_input>` before injection (the
+ * learnings file is attacker-controllable in fork PRs).
+ *
+ * @param {Array<{file?: string, pattern?: string}>} learnings
+ * @returns {string}
+ */
+function formatLearningsForPrompt(learnings) {
+  const list = Array.isArray(learnings) ? learnings : [];
+  if (list.length === 0) return '';
+  const lines = [
+    'The following patterns have been previously reviewed and accepted — do not flag them:',
+  ];
+  for (const l of list) {
+    const file = typeof l?.file === 'string' ? l.file : '';
+    const pattern = typeof l?.pattern === 'string' ? l.pattern : '';
+    if (file === '' || pattern === '') continue;
+    lines.push(`- ${file}: ${pattern}`);
+  }
+  // If every entry was malformed, fall back to the empty string.
+  if (lines.length === 1) return '';
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
+ * loadLearnings
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the PR head SHA from `opts.headSha` or
+ * `context.payload.pull_request.head.sha`.
+ *
+ * @param {Object} opts
+ * @returns {string}
+ */
+function learnings_resolveHeadSha(opts) {
+  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
+  const sha = opts.context?.payload?.pull_request?.head?.sha;
+  return typeof sha === 'string' ? sha : '';
+}
+
+/**
+ * Load `.zai/learnings.yml` from the PR's head SHA. Treated as UNTRUSTED.
+ *
+ * Flow:
+ *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
+ *   2. Fetch the file via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
+ *   3. Base64-decode the content.
+ *   4. Parse with {@link parseLearnings} (validates + drops bad entries).
+ *
+ * On ANY error (404, parse failure, oversized, missing SHA, missing owner/repo),
+ * `deps.core.warning(...)` is called and `[]` is returned. This function NEVER
+ * throws — a broken/untrusted `.zai/learnings.yml` must never break the review.
+ *
+ * @param {Object} opts - `{ octokit, context, path?, headSha? }`
+ * @param {Object} [deps] - `{ core }` (for warnings).
+ * @param {{warning?: Function, info?: Function}} [deps.core]
+ * @returns {Promise<Array<{file: string, pattern: string, reason?: string}>>}
+ */
+async function loadLearnings(opts = {}, deps = {}) {
+  const { octokit, context } = opts;
+  const path =
+    typeof opts.path === 'string' && opts.path !== ''
+      ? opts.path
+      : '.zai/learnings.yml';
+  const core = deps.core;
+  const warn = (msg) => {
+    if (core && typeof core.warning === 'function') core.warning(msg);
+  };
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) {
+    warn('learnings: missing owner/repo in context; skipping .zai/learnings.yml load.');
+    return [];
+  }
+
+  const headSha = learnings_resolveHeadSha(opts);
+  if (headSha === '') {
+    warn('learnings: could not resolve PR head SHA; skipping .zai/learnings.yml load.');
+    return [];
+  }
+
+  let data;
+  try {
+    const resp = await octokit.rest.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref: headSha,
+    });
+    data = resp?.data;
+  } catch (error) {
+    const status = error?.status;
+    if (status === 404) {
+      // 404 is the common case (most repos don't have a learnings file); still
+      // surface a warning so operators can observe it.
+      warn(`learnings: no ${path} found at ${headSha.slice(0, 7)} (404).`);
+      return [];
+    }
+    warn(
+      `learnings: failed to fetch ${path} (${status ?? 'unknown'}): ` +
+        `${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+
+  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
+  // a directory or a non-file response is treated as "no learnings".
+  let text;
+  if (data && typeof data.content === 'string') {
+    const size = typeof data.size === 'number' ? data.size : data.content.length;
+    if (size > MAX_LEARNINGS_BYTES) {
+      warn(
+        `learnings: ${path} is ${size} bytes (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
+      );
+      return [];
+    }
+    try {
+      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
+    } catch {
+      warn(`learnings: ${path} could not be base64-decoded; skipping.`);
+      return [];
+    }
+    if (typeof text === 'string' && text.length > MAX_LEARNINGS_BYTES) {
+      warn(
+        `learnings: ${path} decodes to ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
+      );
+      return [];
+    }
+  } else if (typeof data === 'string') {
+    text = data;
+    if (text.length > MAX_LEARNINGS_BYTES) {
+      warn(
+        `learnings: ${path} is ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
+      );
+      return [];
+    }
+  } else {
+    // Not a file (directory listing or symlink) — no learnings.
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = parseLearnings(text);
+  } catch (error) {
+    // parseLearnings is never expected to throw, but defend in depth.
+    warn(
+      `learnings: ${path} failed to parse: ${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+
+  if (parsed.length === 0) {
+    warn(
+      `learnings: ${path} parsed but contained no valid entries; ignoring.`,
+    );
+    return [];
+  }
+  return parsed;
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -47602,6 +48215,7 @@ async function loadCodeowners(opts = {}, deps = {}) {
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
 
 
 
@@ -47841,6 +48455,7 @@ const INPUT_NAMES = [
   'ZAI_STRICT_MODE',
   'ZAI_SUGGEST_REVIEWERS',
   'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
   'GITHUB_TOKEN',
 ];
 
@@ -47973,6 +48588,9 @@ async function run(context, deps = {}) {
     suggestReviewers: suggestReviewersFn = suggestReviewers,
     formatSuggestedReviewersLine: formatSuggestedReviewersLineFn = formatSuggestedReviewersLine,
     pickAssignableReviewers: pickAssignableReviewersFn = pickAssignableReviewers,
+    loadLearnings: loadLearningsFn = loadLearnings,
+    filterFindingsByLearnings: filterFindingsByLearningsFn = filterFindingsByLearnings,
+    formatLearningsForPrompt: formatLearningsForPromptFn = formatLearningsForPrompt,
   } = deps;
 
   const event = eventName(context);
@@ -48037,6 +48655,25 @@ async function run(context, deps = {}) {
       : {};
     const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
 
+    // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The file records
+    // "previously-reviewed / won't-fix" patterns so the bot doesn't re-raise
+    // the same finding on every run. OPT-IN (ZAI_LEARNINGS_ENABLED) because it
+    // is a new trust surface: the file is attacker-controllable in fork PRs, so
+    // a malicious contributor could otherwise commit an entry that suppresses a
+    // real finding. loadLearnings is fail-soft (any error → [] + warning); the
+    // suppression is conservative (glob + case-insensitive substring on both
+    // axes). The accepted patterns are also carried into the prompt as additive
+    // context (see learningsContext below).
+    const learnings = config.learningsEnabled
+      ? await loadLearningsFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : [];
+    const learningsContext = formatLearningsForPromptFn(learnings);
+    if (learnings.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Learnings: ${learnings.length} accepted-pattern rule(s) loaded.`,
+      );
+    }
+
     // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
     // become high-confidence findings directly (merged over LLM findings at
     // the same file:line+title) and are injected into the LLM prompt as
@@ -48088,6 +48725,7 @@ async function run(context, deps = {}) {
         toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,
         scannerContext,
+        learningsContext,
       },
       {
         callApi,
@@ -48171,7 +48809,7 @@ async function run(context, deps = {}) {
         }
       }
     }
-    const { kept: keptFindings, suppressed: suppressedCount } =
+    const { kept: incrementalKept, suppressed: suppressedCount } =
       filterIncrementalFindingsFn(result.findings, priorHashes);
     if (suppressedCount > 0 && coreDep?.info) {
       coreDep.info(
@@ -48179,10 +48817,26 @@ async function run(context, deps = {}) {
       );
     }
 
+    // Phase 8.2: drop findings that match a previously-reviewed / won't-fix
+    // learning. Applied AFTER incremental suppression so the two layers
+    // compose. When learningsEnabled is off, `learnings` is [] and this is a
+    // no-op (everything is kept). Conservative: a learning only suppresses when
+    // the glob AND the substring both match.
+    const { kept: keptFindings, suppressed: learningsSuppressed } =
+      filterFindingsByLearningsFn(incrementalKept, learnings);
+    if (learningsSuppressed > 0 && coreDep?.info) {
+      coreDep.info(
+        `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
     // The hash block is built from the FULL findings set (not just kept) so
     // the next run sees the complete canonical set — otherwise a finding that
     // was suppressed this run would re-surface on the next. Empty string when
-    // incremental review is disabled OR there are no findings at all.
+    // incremental review is disabled OR there are no findings at all. NOTE: a
+    // learning-suppressed finding is also part of this canonical set, so it
+    // stays incremental-suppressed until its content changes; learnings
+    // filtering re-applies on every run regardless, so correctness is preserved.
     const hashBlock =
       config.incrementalReview === true && Array.isArray(result.findings) && result.findings.length > 0
         ? buildFindingsHashBlockFn(result.findings)
@@ -48513,6 +49167,13 @@ async function run(context, deps = {}) {
       formatFindingsAsSummary: formatFindingsAsSummaryFn,
       buildCommentBody: buildCommentBodyFn,
       upsertReviewComment: upsertReviewCommentFn,
+      // v2 inline-review pipeline (mirrors the pull_request branch).
+      partitionFindings: partitionFindingsFn,
+      buildReviewBody: buildReviewBodyFn,
+      buildReviewComments: buildReviewCommentsFn,
+      upsertReview: upsertReviewFn,
+      postFallbackComment: postFallbackCommentFn,
+      resolveReviewEvent: resolveReviewEventFn,
     });
     return;
   }

@@ -147,7 +147,7 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
  * Otherwise the body is emitted flat.
  *
  * @param {Array<{filename: string, status: string, patch?: string}>} [files]
- * @param {{maxDiffChars?: number, maxFindings?: number, scannerContext?: string, pathInstructions?: Array<{path: string, instructions: string}>, toneInstructions?: string, batchNumber?: number, totalBatches?: number}} [options]
+ * @param {{maxDiffChars?: number, maxFindings?: number, scannerContext?: string, pathInstructions?: Array<{path: string, instructions: string}>, toneInstructions?: string, batchNumber?: number, totalBatches?: number, learningsContext?: string}} [options]
  * @returns {string}
  */
 export function buildStructuredReviewPrompt(files, options = {}) {
@@ -184,7 +184,16 @@ export function buildStructuredReviewPrompt(files, options = {}) {
       ? `\n\n<untrusted_input source="repo-config" kind="tone">Tone: ${escapeDiffFence(options.toneInstructions)}</untrusted_input>`
       : '';
 
-  const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}`;
+  // Phase 8.2: optional learnings context (from .zai/learnings.yml — UNTRUSTED,
+  // wrapped). The pre-rendered block already lists the accepted patterns; we
+  // fence-escape the whole block so an attacker cannot close the wrapping tag
+  // or inject instructions via the file/pattern strings.
+  const learningsBlock =
+    typeof options.learningsContext === 'string' && options.learningsContext.length > 0
+      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeDiffFence(options.learningsContext)}\n</untrusted_input>`
+      : '';
+
+  const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}${learningsBlock}`;
 
   if (!Array.isArray(files) || files.length === 0) {
     return header;

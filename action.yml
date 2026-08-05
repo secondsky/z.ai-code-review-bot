@@ -298,6 +298,24 @@ inputs:
     required: false
     default: 'false'
 
+  # --- v2 learnings / memory (Phase 8.2) ---
+  ZAI_LEARNINGS_ENABLED:
+    description: |-
+      Master switch for the `.zai/learnings.yml` memory file. When true, the
+      bot fetches `.zai/learnings.yml` from the PR's head SHA and uses it to
+      suppress findings that were previously reviewed and accepted ("won't-fix"
+      / "this pattern is acceptable here") so it doesn't re-raise the same
+      finding on every run. OFF by default — this is a new trust surface: the
+      file is attacker-controllable in fork PRs, so a malicious contributor
+      could otherwise commit an entry that suppresses a real security finding.
+      The suppression is conservative (a glob match on the file AND a
+      case-insensitive substring match on the finding's title or description),
+      the file is treated as UNTRUSTED, and the accepted patterns are also
+      carried into the review prompt as additive context. Fail-soft: a
+      broken/missing file logs a warning and never breaks the review.
+    required: false
+    default: 'false'
+
 runs:
   using: 'node20'
   main: 'dist/index.js'

@@ -380,7 +380,7 @@ export async function runWithConcurrency(items, concurrency, fn) {
  * successful callApi invocation — halving produces multiple).
  *
  * @param {Array} entries  - the batch's review entries
- * @param {Object} state   - { apiKey, model, batchNumber, totalBatches, maxFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} state   - { apiKey, model, batchNumber, totalBatches, maxFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
  * @param {Object} deps    - { callApi, buildStructuredReviewPrompt, core }
  * @returns {Promise<string[]>} raw model-text strings
  */
@@ -399,6 +399,7 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
       pathInstructions: state.pathInstructions,
       toneInstructions: state.toneInstructions,
       maxDiffChars: state.maxDiffChars,
+      learningsContext: state.learningsContext,
     },
   );
 
@@ -447,7 +448,7 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
  *   6. Return {findings, summary, metadata}.
  *
  * @param {Array} files - raw changed files (each {filename, status, patch?, ...})
- * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars? }
+ * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
  * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndCapFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
  * @returns {Promise<{findings: Array, summary: string, metadata: Object}>}
  */
@@ -488,6 +489,7 @@ export async function runStructuredReview(files, config, deps = {}) {
     pathInstructions: config.pathInstructions,
     toneInstructions: config.toneInstructions,
     maxDiffChars: config.maxDiffChars,
+    learningsContext: config.learningsContext,
   };
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);

@@ -14,6 +14,12 @@ import {
   DEFAULT_MAX_PRS,
 } from '../src/lib/schedule.js';
 import { MARKER } from '../src/lib/comments.js';
+import { partitionFindings } from '../src/lib/diff.js';
+import {
+  buildReviewBody,
+  buildReviewComments,
+  resolveReviewEvent,
+} from '../src/lib/review.js';
 
 /* ---------- fakes ---------- */
 
@@ -150,6 +156,15 @@ const makeStubs = (overrides = {}) => ({
   formatFindingsAsSummary: vi.fn(() => `## Z.ai Code Review\n\nreview\n\n${MARKER}`),
   buildCommentBody: vi.fn(({ content }) => `${content}\n\n${MARKER}`),
   upsertReviewComment: vi.fn(async () => ({ action: 'created', commentId: 1 })),
+  // v2 inline-review pipeline deps. The pure builders + partitionFindings are
+  // real (so the inline/summaryOnly split is exercised truthfully); the I/O
+  // collaborators (upsertReview, postFallbackComment) are fakes so we can spy.
+  partitionFindings,
+  buildReviewBody,
+  buildReviewComments,
+  resolveReviewEvent,
+  upsertReview: vi.fn(async () => ({ id: 1, commentCount: 0, dismissedCount: 0 })),
+  postFallbackComment: vi.fn(async () => ({ id: 9 })),
   ...overrides,
 });
 
@@ -257,5 +272,139 @@ describe('runScheduledReview', () => {
       core: { info() {}, warning() {} }, callApi, ...s,
     });
     expect(result.reviewed).toBe(2);
+  });
+});
+
+/* ---------- reviewOnePr (v2 inline pipeline) ---------- */
+
+// A file with a real patch so partitionFindings can map an inline finding to a
+// valid RIGHT-side line. The finding below points at line 2 (an added line).
+// (parseFullHunkHeader rejects oldStart < 1, so the hunk must start at line 1.)
+const INLINE_PATCH = '@@ -1,0 +2,2 @@\n+const x = 1;\n+const y = 2;\n';
+const INLINE_FILE = { filename: 'a.js', status: 'modified', patch: INLINE_PATCH };
+const INLINE_FINDING = {
+  file: 'a.js',
+  line: 2,
+  severity: 'high',
+  title: 'Bad',
+  description: 'd',
+};
+
+describe('reviewOnePr', () => {
+  it('submits an inline review via upsertReview when findings map to diff lines', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn(async () => 'review');
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(7, 'sha7'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig(), core, callApi, ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // Inline path: upsertReview called, upsertReviewComment NOT called.
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    expect(s.upsertReviewComment).not.toHaveBeenCalled();
+    // The synthetic context carries owner/repo + pull_request.number + head sha.
+    const call = s.upsertReview.mock.calls[0][0];
+    expect(call.context.repo).toEqual({ owner: 'o', repo: 'r' });
+    expect(call.context.payload.pull_request.number).toBe(7);
+    expect(call.context.payload.pull_request.head.sha).toBe('sha7');
+    expect(call.sha).toBe('sha7');
+    expect(Array.isArray(call.comments)).toBe(true);
+    expect(call.comments.length).toBe(1);
+  });
+
+  it('falls back to upsertReviewComment when no findings map to diff lines (all file-level)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn(async () => 'review');
+    const core = { info: vi.fn(), warning: vi.fn() };
+    // File-level finding (line: null) → partitionFindings routes to summaryOnly.
+    const fileLevelFinding = { file: 'a.js', line: null, severity: 'low', title: 'X', description: 'd' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [fileLevelFinding],
+        summary: 'summary only',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(8, 'sha8'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig(), core, callApi, ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // Summary path: upsertReviewComment called, upsertReview NOT called.
+    expect(s.upsertReviewComment).toHaveBeenCalledTimes(1);
+    expect(s.upsertReview).not.toHaveBeenCalled();
+  });
+
+  it('posts a fallback comment when upsertReview throws', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn(async () => 'review');
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      upsertReview: vi.fn(async () => {
+        throw new Error('review API down');
+      }),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(9, 'sha9'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig(), core, callApi, ...s,
+    });
+
+    // Fallback path: postFallbackComment called; the PR is still "reviewed".
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    expect(s.postFallbackComment).toHaveBeenCalledTimes(1);
+    expect(s.upsertReviewComment).not.toHaveBeenCalled();
+    // The fallback body carries the review body + the inline comment bodies.
+    const fbCall = s.postFallbackComment.mock.calls[0][0];
+    expect(typeof fbCall.body).toBe('string');
+    expect(fbCall.body.length).toBeGreaterThan(0);
+  });
+
+  it('threads the new inline deps through runScheduledReview', async () => {
+    // End-to-end: runScheduledReview should call upsertReview when a PR has
+    // inline findings, proving the new deps are threaded from the batch entry.
+    const octokit = makeOctokit({ prs: [mkPr(11, 'sha11')], commentsByPr: {} });
+    const callApi = vi.fn(async () => 'review');
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r', config: makeConfig(),
+      core: { info() {}, warning() {} }, callApi, ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    expect(s.upsertReviewComment).not.toHaveBeenCalled();
   });
 });

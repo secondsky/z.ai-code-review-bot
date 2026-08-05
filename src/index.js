@@ -90,6 +90,11 @@ import {
   formatSuggestedReviewersLine,
   pickAssignableReviewers,
 } from './lib/codeowners.js';
+import {
+  loadLearnings,
+  filterFindingsByLearnings,
+  formatLearningsForPrompt,
+} from './lib/learnings.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -293,6 +298,7 @@ export const INPUT_NAMES = [
   'ZAI_STRICT_MODE',
   'ZAI_SUGGEST_REVIEWERS',
   'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
   'GITHUB_TOKEN',
 ];
 
@@ -425,6 +431,9 @@ export async function run(context, deps = {}) {
     suggestReviewers: suggestReviewersFn = suggestReviewers,
     formatSuggestedReviewersLine: formatSuggestedReviewersLineFn = formatSuggestedReviewersLine,
     pickAssignableReviewers: pickAssignableReviewersFn = pickAssignableReviewers,
+    loadLearnings: loadLearningsFn = loadLearnings,
+    filterFindingsByLearnings: filterFindingsByLearningsFn = filterFindingsByLearnings,
+    formatLearningsForPrompt: formatLearningsForPromptFn = formatLearningsForPrompt,
   } = deps;
 
   const event = eventName(context);
@@ -489,6 +498,25 @@ export async function run(context, deps = {}) {
       : {};
     const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
 
+    // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The file records
+    // "previously-reviewed / won't-fix" patterns so the bot doesn't re-raise
+    // the same finding on every run. OPT-IN (ZAI_LEARNINGS_ENABLED) because it
+    // is a new trust surface: the file is attacker-controllable in fork PRs, so
+    // a malicious contributor could otherwise commit an entry that suppresses a
+    // real finding. loadLearnings is fail-soft (any error → [] + warning); the
+    // suppression is conservative (glob + case-insensitive substring on both
+    // axes). The accepted patterns are also carried into the prompt as additive
+    // context (see learningsContext below).
+    const learnings = config.learningsEnabled
+      ? await loadLearningsFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : [];
+    const learningsContext = formatLearningsForPromptFn(learnings);
+    if (learnings.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Learnings: ${learnings.length} accepted-pattern rule(s) loaded.`,
+      );
+    }
+
     // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
     // become high-confidence findings directly (merged over LLM findings at
     // the same file:line+title) and are injected into the LLM prompt as
@@ -540,6 +568,7 @@ export async function run(context, deps = {}) {
         toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,
         scannerContext,
+        learningsContext,
       },
       {
         callApi,
@@ -623,7 +652,7 @@ export async function run(context, deps = {}) {
         }
       }
     }
-    const { kept: keptFindings, suppressed: suppressedCount } =
+    const { kept: incrementalKept, suppressed: suppressedCount } =
       filterIncrementalFindingsFn(result.findings, priorHashes);
     if (suppressedCount > 0 && coreDep?.info) {
       coreDep.info(
@@ -631,10 +660,26 @@ export async function run(context, deps = {}) {
       );
     }
 
+    // Phase 8.2: drop findings that match a previously-reviewed / won't-fix
+    // learning. Applied AFTER incremental suppression so the two layers
+    // compose. When learningsEnabled is off, `learnings` is [] and this is a
+    // no-op (everything is kept). Conservative: a learning only suppresses when
+    // the glob AND the substring both match.
+    const { kept: keptFindings, suppressed: learningsSuppressed } =
+      filterFindingsByLearningsFn(incrementalKept, learnings);
+    if (learningsSuppressed > 0 && coreDep?.info) {
+      coreDep.info(
+        `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
     // The hash block is built from the FULL findings set (not just kept) so
     // the next run sees the complete canonical set — otherwise a finding that
     // was suppressed this run would re-surface on the next. Empty string when
-    // incremental review is disabled OR there are no findings at all.
+    // incremental review is disabled OR there are no findings at all. NOTE: a
+    // learning-suppressed finding is also part of this canonical set, so it
+    // stays incremental-suppressed until its content changes; learnings
+    // filtering re-applies on every run regardless, so correctness is preserved.
     const hashBlock =
       config.incrementalReview === true && Array.isArray(result.findings) && result.findings.length > 0
         ? buildFindingsHashBlockFn(result.findings)
@@ -965,6 +1010,13 @@ export async function run(context, deps = {}) {
       formatFindingsAsSummary: formatFindingsAsSummaryFn,
       buildCommentBody: buildCommentBodyFn,
       upsertReviewComment: upsertReviewCommentFn,
+      // v2 inline-review pipeline (mirrors the pull_request branch).
+      partitionFindings: partitionFindingsFn,
+      buildReviewBody: buildReviewBodyFn,
+      buildReviewComments: buildReviewCommentsFn,
+      upsertReview: upsertReviewFn,
+      postFallbackComment: postFallbackCommentFn,
+      resolveReviewEvent: resolveReviewEventFn,
     });
     return;
   }

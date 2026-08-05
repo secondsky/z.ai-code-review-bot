@@ -317,6 +317,17 @@ export function loadConfig(inputs = {}, options = {}) {
   const suggestReviewers = isTruthy(read(inputs, 'ZAI_SUGGEST_REVIEWERS'));
   const autoAssignReviewers = isTruthy(read(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS'));
 
+  // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The master switch
+  // defaults to FALSE — opt-in — because the learnings file is a NEW trust
+  // surface (attacker-controllable in fork PRs): a malicious contributor could
+  // commit a learnings entry that suppresses a real security finding. When
+  // enabled, the bot fetches `.zai/learnings.yml` from the PR head SHA, treats
+  // it as UNTRUSTED, and suppresses findings whose (file, title/description)
+  // clearly match a recorded "previously-reviewed / won't-fix" pattern. The
+  // suppression is conservative (glob + case-insensitive substring on BOTH
+  // axes); the prompt also carries the accepted patterns as additive context.
+  const learningsEnabled = isTruthy(read(inputs, 'ZAI_LEARNINGS_ENABLED'));
+
   const config = {
     apiKey,
     model,
@@ -352,6 +363,7 @@ export function loadConfig(inputs = {}, options = {}) {
     strictMode,
     suggestReviewers,
     autoAssignReviewers,
+    learningsEnabled,
     githubToken,
   };
 

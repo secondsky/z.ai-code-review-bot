@@ -615,3 +615,22 @@ describe('autoAssignReviewers (Phase 8.1 — auto-assign)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: '   ' }).autoAssignReviewers).toBe(false);
   });
 });
+
+describe('learningsEnabled (Phase 8.2 — .zai/learnings.yml)', () => {
+  test('defaults to false (opt-in; new trust surface)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).learningsEnabled).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: v }).learningsEnabled).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: v }).learningsEnabled).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, never auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '' }).learningsEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '   ' }).learningsEnabled).toBe(false);
+  });
+});
