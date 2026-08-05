@@ -17,8 +17,9 @@ on:
     - cron: '0 9 * * 1-5'
 
 permissions:
-  pull-requests: write
-  contents: read
+  pull-requests: write   # post reviews + inline comments
+  contents: read         # read repo files (.zai.yml, CODEOWNERS)
+  statuses: write        # commit-status feedback (ZAI_COMMIT_STATUS, default on)
 
 # Serialize schedule runs so two overlapping cron ticks cannot race. Do NOT
 # cancel in-progress — a scheduled batch should complete once started.

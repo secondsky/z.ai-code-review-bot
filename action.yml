@@ -149,16 +149,15 @@ inputs:
     description: |-
       Sampling temperature for the review model (0-2). Lower values are more
       deterministic; higher values are more diverse. Clamped to [0, 2]; invalid
-      values fall back to 0.2. (Reserved for a future task that wires this into
-      the API client.)
+      values fall back to 0.2. Wired into the Z.ai request body.
     required: false
     default: '0.2'
 
   ZAI_MAX_TOKENS:
     description: |-
       Maximum tokens to generate per model call. Clamped to a minimum of 1;
-      invalid values fall back to 4096. (Reserved for a future task that wires
-      this into the API client.)
+      invalid values fall back to 4096. Wired into the Z.ai request body as
+      max_tokens.
     required: false
     default: '4096'
 
