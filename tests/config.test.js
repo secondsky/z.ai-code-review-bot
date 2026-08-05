@@ -494,6 +494,30 @@ describe('walkthrough (Phase 7)', () => {
   });
 });
 
+describe('incrementalReview (Phase 6.3 — incremental dedup)', () => {
+  test('defaults to true (incremental suppression on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).incrementalReview).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: v }).incrementalReview).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: v }).incrementalReview).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches walkthrough convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: '' }).incrementalReview).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: '   ' }).incrementalReview).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: 'TRUE' }).incrementalReview).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: 'Yes' }).incrementalReview).toBe(true);
+  });
+});
+
 describe('repoConfigEnabled (Phase 3 — .zai.yml)', () => {
   test('defaults to true (in-repo config loading on by default)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k' }).repoConfigEnabled).toBe(true);
@@ -515,5 +539,79 @@ describe('repoConfigEnabled (Phase 3 — .zai.yml)', () => {
   test('case-insensitive: "FALSE", "No"', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'FALSE' }).repoConfigEnabled).toBe(false);
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'No' }).repoConfigEnabled).toBe(false);
+  });
+});
+
+describe('strictMode (Phase 8.3 — REQUEST_CHANGES)', () => {
+  test('defaults to false (aggressive — never auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).strictMode).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: v }).strictMode).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: v }).strictMode).toBe(false);
+  });
+
+  test('empty/whitespace → false (NOT defaulted on like commitStatus)', () => {
+    // strictMode is aggressive (blocks merges), so unlike advisory defaults it
+    // does NOT follow the "empty = default-on" convention. Empty stays off.
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: '' }).strictMode).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: '   ' }).strictMode).toBe(false);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'TRUE' }).strictMode).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'Yes' }).strictMode).toBe(true);
+  });
+
+  test('case-insensitive: "FALSE", "No"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'FALSE' }).strictMode).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'No' }).strictMode).toBe(false);
+  });
+});
+
+describe('suggestReviewers (Phase 8.1 — CODEOWNERS suggestions)', () => {
+  test('defaults to false (read-only v1 convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).suggestReviewers).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: v }).suggestReviewers).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: v }).suggestReviewers).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, not auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: '' }).suggestReviewers).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: '   ' }).suggestReviewers).toBe(false);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: 'TRUE' }).suggestReviewers).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: 'Yes' }).suggestReviewers).toBe(true);
+  });
+});
+
+describe('autoAssignReviewers (Phase 8.1 — auto-assign)', () => {
+  test('defaults to false (opt-in mutation)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).autoAssignReviewers).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: v }).autoAssignReviewers).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: v }).autoAssignReviewers).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, not auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: '' }).autoAssignReviewers).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: '   ' }).autoAssignReviewers).toBe(false);
   });
 });

@@ -228,6 +228,20 @@ inputs:
     required: false
     default: 'true'
 
+  # --- v2 incremental review (Phase 6.3) ---
+  ZAI_INCREMENTAL_REVIEW:
+    description: |-
+      Suppress findings that were already reported on a prior run. When true
+      (default), every posted finding is content-hashed (file:line:severity:
+      title:description) and the hashes are stored inside a hidden HTML comment
+      in the review body. On re-push, the bot parses that block out of the
+      prior review and only surfaces NEW or CHANGED findings — CodeRabbit's
+      `auto_incremental_review` pattern. The suppressed count is mentioned in
+      the summary so reviewers know what was elided. Set to `false` to
+      re-report every finding on every run (the v1 behavior).
+    required: false
+    default: 'true'
+
   ZAI_REPO_CONFIG_ENABLED:
     description: |-
       Master switch for in-repo `.zai.yml` configuration. When true (default),
@@ -241,10 +255,49 @@ inputs:
     required: false
     default: 'true'
 
+  # --- v2 strict review mode (Phase 8.3) ---
+  ZAI_STRICT_MODE:
+    description: |-
+      Aggressive: when true, the PR auto-review is submitted as
+      `REQUEST_CHANGES` (instead of advisory `COMMENT`) whenever there is at
+      least one critical or high finding, which BLOCKS merge until the review
+      is dismissed or the changes are addressed. OFF by default and never
+      auto-enabled — both conditions must hold (this flag ON + a critical/high
+      finding) for a block to fire. Lower severities (medium/low/info) never
+      block. Requires `pull-requests: write` in the workflow's `permissions:`
+      block (already required to post reviews). Enable only on repos where you
+      trust the critical/high findings to gate merges.
+    required: false
+    default: 'false'
+
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
     required: false
     default: '${{ github.token }}'
+
+  # --- v2 CODEOWNERS-aware reviewer suggestions (Phase 8.1) ---
+  ZAI_SUGGEST_REVIEWERS:
+    description: |-
+      When true, the bot fetches the PR's CODEOWNERS file (from the head SHA),
+      computes the owners of the changed paths, and appends a "Suggested
+      reviewers" line to the review summary. Read-only — no PR mutation. OFF
+      by default. The CODEOWNERS file is treated as untrusted input
+      (attacker-controllable in fork PRs); fetch + parse are fail-soft (a
+      broken/missing CODEOWNERS is silently skipped with a warning).
+    required: false
+    default: 'false'
+
+  ZAI_AUTO_ASSIGN_REVIEWERS:
+    description: |-
+      When true, the bot additionally calls `pulls.requestReviewers` to assign
+      the suggested reviewers to the PR (implies ZAI_SUGGEST_REVIEWERS).
+      Requires `pull-requests: write` in the workflow's `permissions:` block.
+      Only `@user` handles are forwarded to the assignment API (org/team
+      handles appear in the summary only). OFF by default. Fail-soft: an
+      assignment failure (permissions, invalid users) logs a warning and never
+      fails the review.
+    required: false
+    default: 'false'
 
 runs:
   using: 'node20'

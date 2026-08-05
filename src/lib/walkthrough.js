@@ -422,6 +422,14 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
     lines.push('');
   }
 
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
+    lines.push('');
+  }
+
   // Count per severity.
   const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   for (const f of list) {

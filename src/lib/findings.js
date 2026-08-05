@@ -13,6 +13,8 @@
  * @module src/lib/findings.js
  */
 
+import { createHash } from 'node:crypto';
+
 // ---------------------------------------------------------------------------
 // Allowed-value tables (exported verbatim — the schema contract).
 // ---------------------------------------------------------------------------
@@ -759,6 +761,14 @@ export function formatFindingsAsSummary(findings, options = {}) {
     lines.push('');
   }
 
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
+    lines.push('');
+  }
+
   // Summary section.
   lines.push('### Summary');
   lines.push('');
@@ -807,6 +817,141 @@ export function formatFindingsAsSummary(findings, options = {}) {
 
   // Each line is followed by '\n' via join. The marker line is last.
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.3 — incremental review (findings dedup across runs)
+// ---------------------------------------------------------------------------
+//
+// On re-push the bot re-reviews and may re-post the same findings that were
+// already reported (and possibly resolved) on a prior run. To avoid the noise
+// of "the same findings re-appearing every push", we store a content hash of
+// each finding inside a hidden HTML comment appended to the review body. On
+// the next run we parse that block out of the prior review and suppress any
+// finding whose hash is unchanged — CodeRabbit's `auto_incremental_review`
+// pattern. The hash block is a SEPARATE HTML comment from {@link MARKER} so
+// the existing marker-based idempotency detection in `listBotReviews`
+// (which searches for `<!-- zai-code-review -->`) keeps working unchanged.
+
+/**
+ * The literal prefix/suffix of the hidden HTML comment that carries the
+ * findings hashes. Kept byte-exact — {@link parseFindingsHashBlock} matches
+ * this prefix. MUST be a distinct comment from {@link MARKER} so the marker
+ * scan and the hash scan don't collide.
+ */
+const HASH_BLOCK_PREFIX = '<!-- zai-hashes:';
+const HASH_BLOCK_SUFFIX = ' -->';
+
+/**
+ * Compute a stable content hash for a finding.
+ *
+ * The hash is SHA-256 (hex) of the canonical key
+ * `${file}:${line ?? 'null'}:${severity}:${title}:${description}`. Only those
+ * five fields participate — `evidence`, `suggestion`, `rule`, `confidence`,
+ * and `category` are intentionally excluded so a re-review that only changed
+ * the suggestion text does NOT re-surface the finding as "new" (the location
+ * and the issue identity are unchanged).
+ *
+ * Defensive: missing/non-string fields are coerced to '' (or 'null' for line)
+ * so a malformed finding never throws — it just hashes to a stable value.
+ *
+ * @param {Record<string, unknown>} finding
+ * @returns {string} 64-char lowercase hex SHA-256 digest.
+ */
+export function hashFinding(finding) {
+  const f = finding && typeof finding === 'object' ? finding : {};
+  const file = typeof f.file === 'string' ? f.file : '';
+  const line =
+    typeof f.line === 'number' && Number.isFinite(f.line) ? f.line : 'null';
+  const severity = typeof f.severity === 'string' ? f.severity : '';
+  const title = typeof f.title === 'string' ? f.title : '';
+  const description = typeof f.description === 'string' ? f.description : '';
+  const key = `${file}:${line}:${severity}:${title}:${description}`;
+  return createHash('sha256').update(key, 'utf8').digest('hex');
+}
+
+/**
+ * Render the hidden HTML comment block carrying the hashes of every finding.
+ *
+ * Output: `<!-- zai-hashes:h1,h2,h3 -->` (comma-joined, no spaces). Empty
+ * input produces `<!-- zai-hashes: -->` (empty list — still a valid block so
+ * the next run can parse it and get an empty Set).
+ *
+ * The block is appended to the review body (separately from {@link MARKER}).
+ * Dedups repeated hashes so a finding reported twice in the same run only
+ * appears once in the canonical set.
+ *
+ * @param {Record<string, unknown>[]} findings
+ * @returns {string}
+ */
+export function buildFindingsHashBlock(findings) {
+  const list = Array.isArray(findings) ? findings : [];
+  const seen = new Set();
+  for (const f of list) {
+    seen.add(hashFinding(f));
+  }
+  return `${HASH_BLOCK_PREFIX}${[...seen].join(',')}${HASH_BLOCK_SUFFIX}`;
+}
+
+/**
+ * Extract the findings hashes from a prior review body.
+ *
+ * Matches the FIRST `<!-- zai-hashes:... -->` comment (oldest wins when a body
+ * somehow carries more than one — the canonical block is the one the bot
+ * itself posts; a malicious/legacy body with two blocks is read
+ * conservatively). Returns the hashes as a Set of strings.
+ *
+ * Defensive: returns an empty Set for non-string input, missing block, or an
+ * empty list inside the block. Never throws.
+ *
+ * @param {string} reviewBody
+ * @returns {Set<string>}
+ */
+export function parseFindingsHashBlock(reviewBody) {
+  const out = new Set();
+  if (typeof reviewBody !== 'string') return out;
+  const match = reviewBody.match(/<!-- zai-hashes:(.*?) -->/);
+  if (!match) return out;
+  const inner = match[1];
+  if (typeof inner !== 'string' || inner.length === 0) return out;
+  for (const piece of inner.split(',')) {
+    const trimmed = piece.trim();
+    if (trimmed.length > 0) out.add(trimmed);
+  }
+  return out;
+}
+
+/**
+ * Drop findings whose hash is in `priorHashes` — the incremental filter.
+ *
+ * Used by the PR review path so a re-push only surfaces findings that are NEW
+ * or CHANGED since the last bot review (matching CodeRabbit's
+ * `auto_incremental_review` behavior). `priorHashes` is the Set returned by
+ * {@link parseFindingsHashBlock} against the prior review body.
+ *
+ * Defensive: a non-Set `priorHashes` (null/undefined) is treated as empty —
+ * i.e. "first run" semantics (everything is kept). A non-array `newFindings`
+ * yields `{ kept: [], suppressed: 0 }`.
+ *
+ * @param {Record<string, unknown>[]} newFindings
+ * @param {Set<string>} priorHashes
+ * @returns {{ kept: Record<string, unknown>[], suppressed: number }}
+ */
+export function filterIncrementalFindings(newFindings, priorHashes) {
+  const list = Array.isArray(newFindings) ? newFindings : [];
+  const known =
+    priorHashes instanceof Set ? priorHashes : new Set();
+  /** @type {Record<string, unknown>[]} */
+  const kept = [];
+  let suppressed = 0;
+  for (const f of list) {
+    if (known.has(hashFinding(f))) {
+      suppressed += 1;
+    } else {
+      kept.push(f);
+    }
+  }
+  return { kept, suppressed };
 }
 
 // Exported internals for testing (none beyond the public exports today).

@@ -1,0 +1,420 @@
+/**
+ * CODEOWNERS-aware reviewer suggestions (Phase 8.1).
+ *
+ * Parses the repo's CODEOWNERS file and suggests reviewers for the PR's changed
+ * paths. The suggestion is read-only by default (a line in the review summary);
+ * opt-in auto-assignment calls `pulls.requestReviewers`.
+ *
+ * The CODEOWNERS file is fetched from the PR's HEAD SHA and is treated as
+ * UNTRUSTED attacker-controllable input: in a fork PR, a contributor can commit
+ * a CODEOWNERS that names arbitrary `@user`/`@org/team` handles. The parser is
+ * therefore hand-rolled (no dependency), tolerant of malformed input, and never
+ * throws. {@link loadCodeowners} is fail-soft: ANY error (404, parse failure,
+ * network) collapses to `[]` rules + a `core.warning`.
+ *
+ * Matching mirrors GitHub's CODEOWNERS semantics: for each file, the LAST
+ * matching pattern in the file wins. Patterns support gitignore-style globs via
+ * the existing `picomatch` dependency (the same engine `glob.js` uses):
+ *   - `*` matches within a single path segment
+ *   - `**` matches across segments
+ *   - `?` matches one char
+ *   - `{a,b}` brace expansion
+ *   - `src/` (trailing slash) matches everything under `src/` recursively
+ *
+ * @module src/lib/codeowners.js
+ */
+
+import picomatch from 'picomatch';
+
+/** Hard cap on the size of a CODEOWNERS file we will parse (cost/DoS guard). */
+const MAX_CODEOWNERS_BYTES = 256 * 1024; // 256 KiB
+
+/** Candidate CODEOWNERS paths, searched in this order (GitHub's order). */
+export const CODEOWNERS_PATHS = ['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS'];
+
+/* ------------------------------------------------------------------ *
+ * parseCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Strip a trailing CODEOWNERS `# ...` comment from a line. A `#` only starts a
+ * comment when it is at the start of the line or preceded by whitespace
+ * (mirrors the convention used throughout this codebase; `value#frag` is NOT
+ * a comment). The `#` itself never appears in a valid owner handle.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+function stripComment(line) {
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '#') {
+      const prev = i > 0 ? line[i - 1] : '';
+      if (i === 0 || /\s/.test(prev)) {
+        return line.slice(0, i);
+      }
+    }
+  }
+  return line;
+}
+
+/**
+ * Parse a CODEOWNERS document into `[{pattern, owners}]`, in file order.
+ *
+ * Tolerant of malformed input and NEVER throws. Returns `[]` for non-string
+ * input, empty input, or documents with no valid lines.
+ *
+ * Each line:
+ *   - comment lines (`# ...`) are skipped
+ *   - inline comments (` ... # note`) are stripped (whitespace-prefixed `#`)
+ *   - blank lines (after comment-strip) are skipped
+ *   - the first whitespace-separated token is the `pattern`; trailing tokens
+ *     starting with `@` are the `owners`. A line with no pattern is skipped.
+ *   - a pattern with no `@`-owners yields `owners: []` (still a valid rule —
+ *     CODEOWNERS permits unowned patterns; they "match" with empty owners).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} text
+ * @returns {Array<{pattern: string, owners: string[]}>}
+ */
+export function parseCodeowners(text) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+  const out = [];
+  const lines = text.split(/\r?\n/);
+  for (const raw of lines) {
+    const stripped = stripComment(raw).trim();
+    if (stripped === '') continue;
+    // Split on runs of whitespace. The first token is the pattern; everything
+    // after is the owners list. CODEOWNERS tokens are separated by spaces/tabs.
+    const tokens = stripped.split(/\s+/);
+    const pattern = tokens[0];
+    if (!pattern) continue;
+    const owners = tokens.slice(1).filter((t) => t.length > 0);
+    out.push({ pattern, owners });
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * matchCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Convert a CODEOWNERS pattern into a picomatch glob.
+ *
+ * GitHub's CODEOWNERS treats a trailing slash (`src/`) as "everything under
+ * `src/` recursively" — picomatch expresses that as `src/**`. A pattern
+ * without a trailing slash is passed through unchanged (picomatch already
+ * understands `*`, `**`, `?`, `{a,b}`). A bare `*` stays `*` and matches any
+ * top-level file.
+ *
+ * CODEOWNERS does NOT support gitignore-style `!` negation, but picomatch
+ * interprets a leading `!` as negation. To keep CODEOWNERS semantics (and to
+ * keep an attacker-controllable CODEOWNERS from emitting "match everything"
+ * negation patterns), any leading run of `!` is stripped before compiling.
+ *
+ * @param {string} pattern
+ * @returns {string}
+ */
+function toGlob(pattern) {
+  let p = pattern;
+  // Strip leading `!` (CODEOWNERS has no negation; picomatch would mis-read it).
+  p = p.replace(/^!+/, '');
+  if (p.endsWith('/')) return `${p}**`;
+  return p;
+}
+
+/**
+ * Compile (memoized) a picomatch matcher for a CODEOWNERS pattern. We test each
+ * changed file against BOTH the full path and the basename (OR) — mirroring the
+ * `glob.js` convention so `*.js` matches both `foo.js` and `src/foo.js`.
+ *
+ * @param {string} pattern
+ * @returns {(filename: string) => boolean}
+ */
+const matcherCache = new Map();
+function matcherFor(pattern) {
+  let fn = matcherCache.get(pattern);
+  if (fn) return fn;
+  const glob = toGlob(pattern);
+  try {
+    const re = picomatch.makeRe(glob, { dot: true });
+    fn = (filename) => {
+      if (!re) return false;
+      if (re.test(filename)) return true;
+      // basename match (same convention as matchesAnyPattern in glob.js).
+      const slash = filename.lastIndexOf('/');
+      if (slash >= 0 && slash + 1 < filename.length) {
+        return re.test(filename.slice(slash + 1));
+      }
+      return false;
+    };
+  } catch {
+    fn = () => false;
+  }
+  matcherCache.set(pattern, fn);
+  return fn;
+}
+
+/**
+ * For each changed file, find the matching CODEOWNERS rules (LAST match wins,
+ * matching GitHub's behavior) and return a Map of `filename -> owners[]`.
+ *
+ * Files with no match are omitted from the Map (a `has(key)` check distinguishes
+ * "no rule matched" from "matched an unowned rule → owners: []").
+ *
+ * Never throws; tolerates non-array inputs (returns an empty Map).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {Array<{pattern: string, owners: string[]}>} codeownersRules
+ * @param {string[]} changedFiles
+ * @returns {Map<string, string[]>}
+ */
+export function matchCodeowners(codeownersRules, changedFiles) {
+  const out = new Map();
+  if (!Array.isArray(codeownersRules) || !Array.isArray(changedFiles)) {
+    return out;
+  }
+  if (codeownersRules.length === 0 || changedFiles.length === 0) {
+    return out;
+  }
+
+  for (const filename of changedFiles) {
+    if (typeof filename !== 'string' || filename.length === 0) continue;
+    let lastOwners = null; // null = no match yet; [] = matched an unowned rule
+    for (const rule of codeownersRules) {
+      if (!rule || typeof rule.pattern !== 'string') continue;
+      const match = matcherFor(rule.pattern);
+      if (match(filename)) {
+        lastOwners = Array.isArray(rule.owners) ? rule.owners.slice() : [];
+      }
+    }
+    if (lastOwners !== null) {
+      out.set(filename, lastOwners);
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * suggestReviewers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Aggregate unique owners across all changed files.
+ *
+ * Returns `{suggestedReviewers, byFile}` where `suggestedReviewers` is the
+ * de-duplicated owner list (order = first-seen across files in iteration
+ * order) and `byFile` is the Map from {@link matchCodeowners}.
+ *
+ * Owners from matched-but-unowned patterns (empty `owners: []`) contribute
+ * nothing; only non-empty owner lists are aggregated.
+ *
+ * Never throws; tolerates non-array inputs.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string[]} changedFiles
+ * @param {Array<{pattern: string, owners: string[]}>} codeownersRules
+ * @returns {{suggestedReviewers: string[], byFile: Map<string, string[]>}}
+ */
+export function suggestReviewers(changedFiles, codeownersRules) {
+  const byFile = matchCodeowners(codeownersRules, changedFiles);
+  const suggestedReviewers = [];
+  const seen = new Set();
+  for (const owners of byFile.values()) {
+    if (!Array.isArray(owners)) continue;
+    for (const owner of owners) {
+      if (typeof owner !== 'string' || owner.length === 0) continue;
+      if (seen.has(owner)) continue;
+      seen.add(owner);
+      suggestedReviewers.push(owner);
+    }
+  }
+  return { suggestedReviewers, byFile };
+}
+
+/* ------------------------------------------------------------------ *
+ * Suggestion rendering / selection helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Render a "Suggested reviewers" line for the review/comment body.
+ *
+ * Returns an empty string when `owners` is empty (so callers can always
+ * concatenate the result). The line lists every owner handle verbatim
+ * (already `@`-prefixed from the CODEOWNERS file). Pure (exported for testing).
+ *
+ * @param {string[]} owners
+ * @returns {string}
+ */
+export function formatSuggestedReviewersLine(owners) {
+  if (!Array.isArray(owners) || owners.length === 0) return '';
+  return `**Suggested reviewers:** ${owners.join(', ')}`;
+}
+
+/**
+ * Select the owners that can be passed to `pulls.requestReviewers`.
+ *
+ * The GitHub `requestReviewers` API accepts `reviewers` (user logins, no `@`)
+ * and `team_reviewers` (team slugs, no `@org/`). Team assignment requires
+ * extra org-level permissions the bot may not have, so we surface teams in the
+ * summary only and forward USERS to the assignment API. An owner qualifies as a
+ * user handle iff it is `@name` with no slash. Returns the logins WITHOUT the
+ * leading `@` (the API expects bare logins).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string[]} owners
+ * @returns {string[]}
+ */
+export function pickAssignableReviewers(owners) {
+  if (!Array.isArray(owners) || owners.length === 0) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of owners) {
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    // Strip a single leading `@`. (Handles from CODEOWNERS are `@login` or
+    // `@org/team`.) A user handle has no `/`.
+    const handle = raw.startsWith('@') ? raw.slice(1) : raw;
+    if (handle.includes('/')) continue; // team — summary only
+    if (handle.length === 0) continue;
+    if (seen.has(handle)) continue;
+    seen.add(handle);
+    out.push(handle);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * loadCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the PR head SHA from `opts.headSha` or
+ * `context.payload.pull_request.head.sha`.
+ *
+ * @param {Object} opts
+ * @returns {string}
+ */
+function resolveHeadSha(opts) {
+  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
+  const sha = opts.context?.payload?.pull_request?.head?.sha;
+  return typeof sha === 'string' ? sha : '';
+}
+
+/**
+ * Try to fetch a single path from the repo at `headSha`. Resolves to the
+ * decoded UTF-8 text on success, or `null` if the path is absent (404) or
+ * otherwise unavailable. Network/decode errors propagate to the caller (the
+ * outer loop converts them into a fail-soft warning).
+ *
+ * @param {object} octokit
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} path
+ * @param {string} ref
+ * @returns {Promise<string|null>}
+ */
+async function fetchPath(octokit, owner, repo, path, ref) {
+  let data;
+  try {
+    const resp = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+    data = resp?.data;
+  } catch (error) {
+    const status = error?.status;
+    if (status === 404) return null; // not at this path — try the next candidate
+    throw error; // other errors bubble to the fail-soft boundary
+  }
+  if (!data || typeof data.content !== 'string') return null;
+  const size = typeof data.size === 'number' ? data.size : data.content.length;
+  if (size > MAX_CODEOWNERS_BYTES) {
+    throw new Error(
+      `CODEOWNERS at ${path} is ${size} bytes (cap ${MAX_CODEOWNERS_BYTES})`,
+    );
+  }
+  const text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
+  if (text.length > MAX_CODEOWNERS_BYTES) {
+    throw new Error(
+      `CODEOWNERS at ${path} decodes to ${text.length} chars (cap ${MAX_CODEOWNERS_BYTES})`,
+    );
+  }
+  return text;
+}
+
+/**
+ * Load + parse the CODEOWNERS file from the PR's HEAD SHA. Treated as UNTRUSTED.
+ *
+ * Searches `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS` in order and
+ * returns the parsed rules from the FIRST path that exists. The fetch uses the
+ * PR head SHA as `ref` so the suggestion reflects the PR's OWN CODEOWNERS (not
+ * the base branch's).
+ *
+ * On ANY error (no file found, network failure, oversized, decode error) this
+ * function NEVER throws: it calls `deps.core.warning(...)` and returns `[]`.
+ *
+ * @param {Object} opts - `{ octokit, context, headSha? }`
+ * @param {Object} [deps] - `{ core }` (for warnings).
+ * @param {{warning?: Function, info?: Function}} [deps.core]
+ * @returns {Promise<Array<{pattern: string, owners: string[]}>>}
+ */
+export async function loadCodeowners(opts = {}, deps = {}) {
+  const { octokit, context } = opts;
+  const core = deps.core;
+  const warn = (msg) => {
+    if (core && typeof core.warning === 'function') core.warning(msg);
+  };
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) {
+    warn('codeowners: missing owner/repo in context; skipping CODEOWNERS load.');
+    return [];
+  }
+
+  const headSha = resolveHeadSha(opts);
+  if (headSha === '') {
+    warn('codeowners: could not resolve PR head SHA; skipping CODEOWNERS load.');
+    return [];
+  }
+
+  let text = null;
+  let foundPath = null;
+  try {
+    for (const path of CODEOWNERS_PATHS) {
+      const content = await fetchPath(octokit, owner, repo, path, headSha);
+      if (content !== null) {
+        text = content;
+        foundPath = path;
+        break;
+      }
+    }
+  } catch (error) {
+    warn(
+      `codeowners: failed to fetch CODEOWNERS: ${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+
+  if (text === null) {
+    warn(
+      `codeowners: no CODEOWNERS found at ${headSha.slice(0, 7)} ` +
+        `(tried ${CODEOWNERS_PATHS.join(', ')}).`,
+    );
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = parseCodeowners(text);
+  } catch (error) {
+    // parseCodeowners is never expected to throw, but defend in depth.
+    warn(
+      `codeowners: ${foundPath} failed to parse: ${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+  return parsed;
+}

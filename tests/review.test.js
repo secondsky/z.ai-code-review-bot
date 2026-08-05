@@ -13,6 +13,7 @@ import {
   buildReviewBody,
   buildReviewComments,
   buildReviewPayload,
+  resolveReviewEvent,
   listBotReviews,
   dismissStaleReviews,
   upsertReview,
@@ -167,6 +168,110 @@ describe('buildReviewPayload', () => {
       event: 'REQUEST_CHANGES',
     });
     expect(payload.event).toBe('REQUEST_CHANGES');
+  });
+
+  it('passes the event through unchanged when provided', () => {
+    // The caller (index.js) decides the event via resolveReviewEvent; the
+    // payload builder must forward whatever it gets verbatim.
+    const payload = buildReviewPayload({
+      body: 'b',
+      comments: [],
+      event: 'REQUEST_CHANGES',
+    });
+    expect(payload.event).toBe('REQUEST_CHANGES');
+    // And COMMENT stays COMMENT (no accidental escalation).
+    expect(
+      buildReviewPayload({ body: 'b', comments: [], event: 'COMMENT' }).event,
+    ).toBe('COMMENT');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * resolveReviewEvent (Phase 8.3 — strict mode)
+ * ------------------------------------------------------------------ */
+
+describe('resolveReviewEvent', () => {
+  it('returns COMMENT when strictMode is off (default), regardless of findings', () => {
+    const findings = [
+      { severity: 'critical' },
+      { severity: 'high' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: false })).toBe('COMMENT');
+  });
+
+  it('returns COMMENT when strictMode is off even with critical findings', () => {
+    // Strict mode is NEVER auto-enabled — the default config has it off.
+    expect(resolveReviewEvent([{ severity: 'critical' }], {})).toBe('COMMENT');
+    expect(
+      resolveReviewEvent([{ severity: 'critical' }], { strictMode: undefined }),
+    ).toBe('COMMENT');
+  });
+
+  it('returns COMMENT when strictMode is on but no critical/high findings', () => {
+    const findings = [
+      { severity: 'medium' },
+      { severity: 'low' },
+      { severity: 'info' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe('COMMENT');
+  });
+
+  it('returns COMMENT when strictMode is on but findings is empty', () => {
+    expect(resolveReviewEvent([], { strictMode: true })).toBe('COMMENT');
+  });
+
+  it('returns REQUEST_CHANGES when strictMode is on and a critical finding exists', () => {
+    const findings = [
+      { severity: 'low' },
+      { severity: 'critical' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe(
+      'REQUEST_CHANGES',
+    );
+  });
+
+  it('returns REQUEST_CHANGES when strictMode is on and a high finding exists', () => {
+    const findings = [
+      { severity: 'info' },
+      { severity: 'high' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe(
+      'REQUEST_CHANGES',
+    );
+  });
+
+  it('returns REQUEST_CHANGES when strictMode is on with a mix including critical', () => {
+    const findings = [
+      { severity: 'critical' },
+      { severity: 'high' },
+      { severity: 'medium' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe(
+      'REQUEST_CHANGES',
+    );
+  });
+
+  it('treats a critical finding as the trigger even alongside lower severities', () => {
+    // Only ONE critical/high is needed — the rest don't downgrade it.
+    const findings = [
+      { severity: 'medium' },
+      { severity: 'critical' },
+      { severity: 'low' },
+    ];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe(
+      'REQUEST_CHANGES',
+    );
+  });
+
+  it('ignores unknown severities (does not crash, does not escalate)', () => {
+    const findings = [{ severity: 'tremendous' }];
+    expect(resolveReviewEvent(findings, { strictMode: true })).toBe('COMMENT');
+  });
+
+  it('handles missing/invalid findings argument gracefully', () => {
+    expect(resolveReviewEvent(null, { strictMode: true })).toBe('COMMENT');
+    expect(resolveReviewEvent(undefined, { strictMode: true })).toBe('COMMENT');
+    expect(resolveReviewEvent('nope', { strictMode: true })).toBe('COMMENT');
   });
 });
 

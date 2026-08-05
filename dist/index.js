@@ -38687,6 +38687,18 @@ function loadConfig(inputs = {}, options = {}) {
   const walkthrough =
     walkthroughRaw === '' ? true : isTruthy(walkthroughRaw);
 
+  // Phase 6.3: incremental review. When true (default), the PR review path
+  // stores a content hash of every finding inside a hidden HTML comment in the
+  // review body. On re-push, the bot parses that block out of the prior
+  // review and suppresses findings whose hash is unchanged — CodeRabbit's
+  // `auto_incremental_review` pattern — so only NEW or CHANGED findings
+  // surface. Empty input means "use the default" (true), matching the
+  // scannersEnabled/commitStatus/walkthrough convention so direct callers get
+  // the feature without setting the input.
+  const incrementalReviewRaw = read(inputs, 'ZAI_INCREMENTAL_REVIEW').trim().toLowerCase();
+  const incrementalReview =
+    incrementalReviewRaw === '' ? true : isTruthy(incrementalReviewRaw);
+
   // Phase 3: in-repo config file (`.zai.yml`). The master switch defaults to
   // TRUE — repos can commit a `.zai.yml` to tailor review behavior (path
   // instructions, tone) WITHOUT editing their workflow YAML. The file is
@@ -38698,6 +38710,28 @@ function loadConfig(inputs = {}, options = {}) {
   const repoConfigEnabledRaw = read(inputs, 'ZAI_REPO_CONFIG_ENABLED').trim().toLowerCase();
   const repoConfigEnabled =
     repoConfigEnabledRaw === '' ? true : isTruthy(repoConfigEnabledRaw);
+
+  // Phase 8.3: strict review mode. When true, the PR auto-review is submitted
+  // with event=REQUEST_CHANGES (instead of COMMENT) whenever there are
+  // critical/high findings — which BLOCKS merge until the review is dismissed
+  // or the changes addressed. Aggressive: OFF by default and NEVER
+  // auto-enabled. Only fires when explicitly turned on AND a critical/high
+  // finding exists (resolveReviewEvent enforces both conditions). Requires
+  // `pull-requests: write` (already needed to post reviews).
+  const strictMode = isTruthy(read(inputs, 'ZAI_STRICT_MODE'));
+
+  // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default —
+  // when `ZAI_SUGGEST_REVIEWERS=true`, the bot parses the PR's CODEOWNERS,
+  // computes the owners of the changed paths, and appends a "Suggested
+  // reviewers" line to the review summary (no PR mutation). When
+  // `ZAI_AUTO_ASSIGN_REVIEWERS=true` (implies suggest), the bot additionally
+  // calls `pulls.requestReviewers` with the user handles. Both are OFF by
+  // default — matching the v1 read-only convention. The CODEOWNERS file is
+  // fetched from the head SHA and treated as UNTRUSTED (attacker-controllable
+  // in fork PRs); only `@user` handles (no `@org/team`) are forwarded to
+  // requestReviewers (teams require extra perms and are summary-only).
+  const suggestReviewers = isTruthy(read(inputs, 'ZAI_SUGGEST_REVIEWERS'));
+  const autoAssignReviewers = isTruthy(read(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS'));
 
   const config = {
     apiKey,
@@ -38729,7 +38763,11 @@ function loadConfig(inputs = {}, options = {}) {
     scannersCacheDir,
     commitStatus,
     walkthrough,
+    incrementalReview,
     repoConfigEnabled,
+    strictMode,
+    suggestReviewers,
+    autoAssignReviewers,
     githubToken,
   };
 
@@ -40073,6 +40111,8 @@ function joinBody(header, entries, options) {
   );
 }
 
+// EXTERNAL MODULE: external "node:crypto"
+var external_node_crypto_ = __nccwpck_require__(7598);
 ;// CONCATENATED MODULE: ./src/lib/findings.js
 /**
  * Structured-findings schema (v2).
@@ -40088,6 +40128,8 @@ function joinBody(header, entries, options) {
  *
  * @module src/lib/findings.js
  */
+
+
 
 // ---------------------------------------------------------------------------
 // Allowed-value tables (exported verbatim — the schema contract).
@@ -40835,6 +40877,14 @@ function formatFindingsAsSummary(findings, options = {}) {
     lines.push('');
   }
 
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
+    lines.push('');
+  }
+
   // Summary section.
   lines.push('### Summary');
   lines.push('');
@@ -40883,6 +40933,141 @@ function formatFindingsAsSummary(findings, options = {}) {
 
   // Each line is followed by '\n' via join. The marker line is last.
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.3 — incremental review (findings dedup across runs)
+// ---------------------------------------------------------------------------
+//
+// On re-push the bot re-reviews and may re-post the same findings that were
+// already reported (and possibly resolved) on a prior run. To avoid the noise
+// of "the same findings re-appearing every push", we store a content hash of
+// each finding inside a hidden HTML comment appended to the review body. On
+// the next run we parse that block out of the prior review and suppress any
+// finding whose hash is unchanged — CodeRabbit's `auto_incremental_review`
+// pattern. The hash block is a SEPARATE HTML comment from {@link MARKER} so
+// the existing marker-based idempotency detection in `listBotReviews`
+// (which searches for `<!-- zai-code-review -->`) keeps working unchanged.
+
+/**
+ * The literal prefix/suffix of the hidden HTML comment that carries the
+ * findings hashes. Kept byte-exact — {@link parseFindingsHashBlock} matches
+ * this prefix. MUST be a distinct comment from {@link MARKER} so the marker
+ * scan and the hash scan don't collide.
+ */
+const HASH_BLOCK_PREFIX = '<!-- zai-hashes:';
+const HASH_BLOCK_SUFFIX = ' -->';
+
+/**
+ * Compute a stable content hash for a finding.
+ *
+ * The hash is SHA-256 (hex) of the canonical key
+ * `${file}:${line ?? 'null'}:${severity}:${title}:${description}`. Only those
+ * five fields participate — `evidence`, `suggestion`, `rule`, `confidence`,
+ * and `category` are intentionally excluded so a re-review that only changed
+ * the suggestion text does NOT re-surface the finding as "new" (the location
+ * and the issue identity are unchanged).
+ *
+ * Defensive: missing/non-string fields are coerced to '' (or 'null' for line)
+ * so a malformed finding never throws — it just hashes to a stable value.
+ *
+ * @param {Record<string, unknown>} finding
+ * @returns {string} 64-char lowercase hex SHA-256 digest.
+ */
+function hashFinding(finding) {
+  const f = finding && typeof finding === 'object' ? finding : {};
+  const file = typeof f.file === 'string' ? f.file : '';
+  const line =
+    typeof f.line === 'number' && Number.isFinite(f.line) ? f.line : 'null';
+  const severity = typeof f.severity === 'string' ? f.severity : '';
+  const title = typeof f.title === 'string' ? f.title : '';
+  const description = typeof f.description === 'string' ? f.description : '';
+  const key = `${file}:${line}:${severity}:${title}:${description}`;
+  return (0,external_node_crypto_.createHash)('sha256').update(key, 'utf8').digest('hex');
+}
+
+/**
+ * Render the hidden HTML comment block carrying the hashes of every finding.
+ *
+ * Output: `<!-- zai-hashes:h1,h2,h3 -->` (comma-joined, no spaces). Empty
+ * input produces `<!-- zai-hashes: -->` (empty list — still a valid block so
+ * the next run can parse it and get an empty Set).
+ *
+ * The block is appended to the review body (separately from {@link MARKER}).
+ * Dedups repeated hashes so a finding reported twice in the same run only
+ * appears once in the canonical set.
+ *
+ * @param {Record<string, unknown>[]} findings
+ * @returns {string}
+ */
+function buildFindingsHashBlock(findings) {
+  const list = Array.isArray(findings) ? findings : [];
+  const seen = new Set();
+  for (const f of list) {
+    seen.add(hashFinding(f));
+  }
+  return `${HASH_BLOCK_PREFIX}${[...seen].join(',')}${HASH_BLOCK_SUFFIX}`;
+}
+
+/**
+ * Extract the findings hashes from a prior review body.
+ *
+ * Matches the FIRST `<!-- zai-hashes:... -->` comment (oldest wins when a body
+ * somehow carries more than one — the canonical block is the one the bot
+ * itself posts; a malicious/legacy body with two blocks is read
+ * conservatively). Returns the hashes as a Set of strings.
+ *
+ * Defensive: returns an empty Set for non-string input, missing block, or an
+ * empty list inside the block. Never throws.
+ *
+ * @param {string} reviewBody
+ * @returns {Set<string>}
+ */
+function parseFindingsHashBlock(reviewBody) {
+  const out = new Set();
+  if (typeof reviewBody !== 'string') return out;
+  const match = reviewBody.match(/<!-- zai-hashes:(.*?) -->/);
+  if (!match) return out;
+  const inner = match[1];
+  if (typeof inner !== 'string' || inner.length === 0) return out;
+  for (const piece of inner.split(',')) {
+    const trimmed = piece.trim();
+    if (trimmed.length > 0) out.add(trimmed);
+  }
+  return out;
+}
+
+/**
+ * Drop findings whose hash is in `priorHashes` — the incremental filter.
+ *
+ * Used by the PR review path so a re-push only surfaces findings that are NEW
+ * or CHANGED since the last bot review (matching CodeRabbit's
+ * `auto_incremental_review` behavior). `priorHashes` is the Set returned by
+ * {@link parseFindingsHashBlock} against the prior review body.
+ *
+ * Defensive: a non-Set `priorHashes` (null/undefined) is treated as empty —
+ * i.e. "first run" semantics (everything is kept). A non-array `newFindings`
+ * yields `{ kept: [], suppressed: 0 }`.
+ *
+ * @param {Record<string, unknown>[]} newFindings
+ * @param {Set<string>} priorHashes
+ * @returns {{ kept: Record<string, unknown>[], suppressed: number }}
+ */
+function filterIncrementalFindings(newFindings, priorHashes) {
+  const list = Array.isArray(newFindings) ? newFindings : [];
+  const known =
+    priorHashes instanceof Set ? priorHashes : new Set();
+  /** @type {Record<string, unknown>[]} */
+  const kept = [];
+  let suppressed = 0;
+  for (const f of list) {
+    if (known.has(hashFinding(f))) {
+      suppressed += 1;
+    } else {
+      kept.push(f);
+    }
+  }
+  return { kept, suppressed };
 }
 
 // Exported internals for testing (none beyond the public exports today).
@@ -41883,6 +42068,14 @@ function formatWalkthroughSummary(findings, files, options = {}) {
     lines.push('');
   }
 
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
+    lines.push('');
+  }
+
   // Count per severity.
   const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   for (const f of list) {
@@ -42477,7 +42670,7 @@ const review_SEVERITY_EMOJI = {
  *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string}} [metadata]
  * @returns {string}
  */
 function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -42499,6 +42692,13 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
   const truncated = typeof metadata.truncated === 'number' ? metadata.truncated : 0;
   if (truncated > 0) {
     lines.push(`_${truncated} findings truncated to cap._`);
+    lines.push('');
+  }
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
     lines.push('');
   }
 
@@ -42603,8 +42803,10 @@ function buildReviewComments(inlineFindings) {
 /**
  * Assemble the full `pulls.createReview` payload.
  *
- * `event` defaults to `'COMMENT'` (advisory review). When strict mode lands
- * (Phase 8.3) a caller can pass `'REQUEST_CHANGES'` to block merge.
+ * `event` defaults to `'COMMENT'` (advisory review). In strict mode (Phase
+ * 8.3) a caller passes `'REQUEST_CHANGES'` (resolved via {@link
+ * resolveReviewEvent}) to block merge until the requesting review is
+ * dismissed or the changes are addressed.
  *
  * @param {{body:string, comments:Array, event?:string}} opts
  * @returns {{body:string, event:string, comments:Array}}
@@ -42615,6 +42817,44 @@ function buildReviewPayload({ body, comments, event } = {}) {
     event: typeof event === 'string' && event.length > 0 ? event : 'COMMENT',
     comments: Array.isArray(comments) ? comments : [],
   };
+}
+
+/**
+ * The set of finding severities that — when present alongside a strict-mode
+ * config — escalate the review event from advisory (`COMMENT`) to blocking
+ * (`REQUEST_CHANGES`). Only `critical` and `high` qualify; medium/low/info
+ * stay advisory even under strict mode.
+ * @type {ReadonlySet<string>}
+ */
+const STRICT_SEVERITIES = new Set(['critical', 'high']);
+
+/**
+ * Decide which GitHub review `event` to submit: advisory `'COMMENT'` (default)
+ * or blocking `'REQUEST_CHANGES'` (strict mode).
+ *
+ * Strict mode is OFF by default and NEVER auto-enabled — it only fires when
+ * `config.strictMode === true`. When strict mode is on, the review escalates
+ * to `REQUEST_CHANGES` ONLY if at least one finding has severity `critical`
+ * or `high`. Lower severities (medium/low/info) and empty/unknown findings
+ * never trigger a block.
+ *
+ * `REQUEST_CHANGES` is a GitHub review state that blocks merge until the
+ * requesting review is dismissed or the changes are addressed — it is
+ * powerful, so this function is deliberately conservative: every condition
+ * must hold (explicit opt-in + a critical/high finding) for it to fire.
+ *
+ * @param {Array<{severity?:string}>} findings - the ranked/capped findings.
+ * @param {{strictMode?:boolean}} config - the merged config object.
+ * @returns {'COMMENT' | 'REQUEST_CHANGES'}
+ */
+function resolveReviewEvent(findings, config) {
+  if (!config || config.strictMode !== true) return 'COMMENT';
+  if (!Array.isArray(findings)) return 'COMMENT';
+  for (const f of findings) {
+    const sev = f && typeof f.severity === 'string' ? f.severity : '';
+    if (STRICT_SEVERITIES.has(sev)) return 'REQUEST_CHANGES';
+  }
+  return 'COMMENT';
 }
 
 /**
@@ -44201,8 +44441,6 @@ function parseAddedLines(patch) {
   return out;
 }
 
-// EXTERNAL MODULE: external "node:crypto"
-var external_node_crypto_ = __nccwpck_require__(7598);
 ;// CONCATENATED MODULE: ./src/lib/scanners/ensure-binary.js
 /**
  * Shared fetch-cache-verify helper for runtime-downloaded scanner binaries
@@ -46570,6 +46808,428 @@ async function loadRepoConfig(opts = {}, deps = {}) {
   return validated;
 }
 
+;// CONCATENATED MODULE: ./src/lib/codeowners.js
+/**
+ * CODEOWNERS-aware reviewer suggestions (Phase 8.1).
+ *
+ * Parses the repo's CODEOWNERS file and suggests reviewers for the PR's changed
+ * paths. The suggestion is read-only by default (a line in the review summary);
+ * opt-in auto-assignment calls `pulls.requestReviewers`.
+ *
+ * The CODEOWNERS file is fetched from the PR's HEAD SHA and is treated as
+ * UNTRUSTED attacker-controllable input: in a fork PR, a contributor can commit
+ * a CODEOWNERS that names arbitrary `@user`/`@org/team` handles. The parser is
+ * therefore hand-rolled (no dependency), tolerant of malformed input, and never
+ * throws. {@link loadCodeowners} is fail-soft: ANY error (404, parse failure,
+ * network) collapses to `[]` rules + a `core.warning`.
+ *
+ * Matching mirrors GitHub's CODEOWNERS semantics: for each file, the LAST
+ * matching pattern in the file wins. Patterns support gitignore-style globs via
+ * the existing `picomatch` dependency (the same engine `glob.js` uses):
+ *   - `*` matches within a single path segment
+ *   - `**` matches across segments
+ *   - `?` matches one char
+ *   - `{a,b}` brace expansion
+ *   - `src/` (trailing slash) matches everything under `src/` recursively
+ *
+ * @module src/lib/codeowners.js
+ */
+
+
+
+/** Hard cap on the size of a CODEOWNERS file we will parse (cost/DoS guard). */
+const MAX_CODEOWNERS_BYTES = 256 * 1024; // 256 KiB
+
+/** Candidate CODEOWNERS paths, searched in this order (GitHub's order). */
+const CODEOWNERS_PATHS = ['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS'];
+
+/* ------------------------------------------------------------------ *
+ * parseCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Strip a trailing CODEOWNERS `# ...` comment from a line. A `#` only starts a
+ * comment when it is at the start of the line or preceded by whitespace
+ * (mirrors the convention used throughout this codebase; `value#frag` is NOT
+ * a comment). The `#` itself never appears in a valid owner handle.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+function codeowners_stripComment(line) {
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '#') {
+      const prev = i > 0 ? line[i - 1] : '';
+      if (i === 0 || /\s/.test(prev)) {
+        return line.slice(0, i);
+      }
+    }
+  }
+  return line;
+}
+
+/**
+ * Parse a CODEOWNERS document into `[{pattern, owners}]`, in file order.
+ *
+ * Tolerant of malformed input and NEVER throws. Returns `[]` for non-string
+ * input, empty input, or documents with no valid lines.
+ *
+ * Each line:
+ *   - comment lines (`# ...`) are skipped
+ *   - inline comments (` ... # note`) are stripped (whitespace-prefixed `#`)
+ *   - blank lines (after comment-strip) are skipped
+ *   - the first whitespace-separated token is the `pattern`; trailing tokens
+ *     starting with `@` are the `owners`. A line with no pattern is skipped.
+ *   - a pattern with no `@`-owners yields `owners: []` (still a valid rule —
+ *     CODEOWNERS permits unowned patterns; they "match" with empty owners).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} text
+ * @returns {Array<{pattern: string, owners: string[]}>}
+ */
+function parseCodeowners(text) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+  const out = [];
+  const lines = text.split(/\r?\n/);
+  for (const raw of lines) {
+    const stripped = codeowners_stripComment(raw).trim();
+    if (stripped === '') continue;
+    // Split on runs of whitespace. The first token is the pattern; everything
+    // after is the owners list. CODEOWNERS tokens are separated by spaces/tabs.
+    const tokens = stripped.split(/\s+/);
+    const pattern = tokens[0];
+    if (!pattern) continue;
+    const owners = tokens.slice(1).filter((t) => t.length > 0);
+    out.push({ pattern, owners });
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * matchCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Convert a CODEOWNERS pattern into a picomatch glob.
+ *
+ * GitHub's CODEOWNERS treats a trailing slash (`src/`) as "everything under
+ * `src/` recursively" — picomatch expresses that as `src/**`. A pattern
+ * without a trailing slash is passed through unchanged (picomatch already
+ * understands `*`, `**`, `?`, `{a,b}`). A bare `*` stays `*` and matches any
+ * top-level file.
+ *
+ * CODEOWNERS does NOT support gitignore-style `!` negation, but picomatch
+ * interprets a leading `!` as negation. To keep CODEOWNERS semantics (and to
+ * keep an attacker-controllable CODEOWNERS from emitting "match everything"
+ * negation patterns), any leading run of `!` is stripped before compiling.
+ *
+ * @param {string} pattern
+ * @returns {string}
+ */
+function toGlob(pattern) {
+  let p = pattern;
+  // Strip leading `!` (CODEOWNERS has no negation; picomatch would mis-read it).
+  p = p.replace(/^!+/, '');
+  if (p.endsWith('/')) return `${p}**`;
+  return p;
+}
+
+/**
+ * Compile (memoized) a picomatch matcher for a CODEOWNERS pattern. We test each
+ * changed file against BOTH the full path and the basename (OR) — mirroring the
+ * `glob.js` convention so `*.js` matches both `foo.js` and `src/foo.js`.
+ *
+ * @param {string} pattern
+ * @returns {(filename: string) => boolean}
+ */
+const matcherCache = new Map();
+function matcherFor(pattern) {
+  let fn = matcherCache.get(pattern);
+  if (fn) return fn;
+  const glob = toGlob(pattern);
+  try {
+    const re = picomatch.makeRe(glob, { dot: true });
+    fn = (filename) => {
+      if (!re) return false;
+      if (re.test(filename)) return true;
+      // basename match (same convention as matchesAnyPattern in glob.js).
+      const slash = filename.lastIndexOf('/');
+      if (slash >= 0 && slash + 1 < filename.length) {
+        return re.test(filename.slice(slash + 1));
+      }
+      return false;
+    };
+  } catch {
+    fn = () => false;
+  }
+  matcherCache.set(pattern, fn);
+  return fn;
+}
+
+/**
+ * For each changed file, find the matching CODEOWNERS rules (LAST match wins,
+ * matching GitHub's behavior) and return a Map of `filename -> owners[]`.
+ *
+ * Files with no match are omitted from the Map (a `has(key)` check distinguishes
+ * "no rule matched" from "matched an unowned rule → owners: []").
+ *
+ * Never throws; tolerates non-array inputs (returns an empty Map).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {Array<{pattern: string, owners: string[]}>} codeownersRules
+ * @param {string[]} changedFiles
+ * @returns {Map<string, string[]>}
+ */
+function matchCodeowners(codeownersRules, changedFiles) {
+  const out = new Map();
+  if (!Array.isArray(codeownersRules) || !Array.isArray(changedFiles)) {
+    return out;
+  }
+  if (codeownersRules.length === 0 || changedFiles.length === 0) {
+    return out;
+  }
+
+  for (const filename of changedFiles) {
+    if (typeof filename !== 'string' || filename.length === 0) continue;
+    let lastOwners = null; // null = no match yet; [] = matched an unowned rule
+    for (const rule of codeownersRules) {
+      if (!rule || typeof rule.pattern !== 'string') continue;
+      const match = matcherFor(rule.pattern);
+      if (match(filename)) {
+        lastOwners = Array.isArray(rule.owners) ? rule.owners.slice() : [];
+      }
+    }
+    if (lastOwners !== null) {
+      out.set(filename, lastOwners);
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * suggestReviewers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Aggregate unique owners across all changed files.
+ *
+ * Returns `{suggestedReviewers, byFile}` where `suggestedReviewers` is the
+ * de-duplicated owner list (order = first-seen across files in iteration
+ * order) and `byFile` is the Map from {@link matchCodeowners}.
+ *
+ * Owners from matched-but-unowned patterns (empty `owners: []`) contribute
+ * nothing; only non-empty owner lists are aggregated.
+ *
+ * Never throws; tolerates non-array inputs.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string[]} changedFiles
+ * @param {Array<{pattern: string, owners: string[]}>} codeownersRules
+ * @returns {{suggestedReviewers: string[], byFile: Map<string, string[]>}}
+ */
+function suggestReviewers(changedFiles, codeownersRules) {
+  const byFile = matchCodeowners(codeownersRules, changedFiles);
+  const suggestedReviewers = [];
+  const seen = new Set();
+  for (const owners of byFile.values()) {
+    if (!Array.isArray(owners)) continue;
+    for (const owner of owners) {
+      if (typeof owner !== 'string' || owner.length === 0) continue;
+      if (seen.has(owner)) continue;
+      seen.add(owner);
+      suggestedReviewers.push(owner);
+    }
+  }
+  return { suggestedReviewers, byFile };
+}
+
+/* ------------------------------------------------------------------ *
+ * Suggestion rendering / selection helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Render a "Suggested reviewers" line for the review/comment body.
+ *
+ * Returns an empty string when `owners` is empty (so callers can always
+ * concatenate the result). The line lists every owner handle verbatim
+ * (already `@`-prefixed from the CODEOWNERS file). Pure (exported for testing).
+ *
+ * @param {string[]} owners
+ * @returns {string}
+ */
+function formatSuggestedReviewersLine(owners) {
+  if (!Array.isArray(owners) || owners.length === 0) return '';
+  return `**Suggested reviewers:** ${owners.join(', ')}`;
+}
+
+/**
+ * Select the owners that can be passed to `pulls.requestReviewers`.
+ *
+ * The GitHub `requestReviewers` API accepts `reviewers` (user logins, no `@`)
+ * and `team_reviewers` (team slugs, no `@org/`). Team assignment requires
+ * extra org-level permissions the bot may not have, so we surface teams in the
+ * summary only and forward USERS to the assignment API. An owner qualifies as a
+ * user handle iff it is `@name` with no slash. Returns the logins WITHOUT the
+ * leading `@` (the API expects bare logins).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string[]} owners
+ * @returns {string[]}
+ */
+function pickAssignableReviewers(owners) {
+  if (!Array.isArray(owners) || owners.length === 0) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of owners) {
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    // Strip a single leading `@`. (Handles from CODEOWNERS are `@login` or
+    // `@org/team`.) A user handle has no `/`.
+    const handle = raw.startsWith('@') ? raw.slice(1) : raw;
+    if (handle.includes('/')) continue; // team — summary only
+    if (handle.length === 0) continue;
+    if (seen.has(handle)) continue;
+    seen.add(handle);
+    out.push(handle);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * loadCodeowners
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the PR head SHA from `opts.headSha` or
+ * `context.payload.pull_request.head.sha`.
+ *
+ * @param {Object} opts
+ * @returns {string}
+ */
+function codeowners_resolveHeadSha(opts) {
+  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
+  const sha = opts.context?.payload?.pull_request?.head?.sha;
+  return typeof sha === 'string' ? sha : '';
+}
+
+/**
+ * Try to fetch a single path from the repo at `headSha`. Resolves to the
+ * decoded UTF-8 text on success, or `null` if the path is absent (404) or
+ * otherwise unavailable. Network/decode errors propagate to the caller (the
+ * outer loop converts them into a fail-soft warning).
+ *
+ * @param {object} octokit
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} path
+ * @param {string} ref
+ * @returns {Promise<string|null>}
+ */
+async function fetchPath(octokit, owner, repo, path, ref) {
+  let data;
+  try {
+    const resp = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+    data = resp?.data;
+  } catch (error) {
+    const status = error?.status;
+    if (status === 404) return null; // not at this path — try the next candidate
+    throw error; // other errors bubble to the fail-soft boundary
+  }
+  if (!data || typeof data.content !== 'string') return null;
+  const size = typeof data.size === 'number' ? data.size : data.content.length;
+  if (size > MAX_CODEOWNERS_BYTES) {
+    throw new Error(
+      `CODEOWNERS at ${path} is ${size} bytes (cap ${MAX_CODEOWNERS_BYTES})`,
+    );
+  }
+  const text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
+  if (text.length > MAX_CODEOWNERS_BYTES) {
+    throw new Error(
+      `CODEOWNERS at ${path} decodes to ${text.length} chars (cap ${MAX_CODEOWNERS_BYTES})`,
+    );
+  }
+  return text;
+}
+
+/**
+ * Load + parse the CODEOWNERS file from the PR's HEAD SHA. Treated as UNTRUSTED.
+ *
+ * Searches `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS` in order and
+ * returns the parsed rules from the FIRST path that exists. The fetch uses the
+ * PR head SHA as `ref` so the suggestion reflects the PR's OWN CODEOWNERS (not
+ * the base branch's).
+ *
+ * On ANY error (no file found, network failure, oversized, decode error) this
+ * function NEVER throws: it calls `deps.core.warning(...)` and returns `[]`.
+ *
+ * @param {Object} opts - `{ octokit, context, headSha? }`
+ * @param {Object} [deps] - `{ core }` (for warnings).
+ * @param {{warning?: Function, info?: Function}} [deps.core]
+ * @returns {Promise<Array<{pattern: string, owners: string[]}>>}
+ */
+async function loadCodeowners(opts = {}, deps = {}) {
+  const { octokit, context } = opts;
+  const core = deps.core;
+  const warn = (msg) => {
+    if (core && typeof core.warning === 'function') core.warning(msg);
+  };
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) {
+    warn('codeowners: missing owner/repo in context; skipping CODEOWNERS load.');
+    return [];
+  }
+
+  const headSha = codeowners_resolveHeadSha(opts);
+  if (headSha === '') {
+    warn('codeowners: could not resolve PR head SHA; skipping CODEOWNERS load.');
+    return [];
+  }
+
+  let text = null;
+  let foundPath = null;
+  try {
+    for (const path of CODEOWNERS_PATHS) {
+      const content = await fetchPath(octokit, owner, repo, path, headSha);
+      if (content !== null) {
+        text = content;
+        foundPath = path;
+        break;
+      }
+    }
+  } catch (error) {
+    warn(
+      `codeowners: failed to fetch CODEOWNERS: ${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+
+  if (text === null) {
+    warn(
+      `codeowners: no CODEOWNERS found at ${headSha.slice(0, 7)} ` +
+        `(tried ${CODEOWNERS_PATHS.join(', ')}).`,
+    );
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = parseCodeowners(text);
+  } catch (error) {
+    // parseCodeowners is never expected to throw, but defend in depth.
+    warn(
+      `codeowners: ${foundPath} failed to parse: ${error?.message ?? String(error)}`,
+    );
+    return [];
+  }
+  return parsed;
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -46599,6 +47259,7 @@ async function loadRepoConfig(opts = {}, deps = {}) {
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
 
 
 
@@ -46711,7 +47372,11 @@ const INPUT_NAMES = [
   'ZAI_SCANNERS_CACHE_DIR',
   'ZAI_COMMIT_STATUS',
   'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
   'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
   'GITHUB_TOKEN',
 ];
 
@@ -46745,6 +47410,26 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ *
+ * The note is appended (with a blank-line separator) so reviewers can see how
+ * many previously-resolved findings were elided. Returns the (possibly empty)
+ * summary with the note appended. Kept as a pure helper so it can be unit
+ * tested in isolation if needed.
+ *
+ * @param {string} summary  The model's original summary prose.
+ * @param {number} suppressedCount  How many findings were suppressed.
+ * @returns {string}
+ */
+function appendIncrementalNote(summary, suppressedCount) {
+  const base = typeof summary === 'string' ? summary : '';
+  const count = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  if (count === 0) return base;
+  const note = `_${count} previously-reported finding${count === 1 ? '' : 's'} suppressed (incremental review)._`;
+  return base.length === 0 ? note : `${base}\n\n${note}`;
 }
 
 /**
@@ -46799,8 +47484,14 @@ async function run(context, deps = {}) {
     partitionFindings: partitionFindingsFn = partitionFindings,
     buildReviewBody: buildReviewBodyFn = buildReviewBody,
     buildReviewComments: buildReviewCommentsFn = buildReviewComments,
+    resolveReviewEvent: resolveReviewEventFn = resolveReviewEvent,
     upsertReview: upsertReviewFn = upsertReview,
+    listBotReviews: listBotReviewsFn = listBotReviews,
     postFallbackComment: postFallbackCommentFn = postFallbackComment,
+    hashFinding: hashFindingFn = hashFinding,
+    buildFindingsHashBlock: buildFindingsHashBlockFn = buildFindingsHashBlock,
+    parseFindingsHashBlock: parseFindingsHashBlockFn = parseFindingsHashBlock,
+    filterIncrementalFindings: filterIncrementalFindingsFn = filterIncrementalFindings,
     runScanners: runScannersFn = runScanners,
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
@@ -46814,6 +47505,10 @@ async function run(context, deps = {}) {
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
+    loadCodeowners: loadCodeownersFn = loadCodeowners,
+    suggestReviewers: suggestReviewersFn = suggestReviewers,
+    formatSuggestedReviewersLine: formatSuggestedReviewersLineFn = formatSuggestedReviewersLine,
+    pickAssignableReviewers: pickAssignableReviewersFn = pickAssignableReviewers,
   } = deps;
 
   const event = eventName(context);
@@ -46980,7 +47675,133 @@ async function run(context, deps = {}) {
       },
     };
 
-    const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
+    // Phase 6.3: incremental review. On re-push, suppress findings whose
+    // content hash is unchanged since the last bot review so only NEW or
+    // CHANGED findings surface (CodeRabbit's auto_incremental_review pattern).
+    // The hash block appended to the prior review body carries the full set;
+    // we read it back here, filter, then re-emit a fresh full-set block on the
+    // new review. Fail-soft: any error reading prior reviews is logged and the
+    // run proceeds with the full findings set (no incremental suppression).
+    let priorHashes = new Set();
+    if (config.incrementalReview === true) {
+      try {
+        const priorReviews = await listBotReviewsFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+        });
+        // The most recent prior review is the canonical hash source. Reviews
+        // come back newest-first from the GitHub API; fall back to scanning
+        // any of them if the first lacks a hash block.
+        const withHashBlock = priorReviews.find(
+          (r) => typeof r?.body === 'string' && r.body.includes('<!-- zai-hashes:'),
+        );
+        if (withHashBlock) {
+          priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
+        }
+      } catch (priorErr) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Could not read prior reviews for incremental filter (${priorErr?.message ?? String(priorErr)}); posting full findings.`,
+          );
+        }
+      }
+    }
+    const { kept: keptFindings, suppressed: suppressedCount } =
+      filterIncrementalFindingsFn(result.findings, priorHashes);
+    if (suppressedCount > 0 && coreDep?.info) {
+      coreDep.info(
+        `Incremental review: suppressed ${suppressedCount} previously-reported finding(s).`,
+      );
+    }
+
+    // The hash block is built from the FULL findings set (not just kept) so
+    // the next run sees the complete canonical set — otherwise a finding that
+    // was suppressed this run would re-surface on the next. Empty string when
+    // incremental review is disabled OR there are no findings at all.
+    const hashBlock =
+      config.incrementalReview === true && Array.isArray(result.findings) && result.findings.length > 0
+        ? buildFindingsHashBlockFn(result.findings)
+        : '';
+
+    // Append a "previously-resolved" note to the model's summary so reviewers
+    // know what was elided. Only when suppression actually happened.
+    const baseSummary = typeof result.summary === 'string' ? result.summary : '';
+    const summaryWithIncrementalNote =
+      suppressedCount > 0
+        ? appendIncrementalNote(baseSummary, suppressedCount)
+        : baseSummary;
+
+    // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default
+    // (a "Suggested reviewers" line appended to the summary prose so it shows
+    // in BOTH the inline review body and the summary-only comment); opt-in
+    // auto-assignment additionally calls pulls.requestReviewers (after the
+    // review is posted, below). The CODEOWNERS file is fetched from the head
+    // SHA and treated as UNTRUSTED; loadCodeowners is fail-soft to [] on any
+    // error. autoAssignReviewers implies suggestReviewers.
+    let suggestedReviewers = [];
+    if (config.suggestReviewers || config.autoAssignReviewers) {
+      try {
+        const codeownersRules = await loadCodeownersFn(
+          { octokit, context, headSha: sha },
+          { core: coreDep },
+        );
+        if (codeownersRules.length > 0) {
+          const filenames = patchable
+            .map((f) => (typeof f?.filename === 'string' ? f.filename : ''))
+            .filter((fn) => fn.length > 0);
+          const suggestion = suggestReviewersFn(filenames, codeownersRules);
+          suggestedReviewers = suggestion.suggestedReviewers;
+        }
+      } catch (err) {
+        // Fail-soft: a broken CODEOWNERS path must never break the review.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS reviewer suggestions failed (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    }
+    const suggestedReviewersLine = formatSuggestedReviewersLineFn(suggestedReviewers);
+    // The suggestion line is carried through `metadata.suggestedReviewersLine`
+    // to the three summary renderers (buildReviewBody, formatFindingsAsSummary,
+    // formatWalkthroughSummary), which render it alongside the deterministic /
+    // truncated metadata lines. (Appending to the summary prose does not work
+    // for the flat findings path, which ignores the prose when findings=0.)
+    const finalSummary = summaryWithIncrementalNote;
+
+    // Phase 8.1: opt-in auto-assignment. Runs AFTER the review/comment is
+    // posted (caller awaits this before returning). Fail-soft: any assignment
+    // error (permissions, invalid users, rate limit) logs a warning and never
+    // fails the review. Only `@user` handles are forwarded (teams are
+    // summary-only). No-op when autoAssignReviewers is off or there are no
+    // assignable users.
+    const maybeAssignReviewers = async () => {
+      if (!config.autoAssignReviewers) return;
+      const reviewers = pickAssignableReviewersFn(suggestedReviewers);
+      if (reviewers.length === 0) return;
+      try {
+        await octokit.rest.pulls.requestReviewers({
+          owner,
+          repo,
+          pull_number: pullNumber,
+          reviewers,
+        });
+        if (coreDep?.info) {
+          coreDep.info(
+            `CODEOWNERS: requested ${reviewers.length} reviewer(s): ${reviewers.join(', ')}.`,
+          );
+        }
+      } catch (err) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS: failed to request reviewers (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    };
+
+    const { inline, summaryOnly } = partitionFindingsFn(keptFindings, patchable);
 
     const truncatedCount = Math.max(
       0,
@@ -46997,17 +47818,30 @@ async function run(context, deps = {}) {
       // are line-anchored and unaffected.
       walkthrough: config.walkthrough === true,
       files: patchable,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line (empty string when
+      // disabled/no CODEOWNERS/no matches → rendered as nothing).
+      suggestedReviewersLine,
     };
 
     if (inline.length > 0) {
       // Build the review body (summary + summary-only findings + marker) and
-      // the inline comments array, then submit as a GitHub review.
-      const reviewBody = buildReviewBodyFn(
-        result.summary,
+      // the inline comments array, then submit as a GitHub review. Phase 6.3:
+      // the hash block is appended AFTER the marker so listBotReviews' marker
+      // scan (which searches for `<!-- zai-code-review -->`) keeps working
+      // unchanged — the two HTML comments coexist in the same body.
+      const baseBody = buildReviewBodyFn(
+        finalSummary,
         summaryOnly,
         reviewMetadata,
       );
+      const reviewBody = hashBlock
+        ? `${baseBody}\n${hashBlock}`
+        : baseBody;
       const comments = buildReviewCommentsFn(inline);
+      // Phase 8.3: strict mode escalates the review event from advisory
+      // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
+      // a critical/high finding. Off by default; never auto-enabled.
+      const reviewEvent = resolveReviewEventFn(keptFindings, config);
       try {
         await upsertReviewFn({
           octokit,
@@ -47016,8 +47850,10 @@ async function run(context, deps = {}) {
           sha,
           body: reviewBody,
           comments,
+          event: reviewEvent,
           core: coreDep,
         });
+        await maybeAssignReviewers();
         return;
       } catch (reviewError) {
         // NEVER silently lose the review. Fall back to a single issue comment
@@ -47029,7 +47865,7 @@ async function run(context, deps = {}) {
         }
         const fallbackBody = buildFallbackBody(
           reviewBody,
-          result.findings,
+          keptFindings,
           config.reviewerName,
         );
         await postFallbackCommentFn({
@@ -47037,6 +47873,7 @@ async function run(context, deps = {}) {
           context: reviewContext,
           body: fallbackBody,
         });
+        await maybeAssignReviewers();
         return;
       }
     }
@@ -47045,28 +47882,34 @@ async function run(context, deps = {}) {
     // via the existing marker-upsert path (keeps idempotency for the
     // no-findings / all-file-level case). When walkthrough is enabled (default)
     // and there are findings, render as a dependency-ordered walkthrough;
-    // otherwise fall back to the flat severity-grouped summary.
+    // otherwise fall back to the flat severity-grouped summary. Phase 6.3:
+    // the summary uses the KEPT findings (after incremental suppression) and
+    // the hash block is appended after the marker (same coexistence model as
+    // the inline-review branch).
     const useWalkthrough =
-      config.walkthrough && Array.isArray(result.findings) && result.findings.length > 0;
+      config.walkthrough && Array.isArray(keptFindings) && keptFindings.length > 0;
     const summaryMetadata = {
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
-      summary: typeof result.summary === 'string' ? result.summary : '',
+      summary: finalSummary,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line.
+      suggestedReviewersLine,
     };
     const content = useWalkthrough
-      ? formatWalkthroughSummaryFn(result.findings, patchable, {
+      ? formatWalkthroughSummaryFn(keptFindings, patchable, {
           reviewerName: config.reviewerName,
           metadata: summaryMetadata,
         })
-      : formatFindingsAsSummaryFn(result.findings, {
+      : formatFindingsAsSummaryFn(keptFindings, {
           reviewerName: config.reviewerName,
           metadata: summaryMetadata,
         });
-    const body = buildCommentBodyFn({
+    const commentBody = buildCommentBodyFn({
       title: config.reviewerName,
       content,
       marker: MARKER,
     });
+    const body = hashBlock ? `${commentBody}\n${hashBlock}` : commentBody;
     await upsertReviewCommentFn({
       octokit,
       owner,
@@ -47076,6 +47919,7 @@ async function run(context, deps = {}) {
       marker: MARKER,
       core: coreDep,
     });
+    await maybeAssignReviewers();
     return;
   }
 

@@ -271,6 +271,18 @@ export function loadConfig(inputs = {}, options = {}) {
   const walkthrough =
     walkthroughRaw === '' ? true : isTruthy(walkthroughRaw);
 
+  // Phase 6.3: incremental review. When true (default), the PR review path
+  // stores a content hash of every finding inside a hidden HTML comment in the
+  // review body. On re-push, the bot parses that block out of the prior
+  // review and suppresses findings whose hash is unchanged — CodeRabbit's
+  // `auto_incremental_review` pattern — so only NEW or CHANGED findings
+  // surface. Empty input means "use the default" (true), matching the
+  // scannersEnabled/commitStatus/walkthrough convention so direct callers get
+  // the feature without setting the input.
+  const incrementalReviewRaw = read(inputs, 'ZAI_INCREMENTAL_REVIEW').trim().toLowerCase();
+  const incrementalReview =
+    incrementalReviewRaw === '' ? true : isTruthy(incrementalReviewRaw);
+
   // Phase 3: in-repo config file (`.zai.yml`). The master switch defaults to
   // TRUE — repos can commit a `.zai.yml` to tailor review behavior (path
   // instructions, tone) WITHOUT editing their workflow YAML. The file is
@@ -282,6 +294,28 @@ export function loadConfig(inputs = {}, options = {}) {
   const repoConfigEnabledRaw = read(inputs, 'ZAI_REPO_CONFIG_ENABLED').trim().toLowerCase();
   const repoConfigEnabled =
     repoConfigEnabledRaw === '' ? true : isTruthy(repoConfigEnabledRaw);
+
+  // Phase 8.3: strict review mode. When true, the PR auto-review is submitted
+  // with event=REQUEST_CHANGES (instead of COMMENT) whenever there are
+  // critical/high findings — which BLOCKS merge until the review is dismissed
+  // or the changes addressed. Aggressive: OFF by default and NEVER
+  // auto-enabled. Only fires when explicitly turned on AND a critical/high
+  // finding exists (resolveReviewEvent enforces both conditions). Requires
+  // `pull-requests: write` (already needed to post reviews).
+  const strictMode = isTruthy(read(inputs, 'ZAI_STRICT_MODE'));
+
+  // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default —
+  // when `ZAI_SUGGEST_REVIEWERS=true`, the bot parses the PR's CODEOWNERS,
+  // computes the owners of the changed paths, and appends a "Suggested
+  // reviewers" line to the review summary (no PR mutation). When
+  // `ZAI_AUTO_ASSIGN_REVIEWERS=true` (implies suggest), the bot additionally
+  // calls `pulls.requestReviewers` with the user handles. Both are OFF by
+  // default — matching the v1 read-only convention. The CODEOWNERS file is
+  // fetched from the head SHA and treated as UNTRUSTED (attacker-controllable
+  // in fork PRs); only `@user` handles (no `@org/team`) are forwarded to
+  // requestReviewers (teams require extra perms and are summary-only).
+  const suggestReviewers = isTruthy(read(inputs, 'ZAI_SUGGEST_REVIEWERS'));
+  const autoAssignReviewers = isTruthy(read(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS'));
 
   const config = {
     apiKey,
@@ -313,7 +347,11 @@ export function loadConfig(inputs = {}, options = {}) {
     scannersCacheDir,
     commitStatus,
     walkthrough,
+    incrementalReview,
     repoConfigEnabled,
+    strictMode,
+    suggestReviewers,
+    autoAssignReviewers,
     githubToken,
   };
 

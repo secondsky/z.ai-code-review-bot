@@ -52,13 +52,21 @@ import {
 } from './lib/changed-files.js';
 import { resolveSystemPrompt } from './lib/prompt.js';
 import { runStructuredReview, isLargePr } from './lib/auto-review.js';
-import { formatFindingsAsSummary } from './lib/findings.js';
+import {
+  formatFindingsAsSummary,
+  hashFinding,
+  buildFindingsHashBlock,
+  parseFindingsHashBlock,
+  filterIncrementalFindings,
+} from './lib/findings.js';
 import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
 import {
   buildReviewBody,
   buildReviewComments,
+  resolveReviewEvent,
   upsertReview,
+  listBotReviews,
   postFallbackComment,
 } from './lib/review.js';
 import { parseCommand } from './lib/commands.js';
@@ -68,6 +76,12 @@ import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 import { setReviewStatus, buildStatusDescription } from './lib/status.js';
 import { loadRepoConfig, mergeRepoConfig } from './lib/repo-config.js';
+import {
+  loadCodeowners,
+  suggestReviewers,
+  formatSuggestedReviewersLine,
+  pickAssignableReviewers,
+} from './lib/codeowners.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -153,7 +167,11 @@ export const INPUT_NAMES = [
   'ZAI_SCANNERS_CACHE_DIR',
   'ZAI_COMMIT_STATUS',
   'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
   'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
   'GITHUB_TOKEN',
 ];
 
@@ -187,6 +205,26 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ *
+ * The note is appended (with a blank-line separator) so reviewers can see how
+ * many previously-resolved findings were elided. Returns the (possibly empty)
+ * summary with the note appended. Kept as a pure helper so it can be unit
+ * tested in isolation if needed.
+ *
+ * @param {string} summary  The model's original summary prose.
+ * @param {number} suppressedCount  How many findings were suppressed.
+ * @returns {string}
+ */
+function appendIncrementalNote(summary, suppressedCount) {
+  const base = typeof summary === 'string' ? summary : '';
+  const count = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  if (count === 0) return base;
+  const note = `_${count} previously-reported finding${count === 1 ? '' : 's'} suppressed (incremental review)._`;
+  return base.length === 0 ? note : `${base}\n\n${note}`;
 }
 
 /**
@@ -241,8 +279,14 @@ export async function run(context, deps = {}) {
     partitionFindings: partitionFindingsFn = partitionFindings,
     buildReviewBody: buildReviewBodyFn = buildReviewBody,
     buildReviewComments: buildReviewCommentsFn = buildReviewComments,
+    resolveReviewEvent: resolveReviewEventFn = resolveReviewEvent,
     upsertReview: upsertReviewFn = upsertReview,
+    listBotReviews: listBotReviewsFn = listBotReviews,
     postFallbackComment: postFallbackCommentFn = postFallbackComment,
+    hashFinding: hashFindingFn = hashFinding,
+    buildFindingsHashBlock: buildFindingsHashBlockFn = buildFindingsHashBlock,
+    parseFindingsHashBlock: parseFindingsHashBlockFn = parseFindingsHashBlock,
+    filterIncrementalFindings: filterIncrementalFindingsFn = filterIncrementalFindings,
     runScanners: runScannersFn = runScanners,
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
@@ -256,6 +300,10 @@ export async function run(context, deps = {}) {
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
+    loadCodeowners: loadCodeownersFn = loadCodeowners,
+    suggestReviewers: suggestReviewersFn = suggestReviewers,
+    formatSuggestedReviewersLine: formatSuggestedReviewersLineFn = formatSuggestedReviewersLine,
+    pickAssignableReviewers: pickAssignableReviewersFn = pickAssignableReviewers,
   } = deps;
 
   const event = eventName(context);
@@ -422,7 +470,133 @@ export async function run(context, deps = {}) {
       },
     };
 
-    const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
+    // Phase 6.3: incremental review. On re-push, suppress findings whose
+    // content hash is unchanged since the last bot review so only NEW or
+    // CHANGED findings surface (CodeRabbit's auto_incremental_review pattern).
+    // The hash block appended to the prior review body carries the full set;
+    // we read it back here, filter, then re-emit a fresh full-set block on the
+    // new review. Fail-soft: any error reading prior reviews is logged and the
+    // run proceeds with the full findings set (no incremental suppression).
+    let priorHashes = new Set();
+    if (config.incrementalReview === true) {
+      try {
+        const priorReviews = await listBotReviewsFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+        });
+        // The most recent prior review is the canonical hash source. Reviews
+        // come back newest-first from the GitHub API; fall back to scanning
+        // any of them if the first lacks a hash block.
+        const withHashBlock = priorReviews.find(
+          (r) => typeof r?.body === 'string' && r.body.includes('<!-- zai-hashes:'),
+        );
+        if (withHashBlock) {
+          priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
+        }
+      } catch (priorErr) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Could not read prior reviews for incremental filter (${priorErr?.message ?? String(priorErr)}); posting full findings.`,
+          );
+        }
+      }
+    }
+    const { kept: keptFindings, suppressed: suppressedCount } =
+      filterIncrementalFindingsFn(result.findings, priorHashes);
+    if (suppressedCount > 0 && coreDep?.info) {
+      coreDep.info(
+        `Incremental review: suppressed ${suppressedCount} previously-reported finding(s).`,
+      );
+    }
+
+    // The hash block is built from the FULL findings set (not just kept) so
+    // the next run sees the complete canonical set — otherwise a finding that
+    // was suppressed this run would re-surface on the next. Empty string when
+    // incremental review is disabled OR there are no findings at all.
+    const hashBlock =
+      config.incrementalReview === true && Array.isArray(result.findings) && result.findings.length > 0
+        ? buildFindingsHashBlockFn(result.findings)
+        : '';
+
+    // Append a "previously-resolved" note to the model's summary so reviewers
+    // know what was elided. Only when suppression actually happened.
+    const baseSummary = typeof result.summary === 'string' ? result.summary : '';
+    const summaryWithIncrementalNote =
+      suppressedCount > 0
+        ? appendIncrementalNote(baseSummary, suppressedCount)
+        : baseSummary;
+
+    // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default
+    // (a "Suggested reviewers" line appended to the summary prose so it shows
+    // in BOTH the inline review body and the summary-only comment); opt-in
+    // auto-assignment additionally calls pulls.requestReviewers (after the
+    // review is posted, below). The CODEOWNERS file is fetched from the head
+    // SHA and treated as UNTRUSTED; loadCodeowners is fail-soft to [] on any
+    // error. autoAssignReviewers implies suggestReviewers.
+    let suggestedReviewers = [];
+    if (config.suggestReviewers || config.autoAssignReviewers) {
+      try {
+        const codeownersRules = await loadCodeownersFn(
+          { octokit, context, headSha: sha },
+          { core: coreDep },
+        );
+        if (codeownersRules.length > 0) {
+          const filenames = patchable
+            .map((f) => (typeof f?.filename === 'string' ? f.filename : ''))
+            .filter((fn) => fn.length > 0);
+          const suggestion = suggestReviewersFn(filenames, codeownersRules);
+          suggestedReviewers = suggestion.suggestedReviewers;
+        }
+      } catch (err) {
+        // Fail-soft: a broken CODEOWNERS path must never break the review.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS reviewer suggestions failed (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    }
+    const suggestedReviewersLine = formatSuggestedReviewersLineFn(suggestedReviewers);
+    // The suggestion line is carried through `metadata.suggestedReviewersLine`
+    // to the three summary renderers (buildReviewBody, formatFindingsAsSummary,
+    // formatWalkthroughSummary), which render it alongside the deterministic /
+    // truncated metadata lines. (Appending to the summary prose does not work
+    // for the flat findings path, which ignores the prose when findings=0.)
+    const finalSummary = summaryWithIncrementalNote;
+
+    // Phase 8.1: opt-in auto-assignment. Runs AFTER the review/comment is
+    // posted (caller awaits this before returning). Fail-soft: any assignment
+    // error (permissions, invalid users, rate limit) logs a warning and never
+    // fails the review. Only `@user` handles are forwarded (teams are
+    // summary-only). No-op when autoAssignReviewers is off or there are no
+    // assignable users.
+    const maybeAssignReviewers = async () => {
+      if (!config.autoAssignReviewers) return;
+      const reviewers = pickAssignableReviewersFn(suggestedReviewers);
+      if (reviewers.length === 0) return;
+      try {
+        await octokit.rest.pulls.requestReviewers({
+          owner,
+          repo,
+          pull_number: pullNumber,
+          reviewers,
+        });
+        if (coreDep?.info) {
+          coreDep.info(
+            `CODEOWNERS: requested ${reviewers.length} reviewer(s): ${reviewers.join(', ')}.`,
+          );
+        }
+      } catch (err) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS: failed to request reviewers (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    };
+
+    const { inline, summaryOnly } = partitionFindingsFn(keptFindings, patchable);
 
     const truncatedCount = Math.max(
       0,
@@ -439,17 +613,30 @@ export async function run(context, deps = {}) {
       // are line-anchored and unaffected.
       walkthrough: config.walkthrough === true,
       files: patchable,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line (empty string when
+      // disabled/no CODEOWNERS/no matches → rendered as nothing).
+      suggestedReviewersLine,
     };
 
     if (inline.length > 0) {
       // Build the review body (summary + summary-only findings + marker) and
-      // the inline comments array, then submit as a GitHub review.
-      const reviewBody = buildReviewBodyFn(
-        result.summary,
+      // the inline comments array, then submit as a GitHub review. Phase 6.3:
+      // the hash block is appended AFTER the marker so listBotReviews' marker
+      // scan (which searches for `<!-- zai-code-review -->`) keeps working
+      // unchanged — the two HTML comments coexist in the same body.
+      const baseBody = buildReviewBodyFn(
+        finalSummary,
         summaryOnly,
         reviewMetadata,
       );
+      const reviewBody = hashBlock
+        ? `${baseBody}\n${hashBlock}`
+        : baseBody;
       const comments = buildReviewCommentsFn(inline);
+      // Phase 8.3: strict mode escalates the review event from advisory
+      // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
+      // a critical/high finding. Off by default; never auto-enabled.
+      const reviewEvent = resolveReviewEventFn(keptFindings, config);
       try {
         await upsertReviewFn({
           octokit,
@@ -458,8 +645,10 @@ export async function run(context, deps = {}) {
           sha,
           body: reviewBody,
           comments,
+          event: reviewEvent,
           core: coreDep,
         });
+        await maybeAssignReviewers();
         return;
       } catch (reviewError) {
         // NEVER silently lose the review. Fall back to a single issue comment
@@ -471,7 +660,7 @@ export async function run(context, deps = {}) {
         }
         const fallbackBody = buildFallbackBody(
           reviewBody,
-          result.findings,
+          keptFindings,
           config.reviewerName,
         );
         await postFallbackCommentFn({
@@ -479,6 +668,7 @@ export async function run(context, deps = {}) {
           context: reviewContext,
           body: fallbackBody,
         });
+        await maybeAssignReviewers();
         return;
       }
     }
@@ -487,28 +677,34 @@ export async function run(context, deps = {}) {
     // via the existing marker-upsert path (keeps idempotency for the
     // no-findings / all-file-level case). When walkthrough is enabled (default)
     // and there are findings, render as a dependency-ordered walkthrough;
-    // otherwise fall back to the flat severity-grouped summary.
+    // otherwise fall back to the flat severity-grouped summary. Phase 6.3:
+    // the summary uses the KEPT findings (after incremental suppression) and
+    // the hash block is appended after the marker (same coexistence model as
+    // the inline-review branch).
     const useWalkthrough =
-      config.walkthrough && Array.isArray(result.findings) && result.findings.length > 0;
+      config.walkthrough && Array.isArray(keptFindings) && keptFindings.length > 0;
     const summaryMetadata = {
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
-      summary: typeof result.summary === 'string' ? result.summary : '',
+      summary: finalSummary,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line.
+      suggestedReviewersLine,
     };
     const content = useWalkthrough
-      ? formatWalkthroughSummaryFn(result.findings, patchable, {
+      ? formatWalkthroughSummaryFn(keptFindings, patchable, {
           reviewerName: config.reviewerName,
           metadata: summaryMetadata,
         })
-      : formatFindingsAsSummaryFn(result.findings, {
+      : formatFindingsAsSummaryFn(keptFindings, {
           reviewerName: config.reviewerName,
           metadata: summaryMetadata,
         });
-    const body = buildCommentBodyFn({
+    const commentBody = buildCommentBodyFn({
       title: config.reviewerName,
       content,
       marker: MARKER,
     });
+    const body = hashBlock ? `${commentBody}\n${hashBlock}` : commentBody;
     await upsertReviewCommentFn({
       octokit,
       owner,
@@ -518,6 +714,7 @@ export async function run(context, deps = {}) {
       marker: MARKER,
       core: coreDep,
     });
+    await maybeAssignReviewers();
     return;
   }
 

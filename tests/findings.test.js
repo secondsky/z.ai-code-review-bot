@@ -24,6 +24,10 @@ import {
   rankAndCapFindings,
   mergeFindings,
   formatFindingsAsSummary,
+  hashFinding,
+  buildFindingsHashBlock,
+  parseFindingsHashBlock,
+  filterIncrementalFindings,
 } from '../src/lib/findings.js';
 
 /** A fully valid finding used as the base for mutations in tests. */
@@ -828,5 +832,262 @@ describe('parseStructuredReview', () => {
     });
     const { findings } = parseStructuredReview(payload);
     expect(findings).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 6.3 — incremental review (findings dedup across runs)
+ * ------------------------------------------------------------------ */
+
+describe('hashFinding', () => {
+  it('is stable: the same finding content yields the same hash', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding(validFinding());
+    expect(a).toBe(b);
+  });
+
+  it('produces a 64-char SHA-256 hex string', () => {
+    const h = hashFinding(validFinding());
+    expect(typeof h).toBe('string');
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('changes when the file changes', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding({ ...validFinding(), file: 'src/other.js' });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the line changes', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding({ ...validFinding(), line: 43 });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the severity changes', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding({ ...validFinding(), severity: 'critical' });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the title changes', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding({ ...validFinding(), title: 'A different issue' });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the description changes', () => {
+    const a = hashFinding(validFinding());
+    const b = hashFinding({ ...validFinding(), description: 'A different body.' });
+    expect(a).not.toBe(b);
+  });
+
+  it('treats null line deterministically (collapses to "null")', () => {
+    // Two file-level findings at the same file with the same content hash equal.
+    const a = hashFinding({ ...validFinding(), line: null });
+    const b = hashFinding({ ...validFinding(), line: null });
+    expect(a).toBe(b);
+  });
+
+  it('ignores fields that are NOT part of the hash key (evidence, suggestion, rule, confidence, category)', () => {
+    const base = validFinding();
+    const a = hashFinding(base);
+    const b = hashFinding({
+      ...base,
+      evidence: 'different evidence',
+      suggestion: 'different suggestion',
+      rule: 'eslint:x',
+      confidence: 'high',
+      category: 'security',
+    });
+    // The hash is over file:line:severity:title:description only.
+    expect(a).toBe(b);
+  });
+
+  it('treats a finding with line:null and a finding with line omitted identically', () => {
+    const withNull = { ...validFinding(), line: null };
+    const { line: _omit, ...withoutLine } = validFinding();
+    void _omit;
+    expect(hashFinding(withNull)).toBe(hashFinding({ ...withoutLine, line: null }));
+  });
+});
+
+describe('buildFindingsHashBlock', () => {
+  it('renders the canonical hidden-comment block with comma-joined hashes', () => {
+    const f1 = validFinding();
+    const f2 = { ...validFinding(), line: 99, title: 'Other' };
+    const block = buildFindingsHashBlock([f1, f2]);
+    const h1 = hashFinding(f1);
+    const h2 = hashFinding(f2);
+    expect(block).toBe(`<!-- zai-hashes:${h1},${h2} -->`);
+  });
+
+  it('emits an empty hashes block for an empty findings list', () => {
+    expect(buildFindingsHashBlock([])).toBe('<!-- zai-hashes: -->');
+  });
+
+  it('emits a single-hash block for one finding', () => {
+    const f = validFinding();
+    expect(buildFindingsHashBlock([f])).toBe(
+      `<!-- zai-hashes:${hashFinding(f)} -->`,
+    );
+  });
+
+  it('dedups repeated hashes (same finding twice → one entry)', () => {
+    const f = validFinding();
+    const block = buildFindingsHashBlock([f, { ...f }]);
+    expect(block).toBe(`<!-- zai-hashes:${hashFinding(f)} -->`);
+  });
+});
+
+describe('parseFindingsHashBlock', () => {
+  it('returns a Set of the hashes embedded in the block', () => {
+    const f1 = validFinding();
+    const f2 = { ...validFinding(), line: 7, title: 'X' };
+    const body = `## Review\n\nprose\n\n${buildFindingsHashBlock([f1, f2])}`;
+    const set = parseFindingsHashBlock(body);
+    expect(set).toBeInstanceOf(Set);
+    expect(set.size).toBe(2);
+    expect(set.has(hashFinding(f1))).toBe(true);
+    expect(set.has(hashFinding(f2))).toBe(true);
+  });
+
+  it('round-trips through build → parse losslessly', () => {
+    const findings = [
+      validFinding(),
+      { ...validFinding(), line: 10, title: 'A' },
+      { ...validFinding(), line: 20, title: 'B', severity: 'critical' },
+    ];
+    const block = buildFindingsHashBlock(findings);
+    const parsed = parseFindingsHashBlock(block);
+    for (const f of findings) {
+      expect(parsed.has(hashFinding(f))).toBe(true);
+    }
+    expect(parsed.size).toBe(findings.length);
+  });
+
+  it('returns an empty Set when the body has no hash block', () => {
+    const set = parseFindingsHashBlock('## Review\n\nNo hashes here.');
+    expect(set.size).toBe(0);
+  });
+
+  it('returns an empty Set when the block is empty (<!-- zai-hashes: -->)', () => {
+    const set = parseFindingsHashBlock('body\n<!-- zai-hashes: -->');
+    expect(set.size).toBe(0);
+  });
+
+  it('returns an empty Set for non-string input', () => {
+    expect(parseFindingsHashBlock(null).size).toBe(0);
+    expect(parseFindingsHashBlock(undefined).size).toBe(0);
+  });
+
+  it('coexists with the idempotency MARKER in the same body', () => {
+    // The MARKER (<!-- zai-code-review -->) and the hash block are SEPARATE
+    // HTML comments in the same review body. Parsing one must not pick up the
+    // other.
+    const body =
+      '## Review\n\nprose\n\n<!-- zai-code-review -->\n<!-- zai-hashes:abc,def -->';
+    const hashes = parseFindingsHashBlock(body);
+    expect(hashes.size).toBe(2);
+    expect(hashes.has('abc')).toBe(true);
+    expect(hashes.has('def')).toBe(true);
+    expect(hashes.has('<!-- zai-code-review -->')).toBe(false);
+  });
+
+  it('picks up the FIRST hash block when multiple are present (oldest wins)', () => {
+    const body =
+      'x\n<!-- zai-hashes:aaa -->\ny\n<!-- zai-hashes:bbb -->';
+    const set = parseFindingsHashBlock(body);
+    // First-wins mirrors how the bot reads its own most recent prior review:
+    // the canonical block is the last one posted, but if a body somehow has
+    // two, we read the first to be conservative. Either way, no throw.
+    expect(set.size).toBeGreaterThanOrEqual(1);
+    expect(set.has('aaa')).toBe(true);
+  });
+});
+
+describe('filterIncrementalFindings', () => {
+  it('keeps everything when priorHashes is empty (first run)', () => {
+    const findings = [validFinding(), { ...validFinding(), line: 9 }];
+    const { kept, suppressed } = filterIncrementalFindings(findings, new Set());
+    expect(kept).toHaveLength(2);
+    expect(suppressed).toBe(0);
+  });
+
+  it('drops findings whose hash is in priorHashes', () => {
+    const fresh = { ...validFinding(), line: 9, title: 'New' };
+    const known = validFinding();
+    const prior = new Set([hashFinding(known)]);
+    const { kept, suppressed } = filterIncrementalFindings(
+      [known, fresh],
+      prior,
+    );
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ line: 9, title: 'New' });
+    expect(suppressed).toBe(1);
+  });
+
+  it('keeps findings whose hash is NOT in priorHashes', () => {
+    const a = { ...validFinding(), line: 1, title: 'A' };
+    const b = { ...validFinding(), line: 2, title: 'B' };
+    const prior = new Set([hashFinding(a)]);
+    const { kept } = filterIncrementalFindings([a, b], prior);
+    expect(kept.map((f) => f.title).sort()).toEqual(['B']);
+  });
+
+  it('suppresses ALL findings when all hashes are known', () => {
+    const findings = [
+      { ...validFinding(), line: 1, title: 'A' },
+      { ...validFinding(), line: 2, title: 'B' },
+    ];
+    const prior = new Set(findings.map(hashFinding));
+    const { kept, suppressed } = filterIncrementalFindings(findings, prior);
+    expect(kept).toEqual([]);
+    expect(suppressed).toBe(2);
+  });
+
+  it('preserves the input order of the kept findings', () => {
+    const a = { ...validFinding(), line: 1, title: 'A' };
+    const b = { ...validFinding(), line: 2, title: 'B' };
+    const c = { ...validFinding(), line: 3, title: 'C' };
+    const prior = new Set([hashFinding(b)]);
+    const { kept } = filterIncrementalFindings([a, b, c], prior);
+    expect(kept.map((f) => f.title)).toEqual(['A', 'C']);
+  });
+
+  it('does not mutate the input findings array', () => {
+    const findings = [validFinding(), { ...validFinding(), line: 9 }];
+    const prior = new Set([hashFinding(findings[0])]);
+    const snapshot = [...findings];
+    filterIncrementalFindings(findings, prior);
+    expect(findings).toEqual(snapshot);
+  });
+
+  it('treats a finding as "new" only if its hash differs from every prior hash', () => {
+    // Same file:line:severity:title:description as a prior → suppressed even if
+    // suggestion/evidence/rule differ (those aren't part of the hash).
+    const prior = new Set([hashFinding(validFinding())]);
+    const tweaked = {
+      ...validFinding(),
+      evidence: 'brand new evidence',
+      suggestion: 'brand new suggestion',
+      rule: 'eslint:different',
+    };
+    const { kept, suppressed } = filterIncrementalFindings([tweaked], prior);
+    expect(kept).toEqual([]);
+    expect(suppressed).toBe(1);
+  });
+
+  it('handles a non-array findings input gracefully', () => {
+    const { kept, suppressed } = filterIncrementalFindings(null, new Set());
+    expect(kept).toEqual([]);
+    expect(suppressed).toBe(0);
+  });
+
+  it('handles a non-Set priorHashes (treated as empty)', () => {
+    const findings = [validFinding()];
+    const { kept, suppressed } = filterIncrementalFindings(findings, null);
+    expect(kept).toHaveLength(1);
+    expect(suppressed).toBe(0);
   });
 });

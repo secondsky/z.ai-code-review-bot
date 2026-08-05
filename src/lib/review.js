@@ -65,7 +65,7 @@ const SEVERITY_EMOJI = {
  *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string}} [metadata]
  * @returns {string}
  */
 export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -87,6 +87,13 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
   const truncated = typeof metadata.truncated === 'number' ? metadata.truncated : 0;
   if (truncated > 0) {
     lines.push(`_${truncated} findings truncated to cap._`);
+    lines.push('');
+  }
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
     lines.push('');
   }
 
@@ -191,8 +198,10 @@ export function buildReviewComments(inlineFindings) {
 /**
  * Assemble the full `pulls.createReview` payload.
  *
- * `event` defaults to `'COMMENT'` (advisory review). When strict mode lands
- * (Phase 8.3) a caller can pass `'REQUEST_CHANGES'` to block merge.
+ * `event` defaults to `'COMMENT'` (advisory review). In strict mode (Phase
+ * 8.3) a caller passes `'REQUEST_CHANGES'` (resolved via {@link
+ * resolveReviewEvent}) to block merge until the requesting review is
+ * dismissed or the changes are addressed.
  *
  * @param {{body:string, comments:Array, event?:string}} opts
  * @returns {{body:string, event:string, comments:Array}}
@@ -203,6 +212,44 @@ export function buildReviewPayload({ body, comments, event } = {}) {
     event: typeof event === 'string' && event.length > 0 ? event : 'COMMENT',
     comments: Array.isArray(comments) ? comments : [],
   };
+}
+
+/**
+ * The set of finding severities that — when present alongside a strict-mode
+ * config — escalate the review event from advisory (`COMMENT`) to blocking
+ * (`REQUEST_CHANGES`). Only `critical` and `high` qualify; medium/low/info
+ * stay advisory even under strict mode.
+ * @type {ReadonlySet<string>}
+ */
+const STRICT_SEVERITIES = new Set(['critical', 'high']);
+
+/**
+ * Decide which GitHub review `event` to submit: advisory `'COMMENT'` (default)
+ * or blocking `'REQUEST_CHANGES'` (strict mode).
+ *
+ * Strict mode is OFF by default and NEVER auto-enabled — it only fires when
+ * `config.strictMode === true`. When strict mode is on, the review escalates
+ * to `REQUEST_CHANGES` ONLY if at least one finding has severity `critical`
+ * or `high`. Lower severities (medium/low/info) and empty/unknown findings
+ * never trigger a block.
+ *
+ * `REQUEST_CHANGES` is a GitHub review state that blocks merge until the
+ * requesting review is dismissed or the changes are addressed — it is
+ * powerful, so this function is deliberately conservative: every condition
+ * must hold (explicit opt-in + a critical/high finding) for it to fire.
+ *
+ * @param {Array<{severity?:string}>} findings - the ranked/capped findings.
+ * @param {{strictMode?:boolean}} config - the merged config object.
+ * @returns {'COMMENT' | 'REQUEST_CHANGES'}
+ */
+export function resolveReviewEvent(findings, config) {
+  if (!config || config.strictMode !== true) return 'COMMENT';
+  if (!Array.isArray(findings)) return 'COMMENT';
+  for (const f of findings) {
+    const sev = f && typeof f.severity === 'string' ? f.severity : '';
+    if (STRICT_SEVERITIES.has(sev)) return 'REQUEST_CHANGES';
+  }
+  return 'COMMENT';
 }
 
 /**
