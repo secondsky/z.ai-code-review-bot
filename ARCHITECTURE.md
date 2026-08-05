@@ -82,6 +82,7 @@ src/index.js  run(context, deps)   ← entry; routes by eventName
 | Module | Responsibility |
 |---|---|
 | `src/lib/repo-config.js` | `.zai.yml` loader: hand-rolled YAML parser, `validateRepoConfig`, `mergeRepoConfig` (security: repo can only narrow). |
+| `src/lib/learnings.js` | `.zai/learnings.yml` loader: parseLearnings, matchesLearning (glob + substring), filterFindingsByLearnings. Untrusted context. |
 | `src/lib/codeowners.js` | CODEOWNERS parser, `matchCodeowners` (last-match-wins), `suggestReviewers`, `loadCodeowners`. |
 | `src/lib/status.js` | `setReviewStatus` (commit statuses, fail-soft), `buildStatusDescription`. |
 | `src/lib/sanitize-output.js` | Output sanitizer: length cap, `@mention` neutralization, alert-banner neutralization. Applied before every comment post. |
@@ -125,4 +126,4 @@ src/index.js  run(context, deps)   ← entry; routes by eventName
 - CI runs vitest on Node 20/22, gates on `dist/` drift, and runs
   `npm audit --audit-level=high`.
 - Dependabot watches npm + github-actions ecosystems (weekly).
-- 1244 tests across 36 files. `dist/` is committed intentionally.
+- 1337 tests across 37 files. `dist/` is committed intentionally.

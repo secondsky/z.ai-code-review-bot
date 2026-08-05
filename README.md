@@ -146,6 +146,7 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 |---|---|---|
 | `ZAI_COMMIT_STATUS` | `true` | Post pending/success commit status (needs `statuses: write`). |
 | `ZAI_REPO_CONFIG_ENABLED` | `true` | Load `.zai.yml` from the repo. |
+| `ZAI_LEARNINGS_ENABLED` | `false` | Load `.zai/learnings.yml` to suppress previously-accepted findings. |
 
 ### Reviewer suggestions
 | Input | Default | Description |
@@ -196,13 +197,13 @@ pull_request event
 | **Inline comments** | ✅ | ✅ | ✅ |
 | **Repo config file** | ✅ `.zai.yml` | ✅ `.coderabbit.yaml` | ❌ |
 | **Cost** | your Z.ai API cost only | subscription | subscription |
-| **Auditable core** | ✅ ~10k LOC, 3 deps, 1244 tests | black box | black box |
+| **Auditable core** | ✅ ~10k LOC, 3 deps, 1337 tests | black box | black box |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (1244 tests)
+npm test            # vitest suite (1337 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 npm audit           # 0 vulnerabilities
