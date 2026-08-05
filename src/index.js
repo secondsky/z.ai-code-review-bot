@@ -53,6 +53,7 @@ import {
 import { resolveSystemPrompt } from './lib/prompt.js';
 import { runStructuredReview, isLargePr } from './lib/auto-review.js';
 import { formatFindingsAsSummary } from './lib/findings.js';
+import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
 import {
   buildReviewBody,
@@ -66,6 +67,7 @@ import { getPRContext } from './lib/handlers/_shared.js';
 import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 import { setReviewStatus, buildStatusDescription } from './lib/status.js';
+import { loadRepoConfig, mergeRepoConfig } from './lib/repo-config.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -150,6 +152,8 @@ export const INPUT_NAMES = [
   'ZAI_SCANNERS_ENABLED',
   'ZAI_SCANNERS_CACHE_DIR',
   'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_REPO_CONFIG_ENABLED',
   'GITHUB_TOKEN',
 ];
 
@@ -233,6 +237,7 @@ export async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummary,
     partitionFindings: partitionFindingsFn = partitionFindings,
     buildReviewBody: buildReviewBodyFn = buildReviewBody,
     buildReviewComments: buildReviewCommentsFn = buildReviewComments,
@@ -249,6 +254,8 @@ export async function run(context, deps = {}) {
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
+    loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
+    mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
   } = deps;
 
   const event = eventName(context);
@@ -300,19 +307,42 @@ export async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
+    // Phase 3: in-repo `.zai.yml`. The file is fetched from the PR head SHA
+    // and treated as UNTRUSTED (attacker-controllable in fork PRs). The merge
+    // is security-critical: action inputs ALWAYS win on cost/security knobs;
+    // the repo can only NARROW behavior (lower a cap, add path instructions,
+    // add excludes, disable a scanner). loadRepoConfig NEVER throws — any
+    // failure (404, parse error, oversized) returns `{}` + a warning. Tests
+    // inject `deps.repoConfig` directly to bypass the fetch; production lets
+    // loadRepoConfig run when the master switch is on.
+    const rawRepoConfig = config.repoConfigEnabled
+      ? await loadRepoConfigFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : {};
+    const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
+
     // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
     // become high-confidence findings directly (merged over LLM findings at
     // the same file:line+title) and are injected into the LLM prompt as
     // "already detected, don't re-report" context. Scanners NEVER fail the
     // review — on any error they log a warning and contribute [] findings.
+    // Phase 3: repo `.zai.yml` scanners map onto the scanner orchestrator's
+    // per-scanner toggles: `gitleaks` → secrets, `ast_grep` → patterns. The
+    // repo can only DISABLE a scanner the action enabled (enforced by
+    // mergeRepoConfig).
     const cacheDir = expandHome(config.scannersCacheDir);
+    const scannerRepoConfig = {
+      scanners: {
+        secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
+        patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+      },
+    };
     const scannerResult = await runScannersFn(
       {
         files: patchable,
         repoPath: process.cwd(),
         cacheDir,
-        config: { scannersEnabled: config.scannersEnabled },
-        repoConfig: deps.repoConfig,
+        config: { scannersEnabled: repoConfig.scannersEnabled },
+        repoConfig: scannerRepoConfig,
       },
       { core: coreDep },
     );
@@ -329,11 +359,16 @@ export async function run(context, deps = {}) {
 
     // Structured review: one path for both small and large PRs. Batching
     // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
-    // result is rendered as a structured-findings summary comment.
+    // result is rendered as a structured-findings summary comment. Phase 3:
+    // the merged repo config supplies pathInstructions/toneInstructions
+    // (additive) and may LOWER maxFindings (repo can only narrow the cap).
     const result = await runStructuredReviewFn(
       patchable,
       {
         ...config,
+        maxFindings: repoConfig.maxFindings,
+        pathInstructions: repoConfig.pathInstructions,
+        toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,
         scannerContext,
       },
@@ -397,6 +432,13 @@ export async function run(context, deps = {}) {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      // Phase 7: walkthrough context for the summary-only section of the
+      // review body. When config.walkthrough is true, buildReviewBody renders
+      // the summary-only findings as dependency-ordered cohort sections
+      // (collapsible <details>) instead of a flat bullet list. Inline comments
+      // are line-anchored and unaffected.
+      walkthrough: config.walkthrough === true,
+      files: patchable,
     };
 
     if (inline.length > 0) {
@@ -443,14 +485,25 @@ export async function run(context, deps = {}) {
 
     // No inline-mappable findings: post the whole summary as an issue comment
     // via the existing marker-upsert path (keeps idempotency for the
-    // no-findings / all-file-level case).
-    const content = formatFindingsAsSummaryFn(result.findings, {
-      reviewerName: config.reviewerName,
-      metadata: {
-        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: truncatedCount,
-      },
-    });
+    // no-findings / all-file-level case). When walkthrough is enabled (default)
+    // and there are findings, render as a dependency-ordered walkthrough;
+    // otherwise fall back to the flat severity-grouped summary.
+    const useWalkthrough =
+      config.walkthrough && Array.isArray(result.findings) && result.findings.length > 0;
+    const summaryMetadata = {
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+      summary: typeof result.summary === 'string' ? result.summary : '',
+    };
+    const content = useWalkthrough
+      ? formatWalkthroughSummaryFn(result.findings, patchable, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        })
+      : formatFindingsAsSummaryFn(result.findings, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        });
     const body = buildCommentBodyFn({
       title: config.reviewerName,
       content,

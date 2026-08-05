@@ -38676,6 +38676,29 @@ function loadConfig(inputs = {}, options = {}) {
   const commitStatus =
     commitStatusRaw === '' ? true : isTruthy(commitStatusRaw);
 
+  // Phase 7: walkthrough / cohort-ordered summary rendering. When true
+  // (default), the summary findings are reorganized into dependency-ordered
+  // collapsible cohort sections (database → api → business-logic → … → other)
+  // instead of a flat severity-sorted list. Inline comments stay line-anchored
+  // and are unaffected; only the SUMMARY rendering changes. Empty input means
+  // "use the default" (true), matching the scannersEnabled/commitStatus
+  // convention so direct callers get the feature without setting the input.
+  const walkthroughRaw = read(inputs, 'ZAI_WALKTHROUGH').trim().toLowerCase();
+  const walkthrough =
+    walkthroughRaw === '' ? true : isTruthy(walkthroughRaw);
+
+  // Phase 3: in-repo config file (`.zai.yml`). The master switch defaults to
+  // TRUE — repos can commit a `.zai.yml` to tailor review behavior (path
+  // instructions, tone) WITHOUT editing their workflow YAML. The file is
+  // fetched from the PR head SHA and treated as UNTRUSTED (attacker-
+  // controllable in fork PRs): mergeRepoConfig enforces that it can only
+  // NARROW behavior (lower a cap, add excludes, disable a scanner), never
+  // widen it. Operators who don't want repo-config loading at all can set
+  // ZAI_REPO_CONFIG_ENABLED=false.
+  const repoConfigEnabledRaw = read(inputs, 'ZAI_REPO_CONFIG_ENABLED').trim().toLowerCase();
+  const repoConfigEnabled =
+    repoConfigEnabledRaw === '' ? true : isTruthy(repoConfigEnabledRaw);
+
   const config = {
     apiKey,
     model,
@@ -38705,6 +38728,8 @@ function loadConfig(inputs = {}, options = {}) {
     scannersEnabled,
     scannersCacheDir,
     commitStatus,
+    walkthrough,
+    repoConfigEnabled,
     githubToken,
   };
 
@@ -41433,6 +41458,500 @@ async function runStructuredReview(files, config, deps = {}) {
   };
 }
 
+;// CONCATENATED MODULE: ./src/lib/walkthrough.js
+/**
+ * Phase 7: Walkthrough / cohort ordering.
+ *
+ * Reorganizes a PR's findings from a flat file list into a dependency-ordered
+ * walkthrough — the CodeRabbit "Change Stack" idea. Files are classified into
+ * cohorts by path, cohorts are ordered by dependency rank (foundational first:
+ * database → api → business-logic → config → ui → tests → docs → other), and
+ * findings are rendered under their cohort as collapsible sections so the
+ * summary reads like a narrative instead of a flat severity-sorted list.
+ *
+ * This module is PURE (no I/O, no imports of other project modules). The
+ * renderer's trailing marker is duplicated here as a literal so the module
+ * stays self-contained; it MUST stay byte-exact with comments.js's MARKER.
+ *
+ * @module src/lib/walkthrough.js
+ */
+
+// ---------------------------------------------------------------------------
+// Cohort metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * The canonical cohort ordering (dependency rank — foundational first).
+ * Lower index = more foundational = rendered earlier.
+ * @type {string[]}
+ */
+const COHORT_ORDER = [
+  'database',
+  'api',
+  'business-logic',
+  'config',
+  'ui',
+  'tests',
+  'docs',
+  'other',
+];
+
+/**
+ * Per-cohort emoji for the walkthrough section headers.
+ * @type {Record<string, string>}
+ */
+const COHORT_EMOJI = {
+  database: '🗄️',
+  api: '🔌',
+  'business-logic': '⚙️',
+  config: '🔧',
+  ui: '🎨',
+  tests: '🧪',
+  docs: '📚',
+  other: '📦',
+};
+
+/**
+ * Per-cohort human-readable display label (Title Case).
+ * @type {Record<string, string>}
+ */
+const COHORT_LABEL = {
+  database: 'Database',
+  api: 'API',
+  'business-logic': 'Business Logic',
+  config: 'Config',
+  ui: 'UI',
+  tests: 'Tests',
+  docs: 'Docs',
+  other: 'Other',
+};
+
+/**
+ * Per-severity emoji for the Overview line. Mirrors findings.js so the
+ * walkthrough and the severity-grouped summary stay visually consistent.
+ * @type {Record<string, string>}
+ */
+const walkthrough_SEVERITY_EMOJI = {
+  critical: '🔴',
+  high: '🟠',
+  medium: '🟡',
+  low: '🔵',
+  info: '➖',
+};
+
+/**
+ * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
+ * sorts first. Mirrors findings.js SEVERITY_RANK.
+ * @type {Record<string, number>}
+ */
+const walkthrough_SEVERITY_RANK = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4,
+};
+
+/** Severity display order for the Overview line. */
+const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+
+/**
+ * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
+ * as a literal so this pure module has no cross-module imports.
+ */
+const walkthrough_MARKER = '<!-- zai-code-review -->';
+
+// ---------------------------------------------------------------------------
+// classifyFile
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a regex that matches `segment/` anywhere in the path (as a directory
+ * segment). Used for patterns like `db/`, `api/`, `src/lib/`.
+ *
+ * @param {string} segment  e.g. "db" or "src/lib"
+ * @returns {RegExp}
+ */
+function dirSegment(segment) {
+  // Escape regex metacharacters in the segment, then anchor on a leading
+  // slash-or-start so "db/" matches "/db/" or "^db/" but not "nodb/".
+  const escaped = segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|/)${escaped}/`);
+}
+
+/**
+ * Build a regex that matches a file extension anywhere. `sql` → `\.sql$`.
+ *
+ * @param {string} ext  without leading dot
+ * @returns {RegExp}
+ */
+function extRe(ext) {
+  const escaped = ext.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\.${escaped}$`, 'i');
+}
+
+/**
+ * Build a regex that matches a basename keyword anywhere. `Dockerfile` →
+ * matches a path component equal to "Dockerfile" or starting with it (so
+ * `docker-compose.yml` matches the `docker-compose` keyword).
+ *
+ * @param {string} name
+ * @returns {RegExp}
+ */
+function basenameKeyword(name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|/)${escaped}`, 'i');
+}
+
+/**
+ * Each cohort's matchers, checked in array order. The cohort list itself is
+ * iterated in {@link COHORT_ORDER} order so "first match wins" is enforced by
+ * the classifyFile loop. A filename matches a cohort if ANY matcher hits.
+ *
+ * @type {Array<{ cohort: string, matchers: RegExp[] }>}
+ */
+const COHORT_RULES = [
+  {
+    cohort: 'database',
+    matchers: [
+      dirSegment('db'),
+      dirSegment('migrations'),
+      dirSegment('schema'),
+      dirSegment('prisma'),
+      extRe('sql'),
+      extRe('prisma'),
+    ],
+  },
+  {
+    cohort: 'api',
+    matchers: [
+      dirSegment('api'),
+      dirSegment('server'),
+      dirSegment('routes'),
+      dirSegment('controllers'),
+      dirSegment('endpoints'),
+      dirSegment('handlers'),
+    ],
+  },
+  {
+    cohort: 'business-logic',
+    matchers: [
+      dirSegment('src/lib'),
+      dirSegment('src/services'),
+      dirSegment('src/models'),
+      dirSegment('domain'),
+      dirSegment('core'),
+      dirSegment('business'),
+    ],
+  },
+  {
+    cohort: 'ui',
+    matchers: [
+      dirSegment('components'),
+      dirSegment('pages'),
+      dirSegment('views'),
+      dirSegment('ui'),
+      dirSegment('src/app'),
+      extRe('tsx'),
+      extRe('jsx'),
+      extRe('vue'),
+      extRe('svelte'),
+    ],
+  },
+  {
+    cohort: 'tests',
+    matchers: [
+      /\.test\./i,
+      /\.spec\./i,
+      dirSegment('__tests__'),
+      dirSegment('tests'),
+      dirSegment('test'),
+    ],
+  },
+  {
+    cohort: 'config',
+    matchers: [
+      extRe('yml'),
+      extRe('yaml'),
+      extRe('json'),
+      extRe('toml'),
+      dirSegment('.github'),
+      basenameKeyword('Dockerfile'),
+      basenameKeyword('docker-compose'),
+      basenameKeyword('.env'),
+    ],
+  },
+  {
+    cohort: 'docs',
+    matchers: [
+      extRe('md'),
+      extRe('rst'),
+      dirSegment('docs'),
+      basenameKeyword('CHANGELOG'),
+      basenameKeyword('README'),
+    ],
+  },
+];
+
+/**
+ * Classify a changed file into a cohort by its path.
+ *
+ * Rules are checked in {@link COHORT_ORDER} order; the FIRST matching cohort
+ * wins (so a test file under `src/lib/` classifies as business-logic, because
+ * business-logic is checked before tests). Files matching no rule fall back to
+ * `'other'`.
+ *
+ * @param {string} filename
+ * @returns {string} cohort name: 'database'|'api'|'business-logic'|'ui'|'tests'|'config'|'docs'|'other'
+ */
+function classifyFile(filename) {
+  if (typeof filename !== 'string' || filename.length === 0) return 'other';
+  for (const { cohort, matchers } of COHORT_RULES) {
+    if (matchers.some((re) => re.test(filename))) return cohort;
+  }
+  return 'other';
+}
+
+// ---------------------------------------------------------------------------
+// buildCohorts
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a filename from a file entry that may be a bare string or an object
+ * with `.filename` (the GitHub PR shape).
+ *
+ * @param {unknown} entry
+ * @returns {string}
+ */
+function filenameOf(entry) {
+  if (typeof entry === 'string') return entry;
+  if (entry && typeof entry === 'object') {
+    const f = /** @type {{ filename?: unknown }} */ (entry).filename;
+    if (typeof f === 'string') return f;
+  }
+  return '';
+}
+
+/**
+ * Group files into cohorts, ordered by dependency rank.
+ *
+ * Only includes cohorts that have files. Cohorts are sorted by
+ * {@link COHORT_ORDER} rank (foundational first). Within each cohort, files
+ * are sorted alphabetically by filename.
+ *
+ * Each returned entry: `{ cohort, files, rank }` where `rank` is the index
+ * into COHORT_ORDER.
+ *
+ * @param {Array<{filename?: string} | string>} files
+ * @returns {Array<{cohort: string, files: Array, rank: number}>}
+ */
+function buildCohorts(files) {
+  if (!Array.isArray(files)) return [];
+  /** @type {Map<string, Array>} */
+  const byCohort = new Map();
+  for (const entry of files) {
+    const filename = filenameOf(entry);
+    if (!filename) continue;
+    const cohort = classifyFile(filename);
+    if (!byCohort.has(cohort)) byCohort.set(cohort, []);
+    byCohort.get(cohort).push(entry);
+  }
+  // Sort each cohort's files alphabetically by filename.
+  for (const list of byCohort.values()) {
+    list.sort((a, b) => {
+      const fa = filenameOf(a);
+      const fb = filenameOf(b);
+      if (fa < fb) return -1;
+      if (fa > fb) return 1;
+      return 0;
+    });
+  }
+  // Emit cohorts in dependency-rank order.
+  return COHORT_ORDER
+    .map((cohort, rank) => ({ cohort, rank, list: byCohort.get(cohort) }))
+    .filter((c) => c.list)
+    .map(({ cohort, rank, list }) => ({ cohort, files: list, rank }));
+}
+
+// ---------------------------------------------------------------------------
+// groupFindingsByCohort
+// ---------------------------------------------------------------------------
+
+/**
+ * Assign findings to their file's cohort.
+ *
+ * Builds a `Map<filename, cohort>` from {@link buildCohorts} (over `files`),
+ * then assigns each finding to its file's cohort. Findings whose `file` is not
+ * in the map fall back to `'other'`.
+ *
+ * @param {Array<{file?: string}>} findings
+ * @param {Array<{filename?: string} | string>} files
+ * @returns {Map<string, Array>}
+ */
+function groupFindingsByCohort(findings, files) {
+  /** @type {Map<string, Array>} */
+  const out = new Map();
+  if (!Array.isArray(findings)) return out;
+
+  // filename → cohort, built once.
+  /** @type {Map<string, string>} */
+  const fileCohort = new Map();
+  if (Array.isArray(files)) {
+    for (const entry of files) {
+      const filename = filenameOf(entry);
+      if (!filename) continue;
+      if (!fileCohort.has(filename)) {
+        fileCohort.set(filename, classifyFile(filename));
+      }
+    }
+  }
+
+  const ensure = (cohort) => {
+    if (!out.has(cohort)) out.set(cohort, []);
+    return out.get(cohort);
+  };
+
+  for (const f of findings) {
+    const file = f && typeof f.file === 'string' ? f.file : '';
+    const cohort = fileCohort.get(file) ?? 'other';
+    ensure(cohort).push(f);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// formatWalkthroughSummary
+// ---------------------------------------------------------------------------
+
+/**
+ * Severity rank for a finding; unknown sorts last.
+ *
+ * @param {string} sev
+ * @returns {number}
+ */
+function severityRank(sev) {
+  if (typeof sev === 'string' && Object.prototype.hasOwnProperty.call(walkthrough_SEVERITY_RANK, sev)) {
+    return walkthrough_SEVERITY_RANK[sev];
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Render a walkthrough-style summary: cohorts as collapsible sections,
+ * findings grouped under their cohort.
+ *
+ * Structure:
+ *   ## <reviewerName>
+ *   <summary prose if provided>
+ *   ### 📊 Overview
+ *   <count> findings across <cohortCount> areas · 🔴 N critical · ...
+ *   <for each cohort in dependency order, if it has findings>:
+ *   <details><summary><emoji> <Label> (<count>)</summary>
+ *   - **<file>**<:L<line>> — <title>
+ *     <description>
+ *     <💡 suggestion>
+ *   </details>
+ *   <if no findings>: No issues found. The changes look good. ✅
+ *   <!-- zai-code-review -->
+ *
+ * The trailing marker is byte-exact (required by comments.js idempotency).
+ *
+ * @param {Array} findings
+ * @param {Array} files
+ * @param {{ reviewerName?: string, metadata?: Record<string, unknown> }} [options]
+ * @returns {string}
+ */
+function formatWalkthroughSummary(findings, files, options = {}) {
+  const reviewerName =
+    typeof options.reviewerName === 'string' && options.reviewerName.length > 0
+      ? options.reviewerName
+      : 'Z.ai Code Review';
+  const metadata =
+    options.metadata && typeof options.metadata === 'object' ? options.metadata : {};
+  const summaryProse =
+    typeof metadata.summary === 'string' ? metadata.summary : '';
+
+  const list = Array.isArray(findings) ? findings : [];
+
+  // Header.
+  const lines = [];
+  lines.push(`## ${reviewerName}`);
+  lines.push('');
+
+  if (summaryProse.length > 0) {
+    lines.push(summaryProse);
+    lines.push('');
+  }
+
+  // Count per severity.
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of list) {
+    const sev = typeof f.severity === 'string' ? f.severity : '';
+    if (Object.prototype.hasOwnProperty.call(counts, sev)) counts[sev] += 1;
+  }
+  const total = list.length;
+
+  // Cohort buckets (ordered by dependency rank).
+  const grouped = groupFindingsByCohort(list, files);
+  const orderedCohorts = COHORT_ORDER.filter((c) => grouped.has(c) && grouped.get(c).length > 0);
+  const cohortCount = orderedCohorts.length;
+
+  // Overview line.
+  lines.push('### 📊 Overview');
+  lines.push('');
+  const sevParts = SEVERITY_ORDER.map(
+    (sev) => `${walkthrough_SEVERITY_EMOJI[sev]} ${counts[sev]} ${sev}`,
+  );
+  lines.push(
+    `${total} findings across ${cohortCount} areas · ${sevParts.join(' · ')}`,
+  );
+  lines.push('');
+
+  if (total === 0) {
+    lines.push('No issues found. The changes look good. ✅');
+    lines.push('');
+  } else {
+    for (const cohort of orderedCohorts) {
+      const cohortFindings = grouped.get(cohort).slice().sort((a, b) => {
+        const sa = severityRank(typeof a.severity === 'string' ? a.severity : '');
+        const sb = severityRank(typeof b.severity === 'string' ? b.severity : '');
+        if (sa !== sb) return sa - sb;
+        return 0;
+      });
+      const emoji = COHORT_EMOJI[cohort] ?? '📦';
+      const label = COHORT_LABEL[cohort] ?? 'Other';
+      lines.push('<details>');
+      lines.push(`<summary>${emoji} ${label} (${cohortFindings.length})</summary>`);
+      lines.push('');
+      for (const f of cohortFindings) {
+        const file = typeof f.file === 'string' ? f.file : '';
+        const line = f.line;
+        const title = typeof f.title === 'string' ? f.title : '';
+        const description = typeof f.description === 'string' ? f.description : '';
+        const suggestion =
+          typeof f.suggestion === 'string' && f.suggestion.length > 0
+            ? f.suggestion
+            : null;
+
+        const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
+        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        if (description.length > 0) {
+          lines.push(`  ${description}`);
+        }
+        if (suggestion !== null) {
+          lines.push(`  💡 ${suggestion}`);
+        }
+      }
+      lines.push('');
+      lines.push('</details>');
+      lines.push('');
+    }
+  }
+
+  lines.push(walkthrough_MARKER);
+  return lines.join('\n');
+}
+
 ;// CONCATENATED MODULE: ./src/lib/diff.js
 /**
  * Unified-diff parsing + finding-to-comment mapping for inline line-level
@@ -41916,6 +42435,7 @@ async function upsertPrDescription(
 
 
 
+
 /**
  * Per-severity emoji for inline comment bodies. Mirrors the table in
  * findings.js so the inline comments and the summary stay visually consistent.
@@ -41937,14 +42457,27 @@ const review_SEVERITY_EMOJI = {
  *   <optional truncation note>
  *   <summary prose>
  *   <if summaryOnly non-empty>:
+ *     <if metadata.walkthrough && metadata.files>:
+ *       Cohort-ordered walkthrough sections (collapsible <details>) for the
+ *       summary-only findings — renders the same overview + cohort sections as
+ *       formatWalkthroughSummary, minus the trailing marker (the body adds its
+ *       own marker once at the very end).
+ *     <else>:
  *   ## Additional findings
  *   - **file** — title           (one per summary-only finding)
+ *     <endif>
  *   <endif>
  *   <!-- zai-code-review -->     (byte-exact marker — REQUIRED for idempotency)
  *
+ * The walkthrough path reuses formatWalkthroughSummary but strips its header +
+ * trailing marker so the body keeps a single header (## reviewerName) and a
+ * single trailing marker. This keeps the summary-only findings grouped by
+ * dependency-ordered cohort — the inline comments stay line-anchored and
+ * unaffected.
+ *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string}} [metadata]
  * @returns {string}
  */
 function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -41976,14 +42509,39 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
 
   const summaryOnly = Array.isArray(summaryOnlyFindings) ? summaryOnlyFindings : [];
   if (summaryOnly.length > 0) {
-    lines.push('## Additional findings');
-    lines.push('');
-    for (const f of summaryOnly) {
-      const file = typeof f?.file === 'string' ? f.file : '';
-      const title = typeof f?.title === 'string' ? f.title : '';
-      lines.push(`- **${file}** — ${title}`);
+    const useWalkthrough =
+      metadata.walkthrough === true && Array.isArray(metadata.files);
+
+    if (useWalkthrough) {
+      // Render the summary-only findings as a dependency-ordered walkthrough.
+      // Strip the walkthrough's own header (## reviewerName) and trailing marker
+      // so the review body retains exactly one header and one marker.
+      const rendered = formatWalkthroughSummary(summaryOnly, metadata.files, {
+        reviewerName: reviewerName ?? 'Z.ai Code Review',
+        metadata: { summary: '' },
+      });
+      // Drop the leading "## <name>\n\n" header.
+      let body = rendered;
+      const headerEnd = body.indexOf('\n\n');
+      if (headerEnd !== -1) body = body.slice(headerEnd + 2);
+      // Drop the trailing "\n<!-- zai-code-review -->" — keep everything up to
+      // (but not including) the final marker line.
+      const markerIdx = body.lastIndexOf(MARKER);
+      if (markerIdx !== -1) {
+        body = body.slice(0, markerIdx).replace(/\n+$/, '');
+      }
+      lines.push(body);
+      lines.push('');
+    } else {
+      lines.push('## Additional findings');
+      lines.push('');
+      for (const f of summaryOnly) {
+        const file = typeof f?.file === 'string' ? f.file : '';
+        const title = typeof f?.title === 'string' ? f.title : '';
+        lines.push(`- **${file}** — ${title}`);
+      }
+      lines.push('');
     }
-    lines.push('');
   }
 
   lines.push(MARKER);
@@ -45389,6 +45947,629 @@ async function setReviewStatus(opts, deps = {}) {
   }
 }
 
+;// CONCATENATED MODULE: ./src/lib/repo-config.js
+/**
+ * Load and validate a `.zai.yml` file from the PR's head SHA.
+ *
+ * The `.zai.yml` is the in-repo configuration file repos can commit to customize
+ * review behavior WITHOUT editing their workflow YAML — the `.coderabbit.yaml`
+ * pattern. Because it lives in the repository, it is ATTACKER-CONTROLLABLE in
+ * fork PRs: a malicious contributor can commit a `.zai.yml` that tries to widen
+ * the review's cost/security envelope. This module treats the file as
+ * UNTRUSTED throughout:
+ *
+ *   - `parseZaiYml` is hand-rolled (no js-yaml dependency to attack surface),
+ *     tolerant of malformed input, and never throws.
+ *   - `validateRepoConfig` coerces types and DROPS every unknown key — only a
+ *     fixed allow-list passes through.
+ *   - `mergeRepoConfig` is the security-critical seam: action inputs ALWAYS win
+ *     on cost/security knobs (`maxFindings`, `minSeverity`, the scanner master
+ *     switch). The repo can only NARROW behavior (lower a cap, add path
+ *     instructions, disable a scanner the action enabled).
+ *   - `loadRepoConfig` wraps fetch + parse + validate in a single NEVER-throw
+ *     boundary: any failure (404, parse error, validation drop, oversized) →
+ *     `{}` + a `core.warning`.
+ *
+ * No `@actions/core` import; `core` is injected via `deps`.
+ *
+ * @module src/lib/repo-config.js
+ */
+
+/** Hard cap on the size of a `.zai.yml` we will parse (cost/DoS guard). */
+const MAX_REPO_CONFIG_BYTES = 64 * 1024; // 64 KiB
+
+/** Maximum length of `reviews.tone_instructions` after validation. */
+const MAX_TONE_INSTRUCTIONS_CHARS = 500;
+/** Maximum length of `reviews.language` after validation. */
+const MAX_LANGUAGE_CHARS = 20;
+
+/**
+ * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
+ * single- or double-quoted string. A `#` preceded by whitespace (or at the
+ * start of the line) starts a comment; a `#` glued to a value (`url#anchor`)
+ * does not — mirroring YAML 1.2. The quote-tracking is deliberately simple:
+ * it toggles on the first quote char encountered and toggles back on the
+ * matching one.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+function stripComment(line) {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if (ch === '#' && !inSingle && !inDouble) {
+      // A `#` only starts a comment when it's at the start of the line or
+      // preceded by whitespace. `value#frag` is NOT a comment.
+      const prev = i > 0 ? line[i - 1] : '';
+      if (i === 0 || /\s/.test(prev)) {
+        return line.slice(0, i);
+      }
+    }
+  }
+  return line;
+}
+
+/**
+ * Unquote a YAML scalar value: strips matching surrounding single or double
+ * quotes. Returns the input unchanged when not quoted.
+ *
+ * @param {string} v
+ * @returns {string}
+ */
+function unquote(v) {
+  if (typeof v !== 'string' || v.length < 2) return v;
+  if (
+    (v[0] === '"' && v[v.length - 1] === '"') ||
+    (v[0] === "'" && v[v.length - 1] === "'")
+  ) {
+    return v.slice(1, -1);
+  }
+  return v;
+}
+
+/**
+ * Coerce a raw YAML scalar string into a JS value. Recognizes the literals
+ * `true`/`false` (booleans) and integers; everything else stays a string.
+ * Non-integer numbers stay strings (the schema has no float fields).
+ *
+ * @param {string} raw
+ * @returns {boolean|number|string}
+ */
+function coerceScalar(raw) {
+  const v = raw.trim();
+  if (v === 'true' || v === 'True' || v === 'TRUE') return true;
+  if (v === 'false' || v === 'False' || v === 'FALSE') return false;
+  // Integer (optional leading sign, no decimal point).
+  if (/^[+-]?\d+$/.test(v)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return unquote(v).trim();
+}
+
+/** Known top-level keys. Anything else is dropped by the parser. */
+const TOP_KEYS = new Set(['reviews', 'scanners']);
+/** Known keys under `reviews:`. */
+const REVIEW_KEYS = new Set([
+  'profile',
+  'max_findings',
+  'path_instructions',
+  'path_filters',
+  'tone_instructions',
+  'language',
+]);
+/** Known sub-fields of a `path_instructions` entry object. */
+const PATH_INSTRUCTION_FIELDS = new Set(['path', 'instructions']);
+/** Known keys under `scanners:`. */
+const SCANNER_KEYS = new Set(['gitleaks', 'ast_grep']);
+
+/**
+ * Parse a minimal YAML subset into a plain object.
+ *
+ * Supports exactly the structure of `.zai.yml`:
+ *   - top-level `reviews:` / `scanners:` maps
+ *   - `key: value` scalars (quoted or unquoted, boolean/number/string)
+ *   - arrays of strings (`- value`)
+ *   - arrays of objects (`- key: value` on consecutive lines)
+ *   - 2-space indentation
+ *   - `#` comments (line and inline, quote-aware)
+ *
+ * Unknown keys at any level are SKIPPED (the validator double-checks, but
+ * skipping in the parser keeps the output tidy). Malformed input never throws:
+ * the offending line is skipped and parsing continues.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {string} text
+ * @returns {Record<string, unknown>}
+ */
+function parseZaiYml(text) {
+  const out = {};
+  if (typeof text !== 'string' || text.length === 0) return out;
+
+  const lines = text.split(/\r?\n/);
+
+  // Current top-level section key (`'reviews'` or `'scanners'`) or null.
+  let section = null;
+  // When inside `reviews.path_instructions` (an array of objects): the
+  // in-progress object accumulator.
+  let pendingObj = null;
+  // When inside `reviews.path_filters` (an array of strings).
+  let pendingArrayKey = null;
+
+  const flushObj = () => {
+    if (pendingObj !== null) {
+      const arr = ensureArray(sectionObj(out, section), 'path_instructions');
+      arr.push(pendingObj);
+      pendingObj = null;
+    }
+  };
+  const flushArray = () => {
+    pendingArrayKey = null;
+  };
+
+  for (let raw of lines) {
+    // Strip comments (quote-aware) then drop trailing whitespace.
+    const lineNoComment = stripComment(raw);
+    const line = lineNoComment.replace(/\s+$/, '');
+    // Leading indentation count (spaces only — tabs are not valid YAML).
+    const indent = line.length - line.replace(/^\s+/, '').length;
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+
+    // Top-level key: `reviews:` or `scanners:` (indent 0).
+    if (indent === 0) {
+      // Flush any pending sub-structure before switching context.
+      flushObj();
+      flushArray();
+      const m = trimmed.match(/^([A-Za-z0-9_]+):\s*$/);
+      if (!m) continue; // unknown / malformed top-level line — skip
+      const key = m[1];
+      if (!TOP_KEYS.has(key)) continue; // unknown top-level key — skip
+      section = key;
+      if (!out[section]) out[section] = {};
+      continue;
+    }
+
+    if (section === null) continue; // indented line with no open section — skip
+
+    // Inside a section. Sub-keys are at indent >= 2.
+    // Array item: a line beginning with `- `.
+    if (/^-\s+/.test(trimmed) || trimmed === '-') {
+      // We're in some array context.
+      if (section === 'reviews') {
+        // Flush any prior object/array before starting a new item.
+        if (pendingArrayKey === 'path_filters') {
+          // string array item: `- value`
+          const val = trimmed.replace(/^-\s+/, '');
+          if (val !== '' || trimmed !== '-') {
+            const arr = ensureArray(out.reviews, 'path_filters');
+            arr.push(coerceScalar(val));
+          }
+          continue;
+        }
+        if (pendingArrayKey === 'path_instructions' || pendingObj !== null) {
+          // Object array item: `- key: value` (first line of a new object).
+          flushObj();
+          const body = trimmed.replace(/^-\s+/, '');
+          const km = body.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+          if (km) {
+            const k = km[1];
+            const v = km[2];
+            pendingObj = {};
+            if (PATH_INSTRUCTION_FIELDS.has(k)) {
+              pendingObj[k] = coerceScalar(v);
+            }
+            pendingArrayKey = 'path_instructions';
+          } else {
+            // `- value` form where the section was expecting objects — skip.
+          }
+          continue;
+        }
+        // First array item: detect which array by looking ahead is impossible
+        // without a schema, so we infer from the key that OPENED the array.
+        // (Handled when the array-key line was seen below.)
+        continue;
+      }
+      continue; // arrays not supported under `scanners:` — skip
+    }
+
+    // Plain `key: value` line inside a section.
+    const km = trimmed.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+    if (!km) continue;
+    const key = km[1];
+    const valRaw = km[2];
+
+    if (section === 'reviews') {
+      // Continuation of an array-of-objects entry: when we have a pending
+      // object AND this key is a known sub-field of path_instructions
+      // entries, append to the pending object rather than flushing it.
+      if (
+        pendingObj !== null &&
+        (key === 'path' || key === 'instructions')
+      ) {
+        pendingObj[key] = coerceScalar(valRaw);
+        continue;
+      }
+      if (!REVIEW_KEYS.has(key)) continue; // unknown review key — skip
+      // Flush any pending object/array before a new top-level review key opens.
+      if (key !== 'path_instructions' && key !== 'path_filters') {
+        flushObj();
+        flushArray();
+      }
+      if (valRaw === '') {
+        // Block start: either path_instructions or path_filters.
+        if (key === 'path_instructions' || key === 'path_filters') {
+          flushObj();
+          flushArray();
+          pendingArrayKey = key;
+          if (!Array.isArray(out.reviews[key])) out.reviews[key] = [];
+        } else {
+          // Empty value for a scalar key — skip (nothing to set).
+        }
+        continue;
+      }
+      // Scalar value.
+      flushObj();
+      flushArray();
+      out.reviews[key] = coerceScalar(valRaw);
+      continue;
+    }
+
+    if (section === 'scanners') {
+      if (!SCANNER_KEYS.has(key)) continue; // unknown scanner key — skip
+      if (valRaw === '') continue; // scanners have no nested values
+      out.scanners[key] = coerceScalar(valRaw);
+      continue;
+    }
+  }
+
+  // Flush any trailing structure.
+  flushObj();
+  flushArray();
+
+  return out;
+}
+
+/**
+ * Get-or-create the section object `{}` on `out` for the given key.
+ *
+ * @param {Record<string, unknown>} out
+ * @param {string} section
+ * @returns {Record<string, unknown>}
+ */
+function sectionObj(out, section) {
+  if (!out[section] || typeof out[section] !== 'object') out[section] = {};
+  return out[section];
+}
+
+/**
+ * Get-or-create an array on `obj` for the given key.
+ *
+ * @param {Record<string, unknown>} obj
+ * @param {string} key
+ * @returns {unknown[]}
+ */
+function ensureArray(obj, key) {
+  if (!Array.isArray(obj[key])) obj[key] = [];
+  return obj[key];
+}
+
+/* ------------------------------------------------------------------ *
+ * validateRepoConfig
+ * ------------------------------------------------------------------ */
+
+/**
+ * Validate a parsed `.zai.yml` object: coerce types, drop unknown keys, drop
+ * invalid entries. Returns a NEW clean object; the input is not mutated.
+ *
+ * Returns `{}` for any non-object input and for empty input. Empty `reviews`
+ * or `scanners` sub-objects are omitted from the output (no point carrying
+ * empty containers).
+ *
+ * Pure (exported for testing).
+ *
+ * @param {unknown} parsed
+ * @returns {{reviews?: Object, scanners?: Object}}
+ */
+function validateRepoConfig(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+
+  const out = {};
+
+  // ---- reviews ----
+  const r = parsed.reviews;
+  if (r && typeof r === 'object' && !Array.isArray(r)) {
+    const rv = {};
+    if (r.profile === 'chill' || r.profile === 'assertive') rv.profile = r.profile;
+    if (Number.isInteger(r.max_findings) && r.max_findings > 0) {
+      rv.max_findings = r.max_findings;
+    }
+    if (Array.isArray(r.path_instructions)) {
+      const arr = r.path_instructions
+        .map((entry) => normalizePathInstruction(entry))
+        .filter((e) => e !== null);
+      if (arr.length > 0) rv.path_instructions = arr;
+    }
+    if (Array.isArray(r.path_filters)) {
+      const arr = r.path_filters.filter(
+        (p) => typeof p === 'string' && p.trim() !== '',
+      );
+      if (arr.length > 0) rv.path_filters = arr;
+    }
+    if (typeof r.tone_instructions === 'string') {
+      rv.tone_instructions =
+        r.tone_instructions.length > MAX_TONE_INSTRUCTIONS_CHARS
+          ? r.tone_instructions.slice(0, MAX_TONE_INSTRUCTIONS_CHARS)
+          : r.tone_instructions;
+    }
+    if (typeof r.language === 'string') {
+      rv.language =
+        r.language.length > MAX_LANGUAGE_CHARS
+          ? r.language.slice(0, MAX_LANGUAGE_CHARS)
+          : r.language;
+    }
+    if (Object.keys(rv).length > 0) out.reviews = rv;
+  }
+
+  // ---- scanners ----
+  const s = parsed.scanners;
+  if (s && typeof s === 'object' && !Array.isArray(s)) {
+    const sv = {};
+    if (typeof s.gitleaks === 'boolean') sv.gitleaks = s.gitleaks;
+    if (typeof s.ast_grep === 'boolean') sv.ast_grep = s.ast_grep;
+    if (Object.keys(sv).length > 0) out.scanners = sv;
+  }
+
+  return out;
+}
+
+/**
+ * Normalize one `path_instructions` entry to `{path, instructions}` or `null`.
+ *
+ * @param {unknown} entry
+ * @returns {{path: string, instructions: string}|null}
+ */
+function normalizePathInstruction(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const path = entry.path;
+  const instructions = entry.instructions;
+  if (typeof path !== 'string' || path.trim() === '') return null;
+  if (typeof instructions !== 'string' || instructions.trim() === '') return null;
+  return { path, instructions };
+}
+
+/* ------------------------------------------------------------------ *
+ * mergeRepoConfig
+ * ------------------------------------------------------------------ */
+
+/**
+ * Merge a validated repo config into the action-input config.
+ *
+ * SECURITY-CRITICAL. The repo config is attacker-controllable, so action
+ * inputs ALWAYS win on cost/security knobs; the repo can only NARROW behavior:
+ *
+ *   - `maxFindings`: `Math.min(action, repo)` — the repo can only LOWER the
+ *     cap (never raise it).
+ *   - `minSeverity`: action input wins (repo value is advisory-only in v1).
+ *   - `pathInstructions` / `toneInstructions`: additive — the action has no
+ *     equivalent knob, so these pass straight through from the repo.
+ *   - `excludePatterns` (`pathFilters`): UNION — the repo can exclude MORE,
+ *     never fewer.
+ *   - `scanners`: the repo can DISABLE a scanner (`false`) but can never
+ *     enable one the action's master switch turned off.
+ *
+ * The returned object is a flat config suitable for spreading into the
+ * structured-review / scanner config shapes.
+ *
+ * Pure (exported for testing).
+ *
+ * @param {Object} actionConfig  the loadConfig() output (trusted).
+ * @param {Object} repoConfig    the validated `.zai.yml` output (untrusted).
+ * @returns {Object}
+ */
+function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
+  const a = actionConfig || {};
+  const r = repoConfig && typeof repoConfig === 'object' ? repoConfig : {};
+  const reviews = r.reviews && typeof r.reviews === 'object' ? r.reviews : {};
+  const scanners = r.scanners && typeof r.scanners === 'object' ? r.scanners : {};
+
+  // maxFindings: repo can only LOWER the cap.
+  const actionMaxFindings =
+    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 8;
+  const repoMaxFindings =
+    Number.isInteger(reviews.max_findings) && reviews.max_findings > 0
+      ? reviews.max_findings
+      : Number.POSITIVE_INFINITY;
+  const maxFindings = Math.min(actionMaxFindings, repoMaxFindings);
+
+  // pathInstructions / toneInstructions: additive from repo only.
+  const pathInstructions = Array.isArray(reviews.path_instructions)
+    ? reviews.path_instructions
+    : [];
+  const toneInstructions =
+    typeof reviews.tone_instructions === 'string' ? reviews.tone_instructions : '';
+
+  // excludePatterns UNION repo path_filters (repo can exclude MORE, never fewer).
+  const actionPatterns = Array.isArray(a.excludePatterns) ? a.excludePatterns : [];
+  const repoFilters = Array.isArray(reviews.path_filters) ? reviews.path_filters : [];
+  const excludePatterns = Array.from(new Set([...actionPatterns, ...repoFilters]));
+
+  // minSeverity: action input wins.
+  const minSeverity =
+    typeof a.minSeverity === 'string' && a.minSeverity.length > 0
+      ? a.minSeverity
+      : 'info';
+
+  // Scanners: master switch is action-only; repo can only DISABLE.
+  const scannersEnabled = a.scannersEnabled !== false;
+  const mergedScanners = {
+    // `false` in repo disables; otherwise the action default applies.
+    gitleaks: scanners.gitleaks === false ? false : true,
+    ast_grep: scanners.ast_grep === false ? false : true,
+  };
+
+  return {
+    ...a,
+    maxFindings,
+    minSeverity,
+    pathInstructions,
+    toneInstructions,
+    excludePatterns,
+    scannersEnabled,
+    scanners: mergedScanners,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * loadRepoConfig
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the PR head SHA from `opts.headSha` or
+ * `context.payload.pull_request.head.sha`.
+ *
+ * @param {Object} opts
+ * @returns {string}
+ */
+function resolveHeadSha(opts) {
+  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
+  const sha = opts.context?.payload?.pull_request?.head?.sha;
+  return typeof sha === 'string' ? sha : '';
+}
+
+/**
+ * Load and validate `.zai.yml` from the PR's head SHA. Treated as UNTRUSTED.
+ *
+ * Flow:
+ *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
+ *   2. Fetch `.zai.yml` via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
+ *   3. Base64-decode the content.
+ *   4. Parse with {@link parseZaiYml}.
+ *   5. Validate with {@link validateRepoConfig}.
+ *
+ * On ANY error (404, parse failure, validation drop, oversized, missing SHA),
+ * `deps.core.warning(...)` is called and `{}` is returned. This function
+ * NEVER throws — a broken/untrusted `.zai.yml` must never break the review.
+ *
+ * @param {Object} opts - `{ octokit, context, path?, headSha? }`
+ * @param {Object} [deps] - `{ core }` (for warnings).
+ * @param {{warning?: Function, info?: Function}} [deps.core]
+ * @returns {Promise<Object>}
+ */
+async function loadRepoConfig(opts = {}, deps = {}) {
+  const { octokit, context } = opts;
+  const path = typeof opts.path === 'string' && opts.path !== '' ? opts.path : '.zai.yml';
+  const core = deps.core;
+  const warn = (msg) => {
+    if (core && typeof core.warning === 'function') core.warning(msg);
+  };
+
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) {
+    warn('repo-config: missing owner/repo in context; skipping .zai.yml load.');
+    return {};
+  }
+
+  const headSha = resolveHeadSha(opts);
+  if (headSha === '') {
+    warn('repo-config: could not resolve PR head SHA; skipping .zai.yml load.');
+    return {};
+  }
+
+  let data;
+  try {
+    const resp = await octokit.rest.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref: headSha,
+    });
+    data = resp?.data;
+  } catch (error) {
+    const status = error?.status;
+    if (status === 404) {
+      // 404 is the common case (most repos don't have a .zai.yml), but the
+      // task brief specifies a warning on ANY error so callers can observe it.
+      warn(`repo-config: no ${path} found at ${headSha.slice(0, 7)} (404).`);
+      return {};
+    }
+    warn(
+      `repo-config: failed to fetch ${path} (${status ?? 'unknown'}): ` +
+        `${error?.message ?? String(error)}`,
+    );
+    return {};
+  }
+
+  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
+  // a directory or a non-file response is treated as "no config".
+  let text;
+  if (data && typeof data.content === 'string') {
+    // Reject oversized content before decoding (cost/DoS guard).
+    // `data.size` is the byte count GitHub reports; fall back to the
+    // base64 length when missing.
+    const size = typeof data.size === 'number' ? data.size : data.content.length;
+    if (size > MAX_REPO_CONFIG_BYTES) {
+      warn(
+        `repo-config: ${path} is ${size} bytes (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
+      );
+      return {};
+    }
+    try {
+      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
+    } catch {
+      warn(`repo-config: ${path} could not be base64-decoded; skipping.`);
+      return {};
+    }
+    // Post-decode size guard (base64 length can under-report).
+    if (typeof text === 'string' && text.length > MAX_REPO_CONFIG_BYTES) {
+      warn(
+        `repo-config: ${path} decodes to ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
+      );
+      return {};
+    }
+  } else if (typeof data === 'string') {
+    text = data;
+    if (text.length > MAX_REPO_CONFIG_BYTES) {
+      warn(
+        `repo-config: ${path} is ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
+      );
+      return {};
+    }
+  } else {
+    // Not a file (could be a directory listing or symlink) — no config.
+    return {};
+  }
+
+  let parsed;
+  try {
+    parsed = parseZaiYml(text);
+  } catch (error) {
+    // parseZaiYml is never expected to throw, but defend in depth.
+    warn(
+      `repo-config: ${path} failed to parse: ${error?.message ?? String(error)}`,
+    );
+    return {};
+  }
+
+  // Treat a parse result with NO recognized keys as malformed/empty. The
+  // parser is tolerant (garbage → `{}`), so we surface a warning here to make
+  // a broken `.zai.yml` observable to operators while still returning `{}`.
+  const validated = validateRepoConfig(parsed);
+  if (Object.keys(validated).length === 0) {
+    warn(
+      `repo-config: ${path} parsed but contained no recognized keys; ignoring.`,
+    );
+    return {};
+  }
+  return validated;
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -45418,6 +46599,8 @@ async function setReviewStatus(opts, deps = {}) {
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
+
 
 
 
@@ -45527,6 +46710,8 @@ const INPUT_NAMES = [
   'ZAI_SCANNERS_ENABLED',
   'ZAI_SCANNERS_CACHE_DIR',
   'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_REPO_CONFIG_ENABLED',
   'GITHUB_TOKEN',
 ];
 
@@ -45610,6 +46795,7 @@ async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummary,
     partitionFindings: partitionFindingsFn = partitionFindings,
     buildReviewBody: buildReviewBodyFn = buildReviewBody,
     buildReviewComments: buildReviewCommentsFn = buildReviewComments,
@@ -45626,6 +46812,8 @@ async function run(context, deps = {}) {
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
+    loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
+    mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
   } = deps;
 
   const event = eventName(context);
@@ -45677,19 +46865,42 @@ async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
+    // Phase 3: in-repo `.zai.yml`. The file is fetched from the PR head SHA
+    // and treated as UNTRUSTED (attacker-controllable in fork PRs). The merge
+    // is security-critical: action inputs ALWAYS win on cost/security knobs;
+    // the repo can only NARROW behavior (lower a cap, add path instructions,
+    // add excludes, disable a scanner). loadRepoConfig NEVER throws — any
+    // failure (404, parse error, oversized) returns `{}` + a warning. Tests
+    // inject `deps.repoConfig` directly to bypass the fetch; production lets
+    // loadRepoConfig run when the master switch is on.
+    const rawRepoConfig = config.repoConfigEnabled
+      ? await loadRepoConfigFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : {};
+    const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
+
     // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
     // become high-confidence findings directly (merged over LLM findings at
     // the same file:line+title) and are injected into the LLM prompt as
     // "already detected, don't re-report" context. Scanners NEVER fail the
     // review — on any error they log a warning and contribute [] findings.
+    // Phase 3: repo `.zai.yml` scanners map onto the scanner orchestrator's
+    // per-scanner toggles: `gitleaks` → secrets, `ast_grep` → patterns. The
+    // repo can only DISABLE a scanner the action enabled (enforced by
+    // mergeRepoConfig).
     const cacheDir = expandHome(config.scannersCacheDir);
+    const scannerRepoConfig = {
+      scanners: {
+        secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
+        patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+      },
+    };
     const scannerResult = await runScannersFn(
       {
         files: patchable,
         repoPath: process.cwd(),
         cacheDir,
-        config: { scannersEnabled: config.scannersEnabled },
-        repoConfig: deps.repoConfig,
+        config: { scannersEnabled: repoConfig.scannersEnabled },
+        repoConfig: scannerRepoConfig,
       },
       { core: coreDep },
     );
@@ -45706,11 +46917,16 @@ async function run(context, deps = {}) {
 
     // Structured review: one path for both small and large PRs. Batching
     // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
-    // result is rendered as a structured-findings summary comment.
+    // result is rendered as a structured-findings summary comment. Phase 3:
+    // the merged repo config supplies pathInstructions/toneInstructions
+    // (additive) and may LOWER maxFindings (repo can only narrow the cap).
     const result = await runStructuredReviewFn(
       patchable,
       {
         ...config,
+        maxFindings: repoConfig.maxFindings,
+        pathInstructions: repoConfig.pathInstructions,
+        toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,
         scannerContext,
       },
@@ -45774,6 +46990,13 @@ async function run(context, deps = {}) {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      // Phase 7: walkthrough context for the summary-only section of the
+      // review body. When config.walkthrough is true, buildReviewBody renders
+      // the summary-only findings as dependency-ordered cohort sections
+      // (collapsible <details>) instead of a flat bullet list. Inline comments
+      // are line-anchored and unaffected.
+      walkthrough: config.walkthrough === true,
+      files: patchable,
     };
 
     if (inline.length > 0) {
@@ -45820,14 +47043,25 @@ async function run(context, deps = {}) {
 
     // No inline-mappable findings: post the whole summary as an issue comment
     // via the existing marker-upsert path (keeps idempotency for the
-    // no-findings / all-file-level case).
-    const content = formatFindingsAsSummaryFn(result.findings, {
-      reviewerName: config.reviewerName,
-      metadata: {
-        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: truncatedCount,
-      },
-    });
+    // no-findings / all-file-level case). When walkthrough is enabled (default)
+    // and there are findings, render as a dependency-ordered walkthrough;
+    // otherwise fall back to the flat severity-grouped summary.
+    const useWalkthrough =
+      config.walkthrough && Array.isArray(result.findings) && result.findings.length > 0;
+    const summaryMetadata = {
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+      summary: typeof result.summary === 'string' ? result.summary : '',
+    };
+    const content = useWalkthrough
+      ? formatWalkthroughSummaryFn(result.findings, patchable, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        })
+      : formatFindingsAsSummaryFn(result.findings, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        });
     const body = buildCommentBodyFn({
       title: config.reviewerName,
       content,

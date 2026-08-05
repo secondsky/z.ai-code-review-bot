@@ -22,6 +22,7 @@
 import { MARKER } from './comments.js';
 import { sanitizeModelOutput } from './sanitize-output.js';
 import { postComment } from './handlers/_shared.js';
+import { formatWalkthroughSummary } from './walkthrough.js';
 
 /**
  * Per-severity emoji for inline comment bodies. Mirrors the table in
@@ -44,14 +45,27 @@ const SEVERITY_EMOJI = {
  *   <optional truncation note>
  *   <summary prose>
  *   <if summaryOnly non-empty>:
+ *     <if metadata.walkthrough && metadata.files>:
+ *       Cohort-ordered walkthrough sections (collapsible <details>) for the
+ *       summary-only findings — renders the same overview + cohort sections as
+ *       formatWalkthroughSummary, minus the trailing marker (the body adds its
+ *       own marker once at the very end).
+ *     <else>:
  *   ## Additional findings
  *   - **file** — title           (one per summary-only finding)
+ *     <endif>
  *   <endif>
  *   <!-- zai-code-review -->     (byte-exact marker — REQUIRED for idempotency)
  *
+ * The walkthrough path reuses formatWalkthroughSummary but strips its header +
+ * trailing marker so the body keeps a single header (## reviewerName) and a
+ * single trailing marker. This keeps the summary-only findings grouped by
+ * dependency-ordered cohort — the inline comments stay line-anchored and
+ * unaffected.
+ *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string}} [metadata]
  * @returns {string}
  */
 export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -83,14 +97,39 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
 
   const summaryOnly = Array.isArray(summaryOnlyFindings) ? summaryOnlyFindings : [];
   if (summaryOnly.length > 0) {
-    lines.push('## Additional findings');
-    lines.push('');
-    for (const f of summaryOnly) {
-      const file = typeof f?.file === 'string' ? f.file : '';
-      const title = typeof f?.title === 'string' ? f.title : '';
-      lines.push(`- **${file}** — ${title}`);
+    const useWalkthrough =
+      metadata.walkthrough === true && Array.isArray(metadata.files);
+
+    if (useWalkthrough) {
+      // Render the summary-only findings as a dependency-ordered walkthrough.
+      // Strip the walkthrough's own header (## reviewerName) and trailing marker
+      // so the review body retains exactly one header and one marker.
+      const rendered = formatWalkthroughSummary(summaryOnly, metadata.files, {
+        reviewerName: reviewerName ?? 'Z.ai Code Review',
+        metadata: { summary: '' },
+      });
+      // Drop the leading "## <name>\n\n" header.
+      let body = rendered;
+      const headerEnd = body.indexOf('\n\n');
+      if (headerEnd !== -1) body = body.slice(headerEnd + 2);
+      // Drop the trailing "\n<!-- zai-code-review -->" — keep everything up to
+      // (but not including) the final marker line.
+      const markerIdx = body.lastIndexOf(MARKER);
+      if (markerIdx !== -1) {
+        body = body.slice(0, markerIdx).replace(/\n+$/, '');
+      }
+      lines.push(body);
+      lines.push('');
+    } else {
+      lines.push('## Additional findings');
+      lines.push('');
+      for (const f of summaryOnly) {
+        const file = typeof f?.file === 'string' ? f.file : '';
+        const title = typeof f?.title === 'string' ? f.title : '';
+        lines.push(`- **${file}** — ${title}`);
+      }
+      lines.push('');
     }
-    lines.push('');
   }
 
   lines.push(MARKER);

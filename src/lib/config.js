@@ -260,6 +260,29 @@ export function loadConfig(inputs = {}, options = {}) {
   const commitStatus =
     commitStatusRaw === '' ? true : isTruthy(commitStatusRaw);
 
+  // Phase 7: walkthrough / cohort-ordered summary rendering. When true
+  // (default), the summary findings are reorganized into dependency-ordered
+  // collapsible cohort sections (database → api → business-logic → … → other)
+  // instead of a flat severity-sorted list. Inline comments stay line-anchored
+  // and are unaffected; only the SUMMARY rendering changes. Empty input means
+  // "use the default" (true), matching the scannersEnabled/commitStatus
+  // convention so direct callers get the feature without setting the input.
+  const walkthroughRaw = read(inputs, 'ZAI_WALKTHROUGH').trim().toLowerCase();
+  const walkthrough =
+    walkthroughRaw === '' ? true : isTruthy(walkthroughRaw);
+
+  // Phase 3: in-repo config file (`.zai.yml`). The master switch defaults to
+  // TRUE — repos can commit a `.zai.yml` to tailor review behavior (path
+  // instructions, tone) WITHOUT editing their workflow YAML. The file is
+  // fetched from the PR head SHA and treated as UNTRUSTED (attacker-
+  // controllable in fork PRs): mergeRepoConfig enforces that it can only
+  // NARROW behavior (lower a cap, add excludes, disable a scanner), never
+  // widen it. Operators who don't want repo-config loading at all can set
+  // ZAI_REPO_CONFIG_ENABLED=false.
+  const repoConfigEnabledRaw = read(inputs, 'ZAI_REPO_CONFIG_ENABLED').trim().toLowerCase();
+  const repoConfigEnabled =
+    repoConfigEnabledRaw === '' ? true : isTruthy(repoConfigEnabledRaw);
+
   const config = {
     apiKey,
     model,
@@ -289,6 +312,8 @@ export function loadConfig(inputs = {}, options = {}) {
     scannersEnabled,
     scannersCacheDir,
     commitStatus,
+    walkthrough,
+    repoConfigEnabled,
     githubToken,
   };
 

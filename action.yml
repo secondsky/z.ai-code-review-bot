@@ -215,6 +215,32 @@ inputs:
     required: false
     default: 'true'
 
+  # --- v2 walkthrough / cohort ordering (Phase 7) ---
+  ZAI_WALKTHROUGH:
+    description: |-
+      Render the review summary as a dependency-ordered "walkthrough" —
+      findings are grouped into collapsible cohort sections (database → api →
+      business-logic → config → ui → tests → docs → other) so the summary reads
+      like a narrative of the change rather than a flat severity-sorted list.
+      ON by default. Only the SUMMARY rendering changes; inline line-anchored
+      comments are unaffected. Set to `false` to fall back to the flat
+      severity-grouped summary.
+    required: false
+    default: 'true'
+
+  ZAI_REPO_CONFIG_ENABLED:
+    description: |-
+      Master switch for in-repo `.zai.yml` configuration. When true (default),
+      the bot fetches `.zai.yml` from the PR's head SHA and merges it with the
+      action inputs. The file can only NARROW behavior (add path instructions,
+      set tone, lower the findings cap, add excludes, disable a scanner) — it
+      can NEVER widen it (raise a cap, disable auth, lower cost caps, or enable
+      a scanner the action turned off). This is a security constraint: the file
+      is attacker-controllable in fork PRs. Set to `false` to disable
+      `.zai.yml` loading entirely.
+    required: false
+    default: 'true'
+
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
     required: false

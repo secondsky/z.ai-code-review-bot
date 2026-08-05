@@ -469,3 +469,51 @@ describe('commitStatus (Phase 5)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: 'Yes' }).commitStatus).toBe(true);
   });
 });
+
+describe('walkthrough (Phase 7)', () => {
+  test('defaults to true (walkthrough rendering on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).walkthrough).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: v }).walkthrough).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: v }).walkthrough).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches commitStatus convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: '' }).walkthrough).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: '   ' }).walkthrough).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: 'TRUE' }).walkthrough).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: 'Yes' }).walkthrough).toBe(true);
+  });
+});
+
+describe('repoConfigEnabled (Phase 3 — .zai.yml)', () => {
+  test('defaults to true (in-repo config loading on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).repoConfigEnabled).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: v }).repoConfigEnabled).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: v }).repoConfigEnabled).toBe(false);
+  });
+
+  test('empty/whitespace → true (matches commitStatus/walkthrough convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: '' }).repoConfigEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: '   ' }).repoConfigEnabled).toBe(true);
+  });
+
+  test('case-insensitive: "FALSE", "No"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'FALSE' }).repoConfigEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'No' }).repoConfigEnabled).toBe(false);
+  });
+});

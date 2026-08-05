@@ -63,6 +63,11 @@ function makeConfig(overrides = {}) {
     // Phase 5: commit-status feedback. Default OFF in unit tests so existing
     // assertions on octokit calls stay stable; dedicated status tests opt in.
     commitStatus: false,
+    // Phase 3: in-repo `.zai.yml`. Default OFF in unit tests so loadRepoConfig
+    // (which would hit octokit.repos.getContent) is skipped; dedicated
+    // repo-config tests opt in or inject loadRepoConfig directly.
+    repoConfigEnabled: false,
+    walkthrough: true,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -574,9 +579,13 @@ describe('run — pull_request auto-review', () => {
     expect(prompt).toContain('Already detected by automated scanners');
     expect(prompt).toContain('gitleaks:aws-access-key');
 
-    // The structured-review summary mentions the deterministic count.
+    // The deterministic scanner finding reached the PR summary body. (The
+    // exact summary format varies by rendering phase — walkthrough vs flat —
+    // so we assert the finding's title/rule appear rather than a specific
+    // summary line.)
     const body = octokit.__calls.createComment[0].body;
-    expect(body).toContain('Scanners found 1 deterministic issues.');
+    expect(body).toContain('AWS access key');
+    expect(body).toContain('src/a.js');
   });
 
   it('scannersEnabled=false: runScanners is still called (returns []) but no findings surfaced', async () => {
