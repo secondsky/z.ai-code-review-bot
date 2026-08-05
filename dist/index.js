@@ -41294,101 +41294,294 @@ async function runStructuredReview(files, config, deps = {}) {
   };
 }
 
-;// CONCATENATED MODULE: ./src/lib/commands.js
+;// CONCATENATED MODULE: ./src/lib/diff.js
 /**
- * `/zai` comment parser + command allowlist.
+ * Unified-diff parsing + finding-to-comment mapping for inline line-level
+ * review comments (the v2 headline feature).
  *
- * PURE module: no I/O, no async, no imports of actions modules. It reads a
- * single comment body's first line and returns a structured parse result. The
- * router (src/index.js) uses this to decide whether an `issue_comment` is a
- * command and, if so, which handler to dispatch to.
+ * This module is PURE (no I/O). It reuses {@link parseHunkHeader} from
+ * `./scanners/_patch.js` — that helper already parses the `@@ -a,b +c,d @@`
+ * header line and returns the new-side start (`c`). The richer walker here
+ * emits ALL lines (added + context + deleted) with BOTH old/new line numbers,
+ * which the inline-comment mapper needs: GitHub only accepts comments on lines
+ * that exist in the new (RIGHT) side of the diff — added OR context, never
+ * deleted-only.
  *
- * Supported prefixes (the fork's aliases), case-insensitive, at the start of
- * the (whitespace-trimmed) first line:
- *   `/zai`, `/zai-bot`, `@zai`, `@zai-bot`
+ * The four public entry points compose:
+ *   parseHunks(patch)             → structured hunks (all line types)
+ *   isValidCommentLine(patch, n)  → can GitHub anchor a comment at new-line n?
+ *   findNearestValidLine(patch,n) → snap an off-by-one/deleted line to a valid one
+ *   mapFindingToComment(f, file)  → {path, line, side:'RIGHT'} or null
+ *   partitionFindings(fs, files)  → {inline, summaryOnly} split
  *
- * Result shape: `{ command, args, raw, error }` where exactly one of
- * `command`/`error` is meaningful per the rules below.
+ * @module src/lib/diff.js
  */
 
-/** The verbs the bot recognises. Order is part of the contract. */
-const ALLOWED_COMMANDS = [
-  'ask',
-  'review',
-  'explain',
-  'describe',
-  'impact',
-  'help',
-];
+// Re-export parseHunkHeader so callers can import all diff-parsing helpers
+// from this single canonical module. The walker below uses a richer local
+// variant (parseFullHunkHeader) that also captures the old-side counts.
 
-const ALLOWED_SET = new Set(ALLOWED_COMMANDS);
 
 /**
- * Recognised command prefixes (lowercased). The fork accepted both the slash
- * form and the @-mention form, with and without the `-bot` suffix.
+ * Parse a full hunk header `@@ -a,b +c,d @@` (or single-line `@@ -a +c @@`)
+ * into its four numeric components. Returns null when the line is not a hunk
+ * header or carries no `+c` portion.
+ *
+ * Mirrors {@link parseHunkHeader} but ALSO captures the `-a,b` (old) portion
+ * and the counts — the walker below does not strictly need the counts (it
+ * derives line numbers from the body), but recording them keeps the hunk
+ * metadata faithful to the patch and lets tests assert the parsed shape.
+ *
+ * @param {string} line
+ * @returns {{oldStart:number, oldCount:number, newStart:number, newCount:number} | null}
  */
-const PREFIXES = ['/zai-bot', '/zai', '@zai-bot', '@zai'];
+function parseFullHunkHeader(line) {
+  if (typeof line !== 'string' || !line.startsWith('@@')) return null;
+  const m = line.match(/-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?/);
+  if (!m) return null;
+  const oldStart = parseInt(m[1], 10);
+  const oldCount = m[2] !== undefined ? parseInt(m[2], 10) : 1;
+  const newStart = parseInt(m[3], 10);
+  const newCount = m[4] !== undefined ? parseInt(m[4], 10) : 1;
+  if (![oldStart, newStart].every((n) => Number.isFinite(n) && n >= 1)) {
+    return null;
+  }
+  return { oldStart, oldCount, newStart, newCount };
+}
 
 /**
- * Parse a comment body for a `/zai` (or alias) command.
+ * Parse a unified-diff patch into structured hunks.
  *
- * Rules (per task-7-brief):
- *  - Only the FIRST line is inspected (`text.split('\n')[0]`).
- *  - Non-string input → `{ command: null, args: null, raw: text, error: 'MALFORMED_INPUT' }`.
- *  - Trim leading whitespace; lowercase for prefix detection.
- *  - If the trimmed text does not start with a recognised prefix →
- *    `{ command: null, args: null, raw: text, error: 'NOT_A_COMMAND' }`.
- *  - Strip the prefix; the first remaining token is `command` (lowercased),
- *    the rest of the line is `args` (trimmed single string; may be `''`).
- *  - Empty `command` → `MALFORMED_INPUT`.
- *  - `command` not in {@link ALLOWED_COMMANDS} → `UNKNOWN_COMMAND` (command
- *    and args still returned).
- *  - Otherwise → success (`error: null`).
+ * Each returned hunk carries the `@@ -a,b +c,d @@` numeric header plus a
+ * `lines` array where EVERY body line is typed:
+ *   - `{type:'add', newLine, oldLine:null, text}`  — a `+text` addition
+ *   - `{type:'del', newLine:null, oldLine, text}`  — a `-text` removal
+ *   - `{type:'ctx', newLine, oldLine, text}`       — a ` text` context line
  *
- * @param {string} text
- * @returns {{ command: string|null, args: string|null, raw: string, error: string|null }}
+ * Tracking rules (both counters advance through the body):
+ *   - `+++`/`---` file headers inside the body are skipped (not real additions
+ *     or removals — they only appear at patch scope, but we defend anyway).
+ *   - `\ No newline at end of file` is metadata — skipped, counters unchanged.
+ *   - A truly empty line is treated as a context line (git emits context as a
+ *     leading space, but a bare empty line is also context).
+ *
+ * For patches with no hunk header (shouldn't happen for real GitHub patches)
+ * the walker still runs with counters starting at 1 (best-effort).
+ *
+ * @param {string} patch
+ * @returns {Array<{oldStart:number, oldCount:number, newStart:number, newCount:number, lines:Array<{type:string, newLine:number|null, oldLine:number|null, text:string}>}>}
  */
-function parseCommand(text) {
-  // Defensive: non-string input is a malformed invocation.
-  if (typeof text !== 'string') {
-    return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
+function parseHunks(patch) {
+  if (typeof patch !== 'string' || patch.length === 0) return [];
+
+  /** @type {Array<{oldStart:number, oldCount:number, newStart:number, newCount:number, lines:Array}>} */
+  const hunks = [];
+  let cur = null;
+  let oldLine = 1;
+  let newLine = 1;
+
+  for (const raw of patch.split('\n')) {
+    if (raw.startsWith('@@')) {
+      const header = parseFullHunkHeader(raw);
+      if (header) {
+        oldLine = header.oldStart;
+        newLine = header.newStart;
+        cur = { ...header, lines: [] };
+        hunks.push(cur);
+      }
+      continue;
+    }
+    if (!cur) {
+      // Lines before the first hunk (diff metadata) are skipped entirely.
+      continue;
+    }
+    if (raw.startsWith('+++') || raw.startsWith('---')) {
+      // File headers — not real additions/removals.
+      continue;
+    }
+    if (raw.startsWith('+')) {
+      cur.lines.push({ type: 'add', newLine, oldLine: null, text: raw.slice(1) });
+      newLine++;
+      continue;
+    }
+    if (raw.startsWith('-')) {
+      cur.lines.push({ type: 'del', newLine: null, oldLine, text: raw.slice(1) });
+      oldLine++;
+      continue;
+    }
+    if (raw.startsWith('\\')) {
+      // "\ No newline at end of file" — metadata, counters unchanged.
+      continue;
+    }
+    // Context line (leading space stripped; bare empty line also context).
+    const text = raw.startsWith(' ') ? raw.slice(1) : raw;
+    cur.lines.push({ type: 'ctx', newLine, oldLine, text });
+    oldLine++;
+    newLine++;
   }
 
-  // Only the first line is parsed.
-  const firstLine = text.split('\n')[0];
-  const trimmed = firstLine.trim();
-  const lower = trimmed.toLowerCase();
+  return hunks;
+}
 
-  // Find a recognised prefix at the start.
-  const prefix = PREFIXES.find((p) => lower.startsWith(p));
-  if (!prefix) {
-    return { command: null, args: null, raw: text, error: 'NOT_A_COMMAND' };
+/**
+ * Collect the set of new-side line numbers that GitHub will accept an inline
+ * comment on (added OR context lines — anything with a non-null `newLine`).
+ *
+ * @param {string} patch
+ * @returns {Set<number>}
+ */
+function collectValidLines(patch) {
+  const valid = new Set();
+  for (const hunk of parseHunks(patch)) {
+    for (const entry of hunk.lines) {
+      if (entry.newLine !== null) valid.add(entry.newLine);
+    }
+  }
+  return valid;
+}
+
+/**
+ * Can a GitHub inline review comment anchor to this new-side line number?
+ *
+ * GitHub accepts comments on added lines AND context lines (lines present in
+ * the new version), but NOT on removed-only lines (they have no new-side line
+ * number at all). This walks the patch once and returns true if `line` matches
+ * an `add` or `ctx` entry's `newLine`.
+ *
+ * @param {string} patch
+ * @param {number} line - new-side line number
+ * @returns {boolean}
+ */
+function isValidCommentLine(patch, line) {
+  if (typeof patch !== 'string' || patch.length === 0) return false;
+  if (!Number.isInteger(line) || line < 1) return false;
+  return collectValidLines(patch).has(line);
+}
+
+/**
+ * If the finding's line is slightly off (a deleted line, or an off-by-one),
+ * snap to the nearest valid (add/ctx) new-side line within a small window.
+ *
+ * Search strategy: iterate distances 1..window, checking `line - dist` (above)
+ * and `line + dist` (below). At equal distance, ADDED lines are preferred over
+ * context lines (an addition is the more likely anchor for a finding about new
+ * code). Returns the first valid hit, the line itself if it's already valid,
+ * or null if nothing is within the window.
+ *
+ * @param {string} patch
+ * @param {number} line
+ * @param {number} [window=3] - max distance to search
+ * @returns {number | null}
+ */
+function findNearestValidLine(patch, line, window = 3) {
+  if (typeof patch !== 'string' || patch.length === 0) return null;
+  if (!Number.isInteger(line) || line < 1) return null;
+  const w = Number.isInteger(window) && window >= 0 ? window : 3;
+
+  // Build a line→type map so we can prefer 'add' over 'ctx' at equal distance.
+  /** @type {Map<number, 'add'|'ctx'>} */
+  const lineType = new Map();
+  for (const hunk of parseHunks(patch)) {
+    for (const entry of hunk.lines) {
+      if (entry.newLine !== null) {
+        // 'add' wins over 'ctx' if both somehow map to the same newLine.
+        if (!lineType.has(entry.newLine) || entry.type === 'add') {
+          lineType.set(entry.newLine, entry.type);
+        }
+      }
+    }
   }
 
-  // Strip the prefix and any immediately-following whitespace.
-  const remainder = trimmed.slice(prefix.length).trim();
-  if (remainder === '') {
-    return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
-  }
+  // Exact match first (the common case — no snap needed).
+  if (lineType.has(line)) return line;
 
-  // First token is the command; the rest is args (single trimmed string).
-  const sp = remainder.indexOf(' ');
-  let command;
-  let args;
-  if (sp === -1) {
-    command = remainder;
-    args = '';
-  } else {
-    command = remainder.slice(0, sp);
-    args = remainder.slice(sp + 1).trim();
-  }
-  command = command.toLowerCase();
+  for (let dist = 1; dist <= w; dist++) {
+    // At each distance, prefer 'add' over 'ctx' when both sides are present.
+    const above = line - dist;
+    const below = line + dist;
+    const aboveType = lineType.has(above) ? lineType.get(above) : null;
+    const belowType = lineType.has(below) ? lineType.get(below) : null;
 
-  if (!ALLOWED_SET.has(command)) {
-    return { command, args, raw: text, error: 'UNKNOWN_COMMAND' };
+    if (aboveType === 'add' && belowType === 'add') {
+      // Both adds at equal distance — prefer the one closer to the original
+      // intent. The above (smaller line number) is as good a tie-breaker as
+      // any; pick it deterministically.
+      return above;
+    }
+    if (aboveType === 'add') return above;
+    if (belowType === 'add') return below;
+    // Neither is an add; fall back to whichever ctx exists.
+    if (aboveType === 'ctx') return above;
+    if (belowType === 'ctx') return below;
   }
+  return null;
+}
 
-  return { command, args, raw: text, error: null };
+/**
+ * Map a finding to a GitHub review-comment coordinate, or null if unmappable.
+ *
+ * Rules (in order):
+ *   1. `finding.line` null → null (file-level finding, goes to summary).
+ *   2. `finding.file !== file.filename` → null (defensive; shouldn't happen).
+ *   3. `isValidCommentLine(patch, line)` → `{path, line, side:'RIGHT'}`.
+ *   4. Else try `findNearestValidLine`; if found, return with the snapped line.
+ *   5. Else null.
+ *
+ * @param {{file:string, line:number|null}} finding
+ * @param {{filename:string, patch:string}} file
+ * @returns {{path:string, line:number, side:'RIGHT'} | null}
+ */
+function mapFindingToComment(finding, file) {
+  if (!finding || !file) return null;
+  if (finding.line === null || finding.line === undefined) return null;
+  if (finding.file !== file.filename) return null;
+  if (typeof file.patch !== 'string' || file.patch.length === 0) return null;
+
+  const target = finding.line;
+  if (!Number.isInteger(target) || target < 1) return null;
+
+  if (isValidCommentLine(file.patch, target)) {
+    return { path: file.filename, line: target, side: 'RIGHT' };
+  }
+  const snapped = findNearestValidLine(file.patch, target);
+  if (snapped !== null) {
+    return { path: file.filename, line: snapped, side: 'RIGHT' };
+  }
+  return null;
+}
+
+/**
+ * Partition findings into inline-mappable and summary-only buckets.
+ *
+ * Builds a `Map<filename, file>` for O(1) lookup, then for each finding
+ * attempts `mapFindingToComment`. Non-null results go to `inline` (carrying
+ * the resolved comment coordinate); the rest go to `summaryOnly`.
+ *
+ * @param {Array} findings
+ * @param {Array<{filename:string, patch:string}>} files
+ * @returns {{inline: Array<{finding:object, comment:{path:string, line:number, side:'RIGHT'}}>, summaryOnly: Array<object>}}
+ */
+function partitionFindings(findings, files) {
+  const fileMap = new Map();
+  if (Array.isArray(files)) {
+    for (const f of files) {
+      if (f && typeof f.filename === 'string') fileMap.set(f.filename, f);
+    }
+  }
+  const inline = [];
+  const summaryOnly = [];
+  if (!Array.isArray(findings)) return { inline, summaryOnly };
+
+  for (const finding of findings) {
+    const fileObj = finding && typeof finding.file === 'string' ? fileMap.get(finding.file) : null;
+    const comment = fileObj ? mapFindingToComment(finding, fileObj) : null;
+    if (comment) {
+      inline.push({ finding, comment });
+    } else {
+      summaryOnly.push(finding);
+    }
+  }
+  return { inline, summaryOnly };
 }
 
 ;// CONCATENATED MODULE: ./src/lib/handlers/_shared.js
@@ -41556,6 +41749,407 @@ async function upsertPrDescription(
 
   await updatePr({ owner, repo, pull_number: pullNumber, body: newBody });
   return { updated: true };
+}
+
+;// CONCATENATED MODULE: ./src/lib/review.js
+/**
+ * Inline line-level review comments (v2 headline feature).
+ *
+ * Builds and submits GitHub reviews whose inline comments are anchored to diff
+ * lines — the CodeRabbit/Copilot experience. Replaces the single summary
+ * comment for the PR auto-review path when findings are line-mappable.
+ *
+ * This module does I/O via an injected `octokit` (so tests pass a fake). The
+ * pure builders ({@link buildReviewBody}, {@link buildReviewComments},
+ * {@link buildReviewPayload}) have no I/O and are unit-tested directly.
+ *
+ * Idempotency model (mirrors `comments.js`): the review body carries the
+ * {@link MARKER} HTML comment. On each run, {@link upsertReview} lists prior
+ * bot reviews (matched by marker OR bot login), DISMISSES them (so stale
+ * inline comments disappear on re-push), then creates the fresh review. This
+ * "dismiss-stale-then-post" sequence keeps exactly one active bot review per
+ * PR head SHA without piling up duplicates.
+ *
+ * @module src/lib/review.js
+ */
+
+
+
+
+
+/**
+ * Per-severity emoji for inline comment bodies. Mirrors the table in
+ * findings.js so the inline comments and the summary stay visually consistent.
+ */
+const review_SEVERITY_EMOJI = {
+  critical: '🔴',
+  high: '🟠',
+  medium: '🟡',
+  low: '🔵',
+  info: '➖',
+};
+
+/**
+ * Build the review body (the top-level prose shown on the review).
+ *
+ * Structure:
+ *   ## <reviewerName>            (when reviewerName provided)
+ *   <optional deterministic-findings note>
+ *   <optional truncation note>
+ *   <summary prose>
+ *   <if summaryOnly non-empty>:
+ *   ## Additional findings
+ *   - **file** — title           (one per summary-only finding)
+ *   <endif>
+ *   <!-- zai-code-review -->     (byte-exact marker — REQUIRED for idempotency)
+ *
+ * @param {string} summary - the model's prose summary
+ * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number}} [metadata]
+ * @returns {string}
+ */
+function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
+  const lines = [];
+  const reviewerName =
+    typeof metadata.reviewerName === 'string' && metadata.reviewerName.length > 0
+      ? metadata.reviewerName
+      : null;
+  if (reviewerName) {
+    lines.push(`## ${reviewerName}`);
+    lines.push('');
+  }
+
+  const detCount = typeof metadata.deterministicFindingsCount === 'number' ? metadata.deterministicFindingsCount : 0;
+  if (detCount > 0) {
+    lines.push(`🔍 Scanners found ${detCount} deterministic issues.`);
+    lines.push('');
+  }
+  const truncated = typeof metadata.truncated === 'number' ? metadata.truncated : 0;
+  if (truncated > 0) {
+    lines.push(`_${truncated} findings truncated to cap._`);
+    lines.push('');
+  }
+
+  if (typeof summary === 'string' && summary.length > 0) {
+    lines.push(summary);
+    lines.push('');
+  }
+
+  const summaryOnly = Array.isArray(summaryOnlyFindings) ? summaryOnlyFindings : [];
+  if (summaryOnly.length > 0) {
+    lines.push('## Additional findings');
+    lines.push('');
+    for (const f of summaryOnly) {
+      const file = typeof f?.file === 'string' ? f.file : '';
+      const title = typeof f?.title === 'string' ? f.title : '';
+      lines.push(`- **${file}** — ${title}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(MARKER);
+  return lines.join('\n');
+}
+
+/**
+ * Render a single inline comment body from a finding.
+ *
+ * Format:
+ *   <emoji> **<title>**
+ *   <description>
+ *   > `<evidence>`        (when evidence present)
+ *   💡 <suggestion>       (when suggestion present)
+ *
+ * The whole body is run through `sanitizeModelOutput` before returning so an
+ * indirect prompt-injection in the diff cannot coax @mention spam or forged
+ * alert banners into the bot's trusted review comments.
+ *
+ * @param {Record<string, unknown>} finding
+ * @returns {string}
+ */
+function renderCommentBody(finding) {
+  const severity = typeof finding.severity === 'string' ? finding.severity : 'info';
+  const emoji = review_SEVERITY_EMOJI[severity] ?? '➖';
+  const title = typeof finding.title === 'string' ? finding.title : '';
+  const description = typeof finding.description === 'string' ? finding.description : '';
+  const evidence = typeof finding.evidence === 'string' ? finding.evidence : '';
+  const suggestion =
+    typeof finding.suggestion === 'string' && finding.suggestion.length > 0 ? finding.suggestion : null;
+
+  const parts = [];
+  parts.push(`${emoji} **${title}**`);
+  if (description.length > 0) parts.push(description);
+  if (evidence.length > 0) parts.push(`> \`${evidence}\``);
+  if (suggestion !== null) parts.push(`💡 ${suggestion}`);
+  return sanitizeModelOutput(parts.join('\n'));
+}
+
+/**
+ * Build the comments array for the GitHub review payload.
+ *
+ * Each comment is `{ path, line, side: 'RIGHT', body }`. The bodies are
+ * rendered from each finding via {@link renderCommentBody} (which sanitizes).
+ *
+ * @param {Array<{finding:object, comment:{path:string, line:number, side:string}}>} inlineFindings
+ * @returns {Array<{path:string, line:number, side:string, body:string}>}
+ */
+function buildReviewComments(inlineFindings) {
+  if (!Array.isArray(inlineFindings)) return [];
+  return inlineFindings.map(({ finding, comment }) => ({
+    path: comment.path,
+    line: comment.line,
+    side: comment.side,
+    body: renderCommentBody(finding),
+  }));
+}
+
+/**
+ * Assemble the full `pulls.createReview` payload.
+ *
+ * `event` defaults to `'COMMENT'` (advisory review). When strict mode lands
+ * (Phase 8.3) a caller can pass `'REQUEST_CHANGES'` to block merge.
+ *
+ * @param {{body:string, comments:Array, event?:string}} opts
+ * @returns {{body:string, event:string, comments:Array}}
+ */
+function buildReviewPayload({ body, comments, event } = {}) {
+  return {
+    body: String(body ?? ''),
+    event: typeof event === 'string' && event.length > 0 ? event : 'COMMENT',
+    comments: Array.isArray(comments) ? comments : [],
+  };
+}
+
+/**
+ * List prior reviews posted by the bot on a PR.
+ *
+ * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
+ * page). Filters to reviews whose `body` includes `marker` OR whose `user.login`
+ * ends with `[bot]`. This dual filter catches both the marker-bearing reviews
+ * we posted AND any legacy bot-posted reviews that predate the marker.
+ *
+ * @param {{octokit:object, context:object, marker?:string}} args
+ * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
+ */
+async function listBotReviews({ octokit, context, marker = MARKER }) {
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.pull_request?.number;
+  if (!owner || !repo || typeof pullNumber !== 'number') return [];
+
+  /** @type {Array} */
+  const all = [];
+  const perPage = 100;
+  let page = 1;
+  for (;;) {
+    const { data } = await octokit.rest.pulls.listReviews({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: perPage,
+      page,
+    });
+    const rows = Array.isArray(data) ? data : [];
+    all.push(...rows);
+    if (rows.length < perPage) break;
+    page += 1;
+  }
+
+  return all.filter((r) => {
+    const body = typeof r?.body === 'string' ? r.body : '';
+    const login = typeof r?.user?.login === 'string' ? r.user.login : '';
+    return body.includes(marker) || login.endsWith('[bot]');
+  });
+}
+
+/**
+ * Dismiss prior bot reviews so stale inline comments don't pile up on re-push.
+ *
+ * For each review, calls `pulls.dismissReview` with `message: reason`. Tolerates
+ * individual dismiss failures (an already-dismissed review returns 422) by
+ * logging a warning and continuing — one stale dismissal must not abort the
+ * whole re-review.
+ *
+ * @param {{octokit:object, context:object, reviews:Array, reason:string, core?:{warning?:Function, info?:Function}}} args
+ * @returns {Promise<void>}
+ */
+async function dismissStaleReviews({ octokit, context, reviews, reason, core }) {
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.pull_request?.number;
+  if (!owner || !repo || typeof pullNumber !== 'number') return;
+  if (!Array.isArray(reviews)) return;
+
+  for (const review of reviews) {
+    const reviewId = review?.id;
+    if (reviewId === undefined || reviewId === null) continue;
+    try {
+      await octokit.rest.pulls.dismissReview({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        review_id: reviewId,
+        message: reason,
+      });
+    } catch (err) {
+      // A 422 usually means the review is already dismissed — tolerate it.
+      if (core?.warning) {
+        core.warning(
+          `Failed to dismiss review ${reviewId}: ${err?.message ?? String(err)}`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Post a review with inline comments. Idempotent per SHA: dismisses prior bot
+ * reviews first, then creates the new one.
+ *
+ * Flow:
+ *   1. `listBotReviews` → prior reviews (marker OR bot login).
+ *   2. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`.
+ *   3. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
+ *
+ * Returns `{ id, commentCount, dismissedCount }`.
+ *
+ * @param {{octokit:object, context:object, marker?:string, sha:string, body:string, comments:Array, event?:string, core?:object}} args
+ * @returns {Promise<{id:number, commentCount:number, dismissedCount:number}>}
+ */
+async function upsertReview({ octokit, context, marker = MARKER, sha, body, comments, event, core }) {
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  const pullNumber = context?.payload?.pull_request?.number;
+
+  const prior = await listBotReviews({ octokit, context, marker });
+  const reason = `Superseded by re-review at ${sha ?? ''}`.trim();
+  await dismissStaleReviews({ octokit, context, reviews: prior, reason, core });
+
+  const payload = buildReviewPayload({ body, comments, event });
+  const { data } = await octokit.rest.pulls.createReview({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    body: payload.body,
+    event: payload.event,
+    comments: payload.comments,
+  });
+
+  return {
+    id: data?.id,
+    commentCount: payload.comments.length,
+    dismissedCount: prior.length,
+  };
+}
+
+/**
+ * Post a fallback issue comment when review submission fails (all findings
+ * unmappable, API error, etc.). Delegates to the existing `postComment` from
+ * `handlers/_shared.js` (which already sanitizes). This ensures the review is
+ * NEVER silently lost.
+ *
+ * @param {{octokit:object, context:object, body:string}} args
+ * @returns {Promise<object|null>}  The created comment data, or null.
+ */
+async function postFallbackComment({ octokit, context, body }) {
+  return postComment({ octokit, context, body });
+}
+
+;// CONCATENATED MODULE: ./src/lib/commands.js
+/**
+ * `/zai` comment parser + command allowlist.
+ *
+ * PURE module: no I/O, no async, no imports of actions modules. It reads a
+ * single comment body's first line and returns a structured parse result. The
+ * router (src/index.js) uses this to decide whether an `issue_comment` is a
+ * command and, if so, which handler to dispatch to.
+ *
+ * Supported prefixes (the fork's aliases), case-insensitive, at the start of
+ * the (whitespace-trimmed) first line:
+ *   `/zai`, `/zai-bot`, `@zai`, `@zai-bot`
+ *
+ * Result shape: `{ command, args, raw, error }` where exactly one of
+ * `command`/`error` is meaningful per the rules below.
+ */
+
+/** The verbs the bot recognises. Order is part of the contract. */
+const ALLOWED_COMMANDS = [
+  'ask',
+  'review',
+  'explain',
+  'describe',
+  'impact',
+  'help',
+];
+
+const ALLOWED_SET = new Set(ALLOWED_COMMANDS);
+
+/**
+ * Recognised command prefixes (lowercased). The fork accepted both the slash
+ * form and the @-mention form, with and without the `-bot` suffix.
+ */
+const PREFIXES = ['/zai-bot', '/zai', '@zai-bot', '@zai'];
+
+/**
+ * Parse a comment body for a `/zai` (or alias) command.
+ *
+ * Rules (per task-7-brief):
+ *  - Only the FIRST line is inspected (`text.split('\n')[0]`).
+ *  - Non-string input → `{ command: null, args: null, raw: text, error: 'MALFORMED_INPUT' }`.
+ *  - Trim leading whitespace; lowercase for prefix detection.
+ *  - If the trimmed text does not start with a recognised prefix →
+ *    `{ command: null, args: null, raw: text, error: 'NOT_A_COMMAND' }`.
+ *  - Strip the prefix; the first remaining token is `command` (lowercased),
+ *    the rest of the line is `args` (trimmed single string; may be `''`).
+ *  - Empty `command` → `MALFORMED_INPUT`.
+ *  - `command` not in {@link ALLOWED_COMMANDS} → `UNKNOWN_COMMAND` (command
+ *    and args still returned).
+ *  - Otherwise → success (`error: null`).
+ *
+ * @param {string} text
+ * @returns {{ command: string|null, args: string|null, raw: string, error: string|null }}
+ */
+function parseCommand(text) {
+  // Defensive: non-string input is a malformed invocation.
+  if (typeof text !== 'string') {
+    return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
+  }
+
+  // Only the first line is parsed.
+  const firstLine = text.split('\n')[0];
+  const trimmed = firstLine.trim();
+  const lower = trimmed.toLowerCase();
+
+  // Find a recognised prefix at the start.
+  const prefix = PREFIXES.find((p) => lower.startsWith(p));
+  if (!prefix) {
+    return { command: null, args: null, raw: text, error: 'NOT_A_COMMAND' };
+  }
+
+  // Strip the prefix and any immediately-following whitespace.
+  const remainder = trimmed.slice(prefix.length).trim();
+  if (remainder === '') {
+    return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
+  }
+
+  // First token is the command; the rest is args (single trimmed string).
+  const sp = remainder.indexOf(' ');
+  let command;
+  let args;
+  if (sp === -1) {
+    command = remainder;
+    args = '';
+  } else {
+    command = remainder.slice(0, sp);
+    args = remainder.slice(sp + 1).trim();
+  }
+  command = command.toLowerCase();
+
+  if (!ALLOWED_SET.has(command)) {
+    return { command, args, raw: text, error: 'UNKNOWN_COMMAND' };
+  }
+
+  return { command, args, raw: text, error: null };
 }
 
 ;// CONCATENATED MODULE: ./src/lib/handlers/ask.js
@@ -44591,6 +45185,8 @@ async function runScanners(opts, deps = {}) {
 
 
 
+
+
 /* ------------------------------------------------------------------ *
  * Entry-point guard
  * ------------------------------------------------------------------ */
@@ -44675,6 +45271,38 @@ const INPUT_NAMES = [
 ];
 
 /**
+ * Build the fallback comment body used when inline review submission fails.
+ *
+ * Carries the review summary (already built, marker included) plus every
+ * finding rendered as plain text so the structured review still reaches the PR
+ * even if the review API rejected the payload. The findings are appended after
+ * a clear "Review could not be posted inline" preamble.
+ *
+ * @param {string} reviewBody  The review body (already includes the marker).
+ * @param {Array} findings     All findings (inline + summary-only).
+ * @param {string} reviewerName
+ * @returns {string}
+ */
+function buildFallbackBody(reviewBody, findings, reviewerName) {
+  const list = Array.isArray(findings) ? findings : [];
+  const parts = [
+    `_⚠️ ${reviewerName || 'Z.ai Code Review'} could not be posted as an inline review; falling back to a summary comment._`,
+    '',
+    reviewBody,
+  ];
+  if (list.length > 0) {
+    parts.push('', '### Findings');
+    for (const f of list) {
+      const file = typeof f?.file === 'string' ? f.file : '';
+      const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
+      const title = typeof f?.title === 'string' ? f.title : '';
+      parts.push(`- **${file}${line}** — ${title}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
  * Pull every ZAI_* + GITHUB_TOKEN input into a plain object via core.getInput.
  * `core.getInput` returns '' for unset inputs, which loadConfig handles.
  *
@@ -44722,6 +45350,11 @@ async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    partitionFindings: partitionFindingsFn = partitionFindings,
+    buildReviewBody: buildReviewBodyFn = buildReviewBody,
+    buildReviewComments: buildReviewCommentsFn = buildReviewComments,
+    upsertReview: upsertReviewFn = upsertReview,
+    postFallbackComment: postFallbackCommentFn = postFallbackComment,
     runScanners: runScannersFn = runScanners,
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
@@ -44806,17 +45439,89 @@ async function run(context, deps = {}) {
       },
     );
 
+    // Phase 2: partition findings into inline-mappable (anchored to diff lines
+    // via pulls.createReview) and summary-only. When at least one finding maps
+    // to a diff line, post a GitHub REVIEW with inline comments — the
+    // CodeRabbit/Copilot experience — using dismiss-stale-then-post idempotency.
+    // When NO finding maps (all file-level or unmappable), fall back to the
+    // legacy single summary issue comment so the structured findings still
+    // reach the PR.
+    const reviewContext = {
+      ...context,
+      // The pull_request payload carries the PR number; expose it under
+      // payload.issue.number too so the shared postComment fallback helper
+      // (which reads payload.issue.number) works on this event.
+      payload: {
+        ...context.payload,
+        issue: { number: pullNumber },
+      },
+    };
+    const sha = context?.payload?.pull_request?.head?.sha ?? '';
+
+    const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
+
+    const truncatedCount = Math.max(
+      0,
+      (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+    );
+    const reviewMetadata = {
+      reviewerName: config.reviewerName,
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+    };
+
+    if (inline.length > 0) {
+      // Build the review body (summary + summary-only findings + marker) and
+      // the inline comments array, then submit as a GitHub review.
+      const reviewBody = buildReviewBodyFn(
+        result.summary,
+        summaryOnly,
+        reviewMetadata,
+      );
+      const comments = buildReviewCommentsFn(inline);
+      try {
+        await upsertReviewFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+          sha,
+          body: reviewBody,
+          comments,
+          core: coreDep,
+        });
+        return;
+      } catch (reviewError) {
+        // NEVER silently lose the review. Fall back to a single issue comment
+        // carrying the review body + every finding as text, then rethrow-free.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Review submission failed (${reviewError?.message ?? String(reviewError)}); posting fallback comment.`,
+          );
+        }
+        const fallbackBody = buildFallbackBody(
+          reviewBody,
+          result.findings,
+          config.reviewerName,
+        );
+        await postFallbackCommentFn({
+          octokit,
+          context: reviewContext,
+          body: fallbackBody,
+        });
+        return;
+      }
+    }
+
+    // No inline-mappable findings: post the whole summary as an issue comment
+    // via the existing marker-upsert path (keeps idempotency for the
+    // no-findings / all-file-level case).
     const content = formatFindingsAsSummaryFn(result.findings, {
       reviewerName: config.reviewerName,
       metadata: {
         deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: Math.max(
-          0,
-          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
-        ),
+        truncated: truncatedCount,
       },
     });
-
     const body = buildCommentBodyFn({
       title: config.reviewerName,
       content,

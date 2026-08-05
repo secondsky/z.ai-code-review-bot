@@ -53,6 +53,13 @@ import {
 import { resolveSystemPrompt } from './lib/prompt.js';
 import { runStructuredReview, isLargePr } from './lib/auto-review.js';
 import { formatFindingsAsSummary } from './lib/findings.js';
+import { partitionFindings } from './lib/diff.js';
+import {
+  buildReviewBody,
+  buildReviewComments,
+  upsertReview,
+  postFallbackComment,
+} from './lib/review.js';
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
@@ -143,6 +150,38 @@ export const INPUT_NAMES = [
 ];
 
 /**
+ * Build the fallback comment body used when inline review submission fails.
+ *
+ * Carries the review summary (already built, marker included) plus every
+ * finding rendered as plain text so the structured review still reaches the PR
+ * even if the review API rejected the payload. The findings are appended after
+ * a clear "Review could not be posted inline" preamble.
+ *
+ * @param {string} reviewBody  The review body (already includes the marker).
+ * @param {Array} findings     All findings (inline + summary-only).
+ * @param {string} reviewerName
+ * @returns {string}
+ */
+function buildFallbackBody(reviewBody, findings, reviewerName) {
+  const list = Array.isArray(findings) ? findings : [];
+  const parts = [
+    `_⚠️ ${reviewerName || 'Z.ai Code Review'} could not be posted as an inline review; falling back to a summary comment._`,
+    '',
+    reviewBody,
+  ];
+  if (list.length > 0) {
+    parts.push('', '### Findings');
+    for (const f of list) {
+      const file = typeof f?.file === 'string' ? f.file : '';
+      const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
+      const title = typeof f?.title === 'string' ? f.title : '';
+      parts.push(`- **${file}${line}** — ${title}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
  * Pull every ZAI_* + GITHUB_TOKEN input into a plain object via core.getInput.
  * `core.getInput` returns '' for unset inputs, which loadConfig handles.
  *
@@ -190,6 +229,11 @@ export async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    partitionFindings: partitionFindingsFn = partitionFindings,
+    buildReviewBody: buildReviewBodyFn = buildReviewBody,
+    buildReviewComments: buildReviewCommentsFn = buildReviewComments,
+    upsertReview: upsertReviewFn = upsertReview,
+    postFallbackComment: postFallbackCommentFn = postFallbackComment,
     runScanners: runScannersFn = runScanners,
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
@@ -274,17 +318,89 @@ export async function run(context, deps = {}) {
       },
     );
 
+    // Phase 2: partition findings into inline-mappable (anchored to diff lines
+    // via pulls.createReview) and summary-only. When at least one finding maps
+    // to a diff line, post a GitHub REVIEW with inline comments — the
+    // CodeRabbit/Copilot experience — using dismiss-stale-then-post idempotency.
+    // When NO finding maps (all file-level or unmappable), fall back to the
+    // legacy single summary issue comment so the structured findings still
+    // reach the PR.
+    const reviewContext = {
+      ...context,
+      // The pull_request payload carries the PR number; expose it under
+      // payload.issue.number too so the shared postComment fallback helper
+      // (which reads payload.issue.number) works on this event.
+      payload: {
+        ...context.payload,
+        issue: { number: pullNumber },
+      },
+    };
+    const sha = context?.payload?.pull_request?.head?.sha ?? '';
+
+    const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
+
+    const truncatedCount = Math.max(
+      0,
+      (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+    );
+    const reviewMetadata = {
+      reviewerName: config.reviewerName,
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+    };
+
+    if (inline.length > 0) {
+      // Build the review body (summary + summary-only findings + marker) and
+      // the inline comments array, then submit as a GitHub review.
+      const reviewBody = buildReviewBodyFn(
+        result.summary,
+        summaryOnly,
+        reviewMetadata,
+      );
+      const comments = buildReviewCommentsFn(inline);
+      try {
+        await upsertReviewFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+          sha,
+          body: reviewBody,
+          comments,
+          core: coreDep,
+        });
+        return;
+      } catch (reviewError) {
+        // NEVER silently lose the review. Fall back to a single issue comment
+        // carrying the review body + every finding as text, then rethrow-free.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Review submission failed (${reviewError?.message ?? String(reviewError)}); posting fallback comment.`,
+          );
+        }
+        const fallbackBody = buildFallbackBody(
+          reviewBody,
+          result.findings,
+          config.reviewerName,
+        );
+        await postFallbackCommentFn({
+          octokit,
+          context: reviewContext,
+          body: fallbackBody,
+        });
+        return;
+      }
+    }
+
+    // No inline-mappable findings: post the whole summary as an issue comment
+    // via the existing marker-upsert path (keeps idempotency for the
+    // no-findings / all-file-level case).
     const content = formatFindingsAsSummaryFn(result.findings, {
       reviewerName: config.reviewerName,
       metadata: {
         deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: Math.max(
-          0,
-          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
-        ),
+        truncated: truncatedCount,
       },
     });
-
     const body = buildCommentBodyFn({
       title: config.reviewerName,
       content,

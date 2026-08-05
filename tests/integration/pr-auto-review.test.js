@@ -1,26 +1,29 @@
 /**
- * Integration tests: pull_request → structured review → comment pipeline.
+ * Integration tests: pull_request → structured review → inline review pipeline.
  *
  * These tests drive `run(context, deps)` from `src/index.js` end-to-end through
  * the REAL module wiring: the real `getChangedFiles`, `filterExcludedFiles`,
  * `filterPatchableFiles`, `runStructuredReview`, `isLargePr`,
- * `formatFindingsAsSummary`, `buildCommentBody`, `upsertReviewComment`, and
- * `parseCommand` helpers — only the outermost collaborators (octokit, core,
- * callApi) are faked. This is the full-stack proof that the modules COMPOSE
- * correctly through the router.
+ * `formatFindingsAsSummary`, `buildCommentBody`, `upsertReviewComment`,
+ * `partitionFindings`, `buildReviewBody`, `buildReviewComments`, `upsertReview`,
+ * `postFallbackComment`, and `parseCommand` helpers — only the outermost
+ * collaborators (octokit, core, callApi) are faked. This is the full-stack
+ * proof that the modules COMPOSE correctly through the router.
  *
- * The v2 pipeline replaces the free-form synthesis approach: runStructuredReview
- * is the single path for both small and large PRs (batching handles small PRs
- * as 1 batch). callApi returns a structured {summary, findings} payload which
- * formatFindingsAsSummary renders into the summary comment.
+ * Phase 2 routing: when findings map to diff lines, the router posts a GitHub
+ * REVIEW with inline comments (pulls.createReview, dismiss-stale-then-post).
+ * When no finding maps (all file-level or unmappable), it falls back to the
+ * legacy single summary issue comment (upsertReviewComment).
  *
  * Matrix:
- *   - small PR → callApi once (1 batch), prompt contains both files, one upsert
- *   - large PR → callApi > once (N batches), final structured comment posted
- *   - idempotent update → existing marker comment updated, not duplicated
- *   - no patchable files → NO callApi, NO upsert (short-circuit, end-to-end)
- *   - excludes applied → excluded file NOT in the review prompt
- *   - callApi failure → propagates out of run (no synthesis fallback in v2)
+ *   - small PR no findings → summary comment (createComment)
+ *   - findings on added lines → inline review (createReview with comments)
+ *   - file-level findings only → summary comment (no inline)
+ *   - review API failure → fallback comment (createComment)
+ *   - idempotent update (marker) → updateComment (summary path)
+ *   - no patchable files → short-circuit
+ *   - excludes applied
+ *   - callApi failure → propagates
  */
 import { describe, it, expect } from 'vitest';
 
@@ -57,7 +60,7 @@ const finding = (f, overrides = {}) => ({
 });
 
 /* ------------------------------------------------------------------ *
- * Small PR
+ * Small PR — no findings → summary comment path
  * ------------------------------------------------------------------ */
 
 describe('integration: pull_request structured review — small PR', () => {
@@ -95,8 +98,9 @@ describe('integration: pull_request structured review — small PR', () => {
     // The prompt instructs structured JSON output.
     expect(prompt).toContain('Output ONLY a valid JSON');
 
-    // ONE summary comment was created (no existing marker comment).
+    // No findings → summary comment path (no inline review).
     expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createReview).toHaveLength(0);
     expect(octokit.__calls.updateComment).toHaveLength(0);
     const body = octokit.__calls.createComment[0].body;
     // The body carries the reviewer name (title) and the hidden MARKER.
@@ -104,31 +108,6 @@ describe('integration: pull_request structured review — small PR', () => {
     expect(body).toContain(MARKER);
     // The structured-summary renderer emits the "No issues found" empty state.
     expect(body).toContain('No issues found');
-  });
-
-  it('renders findings (with severity emojis) when the model returns issues', async () => {
-    const core = makeFakeCore();
-    const octokit = makeFakeOctokit({
-      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
-    });
-    const callApi = makeFakeCallApi(
-      structuredPayload('One issue found.', [finding('src/a.js')]),
-    );
-
-    await run(makePRContext(), {
-      config: makeConfig(),
-      core,
-      octokit,
-      callApi,
-      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
-    });
-
-    const body = octokit.__calls.createComment[0].body;
-    // The finding is rendered with the high-severity emoji and the file path.
-    expect(body).toContain('🟠');
-    expect(body).toContain('src/a.js');
-    expect(body).toContain('Issue in src/a.js');
-    expect(body).toContain(MARKER);
   });
 
   it('lists files once and posts to the PR number from the context', async () => {
@@ -156,6 +135,146 @@ describe('integration: pull_request structured review — small PR', () => {
       repo: 'widget',
       issue_number: 77,
     });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Inline review path (Phase 2 headline feature)
+ * ------------------------------------------------------------------ */
+
+describe('integration: pull_request structured review — inline review', () => {
+  it('posts findings as a GitHub REVIEW with inline comments on added lines', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('One issue found.', [finding('src/a.js')]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // A REVIEW was created (not an issue comment).
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(0);
+    const review = octokit.__calls.createReview[0];
+    expect(review).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      pull_number: 42,
+      event: 'COMMENT',
+    });
+    // The review body carries the summary + marker.
+    expect(review.body).toContain('One issue found.');
+    expect(review.body).toContain(MARKER);
+    // Exactly one inline comment, anchored to line 1 (the added line), RIGHT side.
+    expect(review.comments).toHaveLength(1);
+    expect(review.comments[0]).toMatchObject({
+      path: 'src/a.js',
+      line: 1,
+      side: 'RIGHT',
+    });
+    // The inline comment body has the high-severity emoji + finding content.
+    expect(review.comments[0].body).toContain('🟠');
+    expect(review.comments[0].body).toContain('Issue in src/a.js');
+    expect(review.comments[0].body).toContain('A concrete bug.');
+  });
+
+  it('dismisses prior bot reviews before posting (idempotent per SHA)', async () => {
+    const core = makeFakeCore();
+    const oldReview = {
+      id: 777,
+      body: `stale\n\n${MARKER}`,
+      user: { login: 'zai-code-review[bot]' },
+    };
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+      existingReviews: [oldReview],
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('fresh.', [finding('src/a.js')]),
+    );
+
+    await run(makePRContext({ sha: 'feedface' }), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // The stale review was dismissed with a reason referencing the new SHA.
+    expect(octokit.__calls.dismissReview).toHaveLength(1);
+    expect(octokit.__calls.dismissReview[0]).toMatchObject({
+      review_id: 777,
+      pull_number: 42,
+    });
+    expect(octokit.__calls.dismissReview[0].message).toContain('feedface');
+    // Then the new review was created.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+  });
+
+  it('falls back to a summary comment when the review API fails', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+      createReviewFails: true,
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('issue.', [finding('src/a.js')]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // Review was attempted but failed → fallback issue comment posted.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The fallback body carries the review summary + the findings list.
+    expect(body).toContain('issue.');
+    expect(body).toContain('src/a.js');
+    expect(body).toContain('Issue in src/a.js');
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('posts a summary comment (no review) when all findings are file-level', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = 1;')],
+    });
+    // A file-level finding (line: null) cannot map to a diff line.
+    const callApi = makeFakeCallApi(
+      structuredPayload('file issue.', [finding('src/a.js', { line: null })]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // No inline findings → summary comment path (no review created).
+    expect(octokit.__calls.createReview).toHaveLength(0);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The summary renderer lists the finding with its file + title.
+    expect(body).toContain('src/a.js');
+    expect(body).toContain('Issue in src/a.js');
+    expect(body).toContain(MARKER);
   });
 });
 
@@ -189,7 +308,7 @@ describe('integration: pull_request structured review — large PR', () => {
     // Multiple batches → callApi called more than once.
     expect(callApi.mock.calls.length).toBeGreaterThan(1);
 
-    // The final comment was posted and carries the marker.
+    // No findings → summary comment path.
     expect(octokit.__calls.createComment).toHaveLength(1);
     const body = octokit.__calls.createComment[0].body;
     expect(body).toContain(MARKER);
@@ -198,7 +317,7 @@ describe('integration: pull_request structured review — large PR', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Idempotent update
+ * Idempotent update (summary path)
  * ------------------------------------------------------------------ */
 
 describe('integration: pull_request structured review — idempotent update', () => {
@@ -219,7 +338,7 @@ describe('integration: pull_request structured review — idempotent update', ()
       apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
     });
 
-    // updateComment used (NOT createComment).
+    // No findings → summary path → updateComment used (NOT createComment).
     expect(octokit.__calls.updateComment).toHaveLength(1);
     expect(octokit.__calls.updateComment[0].comment_id).toBe(555);
     expect(octokit.__calls.createComment).toHaveLength(0);
@@ -289,6 +408,7 @@ describe('integration: pull_request structured review — no patchable files', (
     expect(callApi).not.toHaveBeenCalled();
     expect(octokit.__calls.createComment).toHaveLength(0);
     expect(octokit.__calls.updateComment).toHaveLength(0);
+    expect(octokit.__calls.createReview).toHaveLength(0);
     expect(core.info).toHaveBeenCalledWith(
       expect.stringContaining('No patchable changes'),
     );
@@ -383,5 +503,6 @@ describe('integration: pull_request structured review — callApi failure', () =
     // No comment posted (the failure happened before the upsert).
     expect(octokit.__calls.createComment).toHaveLength(0);
     expect(octokit.__calls.updateComment).toHaveLength(0);
+    expect(octokit.__calls.createReview).toHaveLength(0);
   });
 });

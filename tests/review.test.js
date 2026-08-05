@@ -1,0 +1,490 @@
+/**
+ * Tests for src/lib/review.js — build, submit, and idempotently upsert GitHub
+ * reviews with inline line-level comments.
+ *
+ * The pure builders (buildReviewBody, buildReviewComments, buildReviewPayload)
+ * have no I/O. The I/O functions (listBotReviews, dismissStaleReviews,
+ * upsertReview, postFallbackComment) are DI-injected via octokit/context, so
+ * tests inject a fake octokit whose `rest.pulls.*` methods record every call.
+ */
+import { describe, it, expect, vi } from 'vitest';
+
+import {
+  buildReviewBody,
+  buildReviewComments,
+  buildReviewPayload,
+  listBotReviews,
+  dismissStaleReviews,
+  upsertReview,
+  postFallbackComment,
+} from '../src/lib/review.js';
+import { MARKER } from '../src/lib/comments.js';
+
+/* ------------------------------------------------------------------ *
+ * Pure builders
+ * ------------------------------------------------------------------ */
+
+describe('buildReviewBody', () => {
+  it('renders the summary prose and the marker', () => {
+    const body = buildReviewBody('Looks good.', [], {});
+    expect(body).toContain('Looks good.');
+    expect(body).toContain(MARKER);
+  });
+
+  it('lists summary-only findings in an "Additional findings" section', () => {
+    const summaryOnly = [
+      { file: 'src/a.js', title: 'Bug here', severity: 'high' },
+      { file: 'src/b.js', title: 'Style issue', severity: 'low' },
+    ];
+    const body = buildReviewBody('Summary.', summaryOnly, {});
+    expect(body).toContain('Additional findings');
+    expect(body).toContain('src/a.js');
+    expect(body).toContain('Bug here');
+    expect(body).toContain('src/b.js');
+    expect(body).toContain('Style issue');
+  });
+
+  it('omits the "Additional findings" section when summaryOnly is empty', () => {
+    const body = buildReviewBody('All inline.', [], {});
+    expect(body).not.toContain('Additional findings');
+  });
+
+  it('includes the marker byte-exact at the end (idempotency detection)', () => {
+    const body = buildReviewBody('s', [], {});
+    expect(body.endsWith(MARKER)).toBe(true);
+  });
+
+  it('includes a deterministic-findings note when metadata says so', () => {
+    const body = buildReviewBody('s', [], { deterministicFindingsCount: 3 });
+    expect(body).toContain('Scanners found 3');
+  });
+
+  it('includes a truncation note when metadata says so', () => {
+    const body = buildReviewBody('s', [], { truncated: 2 });
+    expect(body).toContain('2 findings truncated');
+  });
+});
+
+describe('buildReviewComments', () => {
+  it('produces one {path, line, side, body} per inline finding', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'high',
+          title: 'Null deref',
+          description: 'x can be null',
+          evidence: 'x.foo()',
+          suggestion: 'Guard with if (x)',
+        },
+        comment: { path: 'src/a.js', line: 10, side: 'RIGHT' },
+      },
+    ];
+    const comments = buildReviewComments(inline);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].path).toBe('src/a.js');
+    expect(comments[0].line).toBe(10);
+    expect(comments[0].side).toBe('RIGHT');
+    expect(typeof comments[0].body).toBe('string');
+  });
+
+  it('renders severity emoji + title + description + evidence + suggestion', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'high',
+          title: 'Null deref',
+          description: 'x can be null',
+          evidence: 'x.foo()',
+          suggestion: 'Guard with if (x)',
+        },
+        comment: { path: 'src/a.js', line: 10, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    expect(body).toContain('🟠'); // high severity emoji
+    expect(body).toContain('Null deref');
+    expect(body).toContain('x can be null');
+    expect(body).toContain('x.foo()');
+    expect(body).toContain('Guard with if (x)');
+  });
+
+  it('sanitizes the comment body (neutralizes @mentions)', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'low',
+          title: 'Spam @everyone',
+          description: 'Hey @everyone look',
+          evidence: '',
+          suggestion: null,
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    // The @mention is neutralized (zero-width space inserted).
+    expect(body).not.toMatch(/@everyone/);
+    expect(body).toContain('@\u200beveryone');
+  });
+
+  it('returns [] for empty input', () => {
+    expect(buildReviewComments([])).toEqual([]);
+  });
+
+  it('omits the suggestion line when suggestion is null', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'info',
+          title: 'Note',
+          description: 'fyi',
+          evidence: '',
+          suggestion: null,
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    expect(body).not.toContain('💡');
+  });
+});
+
+describe('buildReviewPayload', () => {
+  it('assembles {body, event, comments} with event defaulting to COMMENT', () => {
+    const payload = buildReviewPayload({
+      body: 'review body',
+      comments: [{ path: 'a.js', line: 1, side: 'RIGHT', body: 'cmt' }],
+    });
+    expect(payload.event).toBe('COMMENT');
+    expect(payload.body).toBe('review body');
+    expect(payload.comments).toHaveLength(1);
+  });
+
+  it('allows event to be overridden (e.g. REQUEST_CHANGES)', () => {
+    const payload = buildReviewPayload({
+      body: 'b',
+      comments: [],
+      event: 'REQUEST_CHANGES',
+    });
+    expect(payload.event).toBe('REQUEST_CHANGES');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * I/O functions (fake octokit)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build a fake octokit whose rest.pulls.{listReviews, dismissReview,
+ * createReview} and rest.issues.createComment record every call.
+ */
+function makeReviewOctokit({
+  reviews = [],
+  listReviewsPages = null,
+  dismissFailsFor = null,
+} = {}) {
+  const calls = {
+    listReviews: [],
+    dismissReview: [],
+    createReview: [],
+    createComment: [],
+  };
+  const octokit = {
+    rest: {
+      pulls: {
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          if (listReviewsPages) {
+            const page = params.page ?? 1;
+            return { data: listReviewsPages[page - 1] ?? [] };
+          }
+          return { data: reviews };
+        },
+        async dismissReview(params) {
+          calls.dismissReview.push(params);
+          if (dismissFailsFor && dismissFailsFor.includes(params.review_id)) {
+            const err = new Error('Validation Failed');
+            err.status = 422;
+            throw err;
+          }
+          return { data: {} };
+        },
+        async createReview(params) {
+          calls.createReview.push(params);
+          return { data: { id: 999 } };
+        },
+      },
+      issues: {
+        async createComment(params) {
+          calls.createComment.push(params);
+          return { data: { id: 1 } };
+        },
+      },
+    },
+  };
+  return { octokit, calls };
+}
+
+function ctx({ owner = 'o', repo = 'r', number = 42, sha = 'abc123' } = {}) {
+  return {
+    repo: { owner, repo },
+    // pull_request event payloads carry the PR number on `pull_request`; the
+    // shared postComment helper reads `payload.issue.number` (issue_comment
+    // shape). Including both lets this one context fixture drive every code
+    // path under test.
+    payload: {
+      pull_request: { number, head: { sha } },
+      issue: { number },
+    },
+  };
+}
+
+/* ---------- listBotReviews ---------- */
+
+describe('listBotReviews', () => {
+  it('paginates fully (per_page=100) until a short page', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      body: 'noise',
+      user: { login: 'someone' },
+    }));
+    const page2 = [
+      { id: 200, body: `r\n\n${MARKER}`, user: { login: 'other' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({ listReviewsPages: [page1, page2] });
+
+    const out = await listBotReviews({
+      octokit,
+      context: ctx(),
+      marker: MARKER,
+    });
+
+    expect(calls.listReviews).toHaveLength(2);
+    expect(calls.listReviews[0]).toMatchObject({
+      owner: 'o',
+      repo: 'r',
+      pull_number: 42,
+      per_page: 100,
+      page: 1,
+    });
+    expect(out.map((r) => r.id)).toEqual([200]);
+  });
+
+  it('filters by marker in body', async () => {
+    const reviews = [
+      { id: 1, body: 'unrelated', user: { login: 'human' } },
+      { id: 2, body: `r\n\n${MARKER}`, user: { login: 'human' } },
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id)).toEqual([2]);
+  });
+
+  it('filters by bot login suffix [bot] when marker absent', async () => {
+    const reviews = [
+      { id: 1, body: 'no marker', user: { login: 'zai-code-review[bot]' } },
+      { id: 2, body: 'no marker', user: { login: 'human' } },
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id)).toEqual([1]);
+  });
+
+  it('returns reviews matching marker OR bot login', async () => {
+    const reviews = [
+      { id: 1, body: `m\n\n${MARKER}`, user: { login: 'human' } }, // marker
+      { id: 2, body: 'x', user: { login: 'github-actions[bot]' } }, // bot login
+      { id: 3, body: 'x', user: { login: 'human2' } }, // neither — excluded
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id).sort()).toEqual([1, 2]);
+  });
+
+  it('stops paginating once a short page is seen (no infinite loop)', async () => {
+    // A single page with 3 items (< per_page=100) → loop terminates.
+    const reviews = [
+      { id: 1, body: 'x', user: { login: 'u' } },
+      { id: 2, body: 'y', user: { login: 'u' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({ reviews });
+    await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(calls.listReviews).toHaveLength(1);
+  });
+});
+
+/* ---------- dismissStaleReviews ---------- */
+
+describe('dismissStaleReviews', () => {
+  it('calls dismissReview for each prior review with the reason', async () => {
+    const reviews = [
+      { id: 11, body: 'x', user: { login: 'bot[bot]' } },
+      { id: 22, body: 'y', user: { login: 'bot[bot]' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({ reviews });
+
+    await dismissStaleReviews({
+      octokit,
+      context: ctx({ sha: 'deadbeef' }),
+      reviews,
+      reason: 'Superseded by re-review at deadbeef',
+    });
+
+    expect(calls.dismissReview).toHaveLength(2);
+    expect(calls.dismissReview[0]).toMatchObject({
+      owner: 'o',
+      repo: 'r',
+      pull_number: 42,
+      review_id: 11,
+      message: 'Superseded by re-review at deadbeef',
+    });
+    expect(calls.dismissReview[1].review_id).toBe(22);
+  });
+
+  it('tolerates individual dismiss failures (422) and continues', async () => {
+    const reviews = [
+      { id: 1, body: 'x', user: { login: 'b[bot]' } },
+      { id: 2, body: 'y', user: { login: 'b[bot]' } },
+      { id: 3, body: 'z', user: { login: 'b[bot]' } },
+    ];
+    // review id 2 throws a 422 (already dismissed).
+    const { octokit, calls } = makeReviewOctokit({
+      reviews,
+      dismissFailsFor: [2],
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    await expect(
+      dismissStaleReviews({
+        octokit,
+        context: ctx(),
+        reviews,
+        reason: 'r',
+        core,
+      }),
+    ).resolves.toBeUndefined();
+
+    // All three were attempted despite the middle one failing.
+    expect(calls.dismissReview.map((c) => c.review_id)).toEqual([1, 2, 3]);
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('handles an empty reviews list (no-op)', async () => {
+    const { octokit, calls } = makeReviewOctokit({});
+    await dismissStaleReviews({
+      octokit,
+      context: ctx(),
+      reviews: [],
+      reason: 'r',
+    });
+    expect(calls.dismissReview).toHaveLength(0);
+  });
+});
+
+/* ---------- upsertReview ---------- */
+
+describe('upsertReview', () => {
+  it('lists → dismisses → creates in order, returns id + counts', async () => {
+    const existing = [
+      { id: 5, body: `old\n\n${MARKER}`, user: { login: 'h' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({ reviews: existing });
+
+    const result = await upsertReview({
+      octokit,
+      context: ctx({ sha: 'sha1' }),
+      marker: MARKER,
+      sha: 'sha1',
+      body: 'new review',
+      comments: [{ path: 'a.js', line: 1, side: 'RIGHT', body: 'c' }],
+    });
+
+    expect(result).toEqual({ id: 999, commentCount: 1, dismissedCount: 1 });
+    // Order: listReviews, dismissReview, createReview.
+    expect(calls.listReviews).toHaveLength(1);
+    expect(calls.dismissReview).toHaveLength(1);
+    expect(calls.dismissReview[0].review_id).toBe(5);
+    expect(calls.createReview).toHaveLength(1);
+    expect(calls.createReview[0]).toMatchObject({
+      owner: 'o',
+      repo: 'r',
+      pull_number: 42,
+      body: 'new review',
+      event: 'COMMENT',
+      comments: [{ path: 'a.js', line: 1, side: 'RIGHT', body: 'c' }],
+    });
+  });
+
+  it('passes event through to createReview', async () => {
+    const { octokit, calls } = makeReviewOctokit({ reviews: [] });
+    await upsertReview({
+      octokit,
+      context: ctx(),
+      marker: MARKER,
+      sha: 's',
+      body: 'b',
+      comments: [],
+      event: 'REQUEST_CHANGES',
+    });
+    expect(calls.createReview[0].event).toBe('REQUEST_CHANGES');
+  });
+
+  it('defaults event to COMMENT when not provided', async () => {
+    const { octokit, calls } = makeReviewOctokit({ reviews: [] });
+    await upsertReview({
+      octokit,
+      context: ctx(),
+      marker: MARKER,
+      sha: 's',
+      body: 'b',
+      comments: [],
+    });
+    expect(calls.createReview[0].event).toBe('COMMENT');
+  });
+
+  it('dismisses with a reason referencing the new SHA', async () => {
+    const existing = [{ id: 9, body: `x\n\n${MARKER}`, user: { login: 'h' } }];
+    const { octokit, calls } = makeReviewOctokit({ reviews: existing });
+    await upsertReview({
+      octokit,
+      context: ctx({ sha: 'feedface' }),
+      marker: MARKER,
+      sha: 'feedface',
+      body: 'b',
+      comments: [],
+    });
+    expect(calls.dismissReview[0].message).toContain('feedface');
+  });
+});
+
+/* ---------- postFallbackComment ---------- */
+
+describe('postFallbackComment', () => {
+  it('delegates to postComment (creates an issue comment)', async () => {
+    const { octokit, calls } = makeReviewOctokit({});
+    await postFallbackComment({
+      octokit,
+      context: ctx(),
+      body: 'fallback body',
+    });
+    expect(calls.createComment).toHaveLength(1);
+    expect(calls.createComment[0]).toMatchObject({
+      owner: 'o',
+      repo: 'r',
+      issue_number: 42,
+    });
+    // postComment sanitizes the body; the raw text survives (no markers here).
+    expect(calls.createComment[0].body).toContain('fallback body');
+  });
+
+  it('returns the result of postComment', async () => {
+    const { octokit } = makeReviewOctokit({});
+    const result = await postFallbackComment({
+      octokit,
+      context: ctx(),
+      body: 'b',
+    });
+    // The fake createComment returns { id: 1 }.
+    expect(result).toMatchObject({ id: 1 });
+  });
+});

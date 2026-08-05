@@ -69,13 +69,22 @@ function file(filename, patch = '@@ diff @@', status = 'modified') {
 }
 
 /** Build a fake octokit with the rest methods the router calls. */
-function makeOctokit({ files = [], list = [], pr = null } = {}) {
+function makeOctokit({
+  files = [],
+  list = [],
+  pr = null,
+  existingReviews = [],
+  createReviewFails = false,
+} = {}) {
   const calls = {
     listFiles: [],
     listComments: [],
     createComment: [],
     updateComment: [],
     get: [],
+    listReviews: [],
+    dismissReview: [],
+    createReview: [],
   };
   const defaultPr = {
     title: 'T',
@@ -93,6 +102,23 @@ function makeOctokit({ files = [], list = [], pr = null } = {}) {
         async get(params) {
           calls.get.push(params);
           return { data: pr ?? defaultPr };
+        },
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          return { data: existingReviews };
+        },
+        async dismissReview(params) {
+          calls.dismissReview.push(params);
+          return { data: {} };
+        },
+        async createReview(params) {
+          calls.createReview.push(params);
+          if (createReviewFails) {
+            const err = new Error('Validation Failed');
+            err.status = 422;
+            throw err;
+          }
+          return { data: { id: 909, ...params } };
         },
       },
       issues: {
@@ -116,14 +142,14 @@ function makeOctokit({ files = [], list = [], pr = null } = {}) {
 }
 
 /** Build a PR context (pull_request event). */
-function prContext({ number = 42, fork = false } = {}) {
+function prContext({ number = 42, fork = false, sha = 'abc123' } = {}) {
   return {
     eventName: 'pull_request',
     repo: { owner: 'owner', repo: 'repo' },
     payload: {
       pull_request: {
         number,
-        head: { repo: { fork } },
+        head: { repo: { fork }, sha },
       },
     },
   };
@@ -579,6 +605,186 @@ describe('run — pull_request auto-review', () => {
       apiClient: { call: vi.fn() },
     });
     expect(core.setFailed).toHaveBeenCalledWith('not a pull request');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * pull_request inline review path (Phase 2)
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request inline review (Phase 2)', () => {
+  it('posts findings as a GitHub REVIEW with inline comments on added lines', async () => {
+    const core = makeCore();
+    // A real patch where line 1 is an added line → mappable to an inline comment.
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 'One issue.',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'a is null',
+            evidence: 'a.foo()',
+            suggestion: 'Guard it',
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // A review was posted with inline comments — NOT a summary issue comment.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(0);
+    const review = octokit.__calls.createReview[0];
+    expect(review.event).toBe('COMMENT');
+    expect(review.comments).toHaveLength(1);
+    expect(review.comments[0]).toMatchObject({
+      path: 'src/a.js',
+      line: 1,
+      side: 'RIGHT',
+    });
+    expect(review.body).toContain('<!-- zai-code-review -->');
+  });
+
+  it('falls back to a summary issue comment when createReview fails', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      createReviewFails: true,
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'low',
+            confidence: 'low',
+            category: 'style',
+            title: 'T',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Review attempted, failed → fallback issue comment posted.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(core.warning).toHaveBeenCalled();
+    // The fallback body carries the findings list.
+    expect(octokit.__calls.createComment[0].body).toContain('src/a.js');
+  });
+
+  it('posts a summary comment (no review) when findings have no mappable lines', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = 1;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: null, // file-level → not inline-mappable
+            severity: 'low',
+            confidence: 'low',
+            category: 'style',
+            title: 'T',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // No inline findings → summary issue comment path (no review).
+    expect(octokit.__calls.createReview).toHaveLength(0);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
+  it('dismisses prior bot reviews before posting the new inline review', async () => {
+    const core = makeCore();
+    const oldReview = {
+      id: 555,
+      body: `stale\n\n<!-- zai-code-review -->`,
+      user: { login: 'zai-code-review[bot]' },
+    };
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      existingReviews: [oldReview],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'x',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext({ sha: 'deadbeef' }), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Stale review dismissed first, then new review created.
+    expect(octokit.__calls.dismissReview).toHaveLength(1);
+    expect(octokit.__calls.dismissReview[0].review_id).toBe(555);
+    expect(octokit.__calls.dismissReview[0].message).toContain('deadbeef');
+    expect(octokit.__calls.createReview).toHaveLength(1);
   });
 });
 

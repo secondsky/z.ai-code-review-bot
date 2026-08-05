@@ -121,9 +121,11 @@ export function file(filename, patch = '@@ diff @@', status = 'modified') {
 export function makeFakeOctokit({
   files = [],
   existingComments = [],
+  existingReviews = [],
   pr = { title: 'Test PR', body: 'A test PR body.' },
   commits = [],
   content = { content: '', encoding: 'utf-8' },
+  createReviewFails = false,
 } = {}) {
   const calls = {
     listFiles: [],
@@ -133,6 +135,9 @@ export function makeFakeOctokit({
     createComment: [],
     updateComment: [],
     getContent: [],
+    listReviews: [],
+    dismissReview: [],
+    createReview: [],
   };
 
   const octokit = {
@@ -149,6 +154,23 @@ export function makeFakeOctokit({
         async listCommits(params) {
           calls.listCommits.push(params);
           return { data: commits };
+        },
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          return { data: existingReviews };
+        },
+        async dismissReview(params) {
+          calls.dismissReview.push(params);
+          return { data: {} };
+        },
+        async createReview(params) {
+          calls.createReview.push(params);
+          if (createReviewFails) {
+            const err = new Error('Validation Failed');
+            err.status = 422;
+            throw err;
+          }
+          return { data: { id: 4242, ...params } };
         },
       },
       issues: {
@@ -236,6 +258,7 @@ export function makePRContext({
   action = 'opened',
   owner = 'owner',
   repo = 'repo',
+  sha = 'deadbeefcafe',
 } = {}) {
   return {
     eventName: 'pull_request',
@@ -246,7 +269,7 @@ export function makePRContext({
         number,
         title,
         body,
-        head: { repo: { fork }, ref: 'feature' },
+        head: { repo: { fork }, ref: 'feature', sha },
         base: { ref: 'main' },
       },
     },
