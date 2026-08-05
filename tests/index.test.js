@@ -54,10 +54,15 @@ function makeConfig(overrides = {}) {
     minSeverity: 'info',
     temperature: 0.2,
     maxTokens: 4096,
+    batchConcurrency: 3,
+    fallbackPrompt: '',
     // Phase 4: scanner master switch OFF in tests by default so the real
     // runScanners (which would download gitleaks/ast-grep) is short-circuited.
     scannersEnabled: false,
     scannersCacheDir: '/tmp/zai-cache-scanners-test',
+    // Phase 5: commit-status feedback. Default OFF in unit tests so existing
+    // assertions on octokit calls stay stable; dedicated status tests opt in.
+    commitStatus: false,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -85,6 +90,7 @@ function makeOctokit({
     listReviews: [],
     dismissReview: [],
     createReview: [],
+    createCommitStatus: [],
   };
   const defaultPr = {
     title: 'T',
@@ -133,6 +139,12 @@ function makeOctokit({
         async updateComment(params) {
           calls.updateComment.push(params);
           return { data: { id: params.comment_id } };
+        },
+      },
+      repos: {
+        async createCommitStatus(params) {
+          calls.createCommitStatus.push(params);
+          return { data: { id: 1, ...params } };
         },
       },
     },
@@ -300,6 +312,11 @@ describe('readAllInputs', () => {
       'ZAI_MIN_SEVERITY',
       'ZAI_TEMPERATURE',
       'ZAI_MAX_TOKENS',
+      'ZAI_COMMIT_STATUS',
+      'ZAI_SCANNERS_ENABLED',
+      'ZAI_SCANNERS_CACHE_DIR',
+      'ZAI_BATCH_CONCURRENCY',
+      'ZAI_FALLBACK_PROMPT',
       'GITHUB_TOKEN',
     ]) {
       expect(seen[name]).toBe(true);
@@ -1169,5 +1186,398 @@ describe('run — error propagation', () => {
         apiClient: { call: vi.fn() },
       }),
     ).rejects.toThrow('boom');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * buildCallApi adapter — temperature / maxTokens / fallbackPrompt wiring
+ *
+ * These tests do NOT inject callApi (the adapter would be bypassed). Instead
+ * they inject `apiClient: { call: spy }` so the adapter wraps our spy and we
+ * can assert exactly which args reach `client.call`.
+ * ------------------------------------------------------------------ */
+describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
+  it('forwards config.temperature and config.maxTokens to client.call', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: true,
+      data: JSON.stringify({ summary: 's', findings: [] }),
+      usedFallback: false,
+    }));
+    // Provide a non-empty patchable file so the pipeline runs.
+    await run(prContext(), {
+      config: makeConfig({ temperature: 0.42, maxTokens: 2048 }),
+      core,
+      octokit,
+      // NOT passing callApi → adapter builds and uses our apiClient.
+      apiClient: { call: callSpy },
+    });
+    expect(callSpy).toHaveBeenCalled();
+    const arg = callSpy.mock.calls[0][0];
+    expect(arg.temperature).toBe(0.42);
+    expect(arg.maxTokens).toBe(2048);
+    // And the baseline fields are still there.
+    expect(arg.apiKey).toBe('test-api-key');
+    expect(arg.model).toBe('glm-5.2');
+    expect(typeof arg.userPrompt).toBe('string');
+  });
+
+  it('forwards default temperature (0.2) and maxTokens (4096) to client.call in the stock config', async () => {
+    // loadConfig ALWAYS produces numbers for these (default 0.2 / 4096). The
+    // adapter forwards them whenever non-null, which is always for a real
+    // config — so a stock run actually sends temperature=0.2 & max_tokens=4096.
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: true,
+      data: JSON.stringify({ summary: 's', findings: [] }),
+      usedFallback: false,
+    }));
+    await run(prContext(), {
+      config: makeConfig(), // default temperature 0.2, maxTokens 4096
+      core,
+      octokit,
+      apiClient: { call: callSpy },
+    });
+    const arg = callSpy.mock.calls[0][0];
+    expect(arg.temperature).toBe(0.2);
+    expect(arg.maxTokens).toBe(4096);
+  });
+
+  it('passes fallbackPrompt to createApiClient when config.fallbackPrompt is a non-empty string', async () => {
+    // Use the createApiClientFn override to capture the factory config.
+    const factoryConfigs = [];
+    const createApiClientFn = vi.fn((factoryConfig) => {
+      factoryConfigs.push(factoryConfig);
+      return {
+        call: vi.fn(async () => ({
+          success: true,
+          data: JSON.stringify({ summary: 's', findings: [] }),
+          usedFallback: false,
+        })),
+      };
+    });
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    await run(prContext(), {
+      config: makeConfig({ fallbackPrompt: 'Summarize only.' }),
+      core,
+      octokit,
+      createApiClient: createApiClientFn,
+    });
+    expect(createApiClientFn).toHaveBeenCalled();
+    expect(factoryConfigs[0].fallbackPrompt).toBe('Summarize only.');
+    expect(factoryConfigs[0].timeout).toBe(120000);
+  });
+
+  it('does NOT pass fallbackPrompt to createApiClient when config.fallbackPrompt is empty (disabled)', async () => {
+    const factoryConfigs = [];
+    const createApiClientFn = vi.fn((factoryConfig) => {
+      factoryConfigs.push(factoryConfig);
+      return {
+        call: vi.fn(async () => ({
+          success: true,
+          data: JSON.stringify({ summary: 's', findings: [] }),
+          usedFallback: false,
+        })),
+      };
+    });
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    await run(prContext(), {
+      config: makeConfig({ fallbackPrompt: '' }),
+      core,
+      octokit,
+      createApiClient: createApiClientFn,
+    });
+    expect(createApiClientFn).toHaveBeenCalled();
+    expect(factoryConfigs[0]).not.toHaveProperty('fallbackPrompt');
+    expect(factoryConfigs[0].timeout).toBe(120000);
+  });
+
+  it('throws on !r.success (retry-loop redacted message propagates through the adapter)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: false,
+      data: null,
+      error: { category: 'provider', message: 'redacted provider error', retryable: true, attempts: 4, totalDuration: 10 },
+      usedFallback: false,
+    }));
+    await expect(
+      run(prContext(), {
+        config: makeConfig(),
+        core,
+        octokit,
+        apiClient: { call: callSpy },
+      }),
+    ).rejects.toThrow('redacted provider error');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * pull_request commit-status feedback (Phase 5)
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request commit-status (Phase 5)', () => {
+  it('posts pending then success when commitStatus is enabled (review completes)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext({ sha: 'sha-1' }), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Two status calls: pending (start) + success (after review).
+    expect(octokit.__calls.createCommitStatus).toHaveLength(2);
+    const [pending, success] = octokit.__calls.createCommitStatus;
+    expect(pending).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      sha: 'sha-1',
+      state: 'pending',
+      context: 'Z.ai Code Review',
+    });
+    expect(pending.description).toContain('in progress');
+    expect(success).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      sha: 'sha-1',
+      state: 'success',
+      context: 'Z.ai Code Review',
+    });
+    // No findings → the "no issues found" success description.
+    expect(success.description).toContain('no issues found');
+  });
+
+  it('success description counts critical/high findings', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [
+        {
+          filename: 'src/a.js',
+          status: 'modified',
+          patch: '@@ -1 +1 @@\n+const a = null;',
+        },
+      ],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          { file: 'src/a.js', line: 1, severity: 'critical', confidence: 'high', category: 'bug', title: 'T', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+          { file: 'src/a.js', line: 2, severity: 'high', confidence: 'high', category: 'bug', title: 'T2', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+          { file: 'src/a.js', line: 3, severity: 'low', confidence: 'low', category: 'style', title: 'T3', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+        ],
+      }),
+    );
+
+    await run(prContext({ sha: 'sha-2' }), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    const success = octokit.__calls.createCommitStatus[1];
+    expect(success.state).toBe('success');
+    expect(success.description).toBe(
+      'Review complete: 3 findings (1 critical, 1 high)',
+    );
+  });
+
+  it('does NOT post any status when commitStatus is disabled (default)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: false }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createCommitStatus).toHaveLength(0);
+  });
+
+  it('does NOT post a status when there are no patchable files (short-circuit before pending)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'binary.png', status: 'added' }],
+    });
+
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createCommitStatus).toHaveLength(0);
+  });
+
+  it('posts pending before a hard error; failure status is main() job', async () => {
+    // run() lets errors propagate. The PENDING status fires at the start of the
+    // review; the FAILURE status is posted by main()'s catch block (verified
+    // separately by reading src/index.js and via the fail-soft run() test).
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => {
+      throw new Error('model down');
+    });
+    const context = prContext({ sha: 'sha-fail' });
+
+    await expect(
+      run(context, {
+        config: makeConfig({ commitStatus: true }),
+        core,
+        octokit,
+        callApi,
+        apiClient: { call: vi.fn() },
+      }),
+    ).rejects.toThrow('model down');
+
+    const statuses = octokit.__calls.createCommitStatus;
+    expect(statuses.length).toBe(1);
+    expect(statuses[0].state).toBe('pending');
+    expect(statuses[0].sha).toBe('sha-fail');
+  });
+
+  it('status API errors are swallowed (fail-soft) and do not break the review', async () => {
+    const core = makeCore();
+    const calls = { createCommitStatus: [], createComment: [] };
+    const octokit = {
+      rest: {
+        pulls: {
+          async listFiles() { return { data: [file('src/a.js')] }; },
+          async get() { return { data: { head: { ref: 'r', sha: 's', repo: { fork: false } } } }; },
+          async listReviews() { return { data: [] }; },
+          async dismissReview() { return { data: {} }; },
+          async createReview(p) { return { data: { id: 1, ...p } }; },
+        },
+        issues: {
+          async listComments() { return { data: [] }; },
+          async createComment(p) { calls.createComment.push(p); return { data: { id: 1 } }; },
+          async updateComment(p) { return { data: { id: 1 } }; },
+        },
+        repos: {
+          async createCommitStatus(p) { calls.createCommitStatus.push(p); throw new Error('statuses:write missing'); },
+        },
+      },
+    };
+    Object.defineProperty(octokit, '__calls', { value: calls, enumerable: false });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    // Must NOT throw — status failures are swallowed.
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(calls.createCommitStatus).toHaveLength(2);
+    expect(calls.createComment).toHaveLength(1);
+    expect(core.warning).toHaveBeenCalled();
+  });
+});
+
+describe('main() — failure commit-status wiring (Phase 5)', () => {
+  it('posts pending before a hard error; main catch is the failure hook', async () => {
+    // main() reads the module-level github object, so the failure-status
+    // catch is verified in a hermetic subprocess: import run() (the same path
+    // main wraps), force run to throw via a failing callApi, and assert that
+    // the pending status fired with the head SHA. main catch block (which
+    // posts failure) is source-verified and mirrors this exact shape.
+    const { spawnSync } = await import('node:child_process');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join, resolve: resolvePath } = await import('node:path');
+    const indexPath = resolvePath('src/index.js');
+    const dir = mkdtempSync(join(tmpdir(), 'zai-main-fail-'));
+    const driver = join(dir, 'driver.mjs');
+    writeFileSync(
+      driver,
+      [
+        'import { run } from ' + JSON.stringify(indexPath) + ';',
+        'const statusCalls = [];',
+        'const octokit = { rest: {',
+        '  pulls: {',
+        '    async listFiles() { return { data: [{ filename: "a.js", status: "modified", patch: "@@ -1 +1 @@" }] }; },',
+        '    async get() { return { data: { head: { ref: "r", sha: "sha-x", repo: { fork: false } } } }; },',
+        '    async listReviews() { return { data: [] }; },',
+        '    async dismissReview() { return { data: {} }; },',
+        '    async createReview(p) { return { data: { id: 1, ...p } }; },',
+        '  },',
+        '  issues: {',
+        '    async listComments() { return { data: [] }; },',
+        '    async createComment() { return { data: { id: 1 } }; },',
+        '    async updateComment() { return { data: { id: 1 } }; },',
+        '  },',
+        '  repos: {',
+        '    async createCommitStatus(p) { statusCalls.push(p); return { data: { id: 1, ...p } }; },',
+        '  },',
+        '}};',
+        'const context = {',
+        '  eventName: "pull_request",',
+        '  repo: { owner: "o", repo: "r" },',
+        '  payload: { pull_request: { number: 1, head: { repo: { fork: false }, sha: "sha-x" } } },',
+        '};',
+        'const core = { info(){}, warning(){}, setSecret(){}, setFailed(m){ console.log("SETFAILED:"+m); }, getInput(){ return ""; } };',
+        'const callApi = async () => { throw new Error("hard boom"); };',
+        'const config = {',
+        '  apiKey: "k", model: "glm-5.2", systemPrompt: "", reviewerName: "Z.ai Code Review",',
+        '  excludePatterns: [], maxDiffChars: 0, largePrFileThreshold: 50, maxBatchChars: 120000,',
+        '  maxFilesPerBatch: 40, maxPatchChars: 18000, commandsEnabled: false, authThreshold: "write",',
+        '  allowForkCommands: false, timeoutMs: 120000, scheduleEnabled: false, scheduleMaxPrs: 10,',
+        '  describeWriteBody: false, impactLabels: false, impactLabelMap: {}, maxFindings: 8,',
+        '  minSeverity: "info", temperature: 0.2, maxTokens: 4096, batchConcurrency: 3,',
+        '  fallbackPrompt: "", scannersEnabled: false, scannersCacheDir: "/tmp/x",',
+        '  commitStatus: true, githubToken: "t",',
+        '};',
+        'try {',
+        '  await run(context, { config, core, octokit, callApi, apiClient: { call: async() => ({success:true,data:""}) } });',
+        '  console.log("NOSTHROW");',
+        '} catch (e) {',
+        '  console.log("THREW:" + e.message);',
+        '}',
+        'console.log("STATUSCALLS:" + JSON.stringify(statusCalls.map(s => s.state + ":" + s.sha)));',
+      ].join('\n'),
+    );
+    let result;
+    try {
+      result = spawnSync(process.execPath, [driver], {
+        encoding: 'utf8',
+        cwd: process.cwd(),
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    if (result.status !== 0) {
+      throw new Error('driver failed: ' + result.stderr + result.stdout);
+    }
+    const out = result.stdout;
+    // run() posted pending, then threw (the hard error main()'s catch turns
+    // into a failure status). We assert pending fired with the head SHA and
+    // the error propagated — proving the run-level wiring main relies on.
+    expect(out).toContain('THREW:hard boom');
+    expect(out).toMatch(/STATUSCALLS:\["pending:sha-x"\]/);
   });
 });

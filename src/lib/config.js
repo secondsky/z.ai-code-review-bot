@@ -219,6 +219,22 @@ export function loadConfig(inputs = {}, options = {}) {
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
   const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
 
+  // Phase 6.1: bounded batch concurrency. Default 3, clamped to [1, 8].
+  // Below-1 values are treated as invalid (defensive: a future caller cannot
+  // request serial/zero concurrency and stall the pipeline). 8 is the cap so
+  // an over-eager operator cannot DOS the provider.
+  const batchConcurrencyRaw = toInt(read(inputs, 'ZAI_BATCH_CONCURRENCY'));
+  let batchConcurrency = 3;
+  if (batchConcurrencyRaw !== null && Number.isFinite(batchConcurrencyRaw) && batchConcurrencyRaw >= 1) {
+    batchConcurrency = Math.min(batchConcurrencyRaw, 8);
+  }
+
+  // Phase 6.2: optional fallback prompt that activates the callWithRetry
+  // timeout-fallback mechanism. Empty (default) = disabled; a non-empty
+  // trimmed string is forwarded to the API client.
+  const fallbackPromptRaw = read(inputs, 'ZAI_FALLBACK_PROMPT').trim();
+  const fallbackPrompt = fallbackPromptRaw === '' ? '' : fallbackPromptRaw;
+
   // v2 deterministic-scanner knobs (Phase 4). The master switch defaults to
   // TRUE — the action.yml input also defaults to 'true', but loadConfig
   // applies the same default so direct callers (e.g. tests, programmatic
@@ -232,6 +248,17 @@ export function loadConfig(inputs = {}, options = {}) {
     read(inputs, 'ZAI_SCANNERS_CACHE_DIR').trim() || '~/.zai-cache/scanners';
 
   const githubToken = read(inputs, 'GITHUB_TOKEN');
+
+  // Phase 5: commit-status feedback (pending → success/failure). Defaults to
+  // TRUE — posting a commit status gives developers immediate feedback while
+  // the review runs, matching CodeRabbit's commit_status feature. Requires the
+  // workflow's `permissions:` block to grant `statuses: write`. The master
+  // switch follows the same empty=default convention as scannersEnabled: an
+  // empty input means "use the default" (true), so direct callers (tests,
+  // programmatic users) get the feature without setting the input.
+  const commitStatusRaw = read(inputs, 'ZAI_COMMIT_STATUS').trim().toLowerCase();
+  const commitStatus =
+    commitStatusRaw === '' ? true : isTruthy(commitStatusRaw);
 
   const config = {
     apiKey,
@@ -257,8 +284,11 @@ export function loadConfig(inputs = {}, options = {}) {
     minSeverity,
     temperature,
     maxTokens,
+    batchConcurrency,
+    fallbackPrompt,
     scannersEnabled,
     scannersCacheDir,
+    commitStatus,
     githubToken,
   };
 

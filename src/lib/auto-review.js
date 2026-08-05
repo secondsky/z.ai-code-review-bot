@@ -307,6 +307,74 @@ const DEFAULT_CALL_API = () => {
 };
 
 /**
+ * Run `fn` over `items` with at most `concurrency` calls in flight at once.
+ * Returns an array of results in the SAME ORDER as `items` — critical for
+ * the structured-review pipeline, where batch order determines parse order,
+ * which determines dedup "first wins". Completion order is irrelevant: even
+ * if batch 5 finishes before batch 1, slot 1 holds batch 1's result.
+ *
+ * If any `fn` rejects, the error propagates (no swallowing). In-flight calls
+ * are allowed to settle naturally (their rejections are ignored); the first
+ * rejection wins and surfaces to the caller. The recursive-halving inside
+ * executeStructuredBatch handles context-overflow on its own.
+ *
+ * Pure helper (no I/O of its own — `fn` does the I/O). Exported for testing.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} concurrency  max in-flight calls (clamped to ≥1)
+ * @param {(item: T, index: number) => Promise<R>|R} fn
+ * @returns {Promise<R[]>}
+ */
+export async function runWithConcurrency(items, concurrency, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Number.isFinite(concurrency) && concurrency >= 1 ? Math.floor(concurrency) : 1;
+  const results = new Array(list.length);
+
+  let cursor = 0;
+  let active = 0;
+
+  return new Promise((resolve, reject) => {
+    if (list.length === 0) {
+      resolve(results);
+      return;
+    }
+
+    const launchNext = () => {
+      // Stop launching once we've hit the limit or run out of items.
+      while (active < limit && cursor < list.length) {
+        const i = cursor++;
+        active++;
+        let p;
+        try {
+          p = Promise.resolve(fn(list[i], i));
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        p.then(
+          (val) => {
+            results[i] = val; // slot by index → preserves input order
+            active--;
+            if (cursor < list.length) {
+              launchNext();
+            } else if (active === 0) {
+              resolve(results);
+            }
+          },
+          (err) => {
+            // First rejection wins; subsequent rejects are swallowed.
+            reject(err);
+          },
+        );
+      }
+    };
+
+    launchNext();
+  });
+}
+
+/**
  * Review one batch of entries via the structured prompt, recursively halving
  * on context-overflow. Returns an array of raw model-text strings (one per
  * successful callApi invocation — halving produces multiple).
@@ -424,20 +492,32 @@ export async function runStructuredReview(files, config, deps = {}) {
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
 
+  // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
+  // `batchConcurrency` calls in flight at once. runWithConcurrency returns
+  // results in INPUT order, so the downstream parse/merge/dedup stays
+  // deterministic regardless of completion order (dedup "first wins" by
+  // batch index). If any batch rejects, the error propagates — recursive
+  // halving inside executeStructuredBatch handles context-overflow on its own.
+  const concurrency = Math.max(1, Math.min(config.batchConcurrency || 3, 8));
+  const totalBatches = batches.length;
+  const batchRawTexts = await runWithConcurrency(batches, concurrency, async (batch, i) => {
+    return executeBatch(
+      batch,
+      { ...batchState, batchNumber: i + 1, totalBatches },
+      { callApi, core },
+    );
+  });
+
   /** @type {Record<string, unknown>[]} */
   const allFindings = [];
   const batchMeta = [];
   let summary = '';
 
-  for (let i = 0; i < batches.length; i++) {
+  // Parse + merge in batch order (deterministic — order preserved by
+  // runWithConcurrency). The last non-empty summary wins.
+  for (let i = 0; i < batchRawTexts.length; i++) {
+    const rawTexts = batchRawTexts[i];
     const batchNumber = i + 1;
-    const totalBatches = batches.length;
-    const rawTexts = await executeBatch(
-      batches[i],
-      { ...batchState, batchNumber, totalBatches },
-      { callApi, core },
-    );
-
     let batchFindingCount = 0;
     for (const raw of rawTexts) {
       const parsed = parseReview(raw, { changedFiles: files });

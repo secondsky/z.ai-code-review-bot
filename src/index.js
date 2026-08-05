@@ -65,6 +65,7 @@ import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
 import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
+import { setReviewStatus, buildStatusDescription } from './lib/status.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -144,8 +145,11 @@ export const INPUT_NAMES = [
   'ZAI_MIN_SEVERITY',
   'ZAI_TEMPERATURE',
   'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
   'ZAI_SCANNERS_ENABLED',
   'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
   'GITHUB_TOKEN',
 ];
 
@@ -243,6 +247,8 @@ export async function run(context, deps = {}) {
     createApiClient: createApiClientFn = createApiClient,
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
+    setReviewStatus: setReviewStatusFn = setReviewStatus,
+    buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
   } = deps;
 
   const event = eventName(context);
@@ -264,6 +270,25 @@ export async function run(context, deps = {}) {
     if (patchable.length === 0) {
       coreDep.info('No patchable changes; skipping.');
       return;
+    }
+
+    // Phase 5: post a "pending" commit status at the START of the review so
+    // developers see immediate feedback instead of staring at a silent PR for
+    // minutes. Fail-soft (setReviewStatus never throws); gated by config so an
+    // operator who lacks `statuses: write` can turn it off. The sha is the PR
+    // head SHA from the pull_request payload.
+    const sha = context?.payload?.pull_request?.head?.sha ?? '';
+    if (config.commitStatus) {
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'pending',
+          description: 'Z.ai review in progress…',
+        },
+        { core: coreDep },
+      );
     }
 
     // Build (or accept an injected) callApi adapter that wraps api.js.
@@ -318,6 +343,32 @@ export async function run(context, deps = {}) {
       },
     );
 
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    if (config.commitStatus) {
+      const criticalCount = result.findings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = result.findings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: result.findings.length,
+            criticalCount,
+            highCount,
+          }),
+        },
+        { core: coreDep },
+      );
+    }
+
     // Phase 2: partition findings into inline-mappable (anchored to diff lines
     // via pulls.createReview) and summary-only. When at least one finding maps
     // to a diff line, post a GitHub REVIEW with inline comments — the
@@ -335,7 +386,6 @@ export async function run(context, deps = {}) {
         issue: { number: pullNumber },
       },
     };
-    const sha = context?.payload?.pull_request?.head?.sha ?? '';
 
     const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
 
@@ -576,11 +626,24 @@ function buildCallApi({
   resolveSystemPromptFn,
 }) {
   if (injectedCallApi) return injectedCallApi;
-  const client = injectedApiClient ?? createApiClientFn({ timeout: config.timeoutMs });
+  // Factory config: timeout always; fallbackPrompt only when set to a
+  // non-empty string (otherwise the client default — no fallback — applies).
+  const factoryConfig = { timeout: config.timeoutMs };
+  if (typeof config.fallbackPrompt === 'string' && config.fallbackPrompt.length > 0) {
+    factoryConfig.fallbackPrompt = config.fallbackPrompt;
+  }
+  const client = injectedApiClient ?? createApiClientFn(factoryConfig);
   const systemPrompt = resolveSystemPromptFn(config);
   return (apiKey, model, prompt) =>
     client
-      .call({ apiKey, model, systemPrompt, userPrompt: prompt })
+      .call({
+        apiKey,
+        model,
+        systemPrompt,
+        userPrompt: prompt,
+        ...(config.temperature != null ? { temperature: config.temperature } : {}),
+        ...(config.maxTokens != null ? { maxTokens: config.maxTokens } : {}),
+      })
       .then((r) => {
         if (!r.success) throw new Error(r.error.message);
         return r.data;
@@ -593,19 +656,45 @@ function buildCallApi({
 
 /**
  * Build config from action inputs and call {@link run}. Errors propagate to
- * the top-level `.catch`, which calls `core.setFailed`.
+ * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
+ * best-effort posts a "failure" commit status so developers aren't left
+ * staring at a forever-pending status.
  *
  * @returns {Promise<void>}
  */
 export async function main() {
   const inputs = readAllInputs(core);
   const config = loadConfig(inputs, { core });
-  return run(github.context, {
-    config,
-    core,
-    github,
-    octokit: github.getOctokit(config.githubToken),
-  });
+  const octokit = github.getOctokit(config.githubToken);
+  try {
+    return await run(github.context, {
+      config,
+      core,
+      github,
+      octokit,
+    });
+  } catch (err) {
+    // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
+    // only — setReviewStatus swallows its own errors and never throws, so this
+    // can never mask the original failure. Only fires for pull_request events
+    // (where a head SHA exists) and when status feedback is enabled.
+    if (config.commitStatus) {
+      const sha = github.context?.payload?.pull_request?.head?.sha;
+      if (sha) {
+        await setReviewStatus(
+          {
+            octokit,
+            context: github.context,
+            sha,
+            state: 'failure',
+            description: 'Z.ai review failed',
+          },
+          { core },
+        );
+      }
+    }
+    throw err;
+  }
 }
 
 // Auto-run ONLY when this file is the process entry point. Import-safe.

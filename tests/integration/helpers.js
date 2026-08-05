@@ -62,6 +62,10 @@ export function makeConfig(overrides = {}) {
     // scanning pass { scannersEnabled: true } and (typically) a fake runScanners.
     scannersEnabled: false,
     scannersCacheDir: '/tmp/zai-cache-scanners-test',
+    // Phase 5: commit-status feedback. Default OFF in the integration helper so
+    // existing end-to-end tests don't see unexpected createCommitStatus calls;
+    // tests that exercise the status path opt in with { commitStatus: true }.
+    commitStatus: false,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -138,6 +142,7 @@ export function makeFakeOctokit({
     listReviews: [],
     dismissReview: [],
     createReview: [],
+    createCommitStatus: [],
   };
 
   const octokit = {
@@ -191,6 +196,10 @@ export function makeFakeOctokit({
         async getContent(params) {
           calls.getContent.push(params);
           return { data: content };
+        },
+        async createCommitStatus(params) {
+          calls.createCommitStatus.push(params);
+          return { data: { id: 1, ...params } };
         },
       },
     },

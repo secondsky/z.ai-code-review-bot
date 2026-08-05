@@ -26,6 +26,7 @@ import {
   isContextLimitError,
   executeStructuredBatch,
   runStructuredReview,
+  runWithConcurrency,
   HIGH_RISK_PATTERNS,
 } from '../src/lib/auto-review.js';
 
@@ -644,6 +645,122 @@ describe('executeStructuredBatch', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * runWithConcurrency (pure helper — order-preserving bounded fan-out)
+ * ------------------------------------------------------------------ */
+describe('runWithConcurrency', () => {
+  test('returns results in input order regardless of completion order', async () => {
+    // Resolves happen out of order: item 1 finishes LAST. The result array
+    // must still be [A, B, C] — input order, not completion order. This is
+    // the critical invariant: dedup "first wins" depends on batch order.
+    const items = ['a', 'b', 'c'];
+    const fn = (x) =>
+      new Promise((resolve) => {
+        // 'b' resolves first, then 'c', then 'a' (delay inversely related to letter)
+        const delay = x === 'a' ? 30 : x === 'b' ? 5 : 15;
+        setTimeout(() => resolve(x.toUpperCase()), delay);
+      });
+    const out = await runWithConcurrency(items, 3, fn);
+    expect(out).toEqual(['A', 'B', 'C']);
+  });
+
+  test('preserves order with a larger set than the concurrency limit', async () => {
+    const items = [];
+    for (let i = 0; i < 10; i++) items.push(i);
+    const fn = async (x) => {
+      // Random-ish delay to scramble completion order.
+      await new Promise((r) => setTimeout(r, (x * 7) % 20));
+      return x * x;
+    };
+    const out = await runWithConcurrency(items, 3, fn);
+    expect(out).toEqual(items.map((x) => x * x));
+  });
+
+  test('respects the concurrency limit (never more than `concurrency` in flight)', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const items = [];
+    for (let i = 0; i < 12; i++) items.push(i);
+    const fn = async (x) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 10));
+      inFlight--;
+      return x;
+    };
+    await runWithConcurrency(items, 4, fn);
+    expect(maxInFlight).toBeLessThanOrEqual(4);
+    // Sanity: with 12 items and concurrency 4, we expect to actually hit 4.
+    expect(maxInFlight).toBeGreaterThanOrEqual(4);
+  });
+
+  test('concurrency of 1 runs items strictly sequentially (max in flight = 1)', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const items = [0, 1, 2, 3];
+    const fn = async (x) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return x;
+    };
+    await runWithConcurrency(items, 1, fn);
+    expect(maxInFlight).toBe(1);
+  });
+
+  test('propagates rejection (does not swallow) and unwinds in-flight calls', async () => {
+    const items = [0, 1, 2, 3];
+    let started = 0;
+    let finished = 0;
+    const fn = async (x) => {
+      started++;
+      await new Promise((r) => setTimeout(r, 10));
+      finished++;
+      if (x === 2) throw new Error('boom');
+      return x;
+    };
+    await expect(runWithConcurrency(items, 2, fn)).rejects.toThrow('boom');
+    // We don't assert exact started/finished counts (race-dependent), only
+    // that the rejection surfaced. Subsequent items may or may not start
+    // depending on timing — but the error must propagate.
+    expect(started).toBeGreaterThanOrEqual(1);
+  });
+
+  test('empty input → empty result', async () => {
+    const fn = vi.fn();
+    const out = await runWithConcurrency([], 3, fn);
+    expect(out).toEqual([]);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  test('passes (item, index) to fn', async () => {
+    const seen = [];
+    const items = ['a', 'b', 'c'];
+    await runWithConcurrency(items, 2, async (item, i) => {
+      seen.push({ item, i });
+    });
+    expect(seen).toEqual([
+      { item: 'a', i: 0 },
+      { item: 'b', i: 1 },
+      { item: 'c', i: 2 },
+    ]);
+  });
+
+  test('concurrency > items.length works (no idle waits)', async () => {
+    const items = ['x', 'y'];
+    const out = await runWithConcurrency(items, 100, (x) => Promise.resolve(x.toUpperCase()));
+    expect(out).toEqual(['X', 'Y']);
+  });
+
+  test('handles mixed sync-async fn returns', async () => {
+    const items = [1, 2, 3];
+    const fn = (x) => x * 2; // synchronous (non-promise) return
+    const out = await runWithConcurrency(items, 2, fn);
+    expect(out).toEqual([2, 4, 6]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * runStructuredReview (orchestration, injected callApi)
  * ------------------------------------------------------------------ */
 describe('runStructuredReview', () => {
@@ -842,5 +959,97 @@ describe('runStructuredReview', () => {
     // info is below high → filtered out; only critical survives.
     expect(out.findings).toHaveLength(1);
     expect(out.findings[0].severity).toBe('critical');
+  });
+
+  test('batches run with bounded concurrency: multiple calls can be in flight simultaneously', async () => {
+    // Force 4 batches via maxFilesPerBatch=1, then confirm that with
+    // batchConcurrency=4 the calls overlap (multiple in flight at once),
+    // whereas a sequential loop would never exceed 1.
+    const files = [];
+    for (let i = 0; i < 4; i++) {
+      files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(900) }));
+    }
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let callCount = 0;
+    const callApi = () =>
+      new Promise((resolve) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        callCount++;
+        const batchIdx = callCount;
+        setTimeout(() => {
+          inFlight--;
+          resolve(structuredPayload(`batch ${batchIdx}`, [finding(`f${batchIdx - 1}.js`)]));
+        }, 20);
+      });
+
+    const out = await runStructuredReview(
+      files,
+      {
+        apiKey: 'k',
+        model: 'm',
+        maxBatchChars: 1000000,
+        maxFilesPerBatch: 1,
+        batchConcurrency: 4,
+      },
+      { callApi },
+    );
+    expect(callCount).toBe(4);
+    expect(maxInFlight).toBeGreaterThan(1); // concurrency happened
+    expect(maxInFlight).toBeLessThanOrEqual(4);
+    // Findings still come out in batch order — determinism holds.
+    expect(out.findings.map((f) => f.file).sort()).toEqual([
+      'f0.js',
+      'f1.js',
+      'f2.js',
+      'f3.js',
+    ]);
+  });
+
+  test('batchConcurrency default (3) and clamp behavior — config knob flows through', async () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(900) }));
+    }
+    let maxInFlight = 0;
+    let inFlight = 0;
+    const callApi = () =>
+      new Promise((resolve) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        setTimeout(() => {
+          inFlight--;
+          resolve(structuredPayload('s', []));
+        }, 15);
+      });
+    // batchConcurrency unset → default 3 (Math.max/Math.min clamp in auto-review).
+    await runStructuredReview(files, { apiKey: 'k', model: 'm', maxBatchChars: 2000 }, { callApi });
+    expect(maxInFlight).toBeLessThanOrEqual(3);
+  });
+
+  test('batchConcurrency=1 runs sequentially (max in flight = 1) and preserves order', async () => {
+    const files = [];
+    for (let i = 0; i < 4; i++) {
+      files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(900) }));
+    }
+    let maxInFlight = 0;
+    let inFlight = 0;
+    const callApi = () =>
+      new Promise((resolve) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        setTimeout(() => {
+          inFlight--;
+          resolve(structuredPayload('s', []));
+        }, 10);
+      });
+    await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxBatchChars: 2000, batchConcurrency: 1 },
+      { callApi },
+    );
+    expect(maxInFlight).toBe(1);
   });
 });

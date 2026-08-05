@@ -14,9 +14,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
-# Auto-review only needs to post one comment. Keep the token scope minimal.
+# Auto-review needs to post a comment AND (optionally) a commit status. Keep the
+# token scope minimal. `pull-requests: write` is required for the review
+# comment; `statuses: write` is required for the pending → success/failure
+# commit-status feedback (ZAI_COMMIT_STATUS, on by default). If you disable
+# ZAI_COMMIT_STATUS you can drop `statuses: write`.
 permissions:
   pull-requests: write
+  statuses: write
 
 # Serialize reviews per head SHA: a new push supersedes the in-flight review of
 # the old SHA (cancel-in-progress: true), and two runs for the same SHA are

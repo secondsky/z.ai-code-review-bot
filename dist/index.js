@@ -38635,6 +38635,22 @@ function loadConfig(inputs = {}, options = {}) {
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
   const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
 
+  // Phase 6.1: bounded batch concurrency. Default 3, clamped to [1, 8].
+  // Below-1 values are treated as invalid (defensive: a future caller cannot
+  // request serial/zero concurrency and stall the pipeline). 8 is the cap so
+  // an over-eager operator cannot DOS the provider.
+  const batchConcurrencyRaw = toInt(read(inputs, 'ZAI_BATCH_CONCURRENCY'));
+  let batchConcurrency = 3;
+  if (batchConcurrencyRaw !== null && Number.isFinite(batchConcurrencyRaw) && batchConcurrencyRaw >= 1) {
+    batchConcurrency = Math.min(batchConcurrencyRaw, 8);
+  }
+
+  // Phase 6.2: optional fallback prompt that activates the callWithRetry
+  // timeout-fallback mechanism. Empty (default) = disabled; a non-empty
+  // trimmed string is forwarded to the API client.
+  const fallbackPromptRaw = read(inputs, 'ZAI_FALLBACK_PROMPT').trim();
+  const fallbackPrompt = fallbackPromptRaw === '' ? '' : fallbackPromptRaw;
+
   // v2 deterministic-scanner knobs (Phase 4). The master switch defaults to
   // TRUE — the action.yml input also defaults to 'true', but loadConfig
   // applies the same default so direct callers (e.g. tests, programmatic
@@ -38648,6 +38664,17 @@ function loadConfig(inputs = {}, options = {}) {
     read(inputs, 'ZAI_SCANNERS_CACHE_DIR').trim() || '~/.zai-cache/scanners';
 
   const githubToken = read(inputs, 'GITHUB_TOKEN');
+
+  // Phase 5: commit-status feedback (pending → success/failure). Defaults to
+  // TRUE — posting a commit status gives developers immediate feedback while
+  // the review runs, matching CodeRabbit's commit_status feature. Requires the
+  // workflow's `permissions:` block to grant `statuses: write`. The master
+  // switch follows the same empty=default convention as scannersEnabled: an
+  // empty input means "use the default" (true), so direct callers (tests,
+  // programmatic users) get the feature without setting the input.
+  const commitStatusRaw = read(inputs, 'ZAI_COMMIT_STATUS').trim().toLowerCase();
+  const commitStatus =
+    commitStatusRaw === '' ? true : isTruthy(commitStatusRaw);
 
   const config = {
     apiKey,
@@ -38673,8 +38700,11 @@ function loadConfig(inputs = {}, options = {}) {
     minSeverity,
     temperature,
     maxTokens,
+    batchConcurrency,
+    fallbackPrompt,
     scannersEnabled,
     scannersCacheDir,
+    commitStatus,
     githubToken,
   };
 
@@ -38881,7 +38911,11 @@ function defaultSleep(ms) {
  * robust option per the brief: `https` is built-in and synchronous to import,
  * so there is no lazy-import ceremony, and tests pass `{ request: fakeRequest }`.
  *
- * @param {{ apiKey: string, model: string, systemPrompt: string, userPrompt: string, timeout: number }} params
+ * Sampling knobs: `temperature` and `maxTokens` are forwarded into the request
+ * body as `temperature` and `max_tokens` ONLY when provided as numbers. They
+ * are omitted otherwise (the provider applies its own defaults).
+ *
+ * @param {{ apiKey: string, model: string, systemPrompt: string, userPrompt: string, timeout: number, temperature?: number, maxTokens?: number }} params
  * @param {{ request?: (options: object) => any }} [deps]
  * @returns {Promise<string>} the assistant message content
  */
@@ -38897,6 +38931,8 @@ function makeApiRequest(params, deps = {}) {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
+      ...(typeof params.temperature === 'number' ? { temperature: params.temperature } : {}),
+      ...(typeof params.maxTokens === 'number' ? { max_tokens: params.maxTokens } : {}),
     });
 
     const options = {
@@ -39119,9 +39155,15 @@ async function callWithRetry(fn, options = {}) {
 /**
  * Build a Z.ai API client.
  *
- * @param {{ timeout?: number, maxRetries?: number, baseDelay?: number, fallbackPrompt?: () => any }} [config]
+ * `fallbackPrompt` accepts either a function (the historical shape used by
+ * `withFallback`) or a plain STRING. A string is normalized to a function that
+ * returns `{ prompt: <string> }` so callWithRetry's timeout-fallback mechanism
+ * can fire. This is the seam Phase 6.2 wires `config.fallbackPrompt` (a string)
+ * into: the index.js adapter passes the config string straight to the factory.
+ *
+ * @param {{ timeout?: number, maxRetries?: number, baseDelay?: number, fallbackPrompt?: (() => any) | string }} [config]
  * @returns {{
- *   call: (args: { apiKey: string, model: string, systemPrompt: string, userPrompt: string, onFallback?: Function, fallbackPrompt?: Function, request?: Function, sleep?: Function }) => Promise<any>,
+ *   call: (args: { apiKey: string, model: string, systemPrompt: string, userPrompt: string, temperature?: number, maxTokens?: number, onFallback?: Function, fallbackPrompt?: Function, request?: Function, sleep?: Function }) => Promise<any>,
  *   withFallback: (fallbackFn: () => any) => any,
  *   config: { timeout: number, maxRetries: number, baseDelay: number },
  * }}
@@ -39134,12 +39176,25 @@ function createApiClient(config = {}) {
     fallbackPrompt: configFallbackPrompt = null,
   } = config;
 
+  // Normalize a string fallbackPrompt to the function shape callWithRetry
+  // expects. A non-empty string becomes `() => ({ prompt: string })`; a
+  // function passes through; anything falsy disables the fallback.
+  const normalizedConfigFallback = (() => {
+    if (typeof configFallbackPrompt === 'string') {
+      const s = configFallbackPrompt.trim();
+      return s.length > 0 ? () => ({ prompt: s }) : null;
+    }
+    return configFallbackPrompt;
+  })();
+
   return {
     /**
      * Send one logical request with retries. `request` and `sleep` are
      * accepted here purely for test injection (defaults are real network and
      * real setTimeout). The apiKey is forwarded to `makeApiRequest` and never
-     * logged.
+     * logged. `temperature` and `maxTokens`, when provided as numbers, are
+     * forwarded to `makeApiRequest` and appear in the request body as
+     * `temperature` and `max_tokens`.
      */
     async call(args = {}) {
       const {
@@ -39147,6 +39202,8 @@ function createApiClient(config = {}) {
         model,
         systemPrompt,
         userPrompt,
+        temperature,
+        maxTokens,
         onFallback = null,
         fallbackPrompt: callFallbackPrompt = null,
         request: requestDep,
@@ -39169,6 +39226,8 @@ function createApiClient(config = {}) {
             systemPrompt,
             userPrompt: currentPrompt,
             timeout: currentTimeout,
+            temperature,
+            maxTokens,
           },
           requestDep ? { request: requestDep } : {},
         );
@@ -39177,7 +39236,7 @@ function createApiClient(config = {}) {
       const deps = {};
       if (sleepDep) deps.sleep = sleepDep;
       if (callFallbackPrompt !== null) deps.fallbackPrompt = callFallbackPrompt;
-      else if (configFallbackPrompt !== null) deps.fallbackPrompt = configFallbackPrompt;
+      else if (normalizedConfigFallback !== null) deps.fallbackPrompt = normalizedConfigFallback;
       if (onFallback) deps.onFallback = onFallback;
 
       return callWithRetry(fn, {
@@ -41109,6 +41168,74 @@ const DEFAULT_CALL_API = () => {
 };
 
 /**
+ * Run `fn` over `items` with at most `concurrency` calls in flight at once.
+ * Returns an array of results in the SAME ORDER as `items` — critical for
+ * the structured-review pipeline, where batch order determines parse order,
+ * which determines dedup "first wins". Completion order is irrelevant: even
+ * if batch 5 finishes before batch 1, slot 1 holds batch 1's result.
+ *
+ * If any `fn` rejects, the error propagates (no swallowing). In-flight calls
+ * are allowed to settle naturally (their rejections are ignored); the first
+ * rejection wins and surfaces to the caller. The recursive-halving inside
+ * executeStructuredBatch handles context-overflow on its own.
+ *
+ * Pure helper (no I/O of its own — `fn` does the I/O). Exported for testing.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} concurrency  max in-flight calls (clamped to ≥1)
+ * @param {(item: T, index: number) => Promise<R>|R} fn
+ * @returns {Promise<R[]>}
+ */
+async function runWithConcurrency(items, concurrency, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Number.isFinite(concurrency) && concurrency >= 1 ? Math.floor(concurrency) : 1;
+  const results = new Array(list.length);
+
+  let cursor = 0;
+  let active = 0;
+
+  return new Promise((resolve, reject) => {
+    if (list.length === 0) {
+      resolve(results);
+      return;
+    }
+
+    const launchNext = () => {
+      // Stop launching once we've hit the limit or run out of items.
+      while (active < limit && cursor < list.length) {
+        const i = cursor++;
+        active++;
+        let p;
+        try {
+          p = Promise.resolve(fn(list[i], i));
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        p.then(
+          (val) => {
+            results[i] = val; // slot by index → preserves input order
+            active--;
+            if (cursor < list.length) {
+              launchNext();
+            } else if (active === 0) {
+              resolve(results);
+            }
+          },
+          (err) => {
+            // First rejection wins; subsequent rejects are swallowed.
+            reject(err);
+          },
+        );
+      }
+    };
+
+    launchNext();
+  });
+}
+
+/**
  * Review one batch of entries via the structured prompt, recursively halving
  * on context-overflow. Returns an array of raw model-text strings (one per
  * successful callApi invocation — halving produces multiple).
@@ -41226,20 +41353,32 @@ async function runStructuredReview(files, config, deps = {}) {
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
 
+  // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
+  // `batchConcurrency` calls in flight at once. runWithConcurrency returns
+  // results in INPUT order, so the downstream parse/merge/dedup stays
+  // deterministic regardless of completion order (dedup "first wins" by
+  // batch index). If any batch rejects, the error propagates — recursive
+  // halving inside executeStructuredBatch handles context-overflow on its own.
+  const concurrency = Math.max(1, Math.min(config.batchConcurrency || 3, 8));
+  const totalBatches = batches.length;
+  const batchRawTexts = await runWithConcurrency(batches, concurrency, async (batch, i) => {
+    return executeBatch(
+      batch,
+      { ...batchState, batchNumber: i + 1, totalBatches },
+      { callApi, core },
+    );
+  });
+
   /** @type {Record<string, unknown>[]} */
   const allFindings = [];
   const batchMeta = [];
   let summary = '';
 
-  for (let i = 0; i < batches.length; i++) {
+  // Parse + merge in batch order (deterministic — order preserved by
+  // runWithConcurrency). The last non-empty summary wins.
+  for (let i = 0; i < batchRawTexts.length; i++) {
+    const rawTexts = batchRawTexts[i];
     const batchNumber = i + 1;
-    const totalBatches = batches.length;
-    const rawTexts = await executeBatch(
-      batches[i],
-      { ...batchState, batchNumber, totalBatches },
-      { callApi, core },
-    );
-
     let batchFindingCount = 0;
     for (const raw of rawTexts) {
       const parsed = parseReview(raw, { changedFiles: files });
@@ -45133,6 +45272,123 @@ async function runScanners(opts, deps = {}) {
   return { findings: deduped, metrics, scannerNames };
 }
 
+;// CONCATENATED MODULE: ./src/lib/status.js
+/**
+ * Commit-status feedback for PR reviews (pending → success/failure).
+ *
+ * Mirrors CodeRabbit's `commit_status` feature: post a `pending` status at the
+ * START of the review so developers see progress immediately, then flip it to
+ * `success` (with a findings summary) or `failure` (on hard error) when done.
+ * High DX value, near-zero cost.
+ *
+ * Octokit and a `@actions/core`-like `core` are INJECTED — never imported at
+ * module load — so this module stays pure and unit-testable. Status feedback
+ * is BEST-EFFORT: any API error (e.g. a missing `statuses: write` scope) is
+ * logged via `core.warning` and swallowed — it must NEVER break the review.
+ */
+
+/** The fixed GitHub commit-status `context` label (the row in the checks UI). */
+const STATUS_CONTEXT = 'Z.ai Code Review';
+
+/** GitHub truncates commit-status descriptions to 140 characters. */
+const MAX_DESCRIPTION_LEN = 140;
+
+/**
+ * Truncate a description to GitHub's 140-character limit. Returns the input
+ * unchanged when it already fits.
+ *
+ * @param {string} description
+ * @returns {string}
+ */
+function truncateDescription(description) {
+  const s = String(description ?? '');
+  if (s.length <= MAX_DESCRIPTION_LEN) return s;
+  return s.slice(0, MAX_DESCRIPTION_LEN);
+}
+
+/**
+ * Build the success description from review results.
+ *
+ * Returns the "no issues" emoji form when `findingCount` is 0 (or missing),
+ * otherwise the "N findings (M critical, H high)" form. Counts default to 0
+ * when missing so a partial object is still safe.
+ *
+ * @param {{ findingCount?: number, criticalCount?: number, highCount?: number }} counts
+ * @returns {string}
+ */
+function buildStatusDescription({
+  findingCount = 0,
+  criticalCount = 0,
+  highCount = 0,
+} = {}) {
+  const findings = Number(findingCount) || 0;
+  const critical = Number(criticalCount) || 0;
+  const high = Number(highCount) || 0;
+  if (findings === 0) {
+    return 'Review complete: no issues found ✅';
+  }
+  return `Review complete: ${findings} findings (${critical} critical, ${high} high)`;
+}
+
+/**
+ * Post a commit status to the PR's head SHA.
+ *
+ * Calls `octokit.rest.repos.createCommitStatus` with the `STATUS_CONTEXT`
+ * label. Owner/repo come from `context.repo`; the SHA comes from `opts.sha`
+ * (the caller passes `context.payload.pull_request.head.sha`).
+ *
+ * FAIL-SOFT: if the API call throws (e.g. missing `statuses: write` scope),
+ * the error is logged via `deps.core.warning` (when a core is provided) and
+ * `false` is returned. This function NEVER throws — status feedback is
+ * best-effort and must not break the review. Missing `sha`, `context.repo`,
+ * or `octokit` are treated as a no-op and return `false`.
+ *
+ * @param {object} opts
+ * @param {object} opts.octokit     Octokit instance (rest.repos.createCommitStatus used).
+ * @param {object} opts.context     @actions/github context (`.repo` read for owner/repo).
+ * @param {string} opts.sha         The PR head SHA to attach the status to.
+ * @param {'pending'|'success'|'failure'|'error'} opts.state  Commit-status state.
+ * @param {string} opts.description Short human message (truncated to 140 chars).
+ * @param {string} [opts.targetUrl] Optional link (e.g. the workflow run URL).
+ * @param {{ core?: { warning?: (m: string) => void } }} [deps]  Optional core-like logger.
+ * @returns {Promise<boolean>} true on success, false on failure/no-op (fail-soft).
+ */
+async function setReviewStatus(opts, deps = {}) {
+  const { octokit, context, sha, state, description, targetUrl } = opts || {};
+
+  // Defense: missing octokit, SHA, or context.repo is a no-op. The caller in
+  // src/index.js guards the sha too, but be belt-and-suspenders so a misuse
+  // from any other call site can never trigger a noisy GitHub API error.
+  if (!octokit) return false;
+  if (typeof sha !== 'string' || sha.length === 0) return false;
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) return false;
+
+  try {
+    await octokit.rest.repos.createCommitStatus({
+      owner,
+      repo,
+      sha,
+      state,
+      description: truncateDescription(description),
+      context: STATUS_CONTEXT,
+      target_url: targetUrl,
+    });
+    return true;
+  } catch (error) {
+    // Fail-soft: status feedback must never break the review. Log and move on.
+    const core = deps?.core;
+    if (core && typeof core.warning === 'function') {
+      core.warning(
+        `Failed to post commit status (${error?.message ?? String(error)}); ` +
+          'continuing without status feedback.',
+      );
+    }
+    return false;
+  }
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 /**
  * GitHub Action entry point + event router.
@@ -45162,6 +45418,7 @@ async function runScanners(opts, deps = {}) {
  *   `run` lets errors propagate (tests can assert). `main` catches and calls
  *   `core.setFailed(err.message)`. Nothing is swallowed.
  */
+
 
 
 
@@ -45265,8 +45522,11 @@ const INPUT_NAMES = [
   'ZAI_MIN_SEVERITY',
   'ZAI_TEMPERATURE',
   'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
   'ZAI_SCANNERS_ENABLED',
   'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
   'GITHUB_TOKEN',
 ];
 
@@ -45364,6 +45624,8 @@ async function run(context, deps = {}) {
     createApiClient: createApiClientFn = createApiClient,
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
+    setReviewStatus: setReviewStatusFn = setReviewStatus,
+    buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
   } = deps;
 
   const event = eventName(context);
@@ -45385,6 +45647,25 @@ async function run(context, deps = {}) {
     if (patchable.length === 0) {
       coreDep.info('No patchable changes; skipping.');
       return;
+    }
+
+    // Phase 5: post a "pending" commit status at the START of the review so
+    // developers see immediate feedback instead of staring at a silent PR for
+    // minutes. Fail-soft (setReviewStatus never throws); gated by config so an
+    // operator who lacks `statuses: write` can turn it off. The sha is the PR
+    // head SHA from the pull_request payload.
+    const sha = context?.payload?.pull_request?.head?.sha ?? '';
+    if (config.commitStatus) {
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'pending',
+          description: 'Z.ai review in progress…',
+        },
+        { core: coreDep },
+      );
     }
 
     // Build (or accept an injected) callApi adapter that wraps api.js.
@@ -45439,6 +45720,32 @@ async function run(context, deps = {}) {
       },
     );
 
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    if (config.commitStatus) {
+      const criticalCount = result.findings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = result.findings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: result.findings.length,
+            criticalCount,
+            highCount,
+          }),
+        },
+        { core: coreDep },
+      );
+    }
+
     // Phase 2: partition findings into inline-mappable (anchored to diff lines
     // via pulls.createReview) and summary-only. When at least one finding maps
     // to a diff line, post a GitHub REVIEW with inline comments — the
@@ -45456,7 +45763,6 @@ async function run(context, deps = {}) {
         issue: { number: pullNumber },
       },
     };
-    const sha = context?.payload?.pull_request?.head?.sha ?? '';
 
     const { inline, summaryOnly } = partitionFindingsFn(result.findings, patchable);
 
@@ -45697,11 +46003,24 @@ function buildCallApi({
   resolveSystemPromptFn,
 }) {
   if (injectedCallApi) return injectedCallApi;
-  const client = injectedApiClient ?? createApiClientFn({ timeout: config.timeoutMs });
+  // Factory config: timeout always; fallbackPrompt only when set to a
+  // non-empty string (otherwise the client default — no fallback — applies).
+  const factoryConfig = { timeout: config.timeoutMs };
+  if (typeof config.fallbackPrompt === 'string' && config.fallbackPrompt.length > 0) {
+    factoryConfig.fallbackPrompt = config.fallbackPrompt;
+  }
+  const client = injectedApiClient ?? createApiClientFn(factoryConfig);
   const systemPrompt = resolveSystemPromptFn(config);
   return (apiKey, model, prompt) =>
     client
-      .call({ apiKey, model, systemPrompt, userPrompt: prompt })
+      .call({
+        apiKey,
+        model,
+        systemPrompt,
+        userPrompt: prompt,
+        ...(config.temperature != null ? { temperature: config.temperature } : {}),
+        ...(config.maxTokens != null ? { maxTokens: config.maxTokens } : {}),
+      })
       .then((r) => {
         if (!r.success) throw new Error(r.error.message);
         return r.data;
@@ -45714,19 +46033,45 @@ function buildCallApi({
 
 /**
  * Build config from action inputs and call {@link run}. Errors propagate to
- * the top-level `.catch`, which calls `core.setFailed`.
+ * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
+ * best-effort posts a "failure" commit status so developers aren't left
+ * staring at a forever-pending status.
  *
  * @returns {Promise<void>}
  */
 async function main() {
   const inputs = readAllInputs(core);
   const config = loadConfig(inputs, { core: core });
-  return run(github.context, {
-    config,
-    core: core,
-    github: github,
-    octokit: github.getOctokit(config.githubToken),
-  });
+  const octokit = github.getOctokit(config.githubToken);
+  try {
+    return await run(github.context, {
+      config,
+      core: core,
+      github: github,
+      octokit,
+    });
+  } catch (err) {
+    // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
+    // only — setReviewStatus swallows its own errors and never throws, so this
+    // can never mask the original failure. Only fires for pull_request events
+    // (where a head SHA exists) and when status feedback is enabled.
+    if (config.commitStatus) {
+      const sha = github.context?.payload?.pull_request?.head?.sha;
+      if (sha) {
+        await setReviewStatus(
+          {
+            octokit,
+            context: github.context,
+            sha,
+            state: 'failure',
+            description: 'Z.ai review failed',
+          },
+          { core: core },
+        );
+      }
+    }
+    throw err;
+  }
 }
 
 // Auto-run ONLY when this file is the process entry point. Import-safe.

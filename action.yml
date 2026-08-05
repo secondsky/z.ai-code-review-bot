@@ -162,6 +162,26 @@ inputs:
     required: false
     default: '4096'
 
+  ZAI_BATCH_CONCURRENCY:
+    description: |-
+      Maximum number of review batches to run concurrently (in parallel) inside
+      a single structured-review run. Larger PRs produce multiple batches; this
+      knob caps how many are in flight at once so a big PR does not N serial API
+      calls. Default 3, clamped to [1, 8]. Findings remain deterministic
+      regardless of completion order (results are merged in batch order).
+    required: false
+    default: '3'
+
+  ZAI_FALLBACK_PROMPT:
+    description: |-
+      Optional fallback prompt that activates the API client's timeout-fallback
+      path: when a request times out twice in a row, subsequent attempts use
+      this prompt instead of the original (often a shorter, "summary-only"
+      instruction). Empty (default) disables the fallback. When set, the
+      fallback fires only on timeouts, never on auth/validation/4xx errors.
+    required: false
+    default: ''
+
   # --- v2 deterministic scanner layer (Phase 4) ---
   ZAI_SCANNERS_ENABLED:
     description: |-
@@ -182,6 +202,18 @@ inputs:
       directory is created on first use.
     required: false
     default: '~/.zai-cache/scanners'
+
+  # --- v2 commit-status feedback (Phase 5) ---
+  ZAI_COMMIT_STATUS:
+    description: |-
+      Post a commit status (pending → success/failure) to the PR's head SHA so
+      developers see review progress immediately instead of staring at a silent
+      PR. ON by default. Requires `statuses: write` in the workflow's
+      `permissions:` block (see the example workflow). If the scope is missing
+      the status post is silently skipped (best-effort) — the review itself is
+      unaffected. Set to `false` to disable entirely.
+    required: false
+    default: 'true'
 
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'

@@ -188,7 +188,11 @@ function defaultSleep(ms) {
  * robust option per the brief: `https` is built-in and synchronous to import,
  * so there is no lazy-import ceremony, and tests pass `{ request: fakeRequest }`.
  *
- * @param {{ apiKey: string, model: string, systemPrompt: string, userPrompt: string, timeout: number }} params
+ * Sampling knobs: `temperature` and `maxTokens` are forwarded into the request
+ * body as `temperature` and `max_tokens` ONLY when provided as numbers. They
+ * are omitted otherwise (the provider applies its own defaults).
+ *
+ * @param {{ apiKey: string, model: string, systemPrompt: string, userPrompt: string, timeout: number, temperature?: number, maxTokens?: number }} params
  * @param {{ request?: (options: object) => any }} [deps]
  * @returns {Promise<string>} the assistant message content
  */
@@ -204,6 +208,8 @@ export function makeApiRequest(params, deps = {}) {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
+      ...(typeof params.temperature === 'number' ? { temperature: params.temperature } : {}),
+      ...(typeof params.maxTokens === 'number' ? { max_tokens: params.maxTokens } : {}),
     });
 
     const options = {
@@ -426,9 +432,15 @@ export async function callWithRetry(fn, options = {}) {
 /**
  * Build a Z.ai API client.
  *
- * @param {{ timeout?: number, maxRetries?: number, baseDelay?: number, fallbackPrompt?: () => any }} [config]
+ * `fallbackPrompt` accepts either a function (the historical shape used by
+ * `withFallback`) or a plain STRING. A string is normalized to a function that
+ * returns `{ prompt: <string> }` so callWithRetry's timeout-fallback mechanism
+ * can fire. This is the seam Phase 6.2 wires `config.fallbackPrompt` (a string)
+ * into: the index.js adapter passes the config string straight to the factory.
+ *
+ * @param {{ timeout?: number, maxRetries?: number, baseDelay?: number, fallbackPrompt?: (() => any) | string }} [config]
  * @returns {{
- *   call: (args: { apiKey: string, model: string, systemPrompt: string, userPrompt: string, onFallback?: Function, fallbackPrompt?: Function, request?: Function, sleep?: Function }) => Promise<any>,
+ *   call: (args: { apiKey: string, model: string, systemPrompt: string, userPrompt: string, temperature?: number, maxTokens?: number, onFallback?: Function, fallbackPrompt?: Function, request?: Function, sleep?: Function }) => Promise<any>,
  *   withFallback: (fallbackFn: () => any) => any,
  *   config: { timeout: number, maxRetries: number, baseDelay: number },
  * }}
@@ -441,12 +453,25 @@ export function createApiClient(config = {}) {
     fallbackPrompt: configFallbackPrompt = null,
   } = config;
 
+  // Normalize a string fallbackPrompt to the function shape callWithRetry
+  // expects. A non-empty string becomes `() => ({ prompt: string })`; a
+  // function passes through; anything falsy disables the fallback.
+  const normalizedConfigFallback = (() => {
+    if (typeof configFallbackPrompt === 'string') {
+      const s = configFallbackPrompt.trim();
+      return s.length > 0 ? () => ({ prompt: s }) : null;
+    }
+    return configFallbackPrompt;
+  })();
+
   return {
     /**
      * Send one logical request with retries. `request` and `sleep` are
      * accepted here purely for test injection (defaults are real network and
      * real setTimeout). The apiKey is forwarded to `makeApiRequest` and never
-     * logged.
+     * logged. `temperature` and `maxTokens`, when provided as numbers, are
+     * forwarded to `makeApiRequest` and appear in the request body as
+     * `temperature` and `max_tokens`.
      */
     async call(args = {}) {
       const {
@@ -454,6 +479,8 @@ export function createApiClient(config = {}) {
         model,
         systemPrompt,
         userPrompt,
+        temperature,
+        maxTokens,
         onFallback = null,
         fallbackPrompt: callFallbackPrompt = null,
         request: requestDep,
@@ -476,6 +503,8 @@ export function createApiClient(config = {}) {
             systemPrompt,
             userPrompt: currentPrompt,
             timeout: currentTimeout,
+            temperature,
+            maxTokens,
           },
           requestDep ? { request: requestDep } : {},
         );
@@ -484,7 +513,7 @@ export function createApiClient(config = {}) {
       const deps = {};
       if (sleepDep) deps.sleep = sleepDep;
       if (callFallbackPrompt !== null) deps.fallbackPrompt = callFallbackPrompt;
-      else if (configFallbackPrompt !== null) deps.fallbackPrompt = configFallbackPrompt;
+      else if (normalizedConfigFallback !== null) deps.fallbackPrompt = normalizedConfigFallback;
       if (onFallback) deps.onFallback = onFallback;
 
       return callWithRetry(fn, {

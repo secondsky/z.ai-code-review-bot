@@ -459,6 +459,112 @@ describe('makeApiRequest', () => {
     expect(parsedUrl.host).toBe('api.z.ai');
     expect(parsedUrl.pathname).toBe('/api/coding/paas/v4/chat/completions');
   });
+
+  test('temperature appears in the request body when provided as a number', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    await makeApiRequest(
+      {
+        apiKey: 'k',
+        model: 'm',
+        systemPrompt: 's',
+        userPrompt: 'u',
+        timeout: 1000,
+        temperature: 0.7,
+      },
+      { request },
+    );
+    const body = JSON.parse(request.calls[0].body);
+    expect(body.temperature).toBe(0.7);
+  });
+
+  test('max_tokens appears in the request body when maxTokens is provided as a number', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    await makeApiRequest(
+      {
+        apiKey: 'k',
+        model: 'm',
+        systemPrompt: 's',
+        userPrompt: 'u',
+        timeout: 1000,
+        maxTokens: 8192,
+      },
+      { request },
+    );
+    const body = JSON.parse(request.calls[0].body);
+    expect(body.max_tokens).toBe(8192);
+  });
+
+  test('both temperature and max_tokens appear when both are provided', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    await makeApiRequest(
+      {
+        apiKey: 'k',
+        model: 'm',
+        systemPrompt: 's',
+        userPrompt: 'u',
+        timeout: 1000,
+        temperature: 0,
+        maxTokens: 1024,
+      },
+      { request },
+    );
+    const body = JSON.parse(request.calls[0].body);
+    expect(body.temperature).toBe(0);
+    expect(body.max_tokens).toBe(1024);
+  });
+
+  test('temperature and max_tokens are ABSENT when not provided (omitted keys)', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    await makeApiRequest(
+      { apiKey: 'k', model: 'm', systemPrompt: 's', userPrompt: 'u', timeout: 1000 },
+      { request },
+    );
+    const body = JSON.parse(request.calls[0].body);
+    expect(body).not.toHaveProperty('temperature');
+    expect(body).not.toHaveProperty('max_tokens');
+    // The baseline fields are still present.
+    expect(body.model).toBe('m');
+    expect(body.messages).toHaveLength(2);
+  });
+
+  test('temperature=undefined and maxTokens=undefined are omitted (not in body)', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    await makeApiRequest(
+      {
+        apiKey: 'k',
+        model: 'm',
+        systemPrompt: 's',
+        userPrompt: 'u',
+        timeout: 1000,
+        temperature: undefined,
+        maxTokens: undefined,
+      },
+      { request },
+    );
+    const body = JSON.parse(request.calls[0].body);
+    expect(body).not.toHaveProperty('temperature');
+    expect(body).not.toHaveProperty('max_tokens');
+  });
 });
 
 /* ------------------------------------------------------------ *
@@ -831,5 +937,123 @@ describe('createApiClient', () => {
     expect(JSON.parse(calls[calls.length - 1].body).messages.find((m) => m.role === 'user').content).toBe(
       'FB_VIA_WITHFALLBACK',
     );
+  });
+
+  test('factory-config fallbackPrompt (string) activates the timeout-fallback path on the client', async () => {
+    // Build a client with `fallbackPrompt: 'SHORT'` — the factory must
+    // synthesize a fallbackPrompt function that returns { prompt: 'SHORT' } so
+    // callWithRetry's timeout-fallback fires. First two calls time out; the
+    // third succeeds with the fallback prompt.
+    const calls = [];
+    const request = (options) => {
+      const callIdx = calls.length;
+      const captured = { options, headers: options.headers || {}, calls };
+      calls.push(captured);
+      let responseCb = null;
+      let errorCb = null;
+      const req = {
+        on(event, cb) {
+          if (event === 'response') responseCb = cb;
+          else if (event === 'error') {
+            errorCb = cb;
+            // First two attempts time out so the fallback (attempt>=1) fires.
+            if (callIdx < 2) {
+              queueMicrotask(() => cb(new Error('Request timed out')));
+            }
+          }
+          return req;
+        },
+        setTimeout() {
+          return req;
+        },
+        destroy(err) {
+          if (err && errorCb) errorCb(err);
+          return req;
+        },
+        write(d) {
+          captured.writes = (captured.writes || []);
+          captured.writes.push(d);
+          return req;
+        },
+        end(d) {
+          if (d) {
+            captured.writes = (captured.writes || []);
+            captured.writes.push(d);
+          }
+          captured.body = (captured.writes || []).join('');
+          if (callIdx >= 2) {
+            const res = buildFakeRes(
+              [JSON.stringify({ choices: [{ message: { content: 'ok' } }] })],
+              { statusCode: 200 },
+            );
+            queueMicrotask(() => responseCb && responseCb(res));
+          }
+          return req;
+        },
+      };
+      captured.req = req;
+      return req;
+    };
+
+    const client = createApiClient({
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      fallbackPrompt: 'SHORT REVIEW ONLY',
+    });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'ORIGINAL',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+    // The 3rd call (attempt 2) must have used the fallback prompt.
+    const lastCall = calls[calls.length - 1];
+    const body = JSON.parse(lastCall.body);
+    expect(body.messages.find((m) => m.role === 'user').content).toBe('SHORT REVIEW ONLY');
+  });
+
+  test('temperature and max_tokens flow through createApiClient.call to the request body', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    const client = createApiClient();
+    await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      temperature: 0.4,
+      maxTokens: 2048,
+      request,
+    });
+    const body = JSON.parse(request.calls[0].body);
+    expect(body.temperature).toBe(0.4);
+    expect(body.max_tokens).toBe(2048);
+  });
+
+  test('temperature and max_tokens omitted from body when client.call does not receive them', async () => {
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([JSON.stringify({ choices: [{ message: { content: 'ok' } }] })], {
+        statusCode: 200,
+      }),
+    }));
+    const client = createApiClient();
+    await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      request,
+    });
+    const body = JSON.parse(request.calls[0].body);
+    expect(body).not.toHaveProperty('temperature');
+    expect(body).not.toHaveProperty('max_tokens');
   });
 });

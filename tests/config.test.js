@@ -393,3 +393,79 @@ describe('scanner knobs (Phase 4)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_CACHE_DIR: '  /tmp/x  ' }).scannersCacheDir).toBe('/tmp/x');
   });
 });
+
+describe('batchConcurrency + fallbackPrompt (Phase 6)', () => {
+  test('batchConcurrency defaults to 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency uses a provided value in [1, 8]', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '1' }).batchConcurrency).toBe(1);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '5' }).batchConcurrency).toBe(5);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '8' }).batchConcurrency).toBe(8);
+  });
+
+  test('batchConcurrency clamps above 8 → 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '20' }).batchConcurrency).toBe(8);
+  });
+
+  test('batchConcurrency clamps below 1 → 3 (default, treated as invalid)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '0' }).batchConcurrency).toBe(3);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '-3' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency NaN → default 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: 'abc' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency empty → default 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '' }).batchConcurrency).toBe(3);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '   ' }).batchConcurrency).toBe(3);
+  });
+
+  test('fallbackPrompt defaults to empty string (disabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).fallbackPrompt).toBe('');
+  });
+
+  test('fallbackPrompt uses a provided non-empty value (trim)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: 'SHORT REVIEW ONLY' }).fallbackPrompt).toBe(
+      'SHORT REVIEW ONLY',
+    );
+  });
+
+  test('fallbackPrompt trims whitespace', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '  x  ' }).fallbackPrompt).toBe('x');
+  });
+
+  test('fallbackPrompt empty/whitespace → empty string (disabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '' }).fallbackPrompt).toBe('');
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '   ' }).fallbackPrompt).toBe('');
+  });
+});
+
+describe('commitStatus (Phase 5)', () => {
+  test('defaults to true (status feedback on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).commitStatus).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: v }).commitStatus).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: v }).commitStatus).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches scannersEnabled convention)', () => {
+    // Empty input means "use the default" → true (per the action.yml default
+    // and the brief). This mirrors scannersEnabled so direct callers without
+    // the input still get status feedback.
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: '' }).commitStatus).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: '   ' }).commitStatus).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: 'TRUE' }).commitStatus).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: 'Yes' }).commitStatus).toBe(true);
+  });
+});
