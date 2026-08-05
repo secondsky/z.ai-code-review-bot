@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions-deps:
+        patterns:
+          - '@actions/*'
+          - '@vercel/ncc'
+          - 'vitest'
+          - '@vitest/*'
+          - 'picomatch'
+      production-deps:
+        dependency-type: production
+      development-deps:
+        dependency-type: development
+    commit-message:
+      prefix: chore(deps)
+      include: scope
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(ci-deps)
+      include: scope

@@ -52,6 +52,20 @@ export function makeConfig(overrides = {}) {
     describeWriteBody: false,
     impactLabels: false,
     impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
+    maxFindings: 8,
+    minSeverity: 'info',
+    temperature: 0.2,
+    maxTokens: 4096,
+    // Phase 4: scanner layer. Integration tests DISABLE the master switch by
+    // default so the real runScanners (which would attempt to download
+    // gitleaks/ast-grep) is short-circuited. Tests that want to exercise
+    // scanning pass { scannersEnabled: true } and (typically) a fake runScanners.
+    scannersEnabled: false,
+    scannersCacheDir: '/tmp/zai-cache-scanners-test',
+    // Phase 5: commit-status feedback. Default OFF in the integration helper so
+    // existing end-to-end tests don't see unexpected createCommitStatus calls;
+    // tests that exercise the status path opt in with { commitStatus: true }.
+    commitStatus: false,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -111,9 +125,11 @@ export function file(filename, patch = '@@ diff @@', status = 'modified') {
 export function makeFakeOctokit({
   files = [],
   existingComments = [],
+  existingReviews = [],
   pr = { title: 'Test PR', body: 'A test PR body.' },
   commits = [],
   content = { content: '', encoding: 'utf-8' },
+  createReviewFails = false,
 } = {}) {
   const calls = {
     listFiles: [],
@@ -123,6 +139,10 @@ export function makeFakeOctokit({
     createComment: [],
     updateComment: [],
     getContent: [],
+    listReviews: [],
+    dismissReview: [],
+    createReview: [],
+    createCommitStatus: [],
   };
 
   const octokit = {
@@ -139,6 +159,23 @@ export function makeFakeOctokit({
         async listCommits(params) {
           calls.listCommits.push(params);
           return { data: commits };
+        },
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          return { data: existingReviews };
+        },
+        async dismissReview(params) {
+          calls.dismissReview.push(params);
+          return { data: {} };
+        },
+        async createReview(params) {
+          calls.createReview.push(params);
+          if (createReviewFails) {
+            const err = new Error('Validation Failed');
+            err.status = 422;
+            throw err;
+          }
+          return { data: { id: 4242, ...params } };
         },
       },
       issues: {
@@ -159,6 +196,10 @@ export function makeFakeOctokit({
         async getContent(params) {
           calls.getContent.push(params);
           return { data: content };
+        },
+        async createCommitStatus(params) {
+          calls.createCommitStatus.push(params);
+          return { data: { id: 1, ...params } };
         },
       },
     },
@@ -226,6 +267,7 @@ export function makePRContext({
   action = 'opened',
   owner = 'owner',
   repo = 'repo',
+  sha = 'deadbeefcafe',
 } = {}) {
   return {
     eventName: 'pull_request',
@@ -236,7 +278,7 @@ export function makePRContext({
         number,
         title,
         body,
-        head: { repo: { fork }, ref: 'feature' },
+        head: { repo: { fork }, ref: 'feature', sha },
         base: { ref: 'main' },
       },
     },

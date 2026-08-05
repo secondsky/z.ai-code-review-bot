@@ -50,13 +50,6 @@ const ALERT_RE = new RegExp(
 );
 
 /**
- * Escape regex metacharacters in a string (used to build dynamic patterns).
- */
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
  * Replace @mentions OUTSIDE of code spans. Returns the (possibly) modified text.
  *
  * Strategy: walk the text once, tracking whether we're inside an inline-code

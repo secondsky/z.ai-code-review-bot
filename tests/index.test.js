@@ -2,15 +2,16 @@
  * Tests for src/index.js — the GitHub Action entry point + event router.
  *
  * Every external collaborator is injected: octokit, core, callApi, apiClient,
- * handlers, and the auto-review/runAutoReview override. Tests never touch the
+ * handlers, and the runStructuredReview override. Tests never touch the
  * network or GitHub. The module MUST be importable without triggering main().
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { hashFinding } from '../src/lib/findings.js';
 
 // Dynamic import so we can assert import-safety AFTER spying on core.setFailed.
 // We re-import per test group where side effects matter.
 const indexModule = await import('../src/index.js');
-const { run, readAllInputs, isMainEntry } = indexModule;
+const { run, readAllInputs, isMainEntry, createScannerDeps, httpsGet } = indexModule;
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -50,6 +51,37 @@ function makeConfig(overrides = {}) {
     describeWriteBody: false,
     impactLabels: false,
     impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
+    maxFindings: 8,
+    minSeverity: 'info',
+    temperature: 0.2,
+    maxTokens: 4096,
+    batchConcurrency: 3,
+    fallbackPrompt: '',
+    // Phase 4: scanner master switch OFF in tests by default so the real
+    // runScanners (which would download gitleaks/ast-grep) is short-circuited.
+    scannersEnabled: false,
+    scannersCacheDir: '/tmp/zai-cache-scanners-test',
+    // Phase 5: commit-status feedback. Default OFF in unit tests so existing
+    // assertions on octokit calls stay stable; dedicated status tests opt in.
+    commitStatus: false,
+    // Phase 3: in-repo `.zai.yml`. Default OFF in unit tests so loadRepoConfig
+    // (which would hit octokit.repos.getContent) is skipped; dedicated
+    // repo-config tests opt in or inject loadRepoConfig directly.
+    repoConfigEnabled: false,
+    walkthrough: true,
+    // Phase 6.3: incremental review. Default OFF in unit tests so existing
+    // assertions on the review body stay stable (no hash block appended, no
+    // suppression); dedicated incremental tests opt in.
+    incrementalReview: false,
+    // Phase 8.3: strict review mode. Default OFF in tests; dedicated strict
+    // tests opt in. When on + a critical/high finding exists, the inline
+    // review is submitted as REQUEST_CHANGES instead of COMMENT.
+    strictMode: false,
+    // Phase 8.1: CODEOWNERS reviewer suggestions. Default OFF in unit tests so
+    // loadCodeowners (which would hit octokit.rest.repos.getContent) is
+    // skipped; dedicated codeowners tests opt in or inject loadCodeowners.
+    suggestReviewers: false,
+    autoAssignReviewers: false,
     githubToken: 'ghs-test-token',
     ...overrides,
   };
@@ -61,13 +93,26 @@ function file(filename, patch = '@@ diff @@', status = 'modified') {
 }
 
 /** Build a fake octokit with the rest methods the router calls. */
-function makeOctokit({ files = [], list = [], pr = null } = {}) {
+function makeOctokit({
+  files = [],
+  list = [],
+  pr = null,
+  existingReviews = [],
+  createReviewFails = false,
+  codeownersContent = '',
+} = {}) {
   const calls = {
     listFiles: [],
     listComments: [],
     createComment: [],
     updateComment: [],
     get: [],
+    listReviews: [],
+    dismissReview: [],
+    createReview: [],
+    createCommitStatus: [],
+    requestReviewers: [],
+    getContent: [],
   };
   const defaultPr = {
     title: 'T',
@@ -86,6 +131,27 @@ function makeOctokit({ files = [], list = [], pr = null } = {}) {
           calls.get.push(params);
           return { data: pr ?? defaultPr };
         },
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          return { data: existingReviews };
+        },
+        async dismissReview(params) {
+          calls.dismissReview.push(params);
+          return { data: {} };
+        },
+        async createReview(params) {
+          calls.createReview.push(params);
+          if (createReviewFails) {
+            const err = new Error('Validation Failed');
+            err.status = 422;
+            throw err;
+          }
+          return { data: { id: 909, ...params } };
+        },
+        async requestReviewers(params) {
+          calls.requestReviewers.push(params);
+          return { data: { ...params } };
+        },
       },
       issues: {
         async listComments(params) {
@@ -101,6 +167,28 @@ function makeOctokit({ files = [], list = [], pr = null } = {}) {
           return { data: { id: params.comment_id } };
         },
       },
+      repos: {
+        async createCommitStatus(params) {
+          calls.createCommitStatus.push(params);
+          return { data: { id: 1, ...params } };
+        },
+        async getContent(params) {
+          calls.getContent.push(params);
+          // Default: no CODEOWNERS (404). Tests that need CODEOWNERS inject
+          // their own octokit or use the `codeowners` field on makeOctokit.
+          if (codeownersContent) {
+            return {
+              data: {
+                content: Buffer.from(codeownersContent, 'utf8').toString('base64'),
+                encoding: 'base64',
+              },
+            };
+          }
+          const err = new Error('Not Found');
+          err.status = 404;
+          throw err;
+        },
+      },
     },
   };
   octokit.__calls = calls;
@@ -108,14 +196,14 @@ function makeOctokit({ files = [], list = [], pr = null } = {}) {
 }
 
 /** Build a PR context (pull_request event). */
-function prContext({ number = 42, fork = false } = {}) {
+function prContext({ number = 42, fork = false, sha = 'abc123' } = {}) {
   return {
     eventName: 'pull_request',
     repo: { owner: 'owner', repo: 'repo' },
     payload: {
       pull_request: {
         number,
-        head: { repo: { fork } },
+        head: { repo: { fork }, sha },
       },
     },
   };
@@ -257,11 +345,39 @@ describe('readAllInputs', () => {
       'ZAI_COMMANDS_ENABLED',
       'ZAI_ALLOW_FORK_COMMANDS',
       'ZAI_AUTH_THRESHOLD',
+      'ZAI_SCHEDULE_ENABLED',
+      'ZAI_SCHEDULE_MAX_PRS',
+      'ZAI_DESCRIBE_WRITE_BODY',
+      'ZAI_IMPACT_LABELS',
+      'ZAI_IMPACT_LABEL_MAP',
+      'ZAI_MAX_FINDINGS',
+      'ZAI_MIN_SEVERITY',
+      'ZAI_TEMPERATURE',
+      'ZAI_MAX_TOKENS',
+      'ZAI_COMMIT_STATUS',
+      'ZAI_SCANNERS_ENABLED',
+      'ZAI_SCANNERS_CACHE_DIR',
+      'ZAI_BATCH_CONCURRENCY',
+      'ZAI_FALLBACK_PROMPT',
       'GITHUB_TOKEN',
     ]) {
       expect(seen[name]).toBe(true);
       expect(inputs[name]).toBe(`val-${name}`);
     }
+  });
+
+  it('INPUT_NAMES lists exactly the inputs readAllInputs pulls (no drift)', () => {
+    // The INPUT_NAMES export is the single source of truth for which inputs the
+    // action reads; loadConfig must accept every one. This guards against a
+    // new input being added to one but not the other.
+    expect(indexModule.INPUT_NAMES).toEqual(
+      expect.arrayContaining([
+        'ZAI_MAX_FINDINGS',
+        'ZAI_MIN_SEVERITY',
+        'ZAI_TEMPERATURE',
+        'ZAI_MAX_TOKENS',
+      ]),
+    );
   });
 
   it('returns a plain object (not a Map)', () => {
@@ -277,12 +393,19 @@ describe('readAllInputs', () => {
  * ------------------------------------------------------------------ */
 
 describe('run — pull_request auto-review', () => {
-  it('small PR: calls callApi once with the auto-review prompt then upserts', async () => {
+  it('small PR: runs the structured-review pipeline (one batch → one callApi) then upserts', async () => {
     const core = makeCore();
     const octokit = makeOctokit({
       files: [file('src/a.js'), file('src/b.js')],
     });
-    const callApi = vi.fn(async () => '## Review\nlooks good');
+    // The structured pipeline calls callApi once per batch; a small PR is one
+    // batch. Return a valid structured-review payload so findings parse.
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 'Looks good overall.',
+        findings: [],
+      }),
+    );
     const config = makeConfig();
 
     await run(prContext(), {
@@ -293,13 +416,15 @@ describe('run — pull_request auto-review', () => {
       apiClient: { call: vi.fn() },
     });
 
-    // callApi invoked exactly once with the auto-review prompt.
+    // callApi invoked exactly once (single batch for a small PR).
     expect(callApi).toHaveBeenCalledTimes(1);
     const [apiKey, model, prompt] = callApi.mock.calls[0];
     expect(apiKey).toBe('test-api-key');
     expect(model).toBe('glm-5.2');
-    expect(prompt).toContain('Please review the following pull request changes');
+    // The prompt is the structured-review prompt (no free-form header).
+    expect(prompt).toContain('Output ONLY a valid JSON');
     expect(prompt).toContain('src/a.js');
+    expect(prompt).toContain('src/b.js');
 
     // upsert created a comment (no existing marker comment in list).
     expect(octokit.__calls.createComment).toHaveLength(1);
@@ -315,7 +440,9 @@ describe('run — pull_request auto-review', () => {
       files: [file('src/a.js')],
       list: [{ id: 555, body: `## Z.ai Code Review\n\nold\n\n${marker}` }],
     });
-    const callApi = vi.fn(async () => 'new review');
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
 
     await run(prContext(), {
       config: makeConfig(),
@@ -330,15 +457,26 @@ describe('run — pull_request auto-review', () => {
     expect(octokit.__calls.createComment).toHaveLength(0);
   });
 
-  it('large PR: routes through runAutoReview instead of the small-PR path', async () => {
+  it('large PR: same structured-review path (batching handles it); runStructuredReview receives the files', async () => {
     const core = makeCore();
     // largePrFileThreshold: 1, with 2 patchable files → isLargePr true.
     const config = makeConfig({ largePrFileThreshold: 1 });
     const octokit = makeOctokit({
       files: [file('src/a.js'), file('src/b.js')],
     });
-    const callApi = vi.fn(async () => 'batch review');
-    const runAutoReviewSpy = vi.fn(async () => 'synthesized review');
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: 'structured review',
+      metadata: {
+        totalBatches: 2,
+        totalFindingsBeforeCap: 0,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+      },
+    }));
 
     await run(prContext(), {
       config,
@@ -346,21 +484,24 @@ describe('run — pull_request auto-review', () => {
       octokit,
       callApi,
       apiClient: { call: vi.fn() },
-      runAutoReview: runAutoReviewSpy,
+      runStructuredReview: runStructuredReviewSpy,
     });
 
-    expect(runAutoReviewSpy).toHaveBeenCalledTimes(1);
-    // The spy received the patchable files, the config, and { callApi, core }.
-    const [spyFiles, spyConfig, spyDeps] = runAutoReviewSpy.mock.calls[0];
+    expect(runStructuredReviewSpy).toHaveBeenCalledTimes(1);
+    // The spy received the patchable files, the config (spread with scanner
+    // findings/context per Phase 4), and { callApi, core }.
+    const [spyFiles, spyConfig, spyDeps] = runStructuredReviewSpy.mock.calls[0];
     expect(spyFiles).toHaveLength(2);
-    expect(spyConfig).toBe(config);
+    // Phase 4 wiring spreads the original config and injects deterministic
+    // findings + scanner context. The base config keys are still present.
+    expect(spyConfig.apiKey).toBe(config.apiKey);
+    expect(spyConfig.model).toBe(config.model);
+    expect(Array.isArray(spyConfig.deterministicFindings)).toBe(true);
+    expect(typeof spyConfig.scannerContext).toBe('string');
     expect(typeof spyDeps.callApi).toBe('function');
     expect(spyDeps.core).toBe(core);
-    // Small-PR callApi path NOT used directly (runAutoReview owns it).
-    expect(callApi).not.toHaveBeenCalled();
-    // Comment still upserted with the synthesized review.
+    // Comment still upserted with the rendered summary.
     expect(octokit.__calls.createComment).toHaveLength(1);
-    expect(octokit.__calls.createComment[0].body).toContain('synthesized review');
   });
 
   it('no patchable files: short-circuits with NO callApi and NO upsert', async () => {
@@ -416,6 +557,101 @@ describe('run — pull_request auto-review', () => {
     expect(prompt).not.toContain('foo.lock');
   });
 
+  it('scannersEnabled: runs runScanners and injects findings + scannerContext into the prompt', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const fakeFindings = [
+      {
+        file: 'src/a.js',
+        line: 1,
+        severity: 'critical',
+        confidence: 'high',
+        category: 'security',
+        title: 'AWS access key',
+        description: 'detected',
+        evidence: 'AKIA…LE',
+        suggestion: null,
+        rule: 'gitleaks:aws-access-key',
+      },
+    ];
+    const fakeScanner = vi.fn(async () => ({
+      findings: fakeFindings,
+      metrics: {
+        filesChanged: 1,
+        additions: 5,
+        deletions: 0,
+        testFiles: 0,
+        sourceFiles: 1,
+        testToSourceRatio: 0,
+        largeFiles: [],
+        generatedFiles: [],
+        todoCount: 0,
+        byStatus: { modified: 1 },
+      },
+      scannerNames: ['secrets:gitleaks'],
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ scannersEnabled: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runScanners: fakeScanner,
+    });
+
+    // Scanner was called with the patchable files + scannersEnabled config.
+    expect(fakeScanner).toHaveBeenCalledTimes(1);
+    const scannerCall = fakeScanner.mock.calls[0];
+    expect(scannerCall[0].files).toHaveLength(1);
+    expect(scannerCall[0].config.scannersEnabled).toBe(true);
+
+    // The LLM prompt received the "do not re-report" context block.
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('Already detected by automated scanners');
+    expect(prompt).toContain('gitleaks:aws-access-key');
+
+    // The deterministic scanner finding reached the PR summary body. (The
+    // exact summary format varies by rendering phase — walkthrough vs flat —
+    // so we assert the finding's title/rule appear rather than a specific
+    // summary line.)
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('AWS access key');
+    expect(body).toContain('src/a.js');
+  });
+
+  it('scannersEnabled=false: runScanners is still called (returns []) but no findings surfaced', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const fakeScanner = vi.fn(async () => ({
+      findings: [],
+      metrics: { filesChanged: 1, additions: 0, deletions: 0, testFiles: 0, sourceFiles: 0, testToSourceRatio: 0, largeFiles: [], generatedFiles: [], todoCount: 0, byStatus: { modified: 1 } },
+      scannerNames: [],
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ scannersEnabled: false }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runScanners: fakeScanner,
+    });
+
+    expect(fakeScanner).toHaveBeenCalledTimes(1);
+    // No "do not re-report" block in the prompt (empty findings).
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).not.toContain('Already detected by automated scanners');
+  });
+
   it('setFails when getPullNumber is null on a pull_request event', async () => {
     const core = makeCore();
     const octokit = makeOctokit({ files: [] });
@@ -432,6 +668,787 @@ describe('run — pull_request auto-review', () => {
       apiClient: { call: vi.fn() },
     });
     expect(core.setFailed).toHaveBeenCalledWith('not a pull request');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * pull_request inline review path (Phase 2)
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request inline review (Phase 2)', () => {
+  it('posts findings as a GitHub REVIEW with inline comments on added lines', async () => {
+    const core = makeCore();
+    // A real patch where line 1 is an added line → mappable to an inline comment.
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 'One issue.',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'a is null',
+            evidence: 'a.foo()',
+            suggestion: 'Guard it',
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // A review was posted with inline comments — NOT a summary issue comment.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(0);
+    const review = octokit.__calls.createReview[0];
+    expect(review.event).toBe('COMMENT');
+    expect(review.comments).toHaveLength(1);
+    expect(review.comments[0]).toMatchObject({
+      path: 'src/a.js',
+      line: 1,
+      side: 'RIGHT',
+    });
+    expect(review.body).toContain('<!-- zai-code-review -->');
+  });
+
+  it('falls back to a summary issue comment when createReview fails', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      createReviewFails: true,
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'low',
+            confidence: 'low',
+            category: 'style',
+            title: 'T',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Review attempted, failed → fallback issue comment posted.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(core.warning).toHaveBeenCalled();
+    // The fallback body carries the findings list.
+    expect(octokit.__calls.createComment[0].body).toContain('src/a.js');
+  });
+
+  it('posts a summary comment (no review) when findings have no mappable lines', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = 1;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: null, // file-level → not inline-mappable
+            severity: 'low',
+            confidence: 'low',
+            category: 'style',
+            title: 'T',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // No inline findings → summary issue comment path (no review).
+    expect(octokit.__calls.createReview).toHaveLength(0);
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
+  it('dismisses prior bot reviews before posting the new inline review', async () => {
+    const core = makeCore();
+    const oldReview = {
+      id: 555,
+      body: `stale\n\n<!-- zai-code-review -->`,
+      user: { login: 'zai-code-review[bot]' },
+    };
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      existingReviews: [oldReview],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'x',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext({ sha: 'deadbeef' }), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Stale review dismissed first, then new review created.
+    expect(octokit.__calls.dismissReview).toHaveLength(1);
+    expect(octokit.__calls.dismissReview[0].review_id).toBe(555);
+    expect(octokit.__calls.dismissReview[0].message).toContain('deadbeef');
+    expect(octokit.__calls.createReview).toHaveLength(1);
+  });
+
+  /* ----------------------------------------------------------------
+   * Phase 8.3: strict mode → REQUEST_CHANGES when critical/high present
+   * ---------------------------------------------------------------- */
+
+  it('strict mode OFF: high finding posts COMMENT (default advisory)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ strictMode: false }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    // Default: advisory COMMENT even with a high finding (strict mode off).
+    expect(octokit.__calls.createReview[0].event).toBe('COMMENT');
+  });
+
+  it('strict mode ON + high finding: posts REQUEST_CHANGES (blocks merge)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ strictMode: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].event).toBe('REQUEST_CHANGES');
+  });
+
+  it('strict mode ON + critical finding: posts REQUEST_CHANGES', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'critical',
+            confidence: 'high',
+            category: 'security',
+            title: 'Secret leak',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ strictMode: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].event).toBe('REQUEST_CHANGES');
+  });
+
+  it('strict mode ON + only medium/low findings: posts COMMENT (no escalation)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = 1;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'medium',
+            confidence: 'medium',
+            category: 'maintainability',
+            title: 'Nit',
+            description: 'd',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ strictMode: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    // Strict mode on, but no critical/high → stays advisory.
+    expect(octokit.__calls.createReview[0].event).toBe('COMMENT');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 8.1 — CODEOWNERS reviewer suggestions
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request CODEOWNERS reviewer suggestions (Phase 8.1)', () => {
+  it('suggestReviewers OFF (default): no CODEOWNERS fetch, no suggestion line', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+      codeownersContent: '* @alice\n',
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // No getContent call (CODEOWNERS not even fetched).
+    expect(octokit.__calls.getContent).toHaveLength(0);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).not.toContain('Suggested reviewers');
+    // No reviewer assignment.
+    expect(octokit.__calls.requestReviewers).toHaveLength(0);
+  });
+
+  it('suggestReviewers ON: appends "Suggested reviewers" line to summary (read-only)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      // README matches `*` only; src/a.js matches `src/**` (last-wins).
+      files: [file('README.md'), file('src/a.js')],
+      codeownersContent: '* @alice\nsrc/** @bob\n',
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 'Looks good.', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ suggestReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // CODEOWNERS was fetched from the head SHA.
+    expect(octokit.__calls.getContent[0]).toMatchObject({
+      path: 'CODEOWNERS',
+    });
+    // Suggestion line appears in the summary comment body, with BOTH owners
+    // (README → @alice via `*`; src/a.js → @bob via `src/**` last-wins). The
+    // comment body is run through the output sanitizer which breaks `@mentions`
+    // with a zero-width space (@\u200b) to prevent notification spam, so we
+    // match the owner logins via a regex that tolerates the separator.
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('Suggested reviewers');
+    expect(body).toMatch(/@\u200b?alice/);
+    expect(body).toMatch(/@\u200b?bob/);
+    // Read-only: no reviewer assignment.
+    expect(octokit.__calls.requestReviewers).toHaveLength(0);
+  });
+
+  it('autoAssignReviewers ON: calls requestReviewers with @user logins (no @)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+      codeownersContent: 'src/** @alice @acme/team @bob\n',
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ autoAssignReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // requestReviewers called once, with bare user logins (no @, no team).
+    expect(octokit.__calls.requestReviewers).toHaveLength(1);
+    expect(octokit.__calls.requestReviewers[0]).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      pull_number: 42,
+    });
+    expect(octokit.__calls.requestReviewers[0].reviewers.sort()).toEqual([
+      'alice',
+      'bob',
+    ]);
+    // The team still appears in the summary suggestion line (sanitizer breaks
+    // the @mention with a zero-width space to prevent notification spam).
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toMatch(/@\u200b?acme\/team/);
+  });
+
+  it('autoAssignReviewers ON but no CODEOWNERS: no requestReviewers call (fail-soft)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+      codeownersContent: '', // 404 everywhere
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ autoAssignReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.requestReviewers).toHaveLength(0);
+    // core.warning fired (no CODEOWNERS found).
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('suggestReviewers ON but no changed files match CODEOWNERS: no suggestion line', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('docs/readme.md')],
+      codeownersContent: 'src/** @fe\n',
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ suggestReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).not.toContain('Suggested reviewers');
+  });
+
+  it('suggestReviewers ON on the inline-review path: suggestion line in review body', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' },
+      ],
+      codeownersContent: 'src/** @alice\n',
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 'One issue.',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'a is null',
+            evidence: 'a.foo()',
+            suggestion: 'Guard it',
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ suggestReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Inline review path: createReview was called (not createComment).
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createComment).toHaveLength(0);
+    expect(octokit.__calls.createReview[0].body).toContain('Suggested reviewers');
+    // The review body is sanitized (C1 fix): @mentions get a zero-width space
+    // break so they can't spam notifications. Assert the sanitized form.
+    expect(octokit.__calls.createReview[0].body).toMatch(/@\u200balice/);
+  });
+
+  it('suggestReviewers ON with a loadCodeowners injection override (bypasses fetch)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const fakeLoad = vi.fn(async () => [{ pattern: '*', owners: ['@injected'] }]);
+
+    await run(prContext(), {
+      config: makeConfig({ suggestReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      loadCodeowners: fakeLoad,
+    });
+
+    expect(fakeLoad).toHaveBeenCalledTimes(1);
+    // No real getContent call (injection bypassed the octokit fetch).
+    expect(octokit.__calls.getContent).toHaveLength(0);
+    // The sanitizer breaks the @mention with a zero-width space.
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toMatch(/@\u200b?injected/);
+  });
+
+  it('requestReviewers failure never fails the review (fail-soft)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js')],
+      codeownersContent: 'src/** @alice\n',
+    });
+    // Override requestReviewers to throw.
+    octokit.rest.pulls.requestReviewers = async () => {
+      throw new Error('Reviews may only be requested by collaborators');
+    };
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ autoAssignReviewers: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // The review comment still posted (not failed) and a warning was logged.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('failed to request reviewers'),
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 6.3 — incremental review (findings dedup across runs)
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request incremental review (Phase 6.3)', () => {
+  it('appends the hash block to the inline review body when incrementalReview is on', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js',
+            line: 1,
+            severity: 'high',
+            confidence: 'medium',
+            category: 'bug',
+            title: 'Null deref',
+            description: 'a is null',
+            evidence: '',
+            suggestion: null,
+            rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const body = octokit.__calls.createReview[0].body;
+    // The MARKER is still present (idempotency detection unchanged).
+    expect(body).toContain('<!-- zai-code-review -->');
+    // The hash block is appended as a SEPARATE HTML comment.
+    expect(body).toMatch(/<!-- zai-hashes:[0-9a-f,]+ -->/);
+    // Both comments coexist in the same body.
+    expect(body.indexOf('<!-- zai-code-review -->')).toBeLessThan(
+      body.indexOf('<!-- zai-hashes:'),
+    );
+  });
+
+  it('does NOT append the hash block when incrementalReview is off', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js', line: 1, severity: 'high', confidence: 'medium',
+            category: 'bug', title: 'X', description: 'd',
+            evidence: '', suggestion: null, rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: false }),
+      core, octokit, callApi, apiClient: { call: vi.fn() },
+    });
+
+    const body = octokit.__calls.createReview[0].body;
+    expect(body).toContain('<!-- zai-code-review -->');
+    expect(body).not.toMatch(/<!-- zai-hashes:/);
+  });
+
+  it('suppresses findings whose hash appears in the prior review body', async () => {
+    const core = makeCore();
+    // Build a prior review body whose hash block contains the EXACT hash of
+    // the finding we're about to re-report. listBotReviews returns this body.
+    const finding = {
+      file: 'src/a.js', line: 1, severity: 'high', confidence: 'medium',
+      category: 'bug', title: 'Dup', description: 'same',
+      evidence: '', suggestion: null, rule: 'llm',
+    };
+    const priorHash = hashFinding(finding);
+    const priorReview = {
+      id: 999,
+      body: `## Z.ai Code Review\n\nstale\n\n<!-- zai-code-review -->\n<!-- zai-hashes:${priorHash} -->`,
+      user: { login: 'zai-code-review[bot]' },
+    };
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      existingReviews: [priorReview],
+    });
+    // The model re-emits the SAME finding (same hash) plus a NEW one.
+    const newFinding = { ...finding, title: 'Brand new', description: 'different' };
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [finding, newFinding] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: true }),
+      core, octokit, callApi, apiClient: { call: vi.fn() },
+    });
+
+    // Only the NEW finding's inline comment is posted.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].comments).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].comments[0].body).toContain('Brand new');
+    // The body carries a "previously-resolved" suppression note.
+    const body = octokit.__calls.createReview[0].body;
+    expect(body).toMatch(/1 previously-reported finding suppressed/);
+    // The new hash block contains BOTH hashes (full set, not just kept).
+    expect(body).toContain(priorHash);
+    expect(body).toContain(hashFinding(newFinding));
+  });
+
+  it('keeps everything when prior review has no hash block (first run)', async () => {
+    const core = makeCore();
+    const priorReview = {
+      id: 1,
+      body: '## Z.ai Code Review\n\nold review without hashes\n\n<!-- zai-code-review -->',
+      user: { login: 'zai-code-review[bot]' },
+    };
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+      existingReviews: [priorReview],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js', line: 1, severity: 'high', confidence: 'medium',
+            category: 'bug', title: 'X', description: 'd',
+            evidence: '', suggestion: null, rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: true }),
+      core, octokit, callApi, apiClient: { call: vi.fn() },
+    });
+
+    // First run: nothing suppressed, finding posted.
+    expect(octokit.__calls.createReview[0].comments).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].body).not.toMatch(/previously-reported/);
+  });
+
+  it('fall-soft: an incremental-read error is logged and the review still reaches the PR', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+const a = null;' }],
+    });
+    // Make the FIRST listReviews call (the incremental read) throw, then
+    // recover so upsertReview's own listBotReviews call succeeds. This models
+    // a transient blip during the incremental phase without breaking the
+    // dismiss-stale-then-post sequence.
+    const realListReviews = octokit.rest.pulls.listReviews;
+    let firstCall = true;
+    octokit.rest.pulls.listReviews = async (params) => {
+      if (firstCall) {
+        firstCall = false;
+        throw new Error('transient API down');
+      }
+      return realListReviews(params);
+    };
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          {
+            file: 'src/a.js', line: 1, severity: 'high', confidence: 'medium',
+            category: 'bug', title: 'X', description: 'd',
+            evidence: '', suggestion: null, rule: 'llm',
+          },
+        ],
+      }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: true }),
+      core, octokit, callApi, apiClient: { call: vi.fn() },
+    });
+
+    // Warning logged about the incremental-read failure.
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringMatching(/Could not read prior reviews for incremental filter/),
+    );
+    // Review still posted with the finding (no suppression — priorHashes empty).
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].comments).toHaveLength(1);
   });
 });
 
@@ -816,5 +1833,489 @@ describe('run — error propagation', () => {
         apiClient: { call: vi.fn() },
       }),
     ).rejects.toThrow('boom');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * buildCallApi adapter — temperature / maxTokens / fallbackPrompt wiring
+ *
+ * These tests do NOT inject callApi (the adapter would be bypassed). Instead
+ * they inject `apiClient: { call: spy }` so the adapter wraps our spy and we
+ * can assert exactly which args reach `client.call`.
+ * ------------------------------------------------------------------ */
+describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
+  it('forwards config.temperature and config.maxTokens to client.call', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: true,
+      data: JSON.stringify({ summary: 's', findings: [] }),
+      usedFallback: false,
+    }));
+    // Provide a non-empty patchable file so the pipeline runs.
+    await run(prContext(), {
+      config: makeConfig({ temperature: 0.42, maxTokens: 2048 }),
+      core,
+      octokit,
+      // NOT passing callApi → adapter builds and uses our apiClient.
+      apiClient: { call: callSpy },
+    });
+    expect(callSpy).toHaveBeenCalled();
+    const arg = callSpy.mock.calls[0][0];
+    expect(arg.temperature).toBe(0.42);
+    expect(arg.maxTokens).toBe(2048);
+    // And the baseline fields are still there.
+    expect(arg.apiKey).toBe('test-api-key');
+    expect(arg.model).toBe('glm-5.2');
+    expect(typeof arg.userPrompt).toBe('string');
+  });
+
+  it('forwards default temperature (0.2) and maxTokens (4096) to client.call in the stock config', async () => {
+    // loadConfig ALWAYS produces numbers for these (default 0.2 / 4096). The
+    // adapter forwards them whenever non-null, which is always for a real
+    // config — so a stock run actually sends temperature=0.2 & max_tokens=4096.
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: true,
+      data: JSON.stringify({ summary: 's', findings: [] }),
+      usedFallback: false,
+    }));
+    await run(prContext(), {
+      config: makeConfig(), // default temperature 0.2, maxTokens 4096
+      core,
+      octokit,
+      apiClient: { call: callSpy },
+    });
+    const arg = callSpy.mock.calls[0][0];
+    expect(arg.temperature).toBe(0.2);
+    expect(arg.maxTokens).toBe(4096);
+  });
+
+  it('passes fallbackPrompt to createApiClient when config.fallbackPrompt is a non-empty string', async () => {
+    // Use the createApiClientFn override to capture the factory config.
+    const factoryConfigs = [];
+    const createApiClientFn = vi.fn((factoryConfig) => {
+      factoryConfigs.push(factoryConfig);
+      return {
+        call: vi.fn(async () => ({
+          success: true,
+          data: JSON.stringify({ summary: 's', findings: [] }),
+          usedFallback: false,
+        })),
+      };
+    });
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    await run(prContext(), {
+      config: makeConfig({ fallbackPrompt: 'Summarize only.' }),
+      core,
+      octokit,
+      createApiClient: createApiClientFn,
+    });
+    expect(createApiClientFn).toHaveBeenCalled();
+    expect(factoryConfigs[0].fallbackPrompt).toBe('Summarize only.');
+    expect(factoryConfigs[0].timeout).toBe(120000);
+  });
+
+  it('does NOT pass fallbackPrompt to createApiClient when config.fallbackPrompt is empty (disabled)', async () => {
+    const factoryConfigs = [];
+    const createApiClientFn = vi.fn((factoryConfig) => {
+      factoryConfigs.push(factoryConfig);
+      return {
+        call: vi.fn(async () => ({
+          success: true,
+          data: JSON.stringify({ summary: 's', findings: [] }),
+          usedFallback: false,
+        })),
+      };
+    });
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    await run(prContext(), {
+      config: makeConfig({ fallbackPrompt: '' }),
+      core,
+      octokit,
+      createApiClient: createApiClientFn,
+    });
+    expect(createApiClientFn).toHaveBeenCalled();
+    expect(factoryConfigs[0]).not.toHaveProperty('fallbackPrompt');
+    expect(factoryConfigs[0].timeout).toBe(120000);
+  });
+
+  it('throws on !r.success (retry-loop redacted message propagates through the adapter)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callSpy = vi.fn(async () => ({
+      success: false,
+      data: null,
+      error: { category: 'provider', message: 'redacted provider error', retryable: true, attempts: 4, totalDuration: 10 },
+      usedFallback: false,
+    }));
+    await expect(
+      run(prContext(), {
+        config: makeConfig(),
+        core,
+        octokit,
+        apiClient: { call: callSpy },
+      }),
+    ).rejects.toThrow('redacted provider error');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * pull_request commit-status feedback (Phase 5)
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request commit-status (Phase 5)', () => {
+  it('posts pending then success when commitStatus is enabled (review completes)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext({ sha: 'sha-1' }), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // Two status calls: pending (start) + success (after review).
+    expect(octokit.__calls.createCommitStatus).toHaveLength(2);
+    const [pending, success] = octokit.__calls.createCommitStatus;
+    expect(pending).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      sha: 'sha-1',
+      state: 'pending',
+      context: 'Z.ai Code Review',
+    });
+    expect(pending.description).toContain('in progress');
+    expect(success).toMatchObject({
+      owner: 'owner',
+      repo: 'repo',
+      sha: 'sha-1',
+      state: 'success',
+      context: 'Z.ai Code Review',
+    });
+    // No findings → the "no issues found" success description.
+    expect(success.description).toContain('no issues found');
+  });
+
+  it('success description counts critical/high findings', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [
+        {
+          filename: 'src/a.js',
+          status: 'modified',
+          patch: '@@ -1 +1 @@\n+const a = null;',
+        },
+      ],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({
+        summary: 's',
+        findings: [
+          { file: 'src/a.js', line: 1, severity: 'critical', confidence: 'high', category: 'bug', title: 'T', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+          { file: 'src/a.js', line: 2, severity: 'high', confidence: 'high', category: 'bug', title: 'T2', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+          { file: 'src/a.js', line: 3, severity: 'low', confidence: 'low', category: 'style', title: 'T3', description: 'd', evidence: '', suggestion: null, rule: 'llm' },
+        ],
+      }),
+    );
+
+    await run(prContext({ sha: 'sha-2' }), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    const success = octokit.__calls.createCommitStatus[1];
+    expect(success.state).toBe('success');
+    expect(success.description).toBe(
+      'Review complete: 3 findings (1 critical, 1 high)',
+    );
+  });
+
+  it('does NOT post any status when commitStatus is disabled (default)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: false }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createCommitStatus).toHaveLength(0);
+  });
+
+  it('does NOT post a status when there are no patchable files (short-circuit before pending)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [{ filename: 'binary.png', status: 'added' }],
+    });
+
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createCommitStatus).toHaveLength(0);
+  });
+
+  it('posts pending before a hard error; failure status is main() job', async () => {
+    // run() lets errors propagate. The PENDING status fires at the start of the
+    // review; the FAILURE status is posted by main()'s catch block (verified
+    // separately by reading src/index.js and via the fail-soft run() test).
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => {
+      throw new Error('model down');
+    });
+    const context = prContext({ sha: 'sha-fail' });
+
+    await expect(
+      run(context, {
+        config: makeConfig({ commitStatus: true }),
+        core,
+        octokit,
+        callApi,
+        apiClient: { call: vi.fn() },
+      }),
+    ).rejects.toThrow('model down');
+
+    const statuses = octokit.__calls.createCommitStatus;
+    expect(statuses.length).toBe(1);
+    expect(statuses[0].state).toBe('pending');
+    expect(statuses[0].sha).toBe('sha-fail');
+  });
+
+  it('status API errors are swallowed (fail-soft) and do not break the review', async () => {
+    const core = makeCore();
+    const calls = { createCommitStatus: [], createComment: [] };
+    const octokit = {
+      rest: {
+        pulls: {
+          async listFiles() { return { data: [file('src/a.js')] }; },
+          async get() { return { data: { head: { ref: 'r', sha: 's', repo: { fork: false } } } }; },
+          async listReviews() { return { data: [] }; },
+          async dismissReview() { return { data: {} }; },
+          async createReview(p) { return { data: { id: 1, ...p } }; },
+        },
+        issues: {
+          async listComments() { return { data: [] }; },
+          async createComment(p) { calls.createComment.push(p); return { data: { id: 1 } }; },
+          async updateComment(p) { return { data: { id: 1 } }; },
+        },
+        repos: {
+          async createCommitStatus(p) { calls.createCommitStatus.push(p); throw new Error('statuses:write missing'); },
+        },
+      },
+    };
+    Object.defineProperty(octokit, '__calls', { value: calls, enumerable: false });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    // Must NOT throw — status failures are swallowed.
+    await run(prContext(), {
+      config: makeConfig({ commitStatus: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(calls.createCommitStatus).toHaveLength(2);
+    expect(calls.createComment).toHaveLength(1);
+    expect(core.warning).toHaveBeenCalled();
+  });
+});
+
+describe('main() — failure commit-status wiring (Phase 5)', () => {
+  it('posts pending before a hard error; main catch is the failure hook', async () => {
+    // main() reads the module-level github object, so the failure-status
+    // catch is verified in a hermetic subprocess: import run() (the same path
+    // main wraps), force run to throw via a failing callApi, and assert that
+    // the pending status fired with the head SHA. main catch block (which
+    // posts failure) is source-verified and mirrors this exact shape.
+    const { spawnSync } = await import('node:child_process');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join, resolve: resolvePath } = await import('node:path');
+    const indexPath = resolvePath('src/index.js');
+    const dir = mkdtempSync(join(tmpdir(), 'zai-main-fail-'));
+    const driver = join(dir, 'driver.mjs');
+    writeFileSync(
+      driver,
+      [
+        'import { run } from ' + JSON.stringify(indexPath) + ';',
+        'const statusCalls = [];',
+        'const octokit = { rest: {',
+        '  pulls: {',
+        '    async listFiles() { return { data: [{ filename: "a.js", status: "modified", patch: "@@ -1 +1 @@" }] }; },',
+        '    async get() { return { data: { head: { ref: "r", sha: "sha-x", repo: { fork: false } } } }; },',
+        '    async listReviews() { return { data: [] }; },',
+        '    async dismissReview() { return { data: {} }; },',
+        '    async createReview(p) { return { data: { id: 1, ...p } }; },',
+        '  },',
+        '  issues: {',
+        '    async listComments() { return { data: [] }; },',
+        '    async createComment() { return { data: { id: 1 } }; },',
+        '    async updateComment() { return { data: { id: 1 } }; },',
+        '  },',
+        '  repos: {',
+        '    async createCommitStatus(p) { statusCalls.push(p); return { data: { id: 1, ...p } }; },',
+        '  },',
+        '}};',
+        'const context = {',
+        '  eventName: "pull_request",',
+        '  repo: { owner: "o", repo: "r" },',
+        '  payload: { pull_request: { number: 1, head: { repo: { fork: false }, sha: "sha-x" } } },',
+        '};',
+        'const core = { info(){}, warning(){}, setSecret(){}, setFailed(m){ console.log("SETFAILED:"+m); }, getInput(){ return ""; } };',
+        'const callApi = async () => { throw new Error("hard boom"); };',
+        'const config = {',
+        '  apiKey: "k", model: "glm-5.2", systemPrompt: "", reviewerName: "Z.ai Code Review",',
+        '  excludePatterns: [], maxDiffChars: 0, largePrFileThreshold: 50, maxBatchChars: 120000,',
+        '  maxFilesPerBatch: 40, maxPatchChars: 18000, commandsEnabled: false, authThreshold: "write",',
+        '  allowForkCommands: false, timeoutMs: 120000, scheduleEnabled: false, scheduleMaxPrs: 10,',
+        '  describeWriteBody: false, impactLabels: false, impactLabelMap: {}, maxFindings: 8,',
+        '  minSeverity: "info", temperature: 0.2, maxTokens: 4096, batchConcurrency: 3,',
+        '  fallbackPrompt: "", scannersEnabled: false, scannersCacheDir: "/tmp/x",',
+        '  commitStatus: true, githubToken: "t",',
+        '};',
+        'try {',
+        '  await run(context, { config, core, octokit, callApi, apiClient: { call: async() => ({success:true,data:""}) } });',
+        '  console.log("NOSTHROW");',
+        '} catch (e) {',
+        '  console.log("THREW:" + e.message);',
+        '}',
+        'console.log("STATUSCALLS:" + JSON.stringify(statusCalls.map(s => s.state + ":" + s.sha)));',
+      ].join('\n'),
+    );
+    let result;
+    try {
+      result = spawnSync(process.execPath, [driver], {
+        encoding: 'utf8',
+        cwd: process.cwd(),
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    if (result.status !== 0) {
+      throw new Error('driver failed: ' + result.stderr + result.stdout);
+    }
+    const out = result.stdout;
+    // run() posted pending, then threw (the hard error main()'s catch turns
+    // into a failure status). We assert pending fired with the head SHA and
+    // the error propagated — proving the run-level wiring main relies on.
+    expect(out).toContain('THREW:hard boom');
+    expect(out).toMatch(/STATUSCALLS:\["pending:sha-x"\]/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * createScannerDeps — production scanner-dep factory (blocker-task-1)
+ *
+ * This is the wiring that lets the deterministic scanners actually invoke
+ * gitleaks / ast-grep in production (downloading + verifying + extracting
+ * on first use, then caching). The shape contract: every property must be a
+ * function (so `runScanners` forwards it and the scanners take the binary
+ * path instead of falling back to regex).
+ * ------------------------------------------------------------------ */
+
+describe('createScannerDeps', () => {
+  it('returns an object with function values for every expected key', () => {
+    const deps = createScannerDeps({ core: { info: () => {} }, cacheDir: '/tmp/x' });
+    expect(deps).toBeTruthy();
+    // Every one of these MUST be a function — if any is undefined, the
+    // scanners fall back to regex and the binary path is dead.
+    expect(typeof deps.ensureBinary).toBe('function');
+    expect(typeof deps.runBinary).toBe('function');
+    expect(typeof deps.runCommand).toBe('function');
+    expect(typeof deps.scanSecrets).toBe('function');
+    expect(typeof deps.scanPatterns).toBe('function');
+    expect(typeof deps.computeMetrics).toBe('function');
+  });
+
+  it('passes `core` through unchanged', () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const deps = createScannerDeps({ core, cacheDir: '/tmp/x' });
+    expect(deps.core).toBe(core);
+  });
+
+  it('ensureBinary wires real fetch/writeFile/stat/mkdir/chmod (functions, not undefined)', async () => {
+    const deps = createScannerDeps({ core: {}, cacheDir: '/tmp/x' });
+    // Drive ensureBinary with a spec that hits the cache-miss path. We inject
+    // fakes via the second arg (the inner-deps merge), proving the production
+    // wrapper accepts overrides AND supplies defaults for everything not
+    // overridden. The injected fetch returns bytes whose SHA matches the spec
+    // checksum, so the happy path runs to completion.
+    const { sha256Hex } = await import('../src/lib/scanners/ensure-binary.js');
+    const bytes = Buffer.from('hello\n');
+    const checksum = sha256Hex(bytes);
+    const fakeFetch = vi.fn(async () => bytes);
+    const fakeWriteFile = vi.fn(async () => {});
+    const fakeStat = vi.fn(async () => {
+      throw new Error('ENOENT');
+    });
+    const fakeChmod = vi.fn(async () => {});
+    const path = await deps.ensureBinary(
+      {
+        name: 'gitleaks',
+        version: '8.21.2',
+        url: 'https://example.com/gitleaks.tar.gz',
+        checksumSha256: checksum,
+        cacheDir: '/cache',
+      },
+      {
+        fetch: fakeFetch,
+        writeFile: fakeWriteFile,
+        stat: fakeStat,
+        chmod: fakeChmod,
+      },
+    );
+    expect(path.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+    expect(fakeWriteFile).toHaveBeenCalledTimes(1);
+    expect(fakeChmod).toHaveBeenCalledTimes(1);
+  });
+
+  it('runBinary returns { stdout, stderr }-shaped result (execFile promisify contract)', async () => {
+    const deps = createScannerDeps({ core: {}, cacheDir: '/tmp/x' });
+    // Echo is universally available on every test runner. Run it via runBinary
+    // to verify the function actually delegates to execFile (not undefined).
+    const result = await deps.runBinary('echo', ['hello']);
+    expect(typeof result).toBe('object');
+    expect(String(result.stdout).trim()).toBe('hello');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * httpsGet — production fetch wrapper
+ * ------------------------------------------------------------------ */
+
+describe('httpsGet', () => {
+  it('is a function', () => {
+    expect(typeof httpsGet).toBe('function');
+  });
+
+  it('rejects on empty / non-string url', async () => {
+    await expect(httpsGet('')).rejects.toThrow(/url is required/);
   });
 });

@@ -32,13 +32,11 @@ inputs:
 
   MAX_DIFF_CHARS:
     description: |-
-      Hard cap on total diff chars sent to the model on the small-PR path
-      (≤ ZAI_LARGE_PR_FILE_THRESHOLD files). 0 = unlimited (NOT recommended —
-      a large PR can produce a huge prompt and exhaust your Z.ai quota; the
-      cap defends against cost abuse from fork PRs). Large PRs use batching
-      regardless. The model's "Rating:" field must NEVER be used as an
-      auto-merge signal — it is model-generated and can be influenced by PR
-      content.
+      Hard cap on total diff chars sent to the model per review batch. 0 =
+      unlimited (NOT recommended — a large PR can produce a huge prompt and
+      exhaust your Z.ai quota; the cap defends against cost abuse from fork
+      PRs). The structured-review pipeline batches large PRs regardless; this
+      cap limits each batch's prompt size.
     required: false
     default: '100000'
 
@@ -130,10 +128,193 @@ inputs:
     required: false
     default: 'critical=zai:critical,high=zai:high,medium=zai:medium,low=zai:low'
 
+  # --- v2 structured-review knobs ---
+  ZAI_MAX_FINDINGS:
+    description: |-
+      Maximum number of findings the review will emit (after ranking + capping).
+      Findings above this cap are dropped (highest-severity first). Clamped to
+      [1, 50] — values outside that range fall back to the default.
+    required: false
+    default: '8'
+
+  ZAI_MIN_SEVERITY:
+    description: |-
+      Lowest severity to include in the review. One of: critical, high, medium,
+      low, info. Findings below this threshold are filtered out. Invalid values
+      fall back to 'info' (with a warning).
+    required: false
+    default: 'info'
+
+  ZAI_TEMPERATURE:
+    description: |-
+      Sampling temperature for the review model (0-2). Lower values are more
+      deterministic; higher values are more diverse. Clamped to [0, 2]; invalid
+      values fall back to 0.2. Wired into the Z.ai request body.
+    required: false
+    default: '0.2'
+
+  ZAI_MAX_TOKENS:
+    description: |-
+      Maximum tokens to generate per model call. Clamped to a minimum of 1;
+      invalid values fall back to 4096. Wired into the Z.ai request body as
+      max_tokens.
+    required: false
+    default: '4096'
+
+  ZAI_BATCH_CONCURRENCY:
+    description: |-
+      Maximum number of review batches to run concurrently (in parallel) inside
+      a single structured-review run. Larger PRs produce multiple batches; this
+      knob caps how many are in flight at once so a big PR does not N serial API
+      calls. Default 3, clamped to [1, 8]. Findings remain deterministic
+      regardless of completion order (results are merged in batch order).
+    required: false
+    default: '3'
+
+  ZAI_FALLBACK_PROMPT:
+    description: |-
+      Optional fallback prompt that activates the API client's timeout-fallback
+      path: when a request times out twice in a row, subsequent attempts use
+      this prompt instead of the original (often a shorter, "summary-only"
+      instruction). Empty (default) disables the fallback. When set, the
+      fallback fires only on timeouts, never on auth/validation/4xx errors.
+    required: false
+    default: ''
+
+  # --- v2 deterministic scanner layer (Phase 4) ---
+  ZAI_SCANNERS_ENABLED:
+    description: |-
+      Master switch for the deterministic scanner layer. When true (default),
+      secrets + code-pattern + metrics scanners run BEFORE the LLM review and
+      their findings are (a) surfaced as high-confidence findings directly and
+      (b) injected into the LLM prompt as "already detected" context so the
+      model doesn't re-report them. When false, no scanners run at all. A
+      repo-level .zai.yml can DISABLE individual scanners (secrets, patterns,
+      metrics) but cannot enable one the action turned off.
+    required: false
+    default: 'true'
+
+  ZAI_SCANNERS_CACHE_DIR:
+    description: |-
+      Directory where scanner binaries (gitleaks, ast-grep) are cached after
+      download + SHA256 verification. Defaults to ~/.zai-cache/scanners. The
+      directory is created on first use.
+    required: false
+    default: '~/.zai-cache/scanners'
+
+  # --- v2 commit-status feedback (Phase 5) ---
+  ZAI_COMMIT_STATUS:
+    description: |-
+      Post a commit status (pending → success/failure) to the PR's head SHA so
+      developers see review progress immediately instead of staring at a silent
+      PR. ON by default. Requires `statuses: write` in the workflow's
+      `permissions:` block (see the example workflow). If the scope is missing
+      the status post is silently skipped (best-effort) — the review itself is
+      unaffected. Set to `false` to disable entirely.
+    required: false
+    default: 'true'
+
+  # --- v2 walkthrough / cohort ordering (Phase 7) ---
+  ZAI_WALKTHROUGH:
+    description: |-
+      Render the review summary as a dependency-ordered "walkthrough" —
+      findings are grouped into collapsible cohort sections (database → api →
+      business-logic → config → ui → tests → docs → other) so the summary reads
+      like a narrative of the change rather than a flat severity-sorted list.
+      ON by default. Only the SUMMARY rendering changes; inline line-anchored
+      comments are unaffected. Set to `false` to fall back to the flat
+      severity-grouped summary.
+    required: false
+    default: 'true'
+
+  # --- v2 incremental review (Phase 6.3) ---
+  ZAI_INCREMENTAL_REVIEW:
+    description: |-
+      Suppress findings that were already reported on a prior run. When true
+      (default), every posted finding is content-hashed (file:line:severity:
+      title:description) and the hashes are stored inside a hidden HTML comment
+      in the review body. On re-push, the bot parses that block out of the
+      prior review and only surfaces NEW or CHANGED findings — CodeRabbit's
+      `auto_incremental_review` pattern. The suppressed count is mentioned in
+      the summary so reviewers know what was elided. Set to `false` to
+      re-report every finding on every run (the v1 behavior).
+    required: false
+    default: 'true'
+
+  ZAI_REPO_CONFIG_ENABLED:
+    description: |-
+      Master switch for in-repo `.zai.yml` configuration. When true (default),
+      the bot fetches `.zai.yml` from the PR's head SHA and merges it with the
+      action inputs. The file can only NARROW behavior (add path instructions,
+      set tone, lower the findings cap, add excludes, disable a scanner) — it
+      can NEVER widen it (raise a cap, disable auth, lower cost caps, or enable
+      a scanner the action turned off). This is a security constraint: the file
+      is attacker-controllable in fork PRs. Set to `false` to disable
+      `.zai.yml` loading entirely.
+    required: false
+    default: 'true'
+
+  # --- v2 strict review mode (Phase 8.3) ---
+  ZAI_STRICT_MODE:
+    description: |-
+      Aggressive: when true, the PR auto-review is submitted as
+      `REQUEST_CHANGES` (instead of advisory `COMMENT`) whenever there is at
+      least one critical or high finding, which BLOCKS merge until the review
+      is dismissed or the changes are addressed. OFF by default and never
+      auto-enabled — both conditions must hold (this flag ON + a critical/high
+      finding) for a block to fire. Lower severities (medium/low/info) never
+      block. Requires `pull-requests: write` in the workflow's `permissions:`
+      block (already required to post reviews). Enable only on repos where you
+      trust the critical/high findings to gate merges.
+    required: false
+    default: 'false'
+
   GITHUB_TOKEN:
     description: 'GitHub token for API access. Defaults to the auto-provided github.token.'
     required: false
     default: '${{ github.token }}'
+
+  # --- v2 CODEOWNERS-aware reviewer suggestions (Phase 8.1) ---
+  ZAI_SUGGEST_REVIEWERS:
+    description: |-
+      When true, the bot fetches the PR's CODEOWNERS file (from the head SHA),
+      computes the owners of the changed paths, and appends a "Suggested
+      reviewers" line to the review summary. Read-only — no PR mutation. OFF
+      by default. The CODEOWNERS file is treated as untrusted input
+      (attacker-controllable in fork PRs); fetch + parse are fail-soft (a
+      broken/missing CODEOWNERS is silently skipped with a warning).
+    required: false
+    default: 'false'
+
+  ZAI_AUTO_ASSIGN_REVIEWERS:
+    description: |-
+      When true, the bot additionally calls `pulls.requestReviewers` to assign
+      the suggested reviewers to the PR (implies ZAI_SUGGEST_REVIEWERS).
+      Requires `pull-requests: write` in the workflow's `permissions:` block.
+      Only `@user` handles are forwarded to the assignment API (org/team
+      handles appear in the summary only). OFF by default. Fail-soft: an
+      assignment failure (permissions, invalid users) logs a warning and never
+      fails the review.
+    required: false
+    default: 'false'
+
+  # --- v2 learnings / memory (Phase 8.2) ---
+  ZAI_LEARNINGS_ENABLED:
+    description: |-
+      Master switch for the `.zai/learnings.yml` memory file. When true, the
+      bot fetches `.zai/learnings.yml` from the PR's head SHA and uses it to
+      suppress findings that were previously reviewed and accepted ("won't-fix"
+      / "this pattern is acceptable here") so it doesn't re-raise the same
+      finding on every run. OFF by default — this is a new trust surface: the
+      file is attacker-controllable in fork PRs, so a malicious contributor
+      could otherwise commit an entry that suppresses a real security finding.
+      The suppression is conservative (a glob match on the file AND a
+      case-insensitive substring match on the finding's title or description),
+      the file is treated as UNTRUSTED, and the accepted patterns are also
+      carried into the review prompt as additive context. Fail-soft: a
+      broken/missing file logs a warning and never breaks the review.
+    required: false
+    default: 'false'
 
 runs:
   using: 'node20'

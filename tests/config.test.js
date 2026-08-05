@@ -261,3 +261,376 @@ describe('loadConfig — works with Map inputs', () => {
     expect(cfg.model).toBe('glm-5.2');
   });
 });
+
+describe('loadConfig — v2 structured-review knobs', () => {
+  test('maxFindings defaults to 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings uses a provided positive value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '5' }).maxFindings).toBe(5);
+  });
+
+  test('maxFindings clamps to min 1 (0 → default 8)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings clamps to min 1 (negative → default 8)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(8);
+  });
+
+  test('maxFindings caps at 50 (runaway noise guard)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '999' }).maxFindings).toBe(50);
+  });
+
+  test('maxFindings NaN → default 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(8);
+  });
+
+  test('minSeverity defaults to "info"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).minSeverity).toBe('info');
+  });
+
+  test.each(['critical', 'high', 'medium', 'low', 'info'])(
+    'minSeverity accepts %s (case-insensitive)',
+    (v) => {
+      expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: v }).minSeverity).toBe(v);
+      expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: v.toUpperCase() }).minSeverity).toBe(v);
+    },
+  );
+
+  test('minSeverity invalid → falls back to "info" + core.warning', () => {
+    const warnings = [];
+    const core = { setSecret: () => {}, warning: (m) => warnings.push(m) };
+    const cfg = loadConfig(
+      { ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: 'bogus' },
+      { core },
+    );
+    expect(cfg.minSeverity).toBe('info');
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain('ZAI_MIN_SEVERITY');
+  });
+
+  test('minSeverity invalid without core → still falls back to "info" (no throw)', () => {
+    const cfg = loadConfig({ ZAI_API_KEY: 'k', ZAI_MIN_SEVERITY: 'bogus' });
+    expect(cfg.minSeverity).toBe('info');
+  });
+
+  test('temperature defaults to 0.2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).temperature).toBe(0.2);
+  });
+
+  test('temperature parses a provided float', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '0.7' }).temperature).toBeCloseTo(0.7);
+  });
+
+  test('temperature clamps to [0, 2] — below 0 → 0', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '-1' }).temperature).toBe(0);
+  });
+
+  test('temperature clamps to [0, 2] — above 2 → 2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: '5' }).temperature).toBe(2);
+  });
+
+  test('temperature NaN → default 0.2', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: 'abc' }).temperature).toBeCloseTo(0.2);
+  });
+
+  test('maxTokens defaults to 4096', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens uses a provided positive value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '8192' }).maxTokens).toBe(8192);
+  });
+
+  test('maxTokens clamps to min 1 (0 → default 4096)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '0' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens clamps to min 1 (negative → default 4096)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '-5' }).maxTokens).toBe(4096);
+  });
+
+  test('maxTokens NaN → default 4096', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: 'xyz' }).maxTokens).toBe(4096);
+  });
+});
+
+describe('scanner knobs (Phase 4)', () => {
+  test('scannersEnabled defaults to true', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersEnabled=true (truthy)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'true' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '1' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'yes' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersEnabled=false on explicit non-truthy values', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'false' }).scannersEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '0' }).scannersEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: 'no' }).scannersEnabled).toBe(false);
+  });
+
+  test('scannersEnabled=true on empty (default true)', () => {
+    // An empty input means "use the default" → true (per the action.yml
+    // default and the brief).
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '' }).scannersEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_ENABLED: '   ' }).scannersEnabled).toBe(true);
+  });
+
+  test('scannersCacheDir defaults to ~/.zai-cache/scanners', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).scannersCacheDir).toBe('~/.zai-cache/scanners');
+  });
+
+  test('scannersCacheDir uses a provided value', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_CACHE_DIR: '/tmp/cache' }).scannersCacheDir).toBe('/tmp/cache');
+  });
+
+  test('scannersCacheDir trims whitespace', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SCANNERS_CACHE_DIR: '  /tmp/x  ' }).scannersCacheDir).toBe('/tmp/x');
+  });
+});
+
+describe('batchConcurrency + fallbackPrompt (Phase 6)', () => {
+  test('batchConcurrency defaults to 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency uses a provided value in [1, 8]', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '1' }).batchConcurrency).toBe(1);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '5' }).batchConcurrency).toBe(5);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '8' }).batchConcurrency).toBe(8);
+  });
+
+  test('batchConcurrency clamps above 8 → 8', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '20' }).batchConcurrency).toBe(8);
+  });
+
+  test('batchConcurrency clamps below 1 → 3 (default, treated as invalid)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '0' }).batchConcurrency).toBe(3);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '-3' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency NaN → default 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: 'abc' }).batchConcurrency).toBe(3);
+  });
+
+  test('batchConcurrency empty → default 3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '' }).batchConcurrency).toBe(3);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_BATCH_CONCURRENCY: '   ' }).batchConcurrency).toBe(3);
+  });
+
+  test('fallbackPrompt defaults to empty string (disabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).fallbackPrompt).toBe('');
+  });
+
+  test('fallbackPrompt uses a provided non-empty value (trim)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: 'SHORT REVIEW ONLY' }).fallbackPrompt).toBe(
+      'SHORT REVIEW ONLY',
+    );
+  });
+
+  test('fallbackPrompt trims whitespace', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '  x  ' }).fallbackPrompt).toBe('x');
+  });
+
+  test('fallbackPrompt empty/whitespace → empty string (disabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '' }).fallbackPrompt).toBe('');
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_FALLBACK_PROMPT: '   ' }).fallbackPrompt).toBe('');
+  });
+});
+
+describe('commitStatus (Phase 5)', () => {
+  test('defaults to true (status feedback on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).commitStatus).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: v }).commitStatus).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: v }).commitStatus).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches scannersEnabled convention)', () => {
+    // Empty input means "use the default" → true (per the action.yml default
+    // and the brief). This mirrors scannersEnabled so direct callers without
+    // the input still get status feedback.
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: '' }).commitStatus).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: '   ' }).commitStatus).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: 'TRUE' }).commitStatus).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_COMMIT_STATUS: 'Yes' }).commitStatus).toBe(true);
+  });
+});
+
+describe('walkthrough (Phase 7)', () => {
+  test('defaults to true (walkthrough rendering on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).walkthrough).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: v }).walkthrough).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: v }).walkthrough).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches commitStatus convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: '' }).walkthrough).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: '   ' }).walkthrough).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: 'TRUE' }).walkthrough).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_WALKTHROUGH: 'Yes' }).walkthrough).toBe(true);
+  });
+});
+
+describe('incrementalReview (Phase 6.3 — incremental dedup)', () => {
+  test('defaults to true (incremental suppression on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).incrementalReview).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: v }).incrementalReview).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: v }).incrementalReview).toBe(false);
+  });
+
+  test('empty/whitespace → true (default, matches walkthrough convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: '' }).incrementalReview).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: '   ' }).incrementalReview).toBe(true);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: 'TRUE' }).incrementalReview).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_INCREMENTAL_REVIEW: 'Yes' }).incrementalReview).toBe(true);
+  });
+});
+
+describe('repoConfigEnabled (Phase 3 — .zai.yml)', () => {
+  test('defaults to true (in-repo config loading on by default)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).repoConfigEnabled).toBe(true);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: v }).repoConfigEnabled).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: v }).repoConfigEnabled).toBe(false);
+  });
+
+  test('empty/whitespace → true (matches commitStatus/walkthrough convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: '' }).repoConfigEnabled).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: '   ' }).repoConfigEnabled).toBe(true);
+  });
+
+  test('case-insensitive: "FALSE", "No"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'FALSE' }).repoConfigEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_REPO_CONFIG_ENABLED: 'No' }).repoConfigEnabled).toBe(false);
+  });
+});
+
+describe('strictMode (Phase 8.3 — REQUEST_CHANGES)', () => {
+  test('defaults to false (aggressive — never auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).strictMode).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: v }).strictMode).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: v }).strictMode).toBe(false);
+  });
+
+  test('empty/whitespace → false (NOT defaulted on like commitStatus)', () => {
+    // strictMode is aggressive (blocks merges), so unlike advisory defaults it
+    // does NOT follow the "empty = default-on" convention. Empty stays off.
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: '' }).strictMode).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: '   ' }).strictMode).toBe(false);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'TRUE' }).strictMode).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'Yes' }).strictMode).toBe(true);
+  });
+
+  test('case-insensitive: "FALSE", "No"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'FALSE' }).strictMode).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_STRICT_MODE: 'No' }).strictMode).toBe(false);
+  });
+});
+
+describe('suggestReviewers (Phase 8.1 — CODEOWNERS suggestions)', () => {
+  test('defaults to false (read-only v1 convention)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).suggestReviewers).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: v }).suggestReviewers).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: v }).suggestReviewers).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, not auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: '' }).suggestReviewers).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: '   ' }).suggestReviewers).toBe(false);
+  });
+
+  test('case-insensitive: "TRUE", "Yes"', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: 'TRUE' }).suggestReviewers).toBe(true);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_SUGGEST_REVIEWERS: 'Yes' }).suggestReviewers).toBe(true);
+  });
+});
+
+describe('autoAssignReviewers (Phase 8.1 — auto-assign)', () => {
+  test('defaults to false (opt-in mutation)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).autoAssignReviewers).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: v }).autoAssignReviewers).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: v }).autoAssignReviewers).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, not auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: '' }).autoAssignReviewers).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_AUTO_ASSIGN_REVIEWERS: '   ' }).autoAssignReviewers).toBe(false);
+  });
+});
+
+describe('learningsEnabled (Phase 8.2 — .zai/learnings.yml)', () => {
+  test('defaults to false (opt-in; new trust surface)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).learningsEnabled).toBe(false);
+  });
+
+  test.each(['true', '1', 'yes'])('truthy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: v }).learningsEnabled).toBe(true);
+  });
+
+  test.each(['false', '0', 'no'])('falsy for "%s"', (v) => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: v }).learningsEnabled).toBe(false);
+  });
+
+  test('empty/whitespace → false (opt-in, never auto-enabled)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '' }).learningsEnabled).toBe(false);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '   ' }).learningsEnabled).toBe(false);
+  });
+});

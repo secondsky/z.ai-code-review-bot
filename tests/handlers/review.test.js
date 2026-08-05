@@ -5,7 +5,7 @@
  *  - valid file → reviews just that file (callApi prompt contains ONLY that patch).
  *  - invalid file → guidance comment, no callApi.
  *  - path traversal (`..` or leading `/`) → rejected, no callApi.
- *  - no args → whole-PR review (reuses buildAutoReviewPrompt on patchable files).
+ *  - no args → whole-PR review (reuses buildStructuredReviewPrompt on patchable files).
  *  - callApi rejects → short error comment, no throw.
  */
 import { describe, it, expect, vi } from 'vitest';

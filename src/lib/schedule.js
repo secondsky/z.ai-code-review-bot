@@ -10,8 +10,10 @@
  *   3. Skips PRs whose head SHA already has a Z.ai marker comment (dedup by
  *      SHA — only new/changed PRs get reviewed, so a stable PR is not
  *      re-reviewed on every cron tick).
- *   4. Runs the existing auto-review pipeline (small-PR single call OR the
- *      large-PR batched `runAutoReview`) and upserts the summary comment —
+ *   4. Runs the structured-review pipeline (`runStructuredReview`) and posts via
+ *      the v2 inline-review path (`partitionFindings` → `buildReviewBody`/
+ *      `buildReviewComments` → `upsertReview`) when findings map to diff lines,
+ *      falling back to the summary comment when no finding is line-mappable —
  *      exactly the same code path as the `pull_request` event.
  *
  * Per-PR failures are logged and isolated; one bad PR never stops the batch.
@@ -110,11 +112,15 @@ export async function hasReviewForSha({
 }
 
 /**
- * Review a single PR using the existing auto-review pipeline. Mirrors the
+ * Review a single PR using the structured-review pipeline. Mirrors the
  * `pull_request` branch of `run()` in src/index.js: fetch changed files, filter
- * excludes + patchable, short-circuit on zero patchable, then either the
- * small-PR single-call path or the large-PR batched `runAutoReview`, and upsert
- * the summary comment.
+ * excludes + patchable, short-circuit on zero patchable, run the structured
+ * review, then post via the v2 inline-review pipeline (partition findings →
+ * buildReviewBody/buildReviewComments → upsertReview) when at least one finding
+ * maps to a diff line. Falls back to the legacy single summary comment when no
+ * finding is line-mappable (all file-level or unmappable), and again to
+ * postFallbackComment if the review submission itself fails — the review is
+ * never silently lost.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -133,11 +139,18 @@ export async function reviewOnePr({
   getChangedFiles,
   filterExcludedFiles,
   filterPatchableFiles,
-  buildAutoReviewPrompt,
-  runAutoReview,
+  runStructuredReview,
   isLargePr,
+  formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
+  // v2 inline-review pipeline deps.
+  partitionFindings,
+  buildReviewBody,
+  buildReviewComments,
+  upsertReview,
+  postFallbackComment,
+  resolveReviewEvent,
 }) {
   try {
     let files = await getChangedFiles({ octokit, owner, repo, pullNumber: pr.number });
@@ -147,17 +160,76 @@ export async function reviewOnePr({
       return { ok: true, action: 'skipped-no-patchable' };
     }
 
-    let review;
-    if (isLargePr(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
-      review = await runAutoReview(patchable, config, { callApi, core });
-    } else {
-      const prompt = buildAutoReviewPrompt(patchable, { maxDiffChars: config.maxDiffChars });
-      review = await callApi(config.apiKey, config.model, prompt);
+    const result = await runStructuredReview(patchable, config, { callApi, core });
+
+    // Synthetic @actions/github-like context. upsertReview reads
+    // context.payload.pull_request.number; postFallbackComment delegates to the
+    // shared postComment helper, which reads context.payload.issue.number — so
+    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
+    const ctx = {
+      repo: { owner, repo },
+      payload: {
+        pull_request: { number: pr.number, head: { sha: pr.headSha } },
+        issue: { number: pr.number },
+      },
+    };
+
+    const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
+
+    if (inline.length > 0) {
+      const body = buildReviewBody(result.summary, summaryOnly, {
+        reviewerName: config.reviewerName,
+        walkthrough: config.walkthrough === true,
+        files: patchable,
+        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+        truncated: Math.max(
+          0,
+          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+        ),
+      });
+      const comments = buildReviewComments(inline);
+      const event = resolveReviewEvent(result.findings, config);
+      try {
+        await upsertReview({
+          octokit,
+          context: ctx,
+          marker: MARKER,
+          sha: pr.headSha,
+          body,
+          comments,
+          event,
+          core,
+        });
+      } catch (reviewError) {
+        // NEVER silently lose the review. Fall back to a single issue comment
+        // carrying the review body + every inline comment body as text.
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review submission failed for PR #${pr.number} (${reviewError?.message ?? String(reviewError)}); posting fallback comment.`,
+          );
+        }
+        const fallbackBody = `${body}\n\n${comments.map((c) => c.body).join('\n\n')}`;
+        await postFallbackComment({ octokit, context: ctx, body: fallbackBody });
+      }
+      return { ok: true, action: 'reviewed' };
     }
+
+    // No inline-mappable findings: post the whole summary as an issue comment
+    // via the existing marker-upsert path (legacy summary comment).
+    const content = formatFindingsAsSummary(result.findings, {
+      reviewerName: config.reviewerName,
+      metadata: {
+        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+        truncated: Math.max(
+          0,
+          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+        ),
+      },
+    });
 
     const body = buildCommentBody({
       title: config.reviewerName,
-      content: review,
+      content,
       marker: MARKER,
     });
     await upsertReviewComment({
@@ -191,11 +263,17 @@ export async function reviewOnePr({
  * @param {Function} args.getChangedFiles
  * @param {Function} args.filterExcludedFiles
  * @param {Function} args.filterPatchableFiles
- * @param {Function} args.buildAutoReviewPrompt
- * @param {Function} args.runAutoReview
+ * @param {Function} args.runStructuredReview
  * @param {Function} args.isLargePr
+ * @param {Function} args.formatFindingsAsSummary
  * @param {Function} args.buildCommentBody
  * @param {Function} args.upsertReviewComment
+ * @param {Function} args.partitionFindings
+ * @param {Function} args.buildReviewBody
+ * @param {Function} args.buildReviewComments
+ * @param {Function} args.upsertReview
+ * @param {Function} args.postFallbackComment
+ * @param {Function} args.resolveReviewEvent
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 export async function runScheduledReview({
@@ -211,11 +289,17 @@ export async function runScheduledReview({
   getChangedFiles,
   filterExcludedFiles,
   filterPatchableFiles,
-  buildAutoReviewPrompt,
-  runAutoReview,
+  runStructuredReview,
   isLargePr,
+  formatFindingsAsSummary,
   buildCommentBody,
   upsertReviewComment,
+  partitionFindings,
+  buildReviewBody,
+  buildReviewComments,
+  upsertReview,
+  postFallbackComment,
+  resolveReviewEvent,
 }) {
   const cap =
     typeof config?.scheduleMaxPrs === 'number' && config.scheduleMaxPrs > 0
@@ -256,11 +340,17 @@ export async function runScheduledReview({
       getChangedFiles,
       filterExcludedFiles,
       filterPatchableFiles,
-      buildAutoReviewPrompt,
-      runAutoReview,
+      runStructuredReview,
       isLargePr,
+      formatFindingsAsSummary,
       buildCommentBody,
       upsertReviewComment,
+      partitionFindings,
+      buildReviewBody,
+      buildReviewComments,
+      upsertReview,
+      postFallbackComment,
+      resolveReviewEvent,
     });
 
     if (result.ok) {

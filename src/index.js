@@ -29,6 +29,11 @@
 
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as fs from 'node:fs/promises';
+import * as https from 'node:https';
 
 import core from '@actions/core';
 import github from '@actions/github';
@@ -49,12 +54,47 @@ import {
   filterExcludedFiles,
   filterPatchableFiles,
 } from './lib/changed-files.js';
-import { resolveSystemPrompt, buildAutoReviewPrompt } from './lib/prompt.js';
-import { runAutoReview, isLargePr } from './lib/auto-review.js';
+import { resolveSystemPrompt } from './lib/prompt.js';
+import { runStructuredReview, isLargePr } from './lib/auto-review.js';
+import {
+  formatFindingsAsSummary,
+  hashFinding,
+  buildFindingsHashBlock,
+  parseFindingsHashBlock,
+  filterIncrementalFindings,
+} from './lib/findings.js';
+import { formatWalkthroughSummary } from './lib/walkthrough.js';
+import { partitionFindings } from './lib/diff.js';
+import {
+  buildReviewBody,
+  buildReviewComments,
+  resolveReviewEvent,
+  upsertReview,
+  listBotReviews,
+  postFallbackComment,
+} from './lib/review.js';
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
 import { runScheduledReview } from './lib/schedule.js';
+import { runScanners, formatScannerContext } from './lib/scanners/index.js';
+import { ensureBinary } from './lib/scanners/ensure-binary.js';
+import { scanSecrets } from './lib/scanners/secrets.js';
+import { scanPatterns } from './lib/scanners/patterns.js';
+import { computeMetrics } from './lib/scanners/metrics.js';
+import { setReviewStatus, buildStatusDescription } from './lib/status.js';
+import { loadRepoConfig, mergeRepoConfig } from './lib/repo-config.js';
+import {
+  loadCodeowners,
+  suggestReviewers,
+  formatSuggestedReviewersLine,
+  pickAssignableReviewers,
+} from './lib/codeowners.js';
+import {
+  loadLearnings,
+  filterFindingsByLearnings,
+  formatLearningsForPrompt,
+} from './lib/learnings.js';
 
 /* ------------------------------------------------------------------ *
  * Entry-point guard
@@ -87,6 +127,138 @@ export function isMainEntry() {
  * readAllInputs
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Expand a leading `~` to the user's home directory. Returns the input
+ * unchanged for non-tilde paths or non-strings. Used to resolve the
+ * ZAI_SCANNERS_CACHE_DIR default (`~/.zai-cache/scanners`) at runtime.
+ *
+ * @param {string} p
+ * @returns {string}
+ */
+export function expandHome(p) {
+  if (typeof p !== 'string' || p.length === 0) return p;
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
+  return p;
+}
+
+/**
+ * Promisified `execFile` from `node:child_process`. Module-level binding so we
+ * don't pay the promisify cost per call and so tests can stub it via the
+ * scanner deps seam.
+ */
+const execFileAsync = promisify(execFileCb);
+
+/**
+ * Minimal `https.get` wrapper that resolves to a Buffer of the response body.
+ * Follows up to 5 redirects (GitHub release assets redirect to a CDN). Rejects
+ * on any network/HTTP error. Used as `deps.fetch` for `ensureBinary`.
+ *
+ * Zero new dependencies: uses only `node:https`. Equivalent to fetch() but
+ * works on Node 18 (where global fetch is behind a flag in some builds) and
+ * returns a Buffer directly (no `Response.arrayBuffer()` dance).
+ *
+ * @param {string} url
+ * @param {{ maxRedirects?: number }} [opts]
+ * @returns {Promise<Buffer>}
+ */
+export function httpsGet(url, opts = {}) {
+  const maxRedirects = typeof opts.maxRedirects === 'number' ? opts.maxRedirects : 5;
+  return new Promise((resolve, reject) => {
+    if (typeof url !== 'string' || url.length === 0) {
+      reject(new Error('httpsGet: url is required'));
+      return;
+    }
+    const req = https.get(url, (res) => {
+      const status = res.statusCode || 0;
+      // Redirect: follow with the Location header.
+      if (status >= 300 && status < 400 && res.headers.location) {
+        if (maxRedirects <= 0) {
+          reject(new Error(`httpsGet: too many redirects (${url})`));
+          res.resume();
+          return;
+        }
+        // Resolve relative redirects against the current URL.
+        const nextUrl = new URL(res.headers.location, url).toString();
+        res.resume(); // free the body
+        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1 }));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        res.resume();
+        reject(new Error(`httpsGet: HTTP ${status} for ${url}`));
+        return;
+      }
+      /** @type {Buffer[]} */
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    // Belt-and-braces timeout so a hung connection can't wedge the action.
+    // 60s should be plenty for any GitHub release asset (≤ 50MB).
+    req.setTimeout(60_000, () => {
+      req.destroy(new Error('httpsGet: request timed out (60s)'));
+    });
+  });
+}
+
+/**
+ * Build the production scanner-dependency kit. Returns the deps object that
+ * `runScanners` forwards to `scanSecrets` / `scanPatterns`. Each dep is a real
+ * Node builtin; tests inject fakes via `deps.runScanners` / `deps.scanSecrets`
+ * overrides higher up.
+ *
+ * Deps produced:
+ *   - `core`           — passed through (the @actions/core kit).
+ *   - `ensureBinary`   — wraps the real `ensureBinary` from
+ *                         `./lib/scanners/ensure-binary.js`, injecting real
+ *                         `fetch` (httpsGet), `writeFile`, `stat`, `mkdir`,
+ *                         `chmod`. Used by both scanners.
+ *   - `runBinary`      — `promisify(execFile)` with a 10MB maxBuffer (used by
+ *                         both scanners; the brief specifies this exact size).
+ *   - `runCommand`     — `promisify(execFile)` without maxBuffer cap (used by
+ *                         the archive extractors to invoke system `tar`).
+ *   - `scanSecrets`    — the real implementation (so `runScanners` doesn't
+ *                         fall through to its no-binary default).
+ *   - `scanPatterns`   — the real implementation.
+ *   - `computeMetrics` — the real implementation.
+ *
+ * The brief specified `runBinary(cmd, args)` and `runCommand(cmd, args)`
+ * signatures; we preserve that (callers use positional args).
+ *
+ * @param {{ core?: object, cacheDir?: string }} [args]
+ * @returns {Object}
+ */
+export function createScannerDeps({ core: coreArg, cacheDir } = {}) {
+  return {
+    core: coreArg,
+    ensureBinary: (spec, innerDeps = {}) =>
+      ensureBinary(spec, {
+        fetch: httpsGet,
+        writeFile: (p, b) => fs.writeFile(p, b),
+        stat: (p) => fs.stat(p),
+        mkdir: (p) => fs.mkdir(p, { recursive: true }),
+        chmod: (p, m) => fs.chmod(p, m),
+        ...innerDeps,
+      }),
+    runBinary: (cmd, args, opts) =>
+      execFileAsync(cmd, args, {
+        maxBuffer: 10 * 1024 * 1024,
+        ...(opts || {}),
+      }),
+    runCommand: (cmd, args, opts) => execFileAsync(cmd, args, opts || {}),
+    scanSecrets,
+    scanPatterns,
+    computeMetrics,
+  };
+}
+
 /**
  * The complete list of action input names, in the order loadConfig reads them.
  * Exported so the test can assert coverage. Keep in sync with config.js.
@@ -111,8 +283,76 @@ export const INPUT_NAMES = [
   'ZAI_DESCRIBE_WRITE_BODY',
   'ZAI_IMPACT_LABELS',
   'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
+  'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
   'GITHUB_TOKEN',
 ];
+
+/**
+ * Build the fallback comment body used when inline review submission fails.
+ *
+ * Carries the review summary (already built, marker included) plus every
+ * finding rendered as plain text so the structured review still reaches the PR
+ * even if the review API rejected the payload. The findings are appended after
+ * a clear "Review could not be posted inline" preamble.
+ *
+ * @param {string} reviewBody  The review body (already includes the marker).
+ * @param {Array} findings     All findings (inline + summary-only).
+ * @param {string} reviewerName
+ * @returns {string}
+ */
+function buildFallbackBody(reviewBody, findings, reviewerName) {
+  const list = Array.isArray(findings) ? findings : [];
+  const parts = [
+    `_⚠️ ${reviewerName || 'Z.ai Code Review'} could not be posted as an inline review; falling back to a summary comment._`,
+    '',
+    reviewBody,
+  ];
+  if (list.length > 0) {
+    parts.push('', '### Findings');
+    for (const f of list) {
+      const file = typeof f?.file === 'string' ? f.file : '';
+      const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
+      const title = typeof f?.title === 'string' ? f.title : '';
+      parts.push(`- **${file}${line}** — ${title}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ *
+ * The note is appended (with a blank-line separator) so reviewers can see how
+ * many previously-resolved findings were elided. Returns the (possibly empty)
+ * summary with the note appended. Kept as a pure helper so it can be unit
+ * tested in isolation if needed.
+ *
+ * @param {string} summary  The model's original summary prose.
+ * @param {number} suppressedCount  How many findings were suppressed.
+ * @returns {string}
+ */
+function appendIncrementalNote(summary, suppressedCount) {
+  const base = typeof summary === 'string' ? summary : '';
+  const count = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  if (count === 0) return base;
+  const note = `_${count} previously-reported finding${count === 1 ? '' : 's'} suppressed (incremental review)._`;
+  return base.length === 0 ? note : `${base}\n\n${note}`;
+}
 
 /**
  * Pull every ZAI_* + GITHUB_TOKEN input into a plain object via core.getInput.
@@ -158,10 +398,24 @@ export async function run(context, deps = {}) {
     getChangedFiles: getChangedFilesFn = getChangedFiles,
     filterExcludedFiles: filterExcludedFilesFn = filterExcludedFiles,
     filterPatchableFiles: filterPatchableFilesFn = filterPatchableFiles,
-    buildAutoReviewPrompt: buildAutoReviewPromptFn = buildAutoReviewPrompt,
-    runAutoReview: runAutoReviewFn = runAutoReview,
+    runStructuredReview: runStructuredReviewFn = runStructuredReview,
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
+    formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
+    formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummary,
+    partitionFindings: partitionFindingsFn = partitionFindings,
+    buildReviewBody: buildReviewBodyFn = buildReviewBody,
+    buildReviewComments: buildReviewCommentsFn = buildReviewComments,
+    resolveReviewEvent: resolveReviewEventFn = resolveReviewEvent,
+    upsertReview: upsertReviewFn = upsertReview,
+    listBotReviews: listBotReviewsFn = listBotReviews,
+    postFallbackComment: postFallbackCommentFn = postFallbackComment,
+    hashFinding: hashFindingFn = hashFinding,
+    buildFindingsHashBlock: buildFindingsHashBlockFn = buildFindingsHashBlock,
+    parseFindingsHashBlock: parseFindingsHashBlockFn = parseFindingsHashBlock,
+    filterIncrementalFindings: filterIncrementalFindingsFn = filterIncrementalFindings,
+    runScanners: runScannersFn = runScanners,
+    formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
     parseCommand: parseCommandFn = parseCommand,
@@ -169,6 +423,17 @@ export async function run(context, deps = {}) {
     createApiClient: createApiClientFn = createApiClient,
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
+    setReviewStatus: setReviewStatusFn = setReviewStatus,
+    buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
+    loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
+    mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
+    loadCodeowners: loadCodeownersFn = loadCodeowners,
+    suggestReviewers: suggestReviewersFn = suggestReviewers,
+    formatSuggestedReviewersLine: formatSuggestedReviewersLineFn = formatSuggestedReviewersLine,
+    pickAssignableReviewers: pickAssignableReviewersFn = pickAssignableReviewers,
+    loadLearnings: loadLearningsFn = loadLearnings,
+    filterFindingsByLearnings: filterFindingsByLearningsFn = filterFindingsByLearnings,
+    formatLearningsForPrompt: formatLearningsForPromptFn = formatLearningsForPrompt,
   } = deps;
 
   const event = eventName(context);
@@ -192,6 +457,25 @@ export async function run(context, deps = {}) {
       return;
     }
 
+    // Phase 5: post a "pending" commit status at the START of the review so
+    // developers see immediate feedback instead of staring at a silent PR for
+    // minutes. Fail-soft (setReviewStatus never throws); gated by config so an
+    // operator who lacks `statuses: write` can turn it off. The sha is the PR
+    // head SHA from the pull_request payload.
+    const sha = context?.payload?.pull_request?.head?.sha ?? '';
+    if (config.commitStatus) {
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'pending',
+          description: 'Z.ai review in progress…',
+        },
+        { core: coreDep },
+      );
+    }
+
     // Build (or accept an injected) callApi adapter that wraps api.js.
     const callApi = buildCallApi({
       injectedCallApi,
@@ -201,21 +485,392 @@ export async function run(context, deps = {}) {
       resolveSystemPromptFn,
     });
 
-    let review;
-    if (isLargePrFn(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
-      review = await runAutoReviewFn(patchable, config, { callApi, core: coreDep });
-    } else {
-      const prompt = buildAutoReviewPromptFn(patchable, {
-        maxDiffChars: config.maxDiffChars,
-      });
-      review = await callApi(config.apiKey, config.model, prompt);
+    // Phase 3: in-repo `.zai.yml`. The file is fetched from the PR head SHA
+    // and treated as UNTRUSTED (attacker-controllable in fork PRs). The merge
+    // is security-critical: action inputs ALWAYS win on cost/security knobs;
+    // the repo can only NARROW behavior (lower a cap, add path instructions,
+    // add excludes, disable a scanner). loadRepoConfig NEVER throws — any
+    // failure (404, parse error, oversized) returns `{}` + a warning. Tests
+    // inject `deps.repoConfig` directly to bypass the fetch; production lets
+    // loadRepoConfig run when the master switch is on.
+    const rawRepoConfig = config.repoConfigEnabled
+      ? await loadRepoConfigFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : {};
+    const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
+
+    // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The file records
+    // "previously-reviewed / won't-fix" patterns so the bot doesn't re-raise
+    // the same finding on every run. OPT-IN (ZAI_LEARNINGS_ENABLED) because it
+    // is a new trust surface: the file is attacker-controllable in fork PRs, so
+    // a malicious contributor could otherwise commit an entry that suppresses a
+    // real finding. loadLearnings is fail-soft (any error → [] + warning); the
+    // suppression is conservative (glob + case-insensitive substring on both
+    // axes). The accepted patterns are also carried into the prompt as additive
+    // context (see learningsContext below).
+    const learnings = config.learningsEnabled
+      ? await loadLearningsFn({ octokit, context, headSha: sha }, { core: coreDep })
+      : [];
+    const learningsContext = formatLearningsForPromptFn(learnings);
+    if (learnings.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Learnings: ${learnings.length} accepted-pattern rule(s) loaded.`,
+      );
     }
 
-    const body = buildCommentBodyFn({
+    // Deterministic scanners (Phase 4): run BEFORE the LLM. Their findings
+    // become high-confidence findings directly (merged over LLM findings at
+    // the same file:line+title) and are injected into the LLM prompt as
+    // "already detected, don't re-report" context. Scanners NEVER fail the
+    // review — on any error they log a warning and contribute [] findings.
+    // Phase 3: repo `.zai.yml` scanners map onto the scanner orchestrator's
+    // per-scanner toggles: `gitleaks` → secrets, `ast_grep` → patterns. The
+    // repo can only DISABLE a scanner the action enabled (enforced by
+    // mergeRepoConfig).
+    const cacheDir = expandHome(config.scannersCacheDir);
+    const scannerRepoConfig = {
+      scanners: {
+        secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
+        patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+      },
+    };
+    const scannerResult = await runScannersFn(
+      {
+        files: patchable,
+        repoPath: process.cwd(),
+        cacheDir,
+        config: { scannersEnabled: repoConfig.scannersEnabled },
+        repoConfig: scannerRepoConfig,
+      },
+      createScannerDeps({ core: coreDep, cacheDir }),
+    );
+    const scannerContext = formatScannerContextFn(
+      scannerResult.findings,
+      scannerResult.metrics,
+    );
+    if (scannerResult.scannerNames.length > 0 && coreDep.info) {
+      coreDep.info(
+        `Scanners: ${scannerResult.findings.length} finding(s) from ` +
+          `${scannerResult.scannerNames.join(', ')}.`,
+      );
+    }
+
+    // Structured review: one path for both small and large PRs. Batching
+    // handles small PRs (1 batch) and large PRs (N batches) uniformly. The
+    // result is rendered as a structured-findings summary comment. Phase 3:
+    // the merged repo config supplies pathInstructions/toneInstructions
+    // (additive) and may LOWER maxFindings (repo can only narrow the cap).
+    const result = await runStructuredReviewFn(
+      patchable,
+      {
+        ...config,
+        maxFindings: repoConfig.maxFindings,
+        pathInstructions: repoConfig.pathInstructions,
+        toneInstructions: repoConfig.toneInstructions,
+        deterministicFindings: scannerResult.findings,
+        scannerContext,
+        learningsContext,
+      },
+      {
+        callApi,
+        core: coreDep,
+      },
+    );
+
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    if (config.commitStatus) {
+      const criticalCount = result.findings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = result.findings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: result.findings.length,
+            criticalCount,
+            highCount,
+          }),
+        },
+        { core: coreDep },
+      );
+    }
+
+    // Phase 2: partition findings into inline-mappable (anchored to diff lines
+    // via pulls.createReview) and summary-only. When at least one finding maps
+    // to a diff line, post a GitHub REVIEW with inline comments — the
+    // CodeRabbit/Copilot experience — using dismiss-stale-then-post idempotency.
+    // When NO finding maps (all file-level or unmappable), fall back to the
+    // legacy single summary issue comment so the structured findings still
+    // reach the PR.
+    const reviewContext = {
+      ...context,
+      // The pull_request payload carries the PR number; expose it under
+      // payload.issue.number too so the shared postComment fallback helper
+      // (which reads payload.issue.number) works on this event.
+      payload: {
+        ...context.payload,
+        issue: { number: pullNumber },
+      },
+    };
+
+    // Phase 6.3: incremental review. On re-push, suppress findings whose
+    // content hash is unchanged since the last bot review so only NEW or
+    // CHANGED findings surface (CodeRabbit's auto_incremental_review pattern).
+    // The hash block appended to the prior review body carries the full set;
+    // we read it back here, filter, then re-emit a fresh full-set block on the
+    // new review. Fail-soft: any error reading prior reviews is logged and the
+    // run proceeds with the full findings set (no incremental suppression).
+    let priorHashes = new Set();
+    if (config.incrementalReview === true) {
+      try {
+        const priorReviews = await listBotReviewsFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+        });
+        // The most recent prior review is the canonical hash source. Reviews
+        // come back newest-first from the GitHub API; fall back to scanning
+        // any of them if the first lacks a hash block.
+        const withHashBlock = priorReviews.find(
+          (r) => typeof r?.body === 'string' && r.body.includes('<!-- zai-hashes:'),
+        );
+        if (withHashBlock) {
+          priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
+        }
+      } catch (priorErr) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Could not read prior reviews for incremental filter (${priorErr?.message ?? String(priorErr)}); posting full findings.`,
+          );
+        }
+      }
+    }
+    const { kept: incrementalKept, suppressed: suppressedCount } =
+      filterIncrementalFindingsFn(result.findings, priorHashes);
+    if (suppressedCount > 0 && coreDep?.info) {
+      coreDep.info(
+        `Incremental review: suppressed ${suppressedCount} previously-reported finding(s).`,
+      );
+    }
+
+    // Phase 8.2: drop findings that match a previously-reviewed / won't-fix
+    // learning. Applied AFTER incremental suppression so the two layers
+    // compose. When learningsEnabled is off, `learnings` is [] and this is a
+    // no-op (everything is kept). Conservative: a learning only suppresses when
+    // the glob AND the substring both match.
+    const { kept: keptFindings, suppressed: learningsSuppressed } =
+      filterFindingsByLearningsFn(incrementalKept, learnings);
+    if (learningsSuppressed > 0 && coreDep?.info) {
+      coreDep.info(
+        `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
+    // The hash block is built from the FULL findings set (not just kept) so
+    // the next run sees the complete canonical set — otherwise a finding that
+    // was suppressed this run would re-surface on the next. Empty string when
+    // incremental review is disabled OR there are no findings at all. NOTE: a
+    // learning-suppressed finding is also part of this canonical set, so it
+    // stays incremental-suppressed until its content changes; learnings
+    // filtering re-applies on every run regardless, so correctness is preserved.
+    const hashBlock =
+      config.incrementalReview === true && Array.isArray(result.findings) && result.findings.length > 0
+        ? buildFindingsHashBlockFn(result.findings)
+        : '';
+
+    // Append a "previously-resolved" note to the model's summary so reviewers
+    // know what was elided. Only when suppression actually happened.
+    const baseSummary = typeof result.summary === 'string' ? result.summary : '';
+    const summaryWithIncrementalNote =
+      suppressedCount > 0
+        ? appendIncrementalNote(baseSummary, suppressedCount)
+        : baseSummary;
+
+    // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default
+    // (a "Suggested reviewers" line appended to the summary prose so it shows
+    // in BOTH the inline review body and the summary-only comment); opt-in
+    // auto-assignment additionally calls pulls.requestReviewers (after the
+    // review is posted, below). The CODEOWNERS file is fetched from the head
+    // SHA and treated as UNTRUSTED; loadCodeowners is fail-soft to [] on any
+    // error. autoAssignReviewers implies suggestReviewers.
+    let suggestedReviewers = [];
+    if (config.suggestReviewers || config.autoAssignReviewers) {
+      try {
+        const codeownersRules = await loadCodeownersFn(
+          { octokit, context, headSha: sha },
+          { core: coreDep },
+        );
+        if (codeownersRules.length > 0) {
+          const filenames = patchable
+            .map((f) => (typeof f?.filename === 'string' ? f.filename : ''))
+            .filter((fn) => fn.length > 0);
+          const suggestion = suggestReviewersFn(filenames, codeownersRules);
+          suggestedReviewers = suggestion.suggestedReviewers;
+        }
+      } catch (err) {
+        // Fail-soft: a broken CODEOWNERS path must never break the review.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS reviewer suggestions failed (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    }
+    const suggestedReviewersLine = formatSuggestedReviewersLineFn(suggestedReviewers);
+    // The suggestion line is carried through `metadata.suggestedReviewersLine`
+    // to the three summary renderers (buildReviewBody, formatFindingsAsSummary,
+    // formatWalkthroughSummary), which render it alongside the deterministic /
+    // truncated metadata lines. (Appending to the summary prose does not work
+    // for the flat findings path, which ignores the prose when findings=0.)
+    const finalSummary = summaryWithIncrementalNote;
+
+    // Phase 8.1: opt-in auto-assignment. Runs AFTER the review/comment is
+    // posted (caller awaits this before returning). Fail-soft: any assignment
+    // error (permissions, invalid users, rate limit) logs a warning and never
+    // fails the review. Only `@user` handles are forwarded (teams are
+    // summary-only). No-op when autoAssignReviewers is off or there are no
+    // assignable users.
+    const maybeAssignReviewers = async () => {
+      if (!config.autoAssignReviewers) return;
+      const reviewers = pickAssignableReviewersFn(suggestedReviewers);
+      if (reviewers.length === 0) return;
+      try {
+        await octokit.rest.pulls.requestReviewers({
+          owner,
+          repo,
+          pull_number: pullNumber,
+          reviewers,
+        });
+        if (coreDep?.info) {
+          coreDep.info(
+            `CODEOWNERS: requested ${reviewers.length} reviewer(s): ${reviewers.join(', ')}.`,
+          );
+        }
+      } catch (err) {
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `CODEOWNERS: failed to request reviewers (${err?.message ?? String(err)}); skipping.`,
+          );
+        }
+      }
+    };
+
+    const { inline, summaryOnly } = partitionFindingsFn(keptFindings, patchable);
+
+    const truncatedCount = Math.max(
+      0,
+      (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+    );
+    const reviewMetadata = {
+      reviewerName: config.reviewerName,
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+      // Phase 7: walkthrough context for the summary-only section of the
+      // review body. When config.walkthrough is true, buildReviewBody renders
+      // the summary-only findings as dependency-ordered cohort sections
+      // (collapsible <details>) instead of a flat bullet list. Inline comments
+      // are line-anchored and unaffected.
+      walkthrough: config.walkthrough === true,
+      files: patchable,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line (empty string when
+      // disabled/no CODEOWNERS/no matches → rendered as nothing).
+      suggestedReviewersLine,
+    };
+
+    if (inline.length > 0) {
+      // Build the review body (summary + summary-only findings + marker) and
+      // the inline comments array, then submit as a GitHub review. Phase 6.3:
+      // the hash block is appended AFTER the marker so listBotReviews' marker
+      // scan (which searches for `<!-- zai-code-review -->`) keeps working
+      // unchanged — the two HTML comments coexist in the same body.
+      const baseBody = buildReviewBodyFn(
+        finalSummary,
+        summaryOnly,
+        reviewMetadata,
+      );
+      const reviewBody = hashBlock
+        ? `${baseBody}\n${hashBlock}`
+        : baseBody;
+      const comments = buildReviewCommentsFn(inline);
+      // Phase 8.3: strict mode escalates the review event from advisory
+      // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
+      // a critical/high finding. Off by default; never auto-enabled.
+      const reviewEvent = resolveReviewEventFn(keptFindings, config);
+      try {
+        await upsertReviewFn({
+          octokit,
+          context: reviewContext,
+          marker: MARKER,
+          sha,
+          body: reviewBody,
+          comments,
+          event: reviewEvent,
+          core: coreDep,
+        });
+        await maybeAssignReviewers();
+        return;
+      } catch (reviewError) {
+        // NEVER silently lose the review. Fall back to a single issue comment
+        // carrying the review body + every finding as text, then rethrow-free.
+        if (coreDep?.warning) {
+          coreDep.warning(
+            `Review submission failed (${reviewError?.message ?? String(reviewError)}); posting fallback comment.`,
+          );
+        }
+        const fallbackBody = buildFallbackBody(
+          reviewBody,
+          keptFindings,
+          config.reviewerName,
+        );
+        await postFallbackCommentFn({
+          octokit,
+          context: reviewContext,
+          body: fallbackBody,
+        });
+        await maybeAssignReviewers();
+        return;
+      }
+    }
+
+    // No inline-mappable findings: post the whole summary as an issue comment
+    // via the existing marker-upsert path (keeps idempotency for the
+    // no-findings / all-file-level case). When walkthrough is enabled (default)
+    // and there are findings, render as a dependency-ordered walkthrough;
+    // otherwise fall back to the flat severity-grouped summary. Phase 6.3:
+    // the summary uses the KEPT findings (after incremental suppression) and
+    // the hash block is appended after the marker (same coexistence model as
+    // the inline-review branch).
+    const useWalkthrough =
+      config.walkthrough && Array.isArray(keptFindings) && keptFindings.length > 0;
+    const summaryMetadata = {
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: truncatedCount,
+      summary: finalSummary,
+      // Phase 8.1: pre-rendered "Suggested reviewers" line.
+      suggestedReviewersLine,
+    };
+    const content = useWalkthrough
+      ? formatWalkthroughSummaryFn(keptFindings, patchable, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        })
+      : formatFindingsAsSummaryFn(keptFindings, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        });
+    const commentBody = buildCommentBodyFn({
       title: config.reviewerName,
-      content: review,
+      content,
       marker: MARKER,
     });
+    const body = hashBlock ? `${commentBody}\n${hashBlock}` : commentBody;
     await upsertReviewCommentFn({
       octokit,
       owner,
@@ -225,6 +880,7 @@ export async function run(context, deps = {}) {
       marker: MARKER,
       core: coreDep,
     });
+    await maybeAssignReviewers();
     return;
   }
 
@@ -349,11 +1005,18 @@ export async function run(context, deps = {}) {
       getChangedFiles: getChangedFilesFn,
       filterExcludedFiles: filterExcludedFilesFn,
       filterPatchableFiles: filterPatchableFilesFn,
-      buildAutoReviewPrompt: buildAutoReviewPromptFn,
-      runAutoReview: runAutoReviewFn,
+      runStructuredReview: runStructuredReviewFn,
       isLargePr: isLargePrFn,
+      formatFindingsAsSummary: formatFindingsAsSummaryFn,
       buildCommentBody: buildCommentBodyFn,
       upsertReviewComment: upsertReviewCommentFn,
+      // v2 inline-review pipeline (mirrors the pull_request branch).
+      partitionFindings: partitionFindingsFn,
+      buildReviewBody: buildReviewBodyFn,
+      buildReviewComments: buildReviewCommentsFn,
+      upsertReview: upsertReviewFn,
+      postFallbackComment: postFallbackCommentFn,
+      resolveReviewEvent: resolveReviewEventFn,
     });
     return;
   }
@@ -386,11 +1049,24 @@ function buildCallApi({
   resolveSystemPromptFn,
 }) {
   if (injectedCallApi) return injectedCallApi;
-  const client = injectedApiClient ?? createApiClientFn({ timeout: config.timeoutMs });
+  // Factory config: timeout always; fallbackPrompt only when set to a
+  // non-empty string (otherwise the client default — no fallback — applies).
+  const factoryConfig = { timeout: config.timeoutMs };
+  if (typeof config.fallbackPrompt === 'string' && config.fallbackPrompt.length > 0) {
+    factoryConfig.fallbackPrompt = config.fallbackPrompt;
+  }
+  const client = injectedApiClient ?? createApiClientFn(factoryConfig);
   const systemPrompt = resolveSystemPromptFn(config);
   return (apiKey, model, prompt) =>
     client
-      .call({ apiKey, model, systemPrompt, userPrompt: prompt })
+      .call({
+        apiKey,
+        model,
+        systemPrompt,
+        userPrompt: prompt,
+        ...(config.temperature != null ? { temperature: config.temperature } : {}),
+        ...(config.maxTokens != null ? { maxTokens: config.maxTokens } : {}),
+      })
       .then((r) => {
         if (!r.success) throw new Error(r.error.message);
         return r.data;
@@ -403,19 +1079,45 @@ function buildCallApi({
 
 /**
  * Build config from action inputs and call {@link run}. Errors propagate to
- * the top-level `.catch`, which calls `core.setFailed`.
+ * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
+ * best-effort posts a "failure" commit status so developers aren't left
+ * staring at a forever-pending status.
  *
  * @returns {Promise<void>}
  */
 export async function main() {
   const inputs = readAllInputs(core);
   const config = loadConfig(inputs, { core });
-  return run(github.context, {
-    config,
-    core,
-    github,
-    octokit: github.getOctokit(config.githubToken),
-  });
+  const octokit = github.getOctokit(config.githubToken);
+  try {
+    return await run(github.context, {
+      config,
+      core,
+      github,
+      octokit,
+    });
+  } catch (err) {
+    // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
+    // only — setReviewStatus swallows its own errors and never throws, so this
+    // can never mask the original failure. Only fires for pull_request events
+    // (where a head SHA exists) and when status feedback is enabled.
+    if (config.commitStatus) {
+      const sha = github.context?.payload?.pull_request?.head?.sha;
+      if (sha) {
+        await setReviewStatus(
+          {
+            octokit,
+            context: github.context,
+            sha,
+            state: 'failure',
+            description: 'Z.ai review failed',
+          },
+          { core },
+        );
+      }
+    }
+    throw err;
+  }
 }
 
 // Auto-run ONLY when this file is the process entry point. Import-safe.

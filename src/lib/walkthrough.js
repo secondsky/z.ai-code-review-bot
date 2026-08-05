@@ -1,0 +1,500 @@
+/**
+ * Phase 7: Walkthrough / cohort ordering.
+ *
+ * Reorganizes a PR's findings from a flat file list into a dependency-ordered
+ * walkthrough — the CodeRabbit "Change Stack" idea. Files are classified into
+ * cohorts by path, cohorts are ordered by dependency rank (foundational first:
+ * database → api → business-logic → config → ui → tests → docs → other), and
+ * findings are rendered under their cohort as collapsible sections so the
+ * summary reads like a narrative instead of a flat severity-sorted list.
+ *
+ * This module is PURE (no I/O, no imports of other project modules). The
+ * renderer's trailing marker is duplicated here as a literal so the module
+ * stays self-contained; it MUST stay byte-exact with comments.js's MARKER.
+ *
+ * @module src/lib/walkthrough.js
+ */
+
+// ---------------------------------------------------------------------------
+// Cohort metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * The canonical cohort ordering (dependency rank — foundational first).
+ * Lower index = more foundational = rendered earlier.
+ * @type {string[]}
+ */
+export const COHORT_ORDER = [
+  'database',
+  'api',
+  'business-logic',
+  'config',
+  'ui',
+  'tests',
+  'docs',
+  'other',
+];
+
+/**
+ * Per-cohort emoji for the walkthrough section headers.
+ * @type {Record<string, string>}
+ */
+const COHORT_EMOJI = {
+  database: '🗄️',
+  api: '🔌',
+  'business-logic': '⚙️',
+  config: '🔧',
+  ui: '🎨',
+  tests: '🧪',
+  docs: '📚',
+  other: '📦',
+};
+
+/**
+ * Per-cohort human-readable display label (Title Case).
+ * @type {Record<string, string>}
+ */
+const COHORT_LABEL = {
+  database: 'Database',
+  api: 'API',
+  'business-logic': 'Business Logic',
+  config: 'Config',
+  ui: 'UI',
+  tests: 'Tests',
+  docs: 'Docs',
+  other: 'Other',
+};
+
+/**
+ * Per-severity emoji for the Overview line. Mirrors findings.js so the
+ * walkthrough and the severity-grouped summary stay visually consistent.
+ * @type {Record<string, string>}
+ */
+const SEVERITY_EMOJI = {
+  critical: '🔴',
+  high: '🟠',
+  medium: '🟡',
+  low: '🔵',
+  info: '➖',
+};
+
+/**
+ * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
+ * sorts first. Mirrors findings.js SEVERITY_RANK.
+ * @type {Record<string, number>}
+ */
+const SEVERITY_RANK = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4,
+};
+
+/** Severity display order for the Overview line. */
+const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+
+/**
+ * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
+ * as a literal so this pure module has no cross-module imports.
+ */
+const MARKER = '<!-- zai-code-review -->';
+
+// ---------------------------------------------------------------------------
+// classifyFile
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a regex that matches `segment/` anywhere in the path (as a directory
+ * segment). Used for patterns like `db/`, `api/`, `src/lib/`.
+ *
+ * @param {string} segment  e.g. "db" or "src/lib"
+ * @returns {RegExp}
+ */
+function dirSegment(segment) {
+  // Escape regex metacharacters in the segment, then anchor on a leading
+  // slash-or-start so "db/" matches "/db/" or "^db/" but not "nodb/".
+  const escaped = segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|/)${escaped}/`);
+}
+
+/**
+ * Build a regex that matches a file extension anywhere. `sql` → `\.sql$`.
+ *
+ * @param {string} ext  without leading dot
+ * @returns {RegExp}
+ */
+function extRe(ext) {
+  const escaped = ext.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\.${escaped}$`, 'i');
+}
+
+/**
+ * Build a regex that matches a basename keyword anywhere. `Dockerfile` →
+ * matches a path component equal to "Dockerfile" or starting with it (so
+ * `docker-compose.yml` matches the `docker-compose` keyword).
+ *
+ * @param {string} name
+ * @returns {RegExp}
+ */
+function basenameKeyword(name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|/)${escaped}`, 'i');
+}
+
+/**
+ * Each cohort's matchers, checked in array order. The cohort list itself is
+ * iterated in {@link COHORT_ORDER} order so "first match wins" is enforced by
+ * the classifyFile loop. A filename matches a cohort if ANY matcher hits.
+ *
+ * @type {Array<{ cohort: string, matchers: RegExp[] }>}
+ */
+const COHORT_RULES = [
+  {
+    cohort: 'database',
+    matchers: [
+      dirSegment('db'),
+      dirSegment('migrations'),
+      dirSegment('schema'),
+      dirSegment('prisma'),
+      extRe('sql'),
+      extRe('prisma'),
+    ],
+  },
+  {
+    cohort: 'api',
+    matchers: [
+      dirSegment('api'),
+      dirSegment('server'),
+      dirSegment('routes'),
+      dirSegment('controllers'),
+      dirSegment('endpoints'),
+      dirSegment('handlers'),
+    ],
+  },
+  {
+    cohort: 'business-logic',
+    matchers: [
+      dirSegment('src/lib'),
+      dirSegment('src/services'),
+      dirSegment('src/models'),
+      dirSegment('domain'),
+      dirSegment('core'),
+      dirSegment('business'),
+    ],
+  },
+  {
+    cohort: 'ui',
+    matchers: [
+      dirSegment('components'),
+      dirSegment('pages'),
+      dirSegment('views'),
+      dirSegment('ui'),
+      dirSegment('src/app'),
+      extRe('tsx'),
+      extRe('jsx'),
+      extRe('vue'),
+      extRe('svelte'),
+    ],
+  },
+  {
+    cohort: 'tests',
+    matchers: [
+      /\.test\./i,
+      /\.spec\./i,
+      dirSegment('__tests__'),
+      dirSegment('tests'),
+      dirSegment('test'),
+    ],
+  },
+  {
+    cohort: 'config',
+    matchers: [
+      extRe('yml'),
+      extRe('yaml'),
+      extRe('json'),
+      extRe('toml'),
+      dirSegment('.github'),
+      basenameKeyword('Dockerfile'),
+      basenameKeyword('docker-compose'),
+      basenameKeyword('.env'),
+    ],
+  },
+  {
+    cohort: 'docs',
+    matchers: [
+      extRe('md'),
+      extRe('rst'),
+      dirSegment('docs'),
+      basenameKeyword('CHANGELOG'),
+      basenameKeyword('README'),
+    ],
+  },
+];
+
+/**
+ * Classify a changed file into a cohort by its path.
+ *
+ * Rules are checked in {@link COHORT_ORDER} order; the FIRST matching cohort
+ * wins (so a test file under `src/lib/` classifies as business-logic, because
+ * business-logic is checked before tests). Files matching no rule fall back to
+ * `'other'`.
+ *
+ * @param {string} filename
+ * @returns {string} cohort name: 'database'|'api'|'business-logic'|'ui'|'tests'|'config'|'docs'|'other'
+ */
+export function classifyFile(filename) {
+  if (typeof filename !== 'string' || filename.length === 0) return 'other';
+  for (const { cohort, matchers } of COHORT_RULES) {
+    if (matchers.some((re) => re.test(filename))) return cohort;
+  }
+  return 'other';
+}
+
+// ---------------------------------------------------------------------------
+// buildCohorts
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a filename from a file entry that may be a bare string or an object
+ * with `.filename` (the GitHub PR shape).
+ *
+ * @param {unknown} entry
+ * @returns {string}
+ */
+function filenameOf(entry) {
+  if (typeof entry === 'string') return entry;
+  if (entry && typeof entry === 'object') {
+    const f = /** @type {{ filename?: unknown }} */ (entry).filename;
+    if (typeof f === 'string') return f;
+  }
+  return '';
+}
+
+/**
+ * Group files into cohorts, ordered by dependency rank.
+ *
+ * Only includes cohorts that have files. Cohorts are sorted by
+ * {@link COHORT_ORDER} rank (foundational first). Within each cohort, files
+ * are sorted alphabetically by filename.
+ *
+ * Each returned entry: `{ cohort, files, rank }` where `rank` is the index
+ * into COHORT_ORDER.
+ *
+ * @param {Array<{filename?: string} | string>} files
+ * @returns {Array<{cohort: string, files: Array, rank: number}>}
+ */
+export function buildCohorts(files) {
+  if (!Array.isArray(files)) return [];
+  /** @type {Map<string, Array>} */
+  const byCohort = new Map();
+  for (const entry of files) {
+    const filename = filenameOf(entry);
+    if (!filename) continue;
+    const cohort = classifyFile(filename);
+    if (!byCohort.has(cohort)) byCohort.set(cohort, []);
+    byCohort.get(cohort).push(entry);
+  }
+  // Sort each cohort's files alphabetically by filename.
+  for (const list of byCohort.values()) {
+    list.sort((a, b) => {
+      const fa = filenameOf(a);
+      const fb = filenameOf(b);
+      if (fa < fb) return -1;
+      if (fa > fb) return 1;
+      return 0;
+    });
+  }
+  // Emit cohorts in dependency-rank order.
+  return COHORT_ORDER
+    .map((cohort, rank) => ({ cohort, rank, list: byCohort.get(cohort) }))
+    .filter((c) => c.list)
+    .map(({ cohort, rank, list }) => ({ cohort, files: list, rank }));
+}
+
+// ---------------------------------------------------------------------------
+// groupFindingsByCohort
+// ---------------------------------------------------------------------------
+
+/**
+ * Assign findings to their file's cohort.
+ *
+ * Builds a `Map<filename, cohort>` from {@link buildCohorts} (over `files`),
+ * then assigns each finding to its file's cohort. Findings whose `file` is not
+ * in the map fall back to `'other'`.
+ *
+ * @param {Array<{file?: string}>} findings
+ * @param {Array<{filename?: string} | string>} files
+ * @returns {Map<string, Array>}
+ */
+export function groupFindingsByCohort(findings, files) {
+  /** @type {Map<string, Array>} */
+  const out = new Map();
+  if (!Array.isArray(findings)) return out;
+
+  // filename → cohort, built once.
+  /** @type {Map<string, string>} */
+  const fileCohort = new Map();
+  if (Array.isArray(files)) {
+    for (const entry of files) {
+      const filename = filenameOf(entry);
+      if (!filename) continue;
+      if (!fileCohort.has(filename)) {
+        fileCohort.set(filename, classifyFile(filename));
+      }
+    }
+  }
+
+  const ensure = (cohort) => {
+    if (!out.has(cohort)) out.set(cohort, []);
+    return out.get(cohort);
+  };
+
+  for (const f of findings) {
+    const file = f && typeof f.file === 'string' ? f.file : '';
+    const cohort = fileCohort.get(file) ?? 'other';
+    ensure(cohort).push(f);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// formatWalkthroughSummary
+// ---------------------------------------------------------------------------
+
+/**
+ * Severity rank for a finding; unknown sorts last.
+ *
+ * @param {string} sev
+ * @returns {number}
+ */
+function severityRank(sev) {
+  if (typeof sev === 'string' && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, sev)) {
+    return SEVERITY_RANK[sev];
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Render a walkthrough-style summary: cohorts as collapsible sections,
+ * findings grouped under their cohort.
+ *
+ * Structure:
+ *   ## <reviewerName>
+ *   <summary prose if provided>
+ *   ### 📊 Overview
+ *   <count> findings across <cohortCount> areas · 🔴 N critical · ...
+ *   <for each cohort in dependency order, if it has findings>:
+ *   <details><summary><emoji> <Label> (<count>)</summary>
+ *   - **<file>**<:L<line>> — <title>
+ *     <description>
+ *     <💡 suggestion>
+ *   </details>
+ *   <if no findings>: No issues found. The changes look good. ✅
+ *   <!-- zai-code-review -->
+ *
+ * The trailing marker is byte-exact (required by comments.js idempotency).
+ *
+ * @param {Array} findings
+ * @param {Array} files
+ * @param {{ reviewerName?: string, metadata?: Record<string, unknown> }} [options]
+ * @returns {string}
+ */
+export function formatWalkthroughSummary(findings, files, options = {}) {
+  const reviewerName =
+    typeof options.reviewerName === 'string' && options.reviewerName.length > 0
+      ? options.reviewerName
+      : 'Z.ai Code Review';
+  const metadata =
+    options.metadata && typeof options.metadata === 'object' ? options.metadata : {};
+  const summaryProse =
+    typeof metadata.summary === 'string' ? metadata.summary : '';
+
+  const list = Array.isArray(findings) ? findings : [];
+
+  // Header.
+  const lines = [];
+  lines.push(`## ${reviewerName}`);
+  lines.push('');
+
+  if (summaryProse.length > 0) {
+    lines.push(summaryProse);
+    lines.push('');
+  }
+
+  // Phase 8.1: optional pre-rendered "Suggested reviewers" line (CODEOWNERS).
+  const suggestedReviewersLine =
+    typeof metadata.suggestedReviewersLine === 'string' ? metadata.suggestedReviewersLine : '';
+  if (suggestedReviewersLine.length > 0) {
+    lines.push(suggestedReviewersLine);
+    lines.push('');
+  }
+
+  // Count per severity.
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of list) {
+    const sev = typeof f.severity === 'string' ? f.severity : '';
+    if (Object.prototype.hasOwnProperty.call(counts, sev)) counts[sev] += 1;
+  }
+  const total = list.length;
+
+  // Cohort buckets (ordered by dependency rank).
+  const grouped = groupFindingsByCohort(list, files);
+  const orderedCohorts = COHORT_ORDER.filter((c) => grouped.has(c) && grouped.get(c).length > 0);
+  const cohortCount = orderedCohorts.length;
+
+  // Overview line.
+  lines.push('### 📊 Overview');
+  lines.push('');
+  const sevParts = SEVERITY_ORDER.map(
+    (sev) => `${SEVERITY_EMOJI[sev]} ${counts[sev]} ${sev}`,
+  );
+  lines.push(
+    `${total} findings across ${cohortCount} areas · ${sevParts.join(' · ')}`,
+  );
+  lines.push('');
+
+  if (total === 0) {
+    lines.push('No issues found. The changes look good. ✅');
+    lines.push('');
+  } else {
+    for (const cohort of orderedCohorts) {
+      const cohortFindings = grouped.get(cohort).slice().sort((a, b) => {
+        const sa = severityRank(typeof a.severity === 'string' ? a.severity : '');
+        const sb = severityRank(typeof b.severity === 'string' ? b.severity : '');
+        if (sa !== sb) return sa - sb;
+        return 0;
+      });
+      const emoji = COHORT_EMOJI[cohort] ?? '📦';
+      const label = COHORT_LABEL[cohort] ?? 'Other';
+      lines.push('<details>');
+      lines.push(`<summary>${emoji} ${label} (${cohortFindings.length})</summary>`);
+      lines.push('');
+      for (const f of cohortFindings) {
+        const file = typeof f.file === 'string' ? f.file : '';
+        const line = f.line;
+        const title = typeof f.title === 'string' ? f.title : '';
+        const description = typeof f.description === 'string' ? f.description : '';
+        const suggestion =
+          typeof f.suggestion === 'string' && f.suggestion.length > 0
+            ? f.suggestion
+            : null;
+
+        const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
+        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        if (description.length > 0) {
+          lines.push(`  ${description}`);
+        }
+        if (suggestion !== null) {
+          lines.push(`  💡 ${suggestion}`);
+        }
+      }
+      lines.push('');
+      lines.push('</details>');
+      lines.push('');
+    }
+  }
+
+  lines.push(MARKER);
+  return lines.join('\n');
+}
