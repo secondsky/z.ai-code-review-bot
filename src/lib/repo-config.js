@@ -454,23 +454,53 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
       : Number.POSITIVE_INFINITY;
   const maxFindings = Math.min(actionMaxFindings, repoMaxFindings);
 
-  // pathInstructions / toneInstructions: additive from repo only.
+  // pathInstructions: additive from repo only.
   const pathInstructions = Array.isArray(reviews.path_instructions)
     ? reviews.path_instructions
     : [];
-  const toneInstructions =
-    typeof reviews.tone_instructions === 'string' ? reviews.tone_instructions : '';
+
+  // toneInstructions: additive from repo only. The `reviews.language` field
+  // (if set) is folded in here as a "Respond in <language>." directive so it
+  // rides the existing additive tone path without a new prompt-builder seam.
+  // This wires the previously-no-op `language` field to its documented effect.
+  const toneParts = [];
+  if (typeof reviews.tone_instructions === 'string' && reviews.tone_instructions.length > 0) {
+    toneParts.push(reviews.tone_instructions);
+  }
+  if (typeof reviews.language === 'string' && reviews.language.trim().length > 0) {
+    toneParts.push(`Respond in ${reviews.language.trim()}.`);
+  }
+  const toneInstructions = toneParts.join(' ');
 
   // excludePatterns UNION repo path_filters (repo can exclude MORE, never fewer).
   const actionPatterns = Array.isArray(a.excludePatterns) ? a.excludePatterns : [];
   const repoFilters = Array.isArray(reviews.path_filters) ? reviews.path_filters : [];
   const excludePatterns = Array.from(new Set([...actionPatterns, ...repoFilters]));
 
-  // minSeverity: action input wins.
-  const minSeverity =
-    typeof a.minSeverity === 'string' && a.minSeverity.length > 0
+  // minSeverity: action input wins, BUT the repo `profile` may NARROW it.
+  // `profile: chill` means "only surface critical+high" — i.e. raise the
+  // effective floor to `high` (rank 1). The repo can only narrow (keep fewer
+  // severities), never widen: if the action already set a stricter floor
+  // (e.g. `high`), chill cannot lower it back to `medium`. `assertive` (the
+  // default) leaves the action floor unchanged. This wires the previously-
+  // no-op `profile` field to its documented effect.
+  // Severity rank: lower = more severe (matches findings.js SEVERITY_RANK).
+  const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const actionMinSeverity =
+    typeof a.minSeverity === 'string' && SEVERITY_RANK[a.minSeverity] !== undefined
       ? a.minSeverity
       : 'info';
+  let minSeverity = actionMinSeverity;
+  const profile = typeof reviews.profile === 'string' ? reviews.profile : '';
+  if (profile === 'chill') {
+    // chill floor = high (rank 1). Narrow only: take the MORE restrictive
+    // (lower-rank) of the action floor and chill's high floor.
+    const actionRank = SEVERITY_RANK[actionMinSeverity];
+    if (actionRank > SEVERITY_RANK.high) {
+      minSeverity = 'high';
+    }
+  }
+  // `assertive` (or unset) → action floor unchanged.
 
   // Scanners: master switch is action-only; repo can only DISABLE.
   const scannersEnabled = a.scannersEnabled !== false;
@@ -491,6 +521,11 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
     excludePatterns,
     scannersEnabled,
     scanners: mergedScanners,
+    // Surface profile/language on the merged config so callers/tests can
+    // observe what was applied (the EFFECT is via minSeverity/toneInstructions
+    // above; these fields are read-only observability).
+    profile: profile || 'assertive',
+    language: typeof reviews.language === 'string' ? reviews.language : '',
   };
 }
 

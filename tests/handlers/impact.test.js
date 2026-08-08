@@ -267,3 +267,68 @@ describe('handleImpactCommand — error path', () => {
     expect(core.warning).toHaveBeenCalled();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * parseSeverity — negation stripping & precedence (Task 11 edge cases)
+ *
+ * The parser strips common negation prefixes (non-, not, no, isn't, aren't,
+ * without) before matching severity words, so a negated severity does not
+ * false-positive into a label. These tests pin that behavior explicitly.
+ * ------------------------------------------------------------------ */
+
+describe('parseSeverity — negation stripping (edge cases)', () => {
+  it('"non-critical" does NOT yield "critical"', () => {
+    expect(parseSeverity('non-critical')).toBeNull();
+  });
+
+  it('"not high" does NOT yield "high"', () => {
+    expect(parseSeverity('not high')).toBeNull();
+  });
+
+  it("\"isn't high\" does NOT yield \"high\"", () => {
+    expect(parseSeverity("isn't high")).toBeNull();
+  });
+
+  it('"no critical issues" does NOT yield "critical"', () => {
+    expect(parseSeverity('no critical issues')).toBeNull();
+  });
+
+  it('negation inside a longer sentence is still stripped', () => {
+    // The negation guard must work mid-sentence, not just on a bare phrase.
+    expect(parseSeverity('This is a non-critical change but worth noting.')).toBeNull();
+    expect(parseSeverity('There are no critical issues here.')).toBeNull();
+    expect(parseSeverity('The risk is not high overall.')).toBeNull();
+  });
+});
+
+describe('parseSeverity — positive matches (edge cases)', () => {
+  it('plain "critical" → "critical"', () => {
+    expect(parseSeverity('critical')).toBe('critical');
+  });
+
+  it('plain "high" → "high"', () => {
+    expect(parseSeverity('high')).toBe('high');
+  });
+});
+
+describe('parseSeverity — precedence (edge cases)', () => {
+  it('"critical" is checked before "high" — "critical and high" → "critical"', () => {
+    // The priority order is critical → high → medium → low. When both
+    // keywords appear, the most severe must win.
+    expect(parseSeverity('critical and high')).toBe('critical');
+  });
+});
+
+describe('parseSeverity — case-insensitive matching (edge cases)', () => {
+  it('"CRITICAL" (all caps) → "critical"', () => {
+    expect(parseSeverity('CRITICAL')).toBe('critical');
+  });
+
+  it('"Critical" (title case) → "critical"', () => {
+    expect(parseSeverity('Critical')).toBe('critical');
+  });
+
+  it('"HiGh" (mixed case) → "high"', () => {
+    expect(parseSeverity('HiGh')).toBe('high');
+  });
+});

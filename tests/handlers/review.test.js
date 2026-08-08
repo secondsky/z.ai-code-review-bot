@@ -9,7 +9,7 @@
  *  - callApi rejects → short error comment, no throw.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleReviewCommand } from '../../src/lib/handlers/review.js';
+import { handleReviewCommand, isUnsafePath } from '../../src/lib/handlers/review.js';
 
 function makeOctokit({
   files = [
@@ -209,5 +209,75 @@ describe('handleReviewCommand — error path', () => {
     expect(body).toContain('Z.ai request failed');
     expect(body).not.toContain('upstream-500');
     expect(core.warning).toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * isUnsafePath — path-traversal guard (Task 11 edge cases)
+ *
+ * The guard rejects any path containing ".." or starting with "/". It is a
+ * deliberately blunt substring check: it false-positives on legitimate
+ * filenames that happen to contain "..", trading convenience for safety.
+ * ------------------------------------------------------------------ */
+
+describe('isUnsafePath — traversal & absolute paths rejected (edge cases)', () => {
+  it('"../../etc/passwd" → true (unsafe)', () => {
+    expect(isUnsafePath('../../etc/passwd')).toBe(true);
+  });
+
+  it('"/etc/passwd" → true (unsafe: leading slash)', () => {
+    expect(isUnsafePath('/etc/passwd')).toBe(true);
+  });
+});
+
+describe('isUnsafePath — safe paths (edge cases)', () => {
+  it('"src/app.js" → false (safe)', () => {
+    expect(isUnsafePath('src/app.js')).toBe(false);
+  });
+
+  it('"src/lib/utils.js" → false (safe with subdirectory)', () => {
+    expect(isUnsafePath('src/lib/utils.js')).toBe(false);
+  });
+});
+
+describe('isUnsafePath — ".." traversal detection (path-segment aware)', () => {
+  it('"my..file.js" → false (safe: ".." inside a filename is NOT traversal)', () => {
+    // FIX: Only ".." used as a PATH SEGMENT (../ or /.. or ^..) is traversal.
+    // Double dots inside a filename (my..file.js, v1..0.js) are legitimate.
+    expect(isUnsafePath('my..file.js')).toBe(false);
+  });
+
+  it('"src/../etc/passwd" → true (unsafe: mid-path traversal)', () => {
+    expect(isUnsafePath('src/../etc/passwd')).toBe(true);
+  });
+
+  it('"../../etc/passwd" → true (unsafe: leading traversal)', () => {
+    expect(isUnsafePath('../../etc/passwd')).toBe(true);
+  });
+
+  it('"src/.." → true (unsafe: trailing traversal segment)', () => {
+    expect(isUnsafePath('src/..')).toBe(true);
+  });
+
+  it('"../config" → true (unsafe: leading traversal segment)', () => {
+    expect(isUnsafePath('../config')).toBe(true);
+  });
+});
+
+describe('isUnsafePath — null byte & empty input (edge cases)', () => {
+  it('empty string → true (unsafe: treated as invalid input)', () => {
+    expect(isUnsafePath('')).toBe(true);
+  });
+
+  it('null byte in path → true (unsafe: control characters rejected)', () => {
+    // FIX: Embedded null bytes are rejected. Null bytes can truncate strings
+    // in C-based downstream tools and are never legitimate in file paths.
+    expect(isUnsafePath('src\x00app.js')).toBe(true);
+  });
+
+  it('non-string input → true (unsafe)', () => {
+    expect(isUnsafePath(undefined)).toBe(true);
+    expect(isUnsafePath(null)).toBe(true);
+    expect(isUnsafePath(42)).toBe(true);
   });
 });

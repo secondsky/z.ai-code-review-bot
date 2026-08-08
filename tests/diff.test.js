@@ -497,3 +497,252 @@ describe('partitionFindings', () => {
     expect(summaryOnly).toHaveLength(1);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * parseHunks — edge cases
+ * ------------------------------------------------------------------ */
+
+describe('parseHunks (edge cases)', () => {
+  it('returns [] for a patch with body lines but no @@ hunk header', () => {
+    // The walker requires a valid hunk header to set `cur`; without one, every
+    // body line is skipped via the `if (!cur) continue` guard. This is the
+    // correct defensive behavior: line numbers cannot be reliably determined
+    // without a header, so the walker refuses to guess (avoids mis-attribution).
+    const patch = ['+added', ' ctx', '-removed'].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toEqual([]);
+  });
+
+  it('handles a malformed @@ header by dropping body lines (no throw)', () => {
+    // A line starting with @@ that fails the `-a +b` regex sets `cur = null`,
+    // so subsequent body lines are skipped rather than mis-attributed.
+    const patch = ['@@ garbage @@', '+body1', '+body2'].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toEqual([]);
+  });
+
+  it('does not let body lines following a malformed header leak into a prior valid hunk', () => {
+    // A valid hunk, then a malformed header, then body lines. The body lines
+    // after the malformed header must NOT attach to the valid hunk.
+    const patch = [
+      '@@ -1,1 +1,1 @@',
+      '+valid',
+      '@@ garbage @@',
+      '+leak1',
+      '+leak2',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0].lines).toEqual([
+      { type: 'add', newLine: 1, oldLine: null, text: 'valid' },
+    ]);
+  });
+
+  it('skips "\\ No newline at end of file" and leaves subsequent line counters unchanged', () => {
+    // The `\ No newline` marker is metadata: it must not advance either counter.
+    // Verify the ctx lines AFTER the marker still get the correct new/old numbers.
+    const patch = [
+      '@@ -1,3 +10,3 @@',
+      '+added10',
+      '\\ No newline at end of file',
+      ' ctx11',
+      ' ctx12',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0].lines).toEqual([
+      { type: 'add', newLine: 10, oldLine: null, text: 'added10' },
+      { type: 'ctx', newLine: 11, oldLine: 1, text: 'ctx11' },
+      { type: 'ctx', newLine: 12, oldLine: 2, text: 'ctx12' },
+    ]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * findNearestValidLine — edge cases
+ * ------------------------------------------------------------------ */
+
+describe('findNearestValidLine (edge cases)', () => {
+  it('returns a valid line at distance exactly equal to the window (window=3)', () => {
+    // Valid lines: 10 (add), 11 (ctx). With window=3, distance 3 is in range
+    // (loop is `dist <= w`). Searching 7 → distance 3 from 10 → returns 10.
+    const patch = ['@@ -1,2 +10,2 @@', '+added10', ' ctx11'].join('\n');
+    expect(findNearestValidLine(patch, 7, 3)).toBe(10);
+    // Same check below: searching 14 → distance 3 from 11 → returns 11.
+    expect(findNearestValidLine(patch, 14, 3)).toBe(11);
+  });
+
+  it('returns null when the nearest valid line is one beyond the window (distance 4, window=3)', () => {
+    // Valid lines: 10, 11. Searching 6 → distance 4 from 10 → out of window.
+    const patch = ['@@ -1,2 +10,2 @@', '+added10', ' ctx11'].join('\n');
+    expect(findNearestValidLine(patch, 6, 3)).toBeNull();
+    // Below: searching 15 → distance 4 from 11 → out of window.
+    expect(findNearestValidLine(patch, 15, 3)).toBeNull();
+  });
+
+  it('add beats ctx at equal distance (ctx above, add below → returns the add below)', () => {
+    // Use two hunks to create non-contiguous valid lines (within a single hunk
+    // valid new-lines are always contiguous, so a true tie needs two hunks).
+    // Hunk1 ctx at new 10; Hunk2 add at new 12. Searching 11 is distance 1
+    // from both: above is ctx, below is add → add wins → 12.
+    const patch = [
+      '@@ -1,1 +10,1 @@',
+      ' ctx10',
+      '@@ -1,1 +12,1 @@',
+      '+add12',
+    ].join('\n');
+    expect(findNearestValidLine(patch, 11)).toBe(12);
+  });
+
+  it('add beats ctx at equal distance (add above, ctx below → returns the add above)', () => {
+    // Hunk1 add at new 10; Hunk2 ctx at new 12. Searching 11: above add, below
+    // ctx → add wins → 10.
+    const patch = [
+      '@@ -1,1 +10,1 @@',
+      '+add10',
+      '@@ -1,1 +12,1 @@',
+      ' ctx12',
+    ].join('\n');
+    expect(findNearestValidLine(patch, 11)).toBe(10);
+  });
+
+  it('two adds at equal distance → returns the above (smaller line number, deterministic tie-break)', () => {
+    // Hunk1 add at new 10; Hunk2 add at new 12. Searching 11: both adds at
+    // distance 1 → deterministic pick is the above → 10.
+    const patch = [
+      '@@ -1,1 +10,1 @@',
+      '+add10',
+      '@@ -1,1 +12,1 @@',
+      '+add12',
+    ].join('\n');
+    expect(findNearestValidLine(patch, 11)).toBe(10);
+  });
+
+  it('exact match returns the line itself (no snap)', () => {
+    // Line 11 is a valid add; searching 11 returns 11 without scanning.
+    const patch = ['@@ -1,2 +10,2 @@', ' ctx10', '+added11'].join('\n');
+    expect(findNearestValidLine(patch, 11)).toBe(11);
+  });
+
+  it('returns null for an empty-string patch', () => {
+    expect(findNearestValidLine('', 1)).toBeNull();
+  });
+
+  it('returns null for a non-string patch (null, number)', () => {
+    expect(findNearestValidLine(null, 1)).toBeNull();
+    expect(findNearestValidLine(123, 1)).toBeNull();
+    expect(findNearestValidLine(undefined, 1)).toBeNull();
+  });
+
+  it('returns null for a non-integer line (float, NaN)', () => {
+    const patch = '@@ -1,1 +1,1 @@\n+a';
+    expect(findNearestValidLine(patch, 1.5)).toBeNull();
+    expect(findNearestValidLine(patch, NaN)).toBeNull();
+  });
+
+  it('returns null for a line < 1 (zero, negative)', () => {
+    const patch = '@@ -1,1 +1,1 @@\n+a';
+    expect(findNearestValidLine(patch, 0)).toBeNull();
+    expect(findNearestValidLine(patch, -5)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * mapFindingToComment — edge cases
+ * ------------------------------------------------------------------ */
+
+describe('mapFindingToComment (edge cases)', () => {
+  it('returns null when finding.file does not match file.filename (defensive)', () => {
+    const patch = '@@ -1,1 +10,1 @@\n+added';
+    const finding = { file: 'src/other.js', line: 10 };
+    const fileObj = { filename: 'src/a.js', patch };
+    expect(mapFindingToComment(finding, fileObj)).toBeNull();
+  });
+
+  it('returns null when finding is null or undefined', () => {
+    const fileObj = { filename: 'src/a.js', patch: '@@ -1,1 +10,1 @@\n+added' };
+    expect(mapFindingToComment(null, fileObj)).toBeNull();
+    expect(mapFindingToComment(undefined, fileObj)).toBeNull();
+  });
+
+  it('returns null when file is null or undefined', () => {
+    const finding = { file: 'src/a.js', line: 10 };
+    expect(mapFindingToComment(finding, null)).toBeNull();
+    expect(mapFindingToComment(finding, undefined)).toBeNull();
+  });
+
+  it('returns null when file.patch is an empty string', () => {
+    const finding = { file: 'src/a.js', line: 10 };
+    const fileObj = { filename: 'src/a.js', patch: '' };
+    expect(mapFindingToComment(finding, fileObj)).toBeNull();
+  });
+
+  it('returns null when finding.line is null (file-level finding goes to summary)', () => {
+    const patch = '@@ -1,1 +10,1 @@\n+added';
+    const finding = { file: 'src/a.js', line: null };
+    const fileObj = { filename: 'src/a.js', patch };
+    expect(mapFindingToComment(finding, fileObj)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * partitionFindings — edge cases
+ * ------------------------------------------------------------------ */
+
+describe('partitionFindings (edge cases)', () => {
+  it('returns {inline:[], summaryOnly:[]} for an empty findings array', () => {
+    const files = [{ filename: 'src/a.js', patch: '@@ -1,1 +10,1 @@\n+a' }];
+    const result = partitionFindings([], files);
+    expect(result.inline).toEqual([]);
+    expect(result.summaryOnly).toEqual([]);
+  });
+
+  it('sends ALL findings to summaryOnly when the files array is empty', () => {
+    const findings = [
+      { file: 'src/a.js', line: 10 },
+      { file: 'src/b.js', line: 5 },
+    ];
+    const result = partitionFindings(findings, []);
+    expect(result.inline).toHaveLength(0);
+    expect(result.summaryOnly).toHaveLength(2);
+    expect(result.summaryOnly).toEqual(findings);
+  });
+
+  it('sends a finding referencing an unknown file to summaryOnly', () => {
+    const files = [{ filename: 'src/a.js', patch: '@@ -1,1 +10,1 @@\n+a' }];
+    const findings = [{ file: 'src/unknown.js', line: 10 }];
+    const result = partitionFindings(findings, files);
+    expect(result.inline).toHaveLength(0);
+    expect(result.summaryOnly).toHaveLength(1);
+    expect(result.summaryOnly[0]).toEqual({ file: 'src/unknown.js', line: 10 });
+  });
+
+  it('splits a mixed batch: some inline, some summaryOnly', () => {
+    const patch = '@@ -1,2 +10,2 @@\n+added\n ctx';
+    const files = [{ filename: 'src/a.js', patch }];
+    const findings = [
+      { file: 'src/a.js', line: 10 }, // inline (exact valid add)
+      { file: 'src/a.js', line: null }, // summary (file-level)
+      { file: 'src/a.js', line: 999 }, // summary (unmappable, out of window)
+      { file: 'src/ghost.js', line: 5 }, // summary (unknown file)
+    ];
+    const result = partitionFindings(findings, files);
+    expect(result.inline).toHaveLength(1);
+    expect(result.inline[0].comment).toEqual({ path: 'src/a.js', line: 10, side: 'RIGHT' });
+    expect(result.summaryOnly).toHaveLength(3);
+    expect(result.summaryOnly.map((f) => f.file)).toEqual([
+      'src/a.js',
+      'src/a.js',
+      'src/ghost.js',
+    ]);
+  });
+
+  it('handles a null/undefined files argument without throwing', () => {
+    const findings = [{ file: 'src/a.js', line: 10 }];
+    expect(() => partitionFindings(findings, null)).not.toThrow();
+    expect(() => partitionFindings(findings, undefined)).not.toThrow();
+    const result = partitionFindings(findings, undefined);
+    expect(result.inline).toHaveLength(0);
+    expect(result.summaryOnly).toHaveLength(1);
+  });
+});

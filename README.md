@@ -67,7 +67,8 @@ Commit a `.zai.yml` to configure review behavior without editing the workflow:
 
 ```yaml
 reviews:
-  profile: chill              # chill (default) | assertive
+  profile: chill              # chill = only critical+high | assertive (default) = all severities
+  language: en-US             # respond in this language (additive; e.g. fr-FR, 日本語)
   max_findings: 8             # can only LOWER the action's cap
   path_instructions:
     - path: "src/auth/**"

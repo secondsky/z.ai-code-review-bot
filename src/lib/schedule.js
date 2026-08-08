@@ -28,6 +28,25 @@ import { MARKER } from './comments.js';
 export const DEFAULT_MAX_PRS = 10;
 
 /**
+ * Build the hidden HTML comment that embeds the PR head SHA in a posted
+ * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
+ * body contains BOTH the marker AND the head SHA; without this block the
+ * review body carries only the fixed marker literal, so the SHA match never
+ * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
+ * "only new/changed PRs" guarantee).
+ *
+ * The block is an HTML comment so it is invisible in the rendered comment.
+ * Returns '' when `sha` is empty so callers can append unconditionally.
+ *
+ * @param {string} sha  the PR head SHA.
+ * @returns {string}
+ */
+export function buildShaBlock(sha) {
+  if (typeof sha !== 'string' || sha.length === 0) return '';
+  return `<!-- zai-sha: ${sha} -->`;
+}
+
+/**
  * Determine whether a comment was authored by a bot. Used to gate marker-based
  * dedup so a drive-by human commenter cannot suppress a scheduled review or
  * hijack the bot's review thread by posting a comment containing the marker.
@@ -202,7 +221,7 @@ export async function reviewOnePr({
     const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
 
     if (inline.length > 0) {
-      const body = buildReviewBody(result.summary, summaryOnly, {
+      const baseBody = buildReviewBody(result.summary, summaryOnly, {
         reviewerName: config.reviewerName,
         walkthrough: config.walkthrough === true,
         files: patchable,
@@ -212,6 +231,12 @@ export async function reviewOnePr({
           (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
         ),
       });
+      // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
+      // cron tick (without it, the body carries only the marker and the PR is
+      // re-reviewed every tick). Appended after the body so the marker scan and
+      // rendered review are unaffected.
+      const shaBlock = buildShaBlock(pr.headSha);
+      const body = shaBlock ? `${baseBody}\n${shaBlock}` : baseBody;
       const comments = buildReviewComments(inline);
       const event = resolveReviewEvent(result.findings, config);
       try {
@@ -252,11 +277,15 @@ export async function reviewOnePr({
       },
     });
 
-    const body = buildCommentBody({
+    const commentBody = buildCommentBody({
       title: config.reviewerName,
       content,
       marker: MARKER,
     });
+    // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
+    // cron tick (see the inline branch above for rationale).
+    const shaBlock = buildShaBlock(pr.headSha);
+    const body = shaBlock ? `${commentBody}\n${shaBlock}` : commentBody;
     await upsertReviewComment({
       octokit,
       owner,
@@ -307,7 +336,10 @@ export async function runScheduledReview({
   repo,
   config,
   core,
-  maxPrs = DEFAULT_MAX_PRS,
+  // maxPrs: optional HARD ceiling (test injection). Default Infinity so the
+  // operator's ZAI_SCHEDULE_MAX_PRS (via config.scheduleMaxPrs) is the primary
+  // source. See cap-resolution comment below.
+  maxPrs = Number.POSITIVE_INFINITY,
   callApi,
   listOpenPrs: listFn = listOpenPrs,
   hasReviewForSha: hasReviewFn = hasReviewForSha,
@@ -326,10 +358,19 @@ export async function runScheduledReview({
   postFallbackComment,
   resolveReviewEvent,
 }) {
-  const cap =
+  // Effective cap resolution. `config.scheduleMaxPrs` (from
+  // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
+  // `maxPrs` PARAMETER is an optional HARD ceiling for test injection only
+  // (default Infinity = no ceiling). When config is unset, fall back to
+  // DEFAULT_MAX_PRS. This fixes a bug where the param default (10) silently
+  // clamped an operator's ZAI_SCHEDULE_MAX_PRS=50 to 10.
+  const configMaxPrs =
     typeof config?.scheduleMaxPrs === 'number' && config.scheduleMaxPrs > 0
-      ? Math.min(config.scheduleMaxPrs, maxPrs)
-      : maxPrs;
+      ? config.scheduleMaxPrs
+      : DEFAULT_MAX_PRS;
+  const ceiling =
+    typeof maxPrs === 'number' && maxPrs > 0 ? maxPrs : Number.POSITIVE_INFINITY;
+  const cap = Math.min(configMaxPrs, ceiling);
 
   const prs = await listFn({ octokit, owner, repo, maxPrs: cap });
   let reviewed = 0;

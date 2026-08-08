@@ -42,15 +42,24 @@ const MIN_TIMEOUT_MS = 10000; // floor for the progressive timeout
  * ------------------------------------------------------------------ */
 
 /**
- * Regex-extract a 4xx/5xx status code embedded anywhere in an error message.
- * The message is matched as-is (callers lowercase it first when needed).
+ * Regex-extract a 4xx/5xx status code from an error message.
+ *
+ * Context-aware: the code must appear in an HTTP-error context — preceded by
+ * "error", "status", "code", a colon, or a quote+colon — so that numbers in
+ * prose (RFC 418), filenames (404.js), or other non-HTTP contexts are NOT
+ * mistaken for status codes. The production error format
+ * `Z.ai API error NNN: ...` always matches.
  *
  * @param {string} message
  * @returns {number | null}
  */
 export function extractStatusCode(message) {
   const str = String(message ?? '');
-  const match = str.match(/\b([45]\d{2})\b/);
+  // Require the 3-digit code to be preceded by an HTTP-error keyword or
+  // delimiter: "error ", "status ", "code ", a colon, or a quote+colon.
+  // This rejects "404.js" (preceded by space but followed by ".js") and
+  // "RFC 418" (preceded by "RFC " with no HTTP keyword).
+  const match = str.match(/(?:error|status|code\b|["':])\s*:?\s*([45]\d{2})\b/i);
   return match ? parseInt(match[1], 10) : null;
 }
 
@@ -144,9 +153,11 @@ export function sanitizeErrorMessage(error) {
   message = message.replace(/(Authorization:\s*)[^\s]+/gi, '$1[REDACTED]');
   // (6) Credential URLs.
   message = message.replace(/https?:\/\/[^\s]*:[^\s@]+@[^\s]*/gi, '[URL_REDACTED]');
-  // (7) JSON blobs containing secret-like keys.
+  // (7) JSON blobs containing secret-like keys. Handles one level of nesting
+  // so an outer object containing both a secret key and a nested sub-object
+  // is fully redacted (e.g. {"token":"x","cfg":{"a":1}} → [REDACTED]).
   message = message.replace(
-    /\{[^{}]*"(?:api[_-]?key|token|secret|password|credential)[^{}]*\}/gi,
+    /\{(?:[^{}]|\{[^{}]*\})*"(?:api[_-]?key|token|secret|password|credential)(?:[^{}]|\{[^{}]*\})*\}/gi,
     '[REDACTED]',
   );
 

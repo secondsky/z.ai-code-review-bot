@@ -14,6 +14,7 @@ import {
   sanitizeModelOutput,
   sanitizeCommentBody,
   neutralizeMentionsOutsideCode,
+  neutralizeMentionsInLine,
   neutralizeAlerts,
   MAX_OUTPUT_CHARS,
 } from '../src/lib/sanitize-output.js';
@@ -220,5 +221,188 @@ describe('exported internals', () => {
     expect(neutralizeAlerts('> [!NOTE]')).toContain('!NOTE');
     // A made-up type is NOT matched (left alone).
     expect(neutralizeAlerts('> [!BOGUS]')).toBe('> [!BOGUS]');
+  });
+});
+
+// ============================================================================
+// Task 7: adversarial edge-case tests.
+// These pin precise regex behavior and the security-critical ordering
+// (sanitize-then-truncate) that the headline tests above only touch lightly.
+// ============================================================================
+
+describe('neutralizeMentionsInLine — regex boundary cases', () => {
+  it('does NOT treat foo@bar.com (email) as a mention', () => {
+    // The @ is preceded by a word char ('o'), so the [^\w`\\/] boundary fails
+    // and the @ is left intact.
+    const out = neutralizeMentionsInLine('Email me at foo@bar.com please');
+    expect(out).toBe('Email me at foo@bar.com please');
+    expect(out).not.toContain('\u200b');
+  });
+
+  it('does NOT treat array@head (identifier-like) as a mention', () => {
+    // 'y' before @ is a word char → no boundary match → @ left intact.
+    const out = neutralizeMentionsInLine('use array@head here');
+    expect(out).toBe('use array@head here');
+    expect(out).not.toContain('\u200b');
+  });
+
+  it('neutralizes a mention at the start of the line (^ anchor)', () => {
+    const out = neutralizeMentionsInLine('@everyone listen up');
+    expect(out).toBe('@\u200beveryone listen up');
+  });
+
+  it('neutralizes a mention after a punctuation boundary', () => {
+    // Comma is a non-word char, so the boundary matches.
+    const out = neutralizeMentionsInLine('Hello, @alice how are you?');
+    expect(out).toBe('Hello, @\u200balice how are you?');
+  });
+
+  it('neutralizes multiple mentions on one line', () => {
+    const out = neutralizeMentionsInLine('@alice and @bob chat');
+    expect(out).toBe('@\u200balice and @\u200bbob chat');
+  });
+
+  it('pins org/team with embedded whitespace (surprising but intentional)', () => {
+    // The MENTION_RE second group allows \s, so '@org/team name' is matched as
+    // a single mention where the team name is 'team name' (space included). This
+    // mirrors GitHub's own team-name handling. Only the @ gets the ZWSP — the
+    // whole 'org/team name' is captured as the name group. We pin this so a
+    // future regex tightening doesn't silently change behavior.
+    const out = neutralizeMentionsInLine('cc @org/team name here');
+    expect(out).toContain('@\u200b');
+    // The captured name extends through the space: 'org/team name'.
+    expect(out).toBe('cc @\u200borg/team name here');
+  });
+});
+
+describe('neutralizeAlerts — alert-type & positioning cases', () => {
+  it.each(['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'])(
+    'neutralizes the > [!%s] banner type',
+    (type) => {
+      const out = neutralizeAlerts(`> [!${type}]\n> body`);
+      expect(out).not.toContain(`[!${type}]`);
+      expect(out).toContain(`!${type}`);
+    },
+  );
+
+  it.each(['[!warning]', '[!Warning]', '[!WaRnInG]'])(
+    'neutralizes %s case-insensitively and uppercases the type',
+    (marker) => {
+      const out = neutralizeAlerts(`> ${marker}\n> body`);
+      expect(out).not.toContain(marker);
+      expect(out).toContain('!WARNING');
+    },
+  );
+
+  it('does NOT neutralize a bare [!NOTE] at start of text (no blockquote)', () => {
+    // The ALERT_RE requires a `>` quote prefix; without it the marker is plain
+    // text and must be left alone. This is intentional: GitHub itself only
+    // renders a callout when the marker is inside a blockquote.
+    const input = '[!NOTE]\nThis is text';
+    expect(neutralizeAlerts(input)).toBe(input);
+  });
+
+  it('does NOT neutralize a [!WARNING] mid-paragraph (not at line start)', () => {
+    // The regex anchors on (^|\n); a marker preceded by inline text on the
+    // same line does not match.
+    const input = 'Some text [!WARNING] more text';
+    expect(neutralizeAlerts(input)).toBe(input);
+  });
+});
+
+describe('sanitizeModelOutput — idempotency (property test)', () => {
+  // A sanitizer that runs between the model and GitHub must be stable: running
+  // it twice must not double-rewrite or otherwise drift. This catches regressions
+  // like "the ZWSP itself becomes part of a new mention match on the second pass."
+  it.each([
+    ['clean text only', 'Looks good to me.'],
+    ['text with mentions', 'Hey @bob and @alice please review'],
+    ['text with alert banner', '> [!WARNING]\n> dangerous'],
+    ['code fence containing @mention', '```js\nconst x = callback(@param);\n```\nDone.'],
+    [
+      'mixed mentions, alerts, and code',
+      '## Review\n\n- ping @alice\n- see `@decorator`\n\n> [!CAUTION]\n> note\n\n```js\n@keep\n```\n@neutralize',
+    ],
+  ])('is idempotent on %s', (_label, input) => {
+    const once = sanitizeModelOutput(input);
+    const twice = sanitizeModelOutput(once);
+    expect(twice).toBe(once);
+  });
+});
+
+describe('sanitizeModelOutput — sanitize-before-truncate ordering', () => {
+  it('neutralizes @mentions that fall in the KEPT portion of an overlong input', () => {
+    // Sanitizer runs on the full text BEFORE slicing. Place a @mention near the
+    // slice boundary; the portion that survives the slice must already have the
+    // ZWSP (i.e. sanitization happened first, truncation second).
+    const before = 'a'.repeat(MAX_OUTPUT_CHARS - 50);
+    const tail = 'cc @boundaryuser and then more text ' + 'b'.repeat(100);
+    const out = sanitizeModelOutput(before + tail);
+    expect(out.length).toBeLessThan(MAX_OUTPUT_CHARS + 200);
+    expect(out.endsWith('output truncated by Z.ai safety filter)')).toBe(true);
+    // The mention in the kept portion carries the ZWSP — proving sanitize ran
+    // before truncate.
+    expect(out).toContain('@\u200bboundaryuser');
+    expect(out).not.toMatch(/@boundaryuser/);
+  });
+
+  it('produces zero-width spaces even when input is mostly mention spam', () => {
+    // An attacker spams thousands of @mentions hoping the truncation marker
+    // hides un-neutralized ones. The sanitizer processes every line first, so
+    // every @mention in the kept prefix is neutralized.
+    let spam = '';
+    for (let i = 0; i < 1000; i++) spam += `ping @user${i} spam text. `;
+    const out = sanitizeModelOutput(spam);
+    expect(out).toContain('\u200b');
+    // No raw @<alphanum> mention (without a following ZWSP) survives in output.
+    expect(out).not.toMatch(/@[A-Za-z0-9]/);
+  });
+});
+
+describe('sanitizeModelOutput — exact-length truncation boundary', () => {
+  it('does NOT truncate input that is exactly MAX_OUTPUT_CHARS long', () => {
+    const exact = 'a'.repeat(MAX_OUTPUT_CHARS);
+    const out = sanitizeModelOutput(exact);
+    expect(out).toBe(exact);
+    expect(out).not.toContain('truncated');
+  });
+
+  it('truncates input that is one char over MAX_OUTPUT_CHARS', () => {
+    const over = 'a'.repeat(MAX_OUTPUT_CHARS + 1);
+    const out = sanitizeModelOutput(over);
+    expect(out.length).toBeGreaterThan(MAX_OUTPUT_CHARS); // marker adds length
+    expect(out.endsWith('output truncated by Z.ai safety filter)')).toBe(true);
+    // The first MAX_OUTPUT_CHARS chars of the input are preserved as the prefix.
+    expect(out.startsWith('a'.repeat(100))).toBe(true);
+  });
+});
+
+describe('sanitizeCommentBody — marker / header positioning', () => {
+  it('leaves an HTML marker mid-content untouched (regex only matches trailing)', () => {
+    // The marker regex is anchored on `$`, so an HTML comment that is NOT the
+    // final trailing marker is treated as ordinary content and passed through
+    // the sanitizer verbatim (it contains nothing to neutralize here).
+    const body = '## Title\n\nSome content\n\n<!-- comment -->\n\nMore content';
+    const out = sanitizeCommentBody(body);
+    // Header preserved, mid marker preserved, no trailing-marker stripping.
+    expect(out).toBe(body);
+  });
+
+  it('preserves header and sanitizes content when there is no marker', () => {
+    const body = '## Title\n\nping @alice about this';
+    const out = sanitizeCommentBody(body);
+    expect(out.startsWith('## Title\n\n')).toBe(true);
+    expect(out).toContain('@\u200balice');
+    // No marker was injected.
+    expect(out).not.toContain('<!--');
+  });
+
+  it('sanitizes content and preserves trailing marker when there is no header', () => {
+    const body = 'plain content cc @spammer\n\n<!-- marker -->';
+    const out = sanitizeCommentBody(body);
+    expect(out.endsWith('\n\n<!-- marker -->')).toBe(true);
+    expect(out).toContain('@\u200bspammer');
+    // No header was synthesized.
+    expect(out.startsWith('## ')).toBe(false);
   });
 });

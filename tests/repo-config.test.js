@@ -661,3 +661,304 @@ describe('loadRepoConfig — no deps.core', () => {
     ).resolves.toEqual({});
   });
 });
+
+/* ================================================================== *
+ * Task 10: edge-case tests for the hand-rolled YAML parser + merge.  *
+ * These pin behavior on attacker-controlled inputs (comments inside  *
+ * quotes, glued # in URLs, colons in values, the security-critical   *
+ * merge boundary, and validator tolerance).                          *
+ * ================================================================== */
+
+/* ------------------------------------------------------------------ *
+ * stripComment (via parseZaiYml) — quote-aware comment stripping
+ * ------------------------------------------------------------------ */
+
+describe('parseZaiYml — comment stripping edge cases', () => {
+  it('does NOT treat # inside double quotes as a comment', () => {
+    const text = 'reviews:\n  tone_instructions: "value # not a comment"\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('value # not a comment');
+  });
+
+  it('does NOT treat # inside single quotes as a comment', () => {
+    const text = "reviews:\n  tone_instructions: 'value # not a comment'\n";
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('value # not a comment');
+  });
+
+  it('does NOT treat a # glued to a non-space value as a comment (URL fragment)', () => {
+    // The `#` in `http://x#frag` has no preceding whitespace, so per YAML 1.2
+    // it is NOT a comment marker and the URL must be preserved verbatim.
+    const text = 'reviews:\n  tone_instructions: http://x#frag\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('http://x#frag');
+  });
+
+  it('strips a standard inline comment preceded by whitespace', () => {
+    const text = 'reviews:\n  profile: chill # this is a comment\n';
+    expect(parseZaiYml(text).reviews.profile).toBe('chill');
+  });
+
+  it('drops a full-line comment entirely', () => {
+    const text = '# this is a comment\nreviews:\n  profile: chill\n';
+    const parsed = parseZaiYml(text);
+    expect(parsed.reviews.profile).toBe('chill');
+    // The comment line must not produce any stray keys.
+    expect(Object.keys(parsed)).toEqual(['reviews']);
+  });
+
+  it('preserves a value that is ONLY a quoted hash', () => {
+    // Edge case: the entire value is a quoted "#..." — must not be eaten.
+    const text = 'reviews:\n  tone_instructions: "#hashtag"\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('#hashtag');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * parseZaiYml — value-with-colon + empty/malformed edge cases
+ * ------------------------------------------------------------------ */
+
+describe('parseZaiYml — values containing colons', () => {
+  it('captures everything after "key: " as the value when unquoted (colon in value)', () => {
+    // The parser regex is ^([A-Za-z0-9_]+):\s*(.*)$ — greedy, first colon
+    // splits key from value. An unquoted value with a colon is kept verbatim
+    // (the parser does NOT treat the second colon as a nesting indicator).
+    const text = 'reviews:\n  tone_instructions: see: this\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('see: this');
+  });
+
+  it('parses a quoted value containing a colon', () => {
+    const text = 'reviews:\n  tone_instructions: "see: this"\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('see: this');
+  });
+
+  it('parses a URL value containing a colon', () => {
+    const text = 'reviews:\n  tone_instructions: https://example.com/foo\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('https://example.com/foo');
+  });
+});
+
+describe('parseZaiYml — empty and whitespace-only input', () => {
+  it('returns {} for the empty string', () => {
+    expect(parseZaiYml('')).toEqual({});
+  });
+
+  it('returns {} for whitespace-only input', () => {
+    expect(parseZaiYml('   \n\t\n  ')).toEqual({});
+  });
+
+  it('returns {} for a single newline', () => {
+    expect(parseZaiYml('\n')).toEqual({});
+  });
+});
+
+describe('parseZaiYml — mixed / inconsistent indentation', () => {
+  it('tolerates deeper-than-expected indentation under a section', () => {
+    // The parser only checks `indent === 0` for the top-level section header;
+    // any indent >= 1 inside a section is treated as a sub-key. Deeper indents
+    // than the conventional 2 spaces still parse as flat key:value pairs.
+    const text = 'reviews:\n      profile: chill\n';
+    expect(parseZaiYml(text).reviews.profile).toBe('chill');
+  });
+
+  it('skips an indented line that appears before any section header', () => {
+    // An indented line with no open section is skipped (parser guards with
+    // `if (section === null) continue;`).
+    const text = '    orphan: value\nreviews:\n  profile: chill\n';
+    const parsed = parseZaiYml(text);
+    expect(parsed.reviews.profile).toBe('chill');
+    expect(parsed).not.toHaveProperty('orphan');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * mergeRepoConfig — security-critical boundary edge cases
+ * ------------------------------------------------------------------ */
+
+describe('mergeRepoConfig — maxFindings security boundary', () => {
+  it('repo cannot RAISE maxFindings above the action cap (Math.min)', () => {
+    const merged = mergeRepoConfig(
+      { maxFindings: 5 },
+      { reviews: { max_findings: 20 } },
+    );
+    // Action cap of 5 must win — the repo may only LOWER it.
+    expect(merged.maxFindings).toBe(5);
+  });
+
+  it('repo max_findings of 0 is treated as Infinity (no cap, does not suppress findings)', () => {
+    // A 0 (or any non-positive-int) repo value is coerced to +Infinity inside
+    // the merge, so it cannot suppress ALL findings — the action cap still applies.
+    const merged = mergeRepoConfig(
+      { maxFindings: 8 },
+      { reviews: { max_findings: 0 } },
+    );
+    expect(merged.maxFindings).toBe(8);
+  });
+
+  it('repo max_findings of -1 is treated as Infinity (does not suppress findings)', () => {
+    const merged = mergeRepoConfig(
+      { maxFindings: 8 },
+      { reviews: { max_findings: -1 } },
+    );
+    expect(merged.maxFindings).toBe(8);
+  });
+
+  it('repo max_findings of NaN/string is treated as Infinity', () => {
+    // Non-integer repo values also collapse to Infinity (Number.isInteger guard).
+    const merged = mergeRepoConfig(
+      { maxFindings: 10 },
+      { reviews: { max_findings: 'a lot' } },
+    );
+    expect(merged.maxFindings).toBe(10);
+  });
+
+  it('repo can LOWER maxFindings below the action cap', () => {
+    const merged = mergeRepoConfig(
+      { maxFindings: 10 },
+      { reviews: { max_findings: 3 } },
+    );
+    expect(merged.maxFindings).toBe(3);
+  });
+
+  it('falls back to the default cap when action has no maxFindings and repo is silent', () => {
+    // No action cap and no repo value → the built-in default of 8 applies.
+    const merged = mergeRepoConfig({}, {});
+    expect(merged.maxFindings).toBe(8);
+  });
+});
+
+describe('mergeRepoConfig — excludePatterns UNION (repo can only add)', () => {
+  it('unions action and repo patterns (both kept, deduped)', () => {
+    const merged = mergeRepoConfig(
+      { excludePatterns: ['*.lock'] },
+      { reviews: { path_filters: ['*.md'] } },
+    );
+    expect(merged.excludePatterns.sort()).toEqual(['*.lock', '*.md']);
+  });
+
+  it('deduplicates identical patterns across action and repo', () => {
+    const merged = mergeRepoConfig(
+      { excludePatterns: ['*.lock', 'dist/**'] },
+      { reviews: { path_filters: ['*.lock', 'build/**'] } },
+    );
+    // `*.lock` appears in both — the Set dedupes it.
+    expect(merged.excludePatterns.sort()).toEqual(['*.lock', 'build/**', 'dist/**']);
+  });
+
+  it('repo can NEVER remove an action excludePattern', () => {
+    // There is no "subtract" path — the repo can only ADD to the union.
+    const merged = mergeRepoConfig(
+      { excludePatterns: ['*.lock', '*.min.js'] },
+      { reviews: { path_filters: ['*.md'] } },
+    );
+    expect(merged.excludePatterns).toContain('*.lock');
+    expect(merged.excludePatterns).toContain('*.min.js');
+    expect(merged.excludePatterns).toContain('*.md');
+  });
+});
+
+describe('mergeRepoConfig — scanners master switch', () => {
+  it('action scannersEnabled: false stays off even if repo sets scanners: true', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: false },
+      { scanners: { gitleaks: true, ast_grep: true } },
+    );
+    expect(merged.scannersEnabled).toBe(false);
+    expect(merged.scanners.gitleaks).toBe(false);
+    expect(merged.scanners.ast_grep).toBe(false);
+  });
+
+  it('action scannersEnabled: true + repo scanners.gitleaks: false → gitleaks disabled', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: true },
+      { scanners: { gitleaks: false } },
+    );
+    expect(merged.scannersEnabled).toBe(true);
+    expect(merged.scanners.gitleaks).toBe(false);
+    // ast_grep not mentioned by repo → stays at the action default (enabled).
+    expect(merged.scanners.ast_grep).toBe(true);
+  });
+
+  it('action scannersEnabled: true + repo silent → both scanners default on', () => {
+    const merged = mergeRepoConfig({ scannersEnabled: true }, {});
+    expect(merged.scannersEnabled).toBe(true);
+    expect(merged.scanners.gitleaks).toBe(true);
+    expect(merged.scanners.ast_grep).toBe(true);
+  });
+
+  it('action scannersEnabled undefined defaults to enabled (repo can still disable)', () => {
+    // `a.scannersEnabled !== false` → undefined is treated as enabled.
+    const merged = mergeRepoConfig({}, { scanners: { gitleaks: false } });
+    expect(merged.scannersEnabled).toBe(true);
+    expect(merged.scanners.gitleaks).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * validateRepoConfig — type coercion + unknown-key tolerance
+ * ------------------------------------------------------------------ */
+
+describe('validateRepoConfig — invalid max_findings types', () => {
+  it('drops a string max_findings (warns by omission, no crash)', () => {
+    // The validator does not emit a warning itself (loadRepoConfig does, when
+    // the whole file is empty). Here we just confirm the invalid value is
+    // dropped gracefully — no exception, no bogus output.
+    const out = validateRepoConfig({ reviews: { max_findings: 'not-a-number' } });
+    expect(out).not.toHaveProperty('reviews');
+  });
+
+  it('drops a float max_findings', () => {
+    const out = validateRepoConfig({ reviews: { max_findings: 3.7 } });
+    expect(out).not.toHaveProperty('reviews');
+  });
+
+  it('drops a boolean max_findings', () => {
+    const out = validateRepoConfig({ reviews: { max_findings: true } });
+    expect(out).not.toHaveProperty('reviews');
+  });
+
+  it('keeps a valid max_findings alongside an invalid one in a fresh call', () => {
+    // Sanity: the guard is per-value, not global.
+    expect(validateRepoConfig({ reviews: { max_findings: 7 } }).reviews.max_findings).toBe(7);
+  });
+});
+
+describe('validateRepoConfig — unknown keys are ignored gracefully', () => {
+  it('drops unknown top-level keys without crashing', () => {
+    const out = validateRepoConfig({
+      reviews: { profile: 'chill' },
+      totally_unknown: { deep: { nested: [1, 2, 3] } },
+      another_stranger: 42,
+    });
+    expect(out.reviews.profile).toBe('chill');
+    expect(out).not.toHaveProperty('totally_unknown');
+    expect(out).not.toHaveProperty('another_stranger');
+  });
+
+  it('drops unknown nested keys under reviews', () => {
+    const out = validateRepoConfig({
+      reviews: {
+        profile: 'chill',
+        rogue_field: 'evil',
+        another_unknown: { nested: true },
+      },
+    });
+    expect(out.reviews.profile).toBe('chill');
+    expect(out.reviews).not.toHaveProperty('rogue_field');
+    expect(out.reviews).not.toHaveProperty('another_unknown');
+  });
+
+  it('drops unknown keys under scanners', () => {
+    const out = validateRepoConfig({
+      scanners: {
+        gitleaks: true,
+        semgrep: true, // not in the allow-list
+        bandit: false, // not in the allow-list
+      },
+    });
+    expect(out.scanners).toEqual({ gitleaks: true });
+  });
+
+  it('does not crash on weirdly-typed reviews/scanners sub-objects', () => {
+    // reviews as an array, scanners as a string — must not throw, must yield {}.
+    expect(validateRepoConfig({ reviews: [1, 2, 3] })).toEqual({});
+    expect(validateRepoConfig({ scanners: 'nope' })).toEqual({});
+  });
+});

@@ -25,7 +25,15 @@ const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 const MAX_WHOLE_PR_DIFF_CHARS = 8000;
 
 /**
- * Reject path-traversal: any path containing `..` or starting with `/`.
+ * Reject path-traversal and other unsafe path patterns.
+ *
+ * Checks:
+ *   - Non-string or empty → unsafe.
+ *   - Leading `/` (absolute path) → unsafe.
+ *   - Embedded null bytes or other control chars → unsafe.
+ *   - `..` as a PATH SEGMENT (e.g. `../`, `/..`, or exactly `..`) → unsafe.
+ *     Double-dots INSIDE a filename (`my..file.js`) are NOT traversal and
+ *     are allowed.
  *
  * Pure (exported for testing).
  *
@@ -35,7 +43,12 @@ const MAX_WHOLE_PR_DIFF_CHARS = 8000;
 export function isUnsafePath(path) {
   if (typeof path !== 'string' || path === '') return true;
   if (path.startsWith('/')) return true;
-  if (path.includes('..')) return true;
+  // Reject embedded control characters (null bytes, etc.).
+  if (/[\x00-\x1f]/.test(path)) return true;
+  // Reject `..` only when it appears as a path segment — preceded by `/` or
+  // start-of-string, AND followed by `/` or end-of-string. This catches
+  // `../`, `/..`, `..`, and `a/../b` without rejecting `my..file.js`.
+  if (/(?:^|\/)\.\.(?:\/|$)/.test(path)) return true;
   return false;
 }
 
