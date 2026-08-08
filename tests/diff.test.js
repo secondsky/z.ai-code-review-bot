@@ -140,6 +140,69 @@ describe('parseHunks', () => {
       { type: 'ctx', newLine: 2, oldLine: 1, text: '' },
     ]);
   });
+
+  it('parses a new-file patch with header @@ -0,0 +1,N @@ (oldStart=0)', () => {
+    // git emits `@@ -0,0 +1,N @@` for newly-created files. The oldStart of 0
+    // must be accepted (not rejected as invalid) so inline comments work on
+    // new files. See F01.
+    const patch = [
+      '@@ -0,0 +1,3 @@',
+      '+line one',
+      '+line two',
+      '+line three',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0]).toMatchObject({ oldStart: 0, oldCount: 0, newStart: 1, newCount: 3 });
+    expect(hunks[0].lines).toEqual([
+      { type: 'add', newLine: 1, oldLine: null, text: 'line one' },
+      { type: 'add', newLine: 2, oldLine: null, text: 'line two' },
+      { type: 'add', newLine: 3, oldLine: null, text: 'line three' },
+    ]);
+  });
+
+  it('parses a mixed patch where a valid hunk is followed by a new-file hunk', () => {
+    // A valid hunk followed by a new-file hunk (`@@ -0,0 +1,2 @@`). Both must
+    // parse correctly — the second hunk's body must NOT bleed into the first
+    // hunk with wrong line numbers. See F02.
+    const patch = [
+      '@@ -1,2 +1,2 @@',
+      ' ctx at 1',
+      '+changed at 2',
+      '@@ -0,0 +1,2 @@',
+      '+brand new at 1',
+      '+brand new at 2',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toHaveLength(2);
+    expect(hunks[0]).toMatchObject({ oldStart: 1, newStart: 1 });
+    expect(hunks[0].lines).toEqual([
+      { type: 'ctx', newLine: 1, oldLine: 1, text: 'ctx at 1' },
+      { type: 'add', newLine: 2, oldLine: null, text: 'changed at 2' },
+    ]);
+    expect(hunks[1]).toMatchObject({ oldStart: 0, newStart: 1 });
+    expect(hunks[1].lines).toEqual([
+      { type: 'add', newLine: 1, oldLine: null, text: 'brand new at 1' },
+      { type: 'add', newLine: 2, oldLine: null, text: 'brand new at 2' },
+    ]);
+  });
+
+  it('does not bleed body lines of a rejected hunk into the prior valid hunk', () => {
+    // If a hunk header is rejected (e.g. a malformed @@ line), its body lines
+    // must NOT be attached to the previous valid hunk. See F02.
+    const patch = [
+      '@@ -1,1 +1,1 @@',
+      '+valid at 1',
+      '@@ not-a-real-hunk',
+      '+orphan body line',
+      '+another orphan',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0].lines).toEqual([
+      { type: 'add', newLine: 1, oldLine: null, text: 'valid at 1' },
+    ]);
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -190,6 +253,21 @@ describe('isValidCommentLine', () => {
     expect(isValidCommentLine(patch, 10)).toBe(true);
     expect(isValidCommentLine(patch, 100)).toBe(true);
     expect(isValidCommentLine(patch, 55)).toBe(false);
+  });
+
+  it('returns the right valid lines for a new-file-only patch (@@ -0,0 +1,N @@)', () => {
+    // A newly-created file has oldStart=0. All added new-side lines must be
+    // valid comment anchors. See F01.
+    const patch = [
+      '@@ -0,0 +1,3 @@',
+      '+line one',
+      '+line two',
+      '+line three',
+    ].join('\n');
+    expect(isValidCommentLine(patch, 1)).toBe(true);
+    expect(isValidCommentLine(patch, 2)).toBe(true);
+    expect(isValidCommentLine(patch, 3)).toBe(true);
+    expect(isValidCommentLine(patch, 4)).toBe(false);
   });
 });
 

@@ -663,6 +663,22 @@ describe('formatFindingsAsSummary', () => {
     expect(out).not.toContain('undefined');
     expect(out).not.toContain('NaN');
   });
+
+  it('escapes backticks in evidence so the inline-code span is not corrupted (F05)', () => {
+    // Evidence is rendered inside backtick code spans. A backtick in the
+    // evidence would close the span early and corrupt the markdown.
+    const out = formatFindingsAsSummary([
+      {
+        ...validFinding(),
+        evidence: 'foo`bar',
+      },
+    ]);
+    // The literal unescaped "foo`bar" must NOT appear (the backtick must be
+    // escaped so the inline code span is preserved).
+    expect(out).not.toContain('foo`bar');
+    // The escaped form should be present.
+    expect(out).toContain('foo\\`bar');
+  });
 });
 
 describe('parseStructuredReview', () => {

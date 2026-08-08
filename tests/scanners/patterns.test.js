@@ -76,9 +76,9 @@ describe('astGrepPatternToRegex', () => {
     expect(re).toBeInstanceOf(RegExp);
     expect(re.test('eval("foo")')).toBe(true);
     expect(re.test('eval(x, y, z)')).toBe(true);
-    // `eval` is a substring of `noteval`, so the line-based match fires.
-    // (ast-grep would NOT match — the regex fallback is less precise by design.)
-    expect(re.test('noteval')).toBe(true);
+    // Parens are now escaped (W2-02), so `noteval` (no paren after `eval`)
+    // correctly does NOT match — the regex fallback is now more precise.
+    expect(re.test('noteval')).toBe(false);
     // Anchoring the search demonstrates the regex works as expected.
     expect(re.test(' eval("foo")')).toBe(true);
   });
@@ -107,6 +107,37 @@ describe('astGrepPatternToRegex', () => {
   it('handles a TODO marker (substring match)', () => {
     const re = astGrepPatternToRegex('TODO');
     expect(re.test('// TODO: fix this')).toBe(true);
+  });
+
+  it('does NOT emit a regex beginning with .*? (ReDoS guard)', () => {
+    // A leading unanchored `.*?` causes catastrophic backtracking on long
+    // near-miss lines. The sql-concat rule (`$CONN.query("$$$" + $VAR)`)
+    // historically translated to a regex starting with `.*?`.
+    const re = astGrepPatternToRegex('$CONN.query("$$$" + $VAR)');
+    expect(re).toBeInstanceOf(RegExp);
+    // The regex source must NOT start with the unanchored wildcard `.*?`.
+    expect(re.source.startsWith('.*?')).toBe(false);
+  });
+
+  it('sql-concat regex completes quickly on a long near-miss line (no ReDoS)', () => {
+    // A pathological line that nearly matches (lots of `a`s, never hits the
+    // required `.query("` literal). Must complete in well under a second.
+    const re = astGrepPatternToRegex('$CONN.query("$$$" + $VAR)');
+    expect(re).toBeInstanceOf(RegExp);
+    const evil = '+const x = ' + 'a'.repeat(50000) + '!';
+    const start = Date.now();
+    re.lastIndex = 0;
+    re.test(evil);
+    const elapsed = Date.now() - start;
+    // Generous threshold (a well-behaved regex is <50ms; ReDoS is >1000ms).
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('sql-concat rule still matches a real SQL-concat line after the ReDoS fix', () => {
+    // The fix must not break legitimate detection. Parens are now escaped
+    // (W2-02), so the regex matches real parenthesized SQL-concat code.
+    const re = astGrepPatternToRegex('$CONN.query("$$$" + $VAR)');
+    expect(re.test('const r = conn.query("SELECT * FROM users" + userId)')).toBe(true);
   });
 });
 

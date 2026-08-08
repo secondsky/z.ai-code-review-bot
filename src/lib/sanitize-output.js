@@ -68,6 +68,11 @@ const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
   let inFence = false; // ``` fence state, tracked across lines
+  // Index in `out` of the most recent OPENING fence line, or -1 when the last
+  // seen fence was properly closed. If the loop ends with inFence === true
+  // (an unclosed fence), we re-neutralize the lines after this opening line so
+  // an attacker cannot smuggle @mentions through by leaving a fence open (C02).
+  let unclosedStart = -1;
   const out = [];
   for (const line of lines) {
     // Toggle fence state if the line opens/closes a ``` block.
@@ -78,10 +83,12 @@ function neutralizeMentionsOutsideCode(text) {
     if (/^\s*```/.test(line)) {
       if (inFence) {
         inFence = false;
+        unclosedStart = -1; // this fence closed cleanly
         out.push(line);
         continue;
       }
       inFence = true;
+      unclosedStart = out.length; // index where the opening fence line lands
       out.push(line);
       continue;
     }
@@ -90,6 +97,16 @@ function neutralizeMentionsOutsideCode(text) {
       continue;
     }
     out.push(neutralizeMentionsInLine(line));
+  }
+  // C02: a fence was opened but never closed. The lines after the opening fence
+  // line were treated as "inside fence" and pushed verbatim — but a properly
+  // formed review would have closed the fence, so those lines are actually
+  // prose and their @mentions must be neutralized. Re-process them now. The
+  // opening fence line itself is left as-is.
+  if (unclosedStart >= 0) {
+    for (let i = unclosedStart + 1; i < out.length; i++) {
+      out[i] = neutralizeMentionsInLine(out[i]);
+    }
   }
   return out.join('\n');
 }

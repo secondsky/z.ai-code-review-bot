@@ -28,6 +28,25 @@ import { MARKER } from './comments.js';
 export const DEFAULT_MAX_PRS = 10;
 
 /**
+ * Determine whether a comment was authored by a bot. Used to gate marker-based
+ * dedup so a drive-by human commenter cannot suppress a scheduled review or
+ * hijack the bot's review thread by posting a comment containing the marker.
+ *
+ * Accepts EITHER signal GitHub surfaces for bot accounts: an explicit
+ * `user.type === 'Bot'` (set for GitHub Apps bot accounts) OR a `user.login`
+ * ending in `[bot]` (the convention for actions and other bot identities).
+ *
+ * @param {{user?: {type?: string, login?: string}}} comment
+ * @returns {boolean}
+ */
+function isBotComment(comment) {
+  const user = comment?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * List open PRs (paginated), returning a minimal shape per PR. Stops once
  * `maxPrs` have been accumulated or the list is exhausted.
  *
@@ -72,11 +91,16 @@ export async function listOpenPrs({
  * Determine whether a PR already has a Z.ai marker comment for the given head
  * SHA. Paginates `listComments` fully so a buried marker is still found.
  *
- * Returns true if ANY comment body contains both the marker and the head SHA
- * (the upsert updates the marker comment in place, so its body carries the
- * current SHA's review; matching on the SHA means a re-push to an old SHA is
- * detected as "not yet reviewed"). When the SHA is unknown, falls back to
+ * Returns true if a BOT-AUTHORED comment body contains both the marker and the
+ * head SHA (the upsert updates the marker comment in place, so its body carries
+ * the current SHA's review; matching on the SHA means a re-push to an old SHA
+ * is detected as "not yet reviewed"). When the SHA is unknown, falls back to
  * marker-only matching.
+ *
+ * SECURITY: The author check (`user.type === 'Bot'` OR `user.login` ends with
+ * `[bot]`) is mandatory. Without it, any commenter (including NONE-association
+ * drive-by users) could post a comment containing the marker + head SHA and
+ * cause the scheduled review to SKIP that PR — a trivial review-suppression.
  *
  * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker }`
  * @returns {Promise<boolean>}
@@ -101,6 +125,7 @@ export async function hasReviewForSha({
     });
     const found = comments.some(
       (c) =>
+        isBotComment(c) &&
         typeof c?.body === 'string' &&
         c.body.includes(marker) &&
         (headSha === '' || c.body.includes(headSha)),

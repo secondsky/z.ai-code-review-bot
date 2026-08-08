@@ -123,6 +123,22 @@ describe('countTodosInPatch', () => {
     expect(countTodosInPatch(patch)).toBe(2);
   });
 
+  it('does NOT count XXX as a substring of larger words (word-boundary match)', () => {
+    // `XXXL` and `XXXY` are NOT TODO markers (XXX glued to other word chars);
+    // only a standalone `XXX` (with word boundaries) should count.
+    const patch = [
+      '+const size = "XXXL"', // clothing size — not a marker
+      '+const code = "XXXY"', // not a marker
+    ].join('\n');
+    expect(countTodosInPatch(patch)).toBe(0);
+  });
+
+  it('still counts a real XXX marker with word boundaries', () => {
+    // A genuine `// XXX:` comment must still register.
+    expect(countTodosInPatch('+// XXX: ugly hack')).toBe(1);
+    expect(countTodosInPatch('+// XXX hack here')).toBe(1);
+  });
+
   it('counts only ONE per line even with multiple markers', () => {
     const patch = '+// TODO and FIXME both here';
     expect(countTodosInPatch(patch)).toBe(1);

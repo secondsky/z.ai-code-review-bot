@@ -109,6 +109,30 @@ describe('resolveCachePath', () => {
   it('throws when version missing', () => {
     expect(() => resolveCachePath({ cacheDir: '/c', name: 'a' })).toThrow(/version/);
   });
+
+  it('rejects a name containing a forward slash (path traversal guard)', () => {
+    expect(() =>
+      resolveCachePath({ cacheDir: '/c', name: '../evil', version: '1.0' }),
+    ).toThrow();
+  });
+
+  it('rejects a name containing a backslash (path traversal guard)', () => {
+    expect(() =>
+      resolveCachePath({ cacheDir: '/c', name: '..\\evil', version: '1.0' }),
+    ).toThrow();
+  });
+
+  it('rejects a version containing a path separator (path traversal guard)', () => {
+    expect(() =>
+      resolveCachePath({ cacheDir: '/c', name: 'gl', version: '../../../etc/passwd' }),
+    ).toThrow();
+  });
+
+  it('rejects a version containing a backslash (path traversal guard)', () => {
+    expect(() =>
+      resolveCachePath({ cacheDir: '/c', name: 'gl', version: '..\\..\\evil' }),
+    ).toThrow();
+  });
 });
 
 describe('selectPlatformAsset', () => {

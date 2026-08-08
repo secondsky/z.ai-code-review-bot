@@ -7,12 +7,24 @@
 import { matchesAnyPattern } from './glob.js';
 
 /**
+ * Defensive ceilings on pagination. GitHub PRs are bounded in practice, but a
+ * misconfigured octokit stub or a pathological response (every page full,
+ * forever) would loop without end. These caps make that impossible.
+ */
+const MAX_PAGES = 100;
+const MAX_FILES = 3000;
+
+/**
  * Fetch ALL changed files in a PR, paginating `pulls.listFiles`.
  *
  * Pages start at 1 and end as soon as a page returns fewer than `perPage`
  * items (the last page is short). Files without a `patch` (binary blobs or
  * diffs GitHub refuses to render) are still included; callers filter on
  * `.patch` via {@link filterPatchableFiles}.
+ *
+ * Defensive ceilings: fetching also stops once {@link MAX_PAGES} pages or
+ * {@link MAX_FILES} files have been accumulated, so a runaway response cannot
+ * loop forever.
  *
  * @param {object} args
  * @param {object} args.octokit    Octokit instance (rest.pulls.listFiles used).
@@ -37,6 +49,12 @@ export async function getChangedFiles({ octokit, owner, repo, pullNumber, perPag
       all.push(file);
     }
     if (data.length < perPage) {
+      break;
+    }
+    if (page >= MAX_PAGES) {
+      break;
+    }
+    if (all.length >= MAX_FILES) {
       break;
     }
     page += 1;

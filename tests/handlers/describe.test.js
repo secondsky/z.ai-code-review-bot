@@ -199,6 +199,83 @@ describe('handleDescribeCommand — ZAI_DESCRIBE_WRITE_BODY (opt-in body upsert)
   });
 });
 
+describe('handleDescribeCommand — H1/M3 sanitization of model output', () => {
+  it('sanitizes @mentions in the description before posting it as a comment', async () => {
+    const octokit = makeOctokit();
+    // Raw model output containing an @mention that the sanitizer must break
+    // (zero-width space inserted after the @) so GitHub won't trigger a ping.
+    const callApi = vi.fn(async () => 'Hey @everyone look here');
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    const body = octokit.__calls.createComment[0].body;
+    // The raw mention trigger must NOT appear.
+    expect(body).not.toContain('@everyone');
+    // Sanitized form: @ + zero-width space + everyone.
+    expect(body).toContain('@\u200beveryone');
+  });
+
+  it('sanitizes @mentions in the description before upserting the PR body (ZAI_DESCRIBE_WRITE_BODY)', async () => {
+    const octokit = makeOctokit({ pr: { body: '' } });
+    const callApi = vi.fn(async () => 'Ping @evil-org/security-team now');
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', describeWriteBody: true },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    expect(octokit.__calls.update).toHaveLength(1);
+    const newBody = octokit.__calls.update[0].body;
+    // Raw mention must NOT reach pulls.update.
+    expect(newBody).not.toContain('@evil-org/security-team');
+    expect(newBody).toContain('@\u200bevil-org/security-team');
+  });
+
+  it('caps overly-long model output before upserting the PR body (M3: avoids GitHub 422)', async () => {
+    const octokit = makeOctokit({ pr: { body: '' } });
+    // 70000 chars of 'a' — well over GitHub's 65536 PR-body limit and over
+    // sanitizeModelOutput's 16000 cap. The sanitizer must truncate it.
+    const huge = 'a'.repeat(70000);
+    const callApi = vi.fn(async () => huge);
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', describeWriteBody: true },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    const newBody = octokit.__calls.update[0].body;
+    // Must be well under the 65536 limit after sanitization.
+    expect(newBody.length).toBeLessThan(65536);
+    expect(newBody).toContain('truncated by Z.ai safety filter');
+  });
+
+  it('caps overly-long model output before posting as a comment', async () => {
+    const octokit = makeOctokit();
+    const huge = 'a'.repeat(70000);
+    const callApi = vi.fn(async () => huge);
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    const body = octokit.__calls.createComment[0].body;
+    expect(body.length).toBeLessThan(65536);
+    expect(body).toContain('truncated by Z.ai safety filter');
+  });
+});
+
 describe('handleDescribeCommand — error path', () => {
   it('callApi rejects → short error comment, no throw', async () => {
     const octokit = makeOctokit();

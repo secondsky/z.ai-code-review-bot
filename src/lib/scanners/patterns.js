@@ -175,15 +175,25 @@ export function astGrepPatternToRegex(pattern) {
   let translated = pattern
     .replace(/\$\$\$[A-Z]*/g, PLACEHOLDER) // $$$ARGS, $$$
     .replace(/\$[A-Z]+/g, PLACEHOLDER); // $VALUE, $X
-  // Step 2: escape regex metacharacters in the literal portions. We leave
-  // `{`, `}`, `(`, `)` UN-ESCAPED: in ast-grep patterns these are structural
-  // syntax that should match literally, and JS regex treats literal `{`, `}`,
-  // `(`, `)` that aren't part of a quantifier/group as literal characters.
-  translated = translated.replace(/[.*+?^$|[\]\\]/g, '\\$&');
+  // Step 2: escape regex metacharacters in the literal portions. Parentheses
+  // ARE escaped (they are literal syntax in the source code being scanned, not
+  // regex groups). Curly braces are left unescaped since they are rarely
+  // meaningful in the code patterns we translate and JS regex treats bare
+  // `{`, `}` as literal characters.
+  translated = translated.replace(/[.*+?^$|[\]\\()]/g, '\\$&');
   // Step 3: replace the placeholder with the actual `.*?` wildcard.
   // The placeholder contains \u0000 which is not a regex metachar, so the
   // escape step left it alone.
   translated = translated.split(PLACEHOLDER).join('.*?');
+  // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
+  // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
+  // suffers catastrophic backtracking on long near-miss lines. Strip a leading
+  // `.*?` — `RegExp.test()` already scans every start position, so the rest of
+  // the pattern still matches anywhere in the line, just without the unbounded
+  // backtracking wildcard prefix.
+  if (translated.startsWith('.*?')) {
+    translated = translated.slice(3);
+  }
   try {
     return new RegExp(translated);
   } catch {

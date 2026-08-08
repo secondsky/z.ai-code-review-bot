@@ -124,6 +124,38 @@ describe('parseSeverity', () => {
   it('returns null when no severity keyword is present', () => {
     expect(parseSeverity('Some generic assessment without a level.')).toBeNull();
   });
+
+  it('M2: does NOT match "highlighted" as "high" (word-boundary)', () => {
+    expect(parseSeverity('The diff is highlighted for visibility')).toBeNull();
+  });
+
+  it('M2: does NOT match "noncritical" as "critical" (substring)', () => {
+    expect(parseSeverity('This is a noncritical change')).toBeNull();
+  });
+
+  it('W2-01: does NOT match "non-critical" (hyphenated negation)', () => {
+    expect(parseSeverity('This is a non-critical change')).toBeNull();
+  });
+
+  it('W2-01: does NOT match "not critical" / "no critical" (negation phrases)', () => {
+    expect(parseSeverity('not critical')).toBeNull();
+    expect(parseSeverity('no critical issues')).toBeNull();
+    expect(parseSeverity('no critical issues, this is straightforward')).toBeNull();
+    expect(parseSeverity("isn't high risk")).toBeNull();
+  });
+
+  it('M2: does NOT match "lowlight" or "highlight" substrings', () => {
+    expect(parseSeverity('lowlight region')).toBeNull();
+    expect(parseSeverity('highlighted section')).toBeNull();
+  });
+
+  it('M2: matches "medium" as a standalone word in a sentence', () => {
+    expect(parseSeverity('Risk is medium overall')).toBe('medium');
+  });
+
+  it('M2: matches "critical" on its own first line even with surrounding text', () => {
+    expect(parseSeverity('critical\nlarge blast radius')).toBe('critical');
+  });
 });
 
 describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)', () => {

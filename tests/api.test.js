@@ -1056,4 +1056,48 @@ describe('createApiClient', () => {
     expect(body).not.toHaveProperty('temperature');
     expect(body).not.toHaveProperty('max_tokens');
   });
+
+  test('BUG3: maxRetries is clamped to [0,10] — a runaway maxRetries does not cause ~1M attempts', async () => {
+    // A misconfigured maxRetries: 1000000 would cause ~1M attempts on a
+    // retryable error. The factory must clamp it to a sane ceiling.
+    let attemptCount = 0;
+    const request = makeFakeRequest(() => {
+      attemptCount++;
+      // Always 500 → retryable, so the loop runs until it gives up.
+      return { res: buildFakeRes(['err'], { statusCode: 500 }) };
+    });
+    const client = createApiClient({ maxRetries: 1000000, baseDelay: 2000, baseTimeout: 120000 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(false);
+    // Clamped to 10 → at most 11 attempts (0..10 inclusive).
+    expect(attemptCount).toBeLessThanOrEqual(11);
+    expect(attemptCount).toBeLessThan(100); // hard guard against runaway
+  });
+
+  test('BUG3: negative maxRetries is clamped to 0 (a single attempt, no retries)', async () => {
+    let attemptCount = 0;
+    const request = makeFakeRequest(() => {
+      attemptCount++;
+      return { res: buildFakeRes(['err'], { statusCode: 500 }) };
+    });
+    const client = createApiClient({ maxRetries: -5, baseDelay: 2000, baseTimeout: 120000 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(false);
+    // maxRetries clamped to 0 → exactly 1 attempt.
+    expect(attemptCount).toBe(1);
+  });
 });

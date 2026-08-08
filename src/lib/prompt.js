@@ -50,13 +50,52 @@ export function escapeXmlAttribute(s) {
  * filename header. Replaces backticks (which would open/close a fence) and
  * newlines (which could start a new line that escapes the fence context).
  *
+ * Also neutralizes the literal `<untrusted_input` / `</untrusted_input` tag
+ * sequences so a hostile repo-config value cannot close the wrapping
+ * `<untrusted_input>` element early and inject trusted-looking instructions
+ * (C01). Other `<` usage (e.g. `Array<T>` in code examples) is preserved.
+ *
  * @param {string} s
  * @returns {string}
  */
 export function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/\r?\n/g, ' ');
+    .replace(/\r?\n/g, ' ')
+    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+}
+
+/**
+ * Escape a MULTI-LINE untrusted string for placement inside an
+ * `<untrusted_input>` wrapper. Unlike {@link escapeDiffFence} (which collapses
+ * newlines for single-line fields), this preserves line breaks so multi-line
+ * content like scanner findings lists retain their structure. It neutralizes
+ * the `<untrusted_input` closing/opening tag sequences (C01) and replaces
+ * backticks (which could close a markdown code fence).
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+export function escapeUntrustedMultiline(s) {
+  return String(s ?? '')
+    .replace(/`/g, "'")
+    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+}
+
+/**
+ * Wrap a block of untrusted content in `<untrusted_input>` tags with the
+ * preamble, for use by command-handler prompts (/zai ask, explain, etc.) that
+ * interpolate PR content (title, body, diff, commit messages, code). The
+ * content is escaped via {@link escapeUntrustedMultiline} so it cannot close
+ * the wrapper early (C01). Multi-line structure is preserved.
+ *
+ * @param {string} content  The untrusted content to wrap.
+ * @param {string} [source]  Optional source label for the wrapper.
+ * @returns {string}
+ */
+export function wrapUntrusted(content, source = 'pr-content') {
+  const escaped = escapeUntrustedMultiline(content);
+  return `${UNTRUSTED_PREAMBLE}\n\n<untrusted_input source="${source}">\n${escaped}\n</untrusted_input>`;
 }
 
 /**
@@ -161,10 +200,12 @@ export function buildStructuredReviewPrompt(files, options = {}) {
   const instruction = `${UNTRUSTED_PREAMBLE}\n\n${STRUCTURED_REVIEW_INSTRUCTION}\n\nEmit at most ${maxFindings} findings, prioritizing the highest-severity issues.`;
 
   // Optional scanner context: deterministic findings already detected — tell
-  // the model NOT to re-report them.
+  // the model NOT to re-report them. The scanner output (attacker-controlled
+  // filenames + diff evidence) is wrapped in <untrusted_input> and escaped,
+  // like every other repo-controlled field (A04).
   const scannerBlock =
     typeof options.scannerContext === 'string' && options.scannerContext.length > 0
-      ? `\n\nThe following issues were already detected deterministically by automated scanners. Do NOT re-report these; focus on logic, architecture, and issues scanners miss.\n\n${options.scannerContext}`
+      ? `\n\nThe following issues were already detected deterministically by automated scanners. Do NOT re-report these; focus on logic, architecture, and issues scanners miss.\n\n<untrusted_input source="scanner">\n${escapeUntrustedMultiline(options.scannerContext)}\n</untrusted_input>`
       : '';
 
   // Optional per-path review guidelines (from .zai.yml — UNTRUSTED, wrapped).

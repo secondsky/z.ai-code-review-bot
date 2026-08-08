@@ -13,6 +13,7 @@
  * throws; no `@actions/core` import; no direct network.
  */
 import { postComment, getPRContext } from './_shared.js';
+import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
 
 /** Fixed error comment (no raw error leakage). */
@@ -123,9 +124,7 @@ export function buildExplainPrompt({ file, start, end, window }) {
     'Describe what this code does, why it is there, and any concerns a',
     'reviewer should know about. Be concise.',
     '',
-    '```',
-    window,
-    '```',
+    wrapUntrusted(window, 'code-window'),
   ].join('\n');
 }
 

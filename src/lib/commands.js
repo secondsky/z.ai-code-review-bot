@@ -75,17 +75,11 @@ export function parseCommand(text) {
   }
 
   // First token is the command; the rest is args (single trimmed string).
-  const sp = remainder.indexOf(' ');
-  let command;
-  let args;
-  if (sp === -1) {
-    command = remainder;
-    args = '';
-  } else {
-    command = remainder.slice(0, sp);
-    args = remainder.slice(sp + 1).trim();
-  }
-  command = command.toLowerCase();
+  // Split on ANY whitespace (\s, covers spaces/tabs/multiple spaces), not just
+  // a literal ' ', so `/zai\task hi` and `/zai  ask   hi` parse correctly.
+  const match = remainder.match(/^(\S+)(?:\s+(.*))?$/);
+  let command = match ? match[1].toLowerCase() : remainder.toLowerCase();
+  let args = match && match[2] ? match[2].trim() : '';
 
   if (!ALLOWED_SET.has(command)) {
     return { command, args, raw: text, error: 'UNKNOWN_COMMAND' };

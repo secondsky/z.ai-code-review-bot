@@ -438,7 +438,7 @@ describe('run — pull_request auto-review', () => {
     const marker = '<!-- zai-code-review -->';
     const octokit = makeOctokit({
       files: [file('src/a.js')],
-      list: [{ id: 555, body: `## Z.ai Code Review\n\nold\n\n${marker}` }],
+      list: [{ id: 555, body: `## Z.ai Code Review\n\nold\n\n${marker}`, user: { login: 'github-actions[bot]', type: 'Bot' } }],
     });
     const callApi = vi.fn(async () =>
       JSON.stringify({ summary: 's', findings: [] }),
@@ -668,6 +668,28 @@ describe('run — pull_request auto-review', () => {
       apiClient: { call: vi.fn() },
     });
     expect(core.setFailed).toHaveBeenCalledWith('not a pull request');
+  });
+
+  it('setFails gracefully when context.repo is undefined (no TypeError)', async () => {
+    // A pull_request event whose context.repo is missing must NOT crash with a
+    // TypeError on destructuring; it should set a failure status and return.
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [] });
+    const ctx = {
+      eventName: 'pull_request',
+      // context.repo is undefined — destructuring `{ owner, repo }` must not throw.
+      payload: { pull_request: { number: 42 } },
+    };
+    await expect(
+      run(ctx, {
+        config: makeConfig(),
+        core,
+        octokit,
+        callApi: vi.fn(),
+        apiClient: { call: vi.fn() },
+      }),
+    ).resolves.toBeUndefined();
+    expect(core.setFailed).toHaveBeenCalled();
   });
 });
 
@@ -1735,6 +1757,36 @@ describe('run — issue_comment routing', () => {
 
     expect(handler).toHaveBeenCalledTimes(1);
   });
+
+  it('fork gate: getPRContext returning null fails CLOSED (treats as fork, blocks)', async () => {
+    // When getPRContext resolves to null (not throws), the fork resolver must
+    // NOT default to isFork=false (fail open). It must fail closed so a broken
+    // PR lookup cannot let a fork command through the gate.
+    const core = makeCore();
+    const octokit = makeOctokit();
+    const handler = vi.fn();
+
+    await run(
+      commentContext({
+        body: '/zai ask hi',
+        association: 'COLLABORATOR',
+        login: 'alice',
+      }),
+      {
+        // allowForkCommands defaults to false → fork gate is active.
+        config: makeConfig(),
+        core,
+        octokit,
+        callApi: vi.fn(),
+        apiClient: { call: vi.fn() },
+        handlers: { ask: handler },
+        getPRContext: vi.fn(async () => null), // resolves null, does NOT throw
+      },
+    );
+
+    // Fail-closed: the command from a (presumed) fork must be blocked.
+    expect(handler).not.toHaveBeenCalled();
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -2317,5 +2369,17 @@ describe('httpsGet', () => {
 
   it('rejects on empty / non-string url', async () => {
     await expect(httpsGet('')).rejects.toThrow(/url is required/);
+  });
+
+  it('rejects non-https URLs (defense-in-depth)', async () => {
+    await expect(httpsGet('http://example.com/file')).rejects.toThrow(/non-https/);
+  });
+
+  it('rejects untrusted redirect hosts by default (W3S-03)', async () => {
+    await expect(httpsGet('https://evil.example.com/file')).rejects.toThrow(/untrusted host/);
+  });
+
+  it('rejects invalid URLs cleanly', async () => {
+    await expect(httpsGet('not-a-url')).rejects.toThrow(/invalid url/);
   });
 });

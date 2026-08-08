@@ -32,6 +32,12 @@ const MAX_REPO_CONFIG_BYTES = 64 * 1024; // 64 KiB
 const MAX_TONE_INSTRUCTIONS_CHARS = 500;
 /** Maximum length of `reviews.language` after validation. */
 const MAX_LANGUAGE_CHARS = 20;
+/** Maximum length of a `path_instructions[].path` after validation. */
+const MAX_PATH_INSTRUCTION_PATH_CHARS = 500;
+/** Maximum length of a `path_instructions[].instructions` after validation. */
+const MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS = 1000;
+/** Maximum number of `path_instructions` entries kept after validation. */
+const MAX_PATH_INSTRUCTION_ENTRIES = 50;
 
 /**
  * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
@@ -342,7 +348,8 @@ export function validateRepoConfig(parsed) {
     if (Array.isArray(r.path_instructions)) {
       const arr = r.path_instructions
         .map((entry) => normalizePathInstruction(entry))
-        .filter((e) => e !== null);
+        .filter((e) => e !== null)
+        .slice(0, MAX_PATH_INSTRUCTION_ENTRIES);
       if (arr.length > 0) rv.path_instructions = arr;
     }
     if (Array.isArray(r.path_filters)) {
@@ -390,7 +397,17 @@ function normalizePathInstruction(entry) {
   const instructions = entry.instructions;
   if (typeof path !== 'string' || path.trim() === '') return null;
   if (typeof instructions !== 'string' || instructions.trim() === '') return null;
-  return { path, instructions };
+  // Cap field lengths (truncate, mirroring tone_instructions/language handling)
+  // so an attacker-controlled .zai.yml cannot bloat the prompt unboundedly.
+  const cappedPath =
+    path.length > MAX_PATH_INSTRUCTION_PATH_CHARS
+      ? path.slice(0, MAX_PATH_INSTRUCTION_PATH_CHARS)
+      : path;
+  const cappedInstructions =
+    instructions.length > MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS
+      ? instructions.slice(0, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS)
+      : instructions;
+  return { path: cappedPath, instructions: cappedInstructions };
 }
 
 /* ------------------------------------------------------------------ *
@@ -457,11 +474,13 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
 
   // Scanners: master switch is action-only; repo can only DISABLE.
   const scannersEnabled = a.scannersEnabled !== false;
-  const mergedScanners = {
-    // `false` in repo disables; otherwise the action default applies.
-    gitleaks: scanners.gitleaks === false ? false : true,
-    ast_grep: scanners.ast_grep === false ? false : true,
-  };
+  const mergedScanners = scannersEnabled
+    ? {
+        // `false` in repo disables; otherwise the action default (enabled) applies.
+        gitleaks: scanners.gitleaks !== false,
+        ast_grep: scanners.ast_grep !== false,
+      }
+    : { gitleaks: false, ast_grep: false };
 
   return {
     ...a,

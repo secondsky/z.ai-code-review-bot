@@ -231,6 +231,28 @@ describe('validateRepoConfig — path_instructions', () => {
     const out = validateRepoConfig({ reviews: { path_instructions: 'not array' } });
     expect(out).not.toHaveProperty('reviews');
   });
+  it('truncates instructions longer than 1000 chars', () => {
+    const long = 'x'.repeat(2000);
+    const out = validateRepoConfig({
+      reviews: { path_instructions: [{ path: 'src/**', instructions: long }] },
+    });
+    expect(out.reviews.path_instructions[0].instructions.length).toBe(1000);
+  });
+  it('truncates path longer than 500 chars', () => {
+    const longPath = 'p'.repeat(1000);
+    const out = validateRepoConfig({
+      reviews: { path_instructions: [{ path: longPath, instructions: 'ok' }] },
+    });
+    expect(out.reviews.path_instructions[0].path.length).toBe(500);
+  });
+  it('caps total entries to 50', () => {
+    const entries = Array.from({ length: 100 }, (_, i) => ({
+      path: `p${i}`,
+      instructions: `i${i}`,
+    }));
+    const out = validateRepoConfig({ reviews: { path_instructions: entries } });
+    expect(out.reviews.path_instructions).toHaveLength(50);
+  });
 });
 
 describe('validateRepoConfig — path_filters', () => {
@@ -417,6 +439,24 @@ describe('mergeRepoConfig — scanners (can only DISABLE)', () => {
     );
     // Action master switch OFF → all scanners stay OFF regardless of repo.
     expect(merged.scannersEnabled).toBe(false);
+    expect(merged.scanners.gitleaks).toBe(false);
+    expect(merged.scanners.ast_grep).toBe(false);
+  });
+  it('master switch OFF forces ALL per-scanner flags false (no repo config)', () => {
+    // When the action turns scanners off entirely, the per-scanner booleans
+    // must also be false — they cannot default to true.
+    const merged = mergeRepoConfig({ scannersEnabled: false }, {});
+    expect(merged.scannersEnabled).toBe(false);
+    expect(merged.scanners.gitleaks).toBe(false);
+    expect(merged.scanners.ast_grep).toBe(false);
+  });
+  it('master switch OFF stays false even when repo explicitly enables both', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: false },
+      { scanners: { gitleaks: true, ast_grep: true } },
+    );
+    expect(merged.scanners.gitleaks).toBe(false);
+    expect(merged.scanners.ast_grep).toBe(false);
   });
   it('repo true keeps a scanner on (when action enabled)', () => {
     const merged = mergeRepoConfig(

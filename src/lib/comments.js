@@ -14,6 +14,23 @@ import { sanitizeCommentBody } from './sanitize-output.js';
 export const MARKER = '<!-- zai-code-review -->';
 
 /**
+ * Determine whether a comment was authored by a bot. Used to gate marker-based
+ * matching so a drive-by human commenter cannot post the marker and cause the
+ * bot to overwrite THEIR comment on every run (comment hijack). Accepts EITHER
+ * signal GitHub surfaces for bot accounts: `user.type === 'Bot'` (GitHub Apps
+ * bot accounts) OR `user.login` ending in `[bot]` (actions and other bots).
+ *
+ * @param {{user?: {type?: string, login?: string}}} comment
+ * @returns {boolean}
+ */
+function isBotComment(comment) {
+  const user = comment?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * Build the comment body from a title and content, appending the marker. The
  * model `content` is run through the output sanitizer first so an indirect
  * prompt-injection cannot coax the bot into emitting @mention spam or forged
@@ -43,7 +60,11 @@ export function buildCommentBody({ title, content, marker }) {
  *    first 100. Without full pagination a PR with >100 comments would lose the
  *    marker comment from the visible window and create a duplicate summary on
  *    every run.
- * 2. Find the first whose body contains `marker` (default {@link MARKER}).
+ * 2. Find the first BOT-AUTHORED comment whose body contains `marker` (default
+ *    {@link MARKER}). The author check (`user.type === 'Bot'` OR `user.login`
+ *    ends with `[bot]`) is mandatory: without it, a non-bot user could post a
+ *    comment containing the marker and the bot would overwrite THEIR comment on
+ *    every run — a comment-hijack that lets an attacker masquerade as the bot.
  * 3. Update it if found, otherwise create a new comment.
  *
  * `listComments` rejections propagate (not swallowed).
@@ -82,7 +103,9 @@ export async function upsertReviewComment({
       page,
     });
     existing =
-      comments.find((c) => typeof c?.body === 'string' && c.body.includes(marker)) ?? null;
+      comments.find(
+        (c) => isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
+      ) ?? null;
     if (existing) break; // found it — no need to fetch more pages
     if (comments.length < perPage) break; // last page reached
     page += 1;
