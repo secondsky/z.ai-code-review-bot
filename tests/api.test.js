@@ -122,10 +122,10 @@ function makeFakeRequest(behavior) {
  * ------------------------------------------------------------ */
 
 describe('extractStatusCode', () => {
-  test('extracts a 4xx/5xx number from a message', () => {
+  test('extracts a 4xx/5xx number from an HTTP error message', () => {
     expect(extractStatusCode('Z.ai API error 429: rate limited')).toBe(429);
     expect(extractStatusCode('Z.ai API error 503: unavailable')).toBe(503);
-    expect(extractStatusCode('something 401 happened')).toBe(401);
+    expect(extractStatusCode('error 401 unauthorized')).toBe(401);
   });
 
   test('extracts a 4xx from JSON-ish code":NNN messages', () => {
@@ -1099,5 +1099,361 @@ describe('createApiClient', () => {
     expect(out.success).toBe(false);
     // maxRetries clamped to 0 → exactly 1 attempt.
     expect(attemptCount).toBe(1);
+  });
+});
+
+/* ============================================================ *
+ * EDGE-CASE TESTS (Task 4)
+ *
+ * These pin down known limitations and boundary conditions of
+ * the existing implementation. They do NOT change production
+ * code; they lock in current behavior so regressions surface.
+ * ============================================================ */
+
+/* ------------------------------------------------------------ *
+ * extractStatusCode — context-aware extraction (FIXED)
+ * ------------------------------------------------------------ */
+
+describe('extractStatusCode (edge cases)', () => {
+  test('does NOT extract a 3-digit code from a filename (context-aware)', () => {
+    // FIX: "404.js" is a filename, not an HTTP status. The extractor now
+    // requires the code to appear in an HTTP-error context (e.g. after
+    // "error", "status", "code") rather than glued to a file extension.
+    expect(extractStatusCode('error in file 404.js')).toBeNull();
+  });
+
+  test('does NOT extract a 4xx code from prose like "RFC 418" (context-aware)', () => {
+    // FIX: "418" in "RFC 418" is an RFC number, not an HTTP status.
+    expect(extractStatusCode('see RFC 418 for details')).toBeNull();
+  });
+
+  test('extracts code from the production error format "Z.ai API error NNN:"', () => {
+    expect(extractStatusCode('Z.ai API error 429: rate limited')).toBe(429);
+    expect(extractStatusCode('Z.ai API error 500: internal')).toBe(500);
+    expect(extractStatusCode('Z.ai API error 403: forbidden')).toBe(403);
+  });
+
+  test('extracts code after "status" or "code" keyword', () => {
+    expect(extractStatusCode('HTTP status 502')).toBe(502);
+    expect(extractStatusCode('status code 401 unauthorized')).toBe(401);
+    expect(extractStatusCode('response code": 403')).toBe(403);
+  });
+
+  test('returns null when no 3-digit 4xx/5xx code is present anywhere', () => {
+    // 2xx/3xx codes are ignored; pure text yields null.
+    expect(extractStatusCode('Request timed out')).toBeNull();
+    expect(extractStatusCode('all good: 200 ok')).toBeNull();
+    expect(extractStatusCode('redirect 301')).toBeNull();
+    expect(extractStatusCode('code is only 2 digits: 50')).toBeNull();
+  });
+
+  test('returns null for null / undefined / non-string input', () => {
+    expect(extractStatusCode(null)).toBeNull();
+    expect(extractStatusCode(undefined)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------ *
+ * categorizeError — full table-driven branch coverage
+ * ------------------------------------------------------------ */
+
+describe('categorizeError (table-driven branches)', () => {
+  // Each case drives exactly one branch of the if/else chain in categorizeError.
+  const cases = [
+    // timeout branch — keyword match, takes precedence over status codes
+    { name: 'message containing "timeout" → timeout/retryable', message: 'Request timeout', expected: { category: 'timeout', retryable: true } },
+    { name: 'message containing "timed out" → timeout/retryable', message: 'operation timed out', expected: { category: 'timeout', retryable: true } },
+    // rate-limit branch
+    { name: 'status 429 → rate-limit/retryable', message: 'Z.ai API error 429: slow down', expected: { category: 'rate-limit', retryable: true } },
+    // auth branch
+    { name: 'status 401 → auth/non-retryable', message: 'Z.ai API error 401: unauthorized', expected: { category: 'auth', retryable: false } },
+    { name: 'status 403 → auth/non-retryable', message: 'Z.ai API error 403: forbidden', expected: { category: 'auth', retryable: false } },
+    // validation branch
+    { name: 'status 400 → validation/non-retryable', message: 'Z.ai API error 400: bad request', expected: { category: 'validation', retryable: false } },
+    // provider branch via 5xx status
+    { name: 'status 500 → provider/retryable', message: 'Z.ai API error 500: oops', expected: { category: 'provider', retryable: true } },
+    { name: 'status 502 → provider/retryable', message: 'Z.ai API error 502: bad gateway', expected: { category: 'provider', retryable: true } },
+    { name: 'status 503 → provider/retryable', message: 'Z.ai API error 503: unavailable', expected: { category: 'provider', retryable: true } },
+    // provider branch via network errors (message is lowercased; the source
+    // matches the lowercase forms, so ECONNREFUSED → econnrefused matches).
+    { name: 'ECONNREFUSED → provider/retryable', message: 'connect ECONNREFUSED 1.2.3.4:443', expected: { category: 'provider', retryable: true } },
+    { name: 'ENETUNREACH → provider/retryable', message: 'ENETUNREACH', expected: { category: 'provider', retryable: true } },
+    // provider branch via empty response
+    { name: '"empty response" → provider/retryable', message: 'Z.ai API returned an empty response', expected: { category: 'provider', retryable: true } },
+    // fallback: unknown error
+    { name: 'unrecognized message → internal/non-retryable', message: 'something completely unknown', expected: { category: 'internal', retryable: false } },
+    // fallback: 4xx that isn't 400/401/403/429 (e.g. 413) → internal
+    { name: 'status 413 (not in matrix) → internal/non-retryable', message: 'Z.ai API error 413: too large', expected: { category: 'internal', retryable: false } },
+  ];
+
+  it.each(cases)('$name', ({ message, expected }) => {
+    expect(categorizeError(new Error(message))).toEqual(expected);
+  });
+
+  it.each([
+    { name: 'null error → internal/non-retryable', error: null },
+    { name: 'undefined error → internal/non-retryable', error: undefined },
+    { name: 'empty object → internal/non-retryable', error: {} },
+  ])('$name', ({ error, name: _name }) => {
+    // The source reads `error?.message ?? ''`; with no message it falls through
+    // to the final `return { category: 'internal', retryable: false }`.
+    expect(categorizeError(error)).toEqual({ category: 'internal', retryable: false });
+  });
+
+  test('timeout keyword takes precedence over an embedded 5xx status code', () => {
+    // The timeout check runs first; even though 503 is in the message, the
+    // category is timeout. Pin this precedence so reordering the if-chain
+    // would surface as a test failure.
+    expect(categorizeError(new Error('Request timed out (503)'))).toEqual({
+      category: 'timeout',
+      retryable: true,
+    });
+  });
+});
+
+/* ------------------------------------------------------------ *
+ * sanitizeErrorMessage — boundary & known limitation cases
+ * ------------------------------------------------------------ */
+
+describe('sanitizeErrorMessage (edge cases)', () => {
+  test('nested JSON containing a secret key is fully redacted (FIXED)', () => {
+    // FIX: Step 7 now handles one level of nesting, so a JSON object with a
+    // secret key AND a nested object is fully redacted.
+    // Before the fix: {"token":"x","nested":{"a":1}} was NOT matched because
+    // [^{}]* cannot span the inner braces, leaking the key name "token".
+    const out = sanitizeErrorMessage('err {"token":"topsecret","nested":{"a":1}} done');
+    // The secret key and value must not appear.
+    expect(out).not.toContain('topsecret');
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('nested JSON with secret in inner object is fully redacted (FIXED)', () => {
+    // {"a":{"token":"x"}} — the inner object with the secret is redacted.
+    const out = sanitizeErrorMessage('err {"a":{"token":"x"}} done');
+    expect(out).not.toContain('"token"');
+    expect(out).not.toContain(':x}');
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('camelCase "apiKey" is redacted (separator is optional in the regex)', () => {
+    // The regex `api[_-]?key` makes the separator optional, so camelCase
+    // `apiKey` matches. Verify both `apiKey=...` and `apiKey: ...` forms.
+    const out = sanitizeErrorMessage('err apiKey=topsecret boom');
+    expect(out).toContain('apiKey=[REDACTED]');
+    expect(out).not.toContain('topsecret');
+  });
+
+  test('camelCase "apiKey" with a colon is redacted', () => {
+    const out = sanitizeErrorMessage('err apiKey: topsecret boom');
+    expect(out).toContain('apiKey: [REDACTED]');
+    expect(out).not.toContain('topsecret');
+  });
+
+  test('a message of exactly 500 chars is NOT truncated', () => {
+    const msg = 'a'.repeat(500);
+    const out = sanitizeErrorMessage(msg);
+    expect(out.length).toBe(500);
+    expect(out.endsWith('...')).toBe(false);
+  });
+
+  test('a message of 501 chars IS truncated with "..."', () => {
+    const msg = 'a'.repeat(501);
+    const out = sanitizeErrorMessage(msg);
+    // Truncated to the first 500 chars + '...' (503 total).
+    expect(out.length).toBe(503);
+    expect(out.endsWith('...')).toBe(true);
+    expect(out.startsWith('a'.repeat(500))).toBe(true);
+  });
+
+  test('Bearer token with mixed case prefix is redacted (Bearer abc123)', () => {
+    const out = sanitizeErrorMessage('Bearer abc123 failed');
+    expect(out).toContain('Bearer [REDACTED]');
+    expect(out).not.toContain('abc123');
+  });
+
+  test('lowercase "bearer" prefix is also redacted', () => {
+    // The Bearer regex uses the /i flag, so case variants match.
+    const out = sanitizeErrorMessage('bearer xyz boom');
+    expect(out).toContain('bearer [REDACTED]');
+    expect(out).not.toContain('xyz');
+  });
+
+  test('credential URL https://user:pass@host.com/path is redacted', () => {
+    const out = sanitizeErrorMessage('failed https://user:pass@host.com/path boom');
+    expect(out).toContain('[URL_REDACTED]');
+    expect(out).not.toContain('user:pass');
+    expect(out).not.toContain('pass@host.com');
+  });
+
+  test('a raw string (not an Error object) is sanitized directly', () => {
+    // The function accepts a string message; verify it passes through and
+    // that redaction still applies.
+    const out = sanitizeErrorMessage('Authorization: Bearer leak');
+    expect(out).toContain('[REDACTED]');
+    expect(out).not.toContain('leak');
+  });
+
+  test('an Error-like object with .message works the same as a string', () => {
+    const out = sanitizeErrorMessage(new Error('Authorization: Bearer obj'));
+    expect(out).toContain('[REDACTED]');
+    expect(out).not.toContain('obj');
+  });
+
+  test('empty string message returns the fallback', () => {
+    // `if (!message)` catches the empty string.
+    expect(sanitizeErrorMessage('')).toBe('An unknown error occurred');
+  });
+});
+
+/* ------------------------------------------------------------ *
+ * callWithRetry — maxRetries boundaries
+ * ------------------------------------------------------------ */
+
+describe('callWithRetry (edge cases)', () => {
+  test('maxRetries: 0 → exactly ONE attempt with no retry, even for a retryable error', async () => {
+    // A 5xx error is normally retryable, but with maxRetries 0 the loop runs
+    // attempt 0 only and then gives up because attempt >= maxRetries.
+    let calls = 0;
+    const fn = () => {
+      calls++;
+      return Promise.reject(new Error('Z.ai API error 500: oops'));
+    };
+    const out = await callWithRetry(fn, {
+      maxRetries: 0,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+    });
+    expect(out.success).toBe(false);
+    expect(out.error.attempts).toBe(1);
+    expect(out.error.category).toBe('provider');
+    expect(out.error.retryable).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  test('non-retryable error (auth) fails immediately even with maxRetries > 0', async () => {
+    // 401 is non-retryable; the loop must bail on the first attempt without
+    // sleeping or retrying, regardless of maxRetries.
+    let calls = 0;
+    const fn = () => {
+      calls++;
+      return Promise.reject(new Error('Z.ai API error 401: no'));
+    };
+    const out = await callWithRetry(fn, {
+      maxRetries: 5,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {
+        throw new Error('sleep should not be called for a non-retryable error');
+      },
+    });
+    expect(out.success).toBe(false);
+    expect(out.error.category).toBe('auth');
+    expect(out.error.attempts).toBe(1);
+    expect(calls).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------ *
+ * createApiClient — maxRetries clamping & fallbackPrompt normalization
+ * ------------------------------------------------------------ */
+
+describe('createApiClient (edge cases)', () => {
+  test('maxRetries: 1000000 is clamped to 10', () => {
+    const client = createApiClient({ maxRetries: 1000000 });
+    expect(client.config.maxRetries).toBe(10);
+  });
+
+  test('maxRetries: 0 stays at 0', () => {
+    const client = createApiClient({ maxRetries: 0 });
+    expect(client.config.maxRetries).toBe(0);
+  });
+
+  test('maxRetries: -5 (negative) is clamped to 0', () => {
+    const client = createApiClient({ maxRetries: -5 });
+    expect(client.config.maxRetries).toBe(0);
+  });
+
+  test('maxRetries: undefined falls back to the default (3)', () => {
+    const client = createApiClient({});
+    expect(client.config.maxRetries).toBe(DEFAULT_MAX_RETRIES);
+  });
+
+  test('string fallbackPrompt is normalized to a function and activates the timeout-fallback path', async () => {
+    // Build a client with `fallbackPrompt: 'SHORT'` (a string). The factory
+    // must wrap it into `() => ({ prompt: 'SHORT' })` so the retry loop's
+    // timeout-fallback fires. First two attempts time out (triggering the
+    // fallback at attempt 1); the third succeeds with the fallback prompt.
+    const calls = [];
+    const request = (url, options) => {
+      const callIdx = calls.length;
+      const captured = { url, options, headers: options?.headers || {} };
+      calls.push(captured);
+      let responseCb = null;
+      let errorCb = null;
+      const req = {
+        on(event, cb) {
+          if (event === 'response') responseCb = cb;
+          else if (event === 'error') {
+            errorCb = cb;
+            if (callIdx < 2) {
+              queueMicrotask(() => cb(new Error('Request timed out')));
+            }
+          }
+          return req;
+        },
+        setTimeout() {
+          return req;
+        },
+        destroy(err) {
+          if (err && errorCb) errorCb(err);
+          return req;
+        },
+        write(d) {
+          captured.writes = (captured.writes || []);
+          captured.writes.push(d);
+          return req;
+        },
+        end(d) {
+          if (d) {
+            captured.writes = (captured.writes || []);
+            captured.writes.push(d);
+          }
+          captured.body = (captured.writes || []).join('');
+          if (callIdx >= 2) {
+            const res = buildFakeRes(
+              [JSON.stringify({ choices: [{ message: { content: 'ok' } }] })],
+              { statusCode: 200 },
+            );
+            queueMicrotask(() => responseCb && responseCb(res));
+          }
+          return req;
+        },
+      };
+      captured.req = req;
+      return req;
+    };
+
+    const client = createApiClient({
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      fallbackPrompt: 'SHORT REVIEW ONLY',
+    });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'ORIGINAL',
+      sleep: async () => {},
+      request,
+    });
+    // The normalization worked → fallback fired and the call succeeded.
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+    // The third attempt carried the normalized fallback prompt.
+    const lastCall = calls[calls.length - 1];
+    const body = JSON.parse(lastCall.body);
+    expect(body.messages.find((m) => m.role === 'user').content).toBe('SHORT REVIEW ONLY');
   });
 });

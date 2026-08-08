@@ -38582,13 +38582,17 @@ function loadConfig(inputs = {}, options = {}) {
           .map((p) => p.trim())
           .filter((p) => p !== '');
 
-  // maxDiffChars: parseInt base 10, NaN -> default. 0 means "unlimited"
-  // (documented); negatives are treated as 0 (unlimited) for safety. The
-  // DEFAULT is a sane cap (set in action.yml); operators who want unlimited
-  // set MAX_DIFF_CHARS=0 explicitly.
+  // maxDiffChars: parseInt base 10, NaN -> default. 0 (and any negative) means
+  // "unlimited" — documented in action.yml and honored here. The DEFAULT is a
+  // sane cap; operators who want unlimited set MAX_DIFF_CHARS=0 (or a negative)
+  // explicitly. A positive integer is honored as the per-batch char cap.
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
-    maxDiffCharsRaw === null || maxDiffCharsRaw < 0 ? 100000 : maxDiffCharsRaw;
+    maxDiffCharsRaw === null
+      ? 100000
+      : maxDiffCharsRaw <= 0
+        ? 0
+        : maxDiffCharsRaw;
 
   // Numeric knobs that drive loops/batching must be positive; clamp to a safe
   // default on any non-finite/negative/zero value to prevent infinite loops
@@ -38848,15 +38852,24 @@ const MIN_TIMEOUT_MS = 10000; // floor for the progressive timeout
  * ------------------------------------------------------------------ */
 
 /**
- * Regex-extract a 4xx/5xx status code embedded anywhere in an error message.
- * The message is matched as-is (callers lowercase it first when needed).
+ * Regex-extract a 4xx/5xx status code from an error message.
+ *
+ * Context-aware: the code must appear in an HTTP-error context — preceded by
+ * "error", "status", "code", a colon, or a quote+colon — so that numbers in
+ * prose (RFC 418), filenames (404.js), or other non-HTTP contexts are NOT
+ * mistaken for status codes. The production error format
+ * `Z.ai API error NNN: ...` always matches.
  *
  * @param {string} message
  * @returns {number | null}
  */
 function extractStatusCode(message) {
   const str = String(message ?? '');
-  const match = str.match(/\b([45]\d{2})\b/);
+  // Require the 3-digit code to be preceded by an HTTP-error keyword or
+  // delimiter: "error ", "status ", "code ", a colon, or a quote+colon.
+  // This rejects "404.js" (preceded by space but followed by ".js") and
+  // "RFC 418" (preceded by "RFC " with no HTTP keyword).
+  const match = str.match(/(?:error|status|code\b|["':])\s*:?\s*([45]\d{2})\b/i);
   return match ? parseInt(match[1], 10) : null;
 }
 
@@ -38950,9 +38963,11 @@ function sanitizeErrorMessage(error) {
   message = message.replace(/(Authorization:\s*)[^\s]+/gi, '$1[REDACTED]');
   // (6) Credential URLs.
   message = message.replace(/https?:\/\/[^\s]*:[^\s@]+@[^\s]*/gi, '[URL_REDACTED]');
-  // (7) JSON blobs containing secret-like keys.
+  // (7) JSON blobs containing secret-like keys. Handles one level of nesting
+  // so an outer object containing both a secret key and a nested sub-object
+  // is fully redacted (e.g. {"token":"x","cfg":{"a":1}} → [REDACTED]).
   message = message.replace(
-    /\{[^{}]*"(?:api[_-]?key|token|secret|password|credential)[^{}]*\}/gi,
+    /\{(?:[^{}]|\{[^{}]*\})*"(?:api[_-]?key|token|secret|password|credential)(?:[^{}]|\{[^{}]*\})*\}/gi,
     '[REDACTED]',
   );
 
@@ -39975,8 +39990,9 @@ const UNTRUSTED_PREAMBLE =
 
 /**
  * Escape a string for safe insertion into an XML attribute value
- * (`name="…"`). Neutralizes `"`, `&`, `<`, `>` so a hostile filename cannot
- * break out of the attribute or inject tag structure.
+ * (`name="…"`). Neutralizes `&`, `"`, `'`, `<`, `>` so a hostile filename
+ * cannot break out of the attribute or inject tag structure. Safe for both
+ * single-quoted and double-quoted attribute contexts.
  *
  * @param {string} s
  * @returns {string}
@@ -39985,6 +40001,7 @@ function escapeXmlAttribute(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -40006,7 +40023,7 @@ function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
     .replace(/\r?\n/g, ' ')
-    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
 /**
@@ -40023,7 +40040,7 @@ function escapeDiffFence(s) {
 function escapeUntrustedMultiline(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
 /**
@@ -42358,8 +42375,9 @@ function parseFullHunkHeader(line) {
  *   - A truly empty line is treated as a context line (git emits context as a
  *     leading space, but a bare empty line is also context).
  *
- * For patches with no hunk header (shouldn't happen for real GitHub patches)
- * the walker still runs with counters starting at 1 (best-effort).
+ * For patches with no hunk header (shouldn't happen for real GitHub patches),
+ * the walker returns `[]` — body lines without a preceding valid `@@` header
+ * are skipped, as their line numbers cannot be reliably determined.
  *
  * @param {string} patch
  * @returns {Array<{oldStart:number, oldCount:number, newStart:number, newCount:number, lines:Array<{type:string, newLine:number|null, oldLine:number|null, text:string}>}>}
@@ -43455,7 +43473,15 @@ const review_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 const MAX_WHOLE_PR_DIFF_CHARS = 8000;
 
 /**
- * Reject path-traversal: any path containing `..` or starting with `/`.
+ * Reject path-traversal and other unsafe path patterns.
+ *
+ * Checks:
+ *   - Non-string or empty → unsafe.
+ *   - Leading `/` (absolute path) → unsafe.
+ *   - Embedded null bytes or other control chars → unsafe.
+ *   - `..` as a PATH SEGMENT (e.g. `../`, `/..`, or exactly `..`) → unsafe.
+ *     Double-dots INSIDE a filename (`my..file.js`) are NOT traversal and
+ *     are allowed.
  *
  * Pure (exported for testing).
  *
@@ -43465,7 +43491,12 @@ const MAX_WHOLE_PR_DIFF_CHARS = 8000;
 function isUnsafePath(path) {
   if (typeof path !== 'string' || path === '') return true;
   if (path.startsWith('/')) return true;
-  if (path.includes('..')) return true;
+  // Reject embedded control characters (null bytes, etc.).
+  if (/[\x00-\x1f]/.test(path)) return true;
+  // Reject `..` only when it appears as a path segment — preceded by `/` or
+  // start-of-string, AND followed by `/` or end-of-string. This catches
+  // `../`, `/..`, `..`, and `a/../b` without rejecting `my..file.js`.
+  if (/(?:^|\/)\.\.(?:\/|$)/.test(path)) return true;
   return false;
 }
 
@@ -44281,6 +44312,25 @@ const HANDLERS = {
 const DEFAULT_MAX_PRS = 10;
 
 /**
+ * Build the hidden HTML comment that embeds the PR head SHA in a posted
+ * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
+ * body contains BOTH the marker AND the head SHA; without this block the
+ * review body carries only the fixed marker literal, so the SHA match never
+ * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
+ * "only new/changed PRs" guarantee).
+ *
+ * The block is an HTML comment so it is invisible in the rendered comment.
+ * Returns '' when `sha` is empty so callers can append unconditionally.
+ *
+ * @param {string} sha  the PR head SHA.
+ * @returns {string}
+ */
+function buildShaBlock(sha) {
+  if (typeof sha !== 'string' || sha.length === 0) return '';
+  return `<!-- zai-sha: ${sha} -->`;
+}
+
+/**
  * Determine whether a comment was authored by a bot. Used to gate marker-based
  * dedup so a drive-by human commenter cannot suppress a scheduled review or
  * hijack the bot's review thread by posting a comment containing the marker.
@@ -44455,7 +44505,7 @@ async function reviewOnePr({
     const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
 
     if (inline.length > 0) {
-      const body = buildReviewBody(result.summary, summaryOnly, {
+      const baseBody = buildReviewBody(result.summary, summaryOnly, {
         reviewerName: config.reviewerName,
         walkthrough: config.walkthrough === true,
         files: patchable,
@@ -44465,6 +44515,12 @@ async function reviewOnePr({
           (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
         ),
       });
+      // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
+      // cron tick (without it, the body carries only the marker and the PR is
+      // re-reviewed every tick). Appended after the body so the marker scan and
+      // rendered review are unaffected.
+      const shaBlock = buildShaBlock(pr.headSha);
+      const body = shaBlock ? `${baseBody}\n${shaBlock}` : baseBody;
       const comments = buildReviewComments(inline);
       const event = resolveReviewEvent(result.findings, config);
       try {
@@ -44505,11 +44561,15 @@ async function reviewOnePr({
       },
     });
 
-    const body = buildCommentBody({
+    const commentBody = buildCommentBody({
       title: config.reviewerName,
       content,
       marker: MARKER,
     });
+    // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
+    // cron tick (see the inline branch above for rationale).
+    const shaBlock = buildShaBlock(pr.headSha);
+    const body = shaBlock ? `${commentBody}\n${shaBlock}` : commentBody;
     await upsertReviewComment({
       octokit,
       owner,
@@ -44560,7 +44620,10 @@ async function runScheduledReview({
   repo,
   config,
   core,
-  maxPrs = DEFAULT_MAX_PRS,
+  // maxPrs: optional HARD ceiling (test injection). Default Infinity so the
+  // operator's ZAI_SCHEDULE_MAX_PRS (via config.scheduleMaxPrs) is the primary
+  // source. See cap-resolution comment below.
+  maxPrs = Number.POSITIVE_INFINITY,
   callApi,
   listOpenPrs: listFn = listOpenPrs,
   hasReviewForSha: hasReviewFn = hasReviewForSha,
@@ -44579,10 +44642,19 @@ async function runScheduledReview({
   postFallbackComment,
   resolveReviewEvent,
 }) {
-  const cap =
+  // Effective cap resolution. `config.scheduleMaxPrs` (from
+  // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
+  // `maxPrs` PARAMETER is an optional HARD ceiling for test injection only
+  // (default Infinity = no ceiling). When config is unset, fall back to
+  // DEFAULT_MAX_PRS. This fixes a bug where the param default (10) silently
+  // clamped an operator's ZAI_SCHEDULE_MAX_PRS=50 to 10.
+  const configMaxPrs =
     typeof config?.scheduleMaxPrs === 'number' && config.scheduleMaxPrs > 0
-      ? Math.min(config.scheduleMaxPrs, maxPrs)
-      : maxPrs;
+      ? config.scheduleMaxPrs
+      : DEFAULT_MAX_PRS;
+  const ceiling =
+    typeof maxPrs === 'number' && maxPrs > 0 ? maxPrs : Number.POSITIVE_INFINITY;
+  const cap = Math.min(configMaxPrs, ceiling);
 
   const prs = await listFn({ octokit, owner, repo, maxPrs: cap });
   let reviewed = 0;
@@ -47311,23 +47383,53 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
       : Number.POSITIVE_INFINITY;
   const maxFindings = Math.min(actionMaxFindings, repoMaxFindings);
 
-  // pathInstructions / toneInstructions: additive from repo only.
+  // pathInstructions: additive from repo only.
   const pathInstructions = Array.isArray(reviews.path_instructions)
     ? reviews.path_instructions
     : [];
-  const toneInstructions =
-    typeof reviews.tone_instructions === 'string' ? reviews.tone_instructions : '';
+
+  // toneInstructions: additive from repo only. The `reviews.language` field
+  // (if set) is folded in here as a "Respond in <language>." directive so it
+  // rides the existing additive tone path without a new prompt-builder seam.
+  // This wires the previously-no-op `language` field to its documented effect.
+  const toneParts = [];
+  if (typeof reviews.tone_instructions === 'string' && reviews.tone_instructions.length > 0) {
+    toneParts.push(reviews.tone_instructions);
+  }
+  if (typeof reviews.language === 'string' && reviews.language.trim().length > 0) {
+    toneParts.push(`Respond in ${reviews.language.trim()}.`);
+  }
+  const toneInstructions = toneParts.join(' ');
 
   // excludePatterns UNION repo path_filters (repo can exclude MORE, never fewer).
   const actionPatterns = Array.isArray(a.excludePatterns) ? a.excludePatterns : [];
   const repoFilters = Array.isArray(reviews.path_filters) ? reviews.path_filters : [];
   const excludePatterns = Array.from(new Set([...actionPatterns, ...repoFilters]));
 
-  // minSeverity: action input wins.
-  const minSeverity =
-    typeof a.minSeverity === 'string' && a.minSeverity.length > 0
+  // minSeverity: action input wins, BUT the repo `profile` may NARROW it.
+  // `profile: chill` means "only surface critical+high" — i.e. raise the
+  // effective floor to `high` (rank 1). The repo can only narrow (keep fewer
+  // severities), never widen: if the action already set a stricter floor
+  // (e.g. `high`), chill cannot lower it back to `medium`. `assertive` (the
+  // default) leaves the action floor unchanged. This wires the previously-
+  // no-op `profile` field to its documented effect.
+  // Severity rank: lower = more severe (matches findings.js SEVERITY_RANK).
+  const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const actionMinSeverity =
+    typeof a.minSeverity === 'string' && SEVERITY_RANK[a.minSeverity] !== undefined
       ? a.minSeverity
       : 'info';
+  let minSeverity = actionMinSeverity;
+  const profile = typeof reviews.profile === 'string' ? reviews.profile : '';
+  if (profile === 'chill') {
+    // chill floor = high (rank 1). Narrow only: take the MORE restrictive
+    // (lower-rank) of the action floor and chill's high floor.
+    const actionRank = SEVERITY_RANK[actionMinSeverity];
+    if (actionRank > SEVERITY_RANK.high) {
+      minSeverity = 'high';
+    }
+  }
+  // `assertive` (or unset) → action floor unchanged.
 
   // Scanners: master switch is action-only; repo can only DISABLE.
   const scannersEnabled = a.scannersEnabled !== false;
@@ -47348,6 +47450,11 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
     excludePatterns,
     scannersEnabled,
     scanners: mergedScanners,
+    // Surface profile/language on the merged config so callers/tests can
+    // observe what was applied (the EFFECT is via minSeverity/toneInstructions
+    // above; these fields are read-only observability).
+    profile: profile || 'assertive',
+    language: typeof reviews.language === 'string' ? reviews.language : '',
   };
 }
 
@@ -49221,15 +49328,18 @@ async function run(context, deps = {}) {
       // the inline comments array, then submit as a GitHub review. Phase 6.3:
       // the hash block is appended AFTER the marker so listBotReviews' marker
       // scan (which searches for `<!-- zai-code-review -->`) keeps working
-      // unchanged — the two HTML comments coexist in the same body.
+      // unchanged — the two HTML comments coexist in the same body. The SHA
+      // block is appended for the same reason AND so the scheduled-review
+      // dedup-by-SHA (hasReviewForSha) recognizes this body on the next cron
+      // tick — without it, a push-reviewed PR is re-reviewed every schedule.
       const baseBody = buildReviewBodyFn(
         finalSummary,
         summaryOnly,
         reviewMetadata,
       );
-      const reviewBody = hashBlock
-        ? `${baseBody}\n${hashBlock}`
-        : baseBody;
+      const shaBlock = buildShaBlock(sha);
+      const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
+      const reviewBody = trailer.length > 0 ? `${baseBody}\n${trailer}` : baseBody;
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -49302,7 +49412,10 @@ async function run(context, deps = {}) {
       content,
       marker: MARKER,
     });
-    const body = hashBlock ? `${commentBody}\n${hashBlock}` : commentBody;
+    // Append hash + SHA blocks (same coexistence model as the inline branch).
+    const shaBlock = buildShaBlock(sha);
+    const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
+    const body = trailer.length > 0 ? `${commentBody}\n${trailer}` : commentBody;
     await upsertReviewCommentFn({
       octokit,
       owner,

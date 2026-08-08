@@ -76,7 +76,7 @@ import {
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
-import { runScheduledReview } from './lib/schedule.js';
+import { runScheduledReview, buildShaBlock } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 import { ensureBinary } from './lib/scanners/ensure-binary.js';
 import { scanSecrets } from './lib/scanners/secrets.js';
@@ -828,15 +828,18 @@ export async function run(context, deps = {}) {
       // the inline comments array, then submit as a GitHub review. Phase 6.3:
       // the hash block is appended AFTER the marker so listBotReviews' marker
       // scan (which searches for `<!-- zai-code-review -->`) keeps working
-      // unchanged — the two HTML comments coexist in the same body.
+      // unchanged — the two HTML comments coexist in the same body. The SHA
+      // block is appended for the same reason AND so the scheduled-review
+      // dedup-by-SHA (hasReviewForSha) recognizes this body on the next cron
+      // tick — without it, a push-reviewed PR is re-reviewed every schedule.
       const baseBody = buildReviewBodyFn(
         finalSummary,
         summaryOnly,
         reviewMetadata,
       );
-      const reviewBody = hashBlock
-        ? `${baseBody}\n${hashBlock}`
-        : baseBody;
+      const shaBlock = buildShaBlock(sha);
+      const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
+      const reviewBody = trailer.length > 0 ? `${baseBody}\n${trailer}` : baseBody;
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -909,7 +912,10 @@ export async function run(context, deps = {}) {
       content,
       marker: MARKER,
     });
-    const body = hashBlock ? `${commentBody}\n${hashBlock}` : commentBody;
+    // Append hash + SHA blocks (same coexistence model as the inline branch).
+    const shaBlock = buildShaBlock(sha);
+    const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
+    const body = trailer.length > 0 ? `${commentBody}\n${trailer}` : commentBody;
     await upsertReviewCommentFn({
       octokit,
       owner,

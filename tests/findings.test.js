@@ -1107,3 +1107,253 @@ describe('filterIncrementalFindings', () => {
     expect(suppressed).toBe(0);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Task 5 — additional edge-case coverage for the JSON-extraction
+ * internals (exercised indirectly through parseFindings and
+ * parseStructuredReview, since extractJsonArray/extractJsonObject are
+ * not exported), hashFinding invariants, and rankAndCapFindings /
+ * mergeFindings boundary conditions.
+ * ------------------------------------------------------------------ */
+
+describe('JSON extraction — array-before-object guard (extractJsonObject)', () => {
+  // extractJsonObject guards its greedy brace scan with: if a '[' appears
+  // before the first '{', skip the brace scan (otherwise the first array
+  // element's {...} would be mistaken for the envelope). This documents that
+  // when an array precedes the object, the object is NOT recovered via the
+  // brace scan and parseStructuredReview falls back to the empty envelope.
+  it('skips the brace scan when a [ appears before the first { (object NOT recovered)', () => {
+    const raw =
+      "Here is a list: [item1] then " +
+      JSON.stringify({ summary: 'review', findings: [] });
+    const { summary, findings } = parseStructuredReview(raw);
+    // The object is unreachable: trim-strategy fails (does not start with {),
+    // fence-strategy finds no fence, and the brace scan is guarded off.
+    expect(summary).toBe('');
+    expect(findings).toEqual([]);
+  });
+
+  it('recovers the object when the [ appears AFTER the { (brace scan active)', () => {
+    // Same content but the object comes FIRST, so the brace scan is not
+    // guarded off and the envelope is recovered even with trailing prose.
+    const obj = { summary: 'review', findings: [] };
+    const raw = JSON.stringify(obj) + " trailing [item1] prose";
+    const { summary } = parseStructuredReview(raw);
+    expect(summary).toBe('review');
+  });
+});
+
+describe('JSON extraction — fenced code blocks', () => {
+  it('extracts the FIRST ```json block when multiple are present', () => {
+    // The fence regex is not global — it matches the first occurrence.
+    const first = [
+      { ...validFinding(), file: 'src/index.js', title: 'first' },
+    ];
+    const second = [
+      { ...validFinding(), file: 'src/index.js', title: 'second' },
+    ];
+    const raw =
+      '```json\n' + JSON.stringify(first) + '\n```\nblah\n```json\n' +
+      JSON.stringify(second) + '\n```';
+    const out = parseFindings(raw, { changedFiles: ['src/index.js'] });
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe('first');
+  });
+
+  it('handles a code fence inside a JSON string value (falls back to bracket scan)', () => {
+    // The fence regex's lazy match terminates at the FIRST ```, which here is
+    // embedded inside a JSON string value. The fenced-block strategy yields
+    // truncated, invalid JSON — but extractJsonArray's greedy bracket scan
+    // (strategy c) recovers the array as a fallback. This pins that recovery.
+    const arr = [
+      {
+        ...validFinding(),
+        description: 'use ```js for highlighting',
+      },
+    ];
+    const raw = '```json\n' + JSON.stringify(arr) + '\n```';
+    const out = parseFindings(raw, { changedFiles: ['src/index.js'] });
+    expect(out).toHaveLength(1);
+    expect(out[0].description).toBe('use ```js for highlighting');
+  });
+
+  it('parses a fenced ``` block with no language tag', () => {
+    const arr = [{ ...validFinding() }];
+    const raw = '```\n' + JSON.stringify(arr) + '\n```';
+    const out = parseFindings(raw, { changedFiles: ['src/index.js'] });
+    expect(out).toHaveLength(1);
+  });
+});
+
+describe('JSON extraction — nested structures', () => {
+  it('parses a fenced object with nested arrays of objects', () => {
+    // Greedy brace scan must match balanced braces around nested content.
+    const obj = {
+      summary: 'nested ok',
+      findings: [],
+      items: [{ a: 1 }, { b: 2 }],
+    };
+    const raw = '```\n' + JSON.stringify(obj) + '\n```';
+    const { summary } = parseStructuredReview(raw);
+    expect(summary).toBe('nested ok');
+  });
+
+  it('parses an array whose elements contain nested objects with arrays', () => {
+    const arr = [{ items: [{ a: 1 }, { b: 2 }] }];
+    const raw = JSON.stringify(arr);
+    // No changedFiles match (the finding would fail the file filter), but the
+    // array itself must still parse without throwing.
+    expect(() => parseFindings(raw, { changedFiles: [] })).not.toThrow();
+    expect(parseFindings(raw, { changedFiles: [] })).toEqual([]);
+  });
+});
+
+describe('hashFinding — invariants and volatility', () => {
+  it('is invariant under changes to evidence, suggestion, confidence, category, rule', () => {
+    // Documents the intentional design: the hash deliberately excludes the
+    // volatile fields so a re-review that only refines the suggestion does
+    // NOT re-surface the finding as new.
+    const base = validFinding();
+    const h1 = hashFinding(base);
+    const h2 = hashFinding({
+      ...base,
+      evidence: 'completely different evidence text',
+      suggestion: 'completely different suggestion text',
+      confidence: 'low',
+      category: 'security',
+      rule: 'eslint:some-rule',
+    });
+    expect(h1).toBe(h2);
+  });
+
+  it('is sensitive to title changes alone', () => {
+    const base = validFinding();
+    const h1 = hashFinding(base);
+    const h2 = hashFinding({ ...base, title: 'A different issue entirely' });
+    expect(h1).not.toBe(h2);
+  });
+
+  it('treats line:null and line:undefined identically (both collapse to "null")', () => {
+    const base = validFinding();
+    const hNull = hashFinding({ ...base, line: null });
+    const hUndef = hashFinding({ ...base, line: undefined });
+    expect(hNull).toBe(hUndef);
+  });
+
+  it('does not throw when line is null', () => {
+    const base = validFinding();
+    expect(() => hashFinding({ ...base, line: null })).not.toThrow();
+    // And still yields a well-formed 64-char hex digest.
+    expect(hashFinding({ ...base, line: null })).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('rankAndCapFindings — boundary options', () => {
+  it('returns an empty array when maxFindings is 0', () => {
+    const findings = [
+      { ...validFinding(), severity: 'critical' },
+      { ...validFinding(), severity: 'high' },
+    ];
+    expect(rankAndCapFindings(findings, { maxFindings: 0 })).toEqual([]);
+  });
+
+  it('falls back to the default cap (8) for a negative maxFindings', () => {
+    // The guard is `maxFindings >= 0`; -1 fails it and falls back to 8, so
+    // the result is NOT empty — it is capped at the default of 8.
+    const findings = Array.from({ length: 12 }, () => ({ ...validFinding() }));
+    const out = rankAndCapFindings(findings, { maxFindings: -1 });
+    expect(out).toHaveLength(8);
+  });
+
+  it('minSeverity medium keeps critical/high/medium and drops low/info', () => {
+    const findings = [
+      { ...validFinding(), severity: 'critical', file: 'a', line: 1 },
+      { ...validFinding(), severity: 'high', file: 'a', line: 2 },
+      { ...validFinding(), severity: 'medium', file: 'a', line: 3 },
+      { ...validFinding(), severity: 'low', file: 'a', line: 4 },
+      { ...validFinding(), severity: 'info', file: 'a', line: 5 },
+    ];
+    const out = rankAndCapFindings(findings, { minSeverity: 'medium' });
+    expect(out.map((f) => f.severity)).toEqual([
+      'critical',
+      'high',
+      'medium',
+    ]);
+  });
+
+  it('returns an empty array for an empty findings array regardless of options', () => {
+    expect(rankAndCapFindings([], { maxFindings: 100, minSeverity: 'info' })).toEqual([]);
+  });
+
+  it('falls back to the default cap when maxFindings is omitted', () => {
+    const findings = Array.from({ length: 12 }, () => ({ ...validFinding() }));
+    expect(rankAndCapFindings(findings)).toHaveLength(8);
+  });
+
+  it('does not mutate the input array', () => {
+    const findings = [
+      { ...validFinding(), severity: 'low', file: 'b', line: 1 },
+      { ...validFinding(), severity: 'critical', file: 'a', line: 1 },
+    ];
+    const snapshot = [...findings];
+    rankAndCapFindings(findings);
+    expect(findings).toEqual(snapshot);
+  });
+});
+
+describe('mergeFindings — deterministic-supersedes-LLM edge cases', () => {
+  // NOTE: signature is mergeFindings(llmFindings, deterministicFindings).
+  it('deterministic supersedes LLM when title matches case-insensitively at same file:line', () => {
+    const llm = [
+      { ...validFinding(), file: 'a.js', line: 5, title: 'SQL Injection', rule: 'llm' },
+    ];
+    const det = [
+      { ...validFinding(), file: 'a.js', line: 5, title: 'sql injection', rule: 'semgrep' },
+    ];
+    const out = mergeFindings(llm, det);
+    expect(out).toHaveLength(1);
+    expect(out[0].rule).toBe('semgrep');
+  });
+
+  it('keeps both findings when same file:line but titles differ', () => {
+    const llm = [
+      { ...validFinding(), file: 'a.js', line: 5, title: 'SQL Injection', rule: 'llm' },
+    ];
+    const det = [
+      { ...validFinding(), file: 'a.js', line: 5, title: 'XSS via innerHTML', rule: 'semgrep' },
+    ];
+    const out = mergeFindings(llm, det);
+    expect(out).toHaveLength(2);
+    expect(out.map((f) => f.rule).sort()).toEqual(['llm', 'semgrep']);
+  });
+
+  it('every deterministic finding always survives regardless of LLM overlap', () => {
+    // Two distinct deterministic findings at the same location both survive.
+    const llm = [{ ...validFinding(), file: 'a.js', line: 5, title: 'A', rule: 'llm' }];
+    const det = [
+      { ...validFinding(), file: 'a.js', line: 5, title: 'A', rule: 'det-a' },
+      { ...validFinding(), file: 'a.js', line: 5, title: 'B', rule: 'det-b' },
+    ];
+    const out = mergeFindings(llm, det);
+    const detOut = out.filter((f) => typeof f.rule === 'string' && f.rule.startsWith('det-'));
+    expect(detOut).toHaveLength(2);
+    // The LLM 'A' is suppressed (covered by det 'A'); only the two dets survive.
+    expect(out).toHaveLength(2);
+  });
+
+  it('returns just the deterministic findings when LLM array is empty', () => {
+    const det = [{ ...validFinding(), file: 'a.js', line: 1, title: 'D', rule: 'semgrep' }];
+    const out = mergeFindings([], det);
+    expect(out).toEqual(det);
+  });
+
+  it('returns just the LLM findings when deterministic array is empty', () => {
+    const llm = [{ ...validFinding(), file: 'a.js', line: 1, title: 'L', rule: 'llm' }];
+    const out = mergeFindings(llm, []);
+    expect(out).toEqual(llm);
+  });
+
+  it('returns an empty array when both inputs are empty', () => {
+    expect(mergeFindings([], [])).toEqual([]);
+  });
+});

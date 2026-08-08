@@ -32,11 +32,11 @@ inputs:
 
   MAX_DIFF_CHARS:
     description: |-
-      Hard cap on total diff chars sent to the model per review batch. 0 =
-      unlimited (NOT recommended — a large PR can produce a huge prompt and
-      exhaust your Z.ai quota; the cap defends against cost abuse from fork
-      PRs). The structured-review pipeline batches large PRs regardless; this
-      cap limits each batch's prompt size.
+      Hard cap on total diff chars sent to the model per review batch. 0 (or any
+      negative value) = unlimited (NOT recommended — a large PR can produce a
+      huge prompt and exhaust your Z.ai quota; the cap defends against cost
+      abuse from fork PRs). The structured-review pipeline batches large PRs
+      regardless; this cap limits each batch's prompt size.
     required: false
     default: '100000'
 

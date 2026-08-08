@@ -1105,3 +1105,455 @@ describe('runStructuredReview', () => {
     expect(maxInFlight).toBe(1);
   });
 });
+
+/* ================================================================== *
+ * EDGE-CASE SUITE (Task 9)
+ *
+ * The blocks below pin exact behavior at the boundaries of the pure
+ * pipeline functions. They supplement (not duplicate) the tests above by
+ * targeting the specific thresholds and guards called out in the task
+ * brief: exact boundary values, guard clauses, and the subtle "first
+ * oversized entry enters anyway" batching rule.
+ * ================================================================== */
+
+/* ------------------------------------------------------------------ *
+ * scoreFile — boundary values for the size contribution
+ * ------------------------------------------------------------------ */
+describe('scoreFile (edge: size-boundary values)', () => {
+  test('patchLen exactly 800 → ceil(800/800)=1 → +1 from length', () => {
+    // Boundary: the divisor is 800, so exactly one "unit" of length.
+    const file = makeFile({ patch: 'x'.repeat(800) });
+    expect(scoreFile(file)).toBe(1);
+  });
+
+  test('patchLen 801 → ceil(801/800)=2 → +2 from length', () => {
+    // Just over the boundary rounds up to the next unit.
+    const file = makeFile({ patch: 'x'.repeat(801) });
+    expect(scoreFile(file)).toBe(2);
+  });
+
+  test('patchLen exactly 32000 (800*40) → +40 (the cap value, not 41)', () => {
+    // 32000/800 = 40 exactly → ceil = 40 → min(40,40)=40. This is the
+    // exact point where the raw ceil first reaches the cap.
+    const file = makeFile({ patch: 'x'.repeat(32000) });
+    expect(scoreFile(file)).toBe(40);
+  });
+
+  test('patchLen 64000 (2x the cap point) → still +40 (cap holds)', () => {
+    // Confirms the cap is a hard ceiling, not proportional beyond 32000.
+    const file = makeFile({ patch: 'x'.repeat(64000) });
+    expect(scoreFile(file)).toBe(40);
+  });
+
+  test('patchLen 31999 → ceil(31999/800)=40 (one below the cap point still 40)', () => {
+    // 31999/800 = 39.99875 → ceil = 40. Pins that the cap is reached just
+    // before the exact 32000 boundary too.
+    const file = makeFile({ patch: 'x'.repeat(31999) });
+    expect(scoreFile(file)).toBe(40);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * scoreFile — status bonus is exactly +8 for added/renamed, +0 otherwise
+ * ------------------------------------------------------------------ */
+describe('scoreFile (edge: status bonus deltas)', () => {
+  test('added → exactly +8 over the size-only baseline', () => {
+    const base = makeFile({ status: 'modified', patch: 'x'.repeat(800) });
+    const added = makeFile({ status: 'added', patch: 'x'.repeat(800) });
+    expect(scoreFile(added) - scoreFile(base)).toBe(8);
+  });
+
+  test('renamed → exactly +8 over the size-only baseline', () => {
+    const base = makeFile({ status: 'modified', patch: 'x'.repeat(800) });
+    const renamed = makeFile({ status: 'renamed', patch: 'x'.repeat(800) });
+    expect(scoreFile(renamed) - scoreFile(base)).toBe(8);
+  });
+
+  test('modified → +0 (no status bonus)', () => {
+    const file = makeFile({ status: 'modified', patch: 'x'.repeat(800) });
+    expect(scoreFile(file)).toBe(1); // size-only, no status bonus
+  });
+
+  test('unknown status → +0 (only added/renamed get the bonus)', () => {
+    const file = makeFile({ status: 'removed', patch: 'x'.repeat(800) });
+    expect(scoreFile(file)).toBe(1);
+  });
+
+  test('missing status → +0', () => {
+    const file = makeFile({ patch: 'x'.repeat(800) });
+    delete file.status;
+    expect(scoreFile(file)).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * scoreFile — high-risk pattern bonus is exactly +24
+ * ------------------------------------------------------------------ */
+describe('scoreFile (edge: high-risk pattern bonus)', () => {
+  test('a known HIGH_RISK_PATTERNS match → exactly +24 over baseline', () => {
+    // 'src/auth/login.js' matches the first pattern (auth). Baseline is a
+    // non-high-risk file with the same patch.
+    const base = makeFile({ filename: 'docs/README.md', patch: 'x'.repeat(800) });
+    const risky = makeFile({ filename: 'src/auth/login.js', patch: 'x'.repeat(800) });
+    expect(scoreFile(risky) - scoreFile(base)).toBe(24);
+  });
+
+  test('high-risk bonus applies even with a zero-length patch', () => {
+    // No size contribution, but the pattern match still adds +24.
+    const file = { filename: 'src/auth/login.js', status: 'modified' };
+    expect(scoreFile(file)).toBe(24);
+  });
+
+  test('high-risk + added + capped size all stack to 40+8+24=72', () => {
+    const file = {
+      filename: 'src/api/server.js', // high-risk
+      status: 'added', // +8
+      patch: 'x'.repeat(800 * 100), // capped +40
+    };
+    expect(scoreFile(file)).toBe(40 + 8 + 24);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * splitTextByLines — oversized single line content verification
+ * ------------------------------------------------------------------ */
+describe('splitTextByLines (edge: oversized single line)', () => {
+  test('a single line exactly 2x maxChars → two equal slices', () => {
+    const line = 'x'.repeat(20);
+    const chunks = splitTextByLines(line, 10);
+    expect(chunks).toEqual(['x'.repeat(10), 'x'.repeat(10)]);
+    // reconstruction via concatenation (NOT join('\n') — slices are not lines)
+    expect(chunks.join('')).toBe(line);
+  });
+
+  test('a single line 2.5x maxChars → three slices (10,10,5)', () => {
+    const line = 'x'.repeat(25);
+    const chunks = splitTextByLines(line, 10);
+    expect(chunks).toEqual(['x'.repeat(10), 'x'.repeat(10), 'x'.repeat(5)]);
+  });
+
+  test('oversized line is NOT mixed with neighboring lines in its slices', () => {
+    // The oversized line's slices must be isolated; 'before' and 'after'
+    // lines go into their own chunks.
+    const text = 'before\n' + 'y'.repeat(25) + '\nafter';
+    const chunks = splitTextByLines(text, 10);
+    // 'before' is its own chunk (flushed before the oversized line starts)
+    expect(chunks[0]).toBe('before');
+    // the three slices of the long line, each exactly 10/10/5
+    expect(chunks[1]).toBe('y'.repeat(10));
+    expect(chunks[2]).toBe('y'.repeat(10));
+    expect(chunks[3]).toBe('y'.repeat(5));
+    // 'after' is its own chunk
+    expect(chunks[4]).toBe('after');
+  });
+
+  test('oversized line preserves content exactly across its slices', () => {
+    const line = 'abcdefghij'.repeat(3); // 30 chars
+    const chunks = splitTextByLines(line, 10);
+    expect(chunks.join('')).toBe(line);
+    expect(chunks.length).toBe(3);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * splitTextByLines — multi-line chunk-size invariant (explicit)
+ * ------------------------------------------------------------------ */
+describe('splitTextByLines (edge: multi-line size invariant)', () => {
+  test('every chunk in a multi-line split is ≤ maxChars', () => {
+    // 6 lines of 9 chars each, maxChars=20. The +1 '\n' joiner means a
+    // 2-line chunk is 9+1+9=19 (fits), a 3-line chunk is 29 (over).
+    const text = Array.from({ length: 6 }, () => 'aaaaaaaaa').join('\n');
+    const chunks = splitTextByLines(text, 20);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(20);
+    }
+    // Reconstruction via '\n' preserves the original text (lines are kept whole).
+    expect(chunks.join('\n')).toBe(text);
+  });
+
+  test('split points fall on line boundaries (no mid-line cuts)', () => {
+    const text = 'line1\nline2\nline3\nline4';
+    const chunks = splitTextByLines(text, 11);
+    // No chunk should contain a partial line — each chunk is whole lines
+    // joined by '\n'.
+    for (const c of chunks) {
+      for (const line of c.split('\n')) {
+        // every line in every chunk must be one of the original lines
+        expect(['line1', 'line2', 'line3', 'line4']).toContain(line);
+      }
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * splitTextByLines — guard clause and empty input (pinned behavior)
+ * ------------------------------------------------------------------ */
+describe('splitTextByLines (edge: guards and empty input)', () => {
+  test('maxChars < 1 guard returns [text] verbatim (no infinite loop)', () => {
+    const text = 'some\nmultiline\ntext';
+    // All non-positive / non-finite values hit the same guard branch:
+    // `!Number.isFinite(maxChars) || maxChars < 1`. Infinity is NOT
+    // finite, so it also hits the guard (treated as "no chunking").
+    expect(splitTextByLines(text, 0)).toEqual([text]);
+    expect(splitTextByLines(text, -5)).toEqual([text]);
+    expect(splitTextByLines(text, NaN)).toEqual([text]);
+    expect(splitTextByLines(text, Infinity)).toEqual([text]);
+  });
+
+  test('empty text returns [""] (pinned — NOT [])', () => {
+    // The early-return for `!source` yields [source] = ['']. This pins
+    // that empty input produces a one-element array with an empty string,
+    // not an empty array.
+    expect(splitTextByLines('', 100)).toEqual(['']);
+  });
+
+  test('null/undefined text returns [""] (coerced to empty string)', () => {
+    expect(splitTextByLines(undefined, 100)).toEqual(['']);
+    expect(splitTextByLines(null, 100)).toEqual(['']);
+  });
+
+  test('non-string text is coerced to empty string → [""]', () => {
+    expect(splitTextByLines(12345, 100)).toEqual(['']);
+    expect(splitTextByLines({}, 100)).toEqual(['']);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * createReviewBatches — oversized entry preceded by normal entries
+ *
+ * NOTE on surprising behavior: entries are sorted by priority (DESC)
+ * BEFORE batching. A large `.js` file (high-risk +24, plus up to +40
+ * size) sorts BEFORE small `.js` files (high-risk +24, +1 size), so the
+ * large file becomes the FIRST batch entry, not a later one. To test
+ * "normals first, then oversized" we must give the oversized entry a
+ * LOWER priority than the preceding normals — e.g. by making the normals
+ * high-risk (`*.js`) and the oversized entry non-high-risk (`*.md`).
+ * ------------------------------------------------------------------ */
+describe('createReviewBatches (edge: oversized entry isolation)', () => {
+  test('an oversized entry preceded by normal entries starts its own batch', () => {
+    // small1.js and small2.js are high-risk (+24) → priority 25 each.
+    // huge.md is non-high-risk → priority min(40, ceil(5000/800))=7.
+    // Sort order: small1.js, small2.js (priority 25), then huge.md (7).
+    // So huge.md is processed THIRD, after the small files have filled a
+    // batch. The guard `currentEntries.length > 0` then flushes before it.
+    const files = [
+      makeFile({ filename: 'small1.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'small2.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'docs/huge.md', patch: 'x'.repeat(5000) }),
+    ];
+    const { batches } = createReviewBatches(files, { maxBatchChars: 1000 });
+    // Find the batch containing 'docs/huge.md'.
+    const hugeBatchIdx = batches.findIndex((b) =>
+      b.some((e) => e.filename === 'docs/huge.md'),
+    );
+    expect(hugeBatchIdx).toBeGreaterThan(0); // not the first batch
+    expect(batches[hugeBatchIdx][0].filename).toBe('docs/huge.md');
+    // The batch before it must contain the small files, NOT huge.md.
+    const priorFilenames = batches[hugeBatchIdx - 1].map((e) => e.filename);
+    expect(priorFilenames).not.toContain('docs/huge.md');
+  });
+
+  test('the FIRST entry, even if oversized, enters the current batch', () => {
+    // To make the oversized entry the FIRST processed, give it the highest
+    // priority: a large high-risk file (huge.js → +24 +40 = 64) sorts before
+    // small high-risk files (small.js → +24 +1 = 25). The first entry's
+    // `currentEntries.length > 0` is false, so no flush — it enters.
+    const files = [
+      makeFile({ filename: 'huge.js', patch: 'x'.repeat(5000) }),
+      makeFile({ filename: 'small.js', patch: 'x'.repeat(100) }),
+    ];
+    const { batches } = createReviewBatches(files, { maxBatchChars: 1000 });
+    // The first batch's first entry is the oversized one.
+    expect(batches[0][0].filename).toBe('huge.js');
+    // 'huge.js' must be in batch 0 (it was never evicted).
+    const allBatch0 = batches[0].map((e) => e.filename);
+    expect(allBatch0).toContain('huge.js');
+  });
+
+  test('oversized entry in the middle does not merge subsequent entries into its batch', () => {
+    // a.js, b.js, c.js are high-risk (+24) → priority 25 each.
+    // BIG.md is non-high-risk → priority min(40, ceil(3000/800))=4.
+    // Sort order: a.js, b.js, c.js (25), then BIG.md (4). So BIG.md is
+    // processed LAST, after the small files have filled earlier batches.
+    const files = [
+      makeFile({ filename: 'a.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'b.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'c.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'docs/BIG.md', patch: 'x'.repeat(3000) }),
+    ];
+    const { batches } = createReviewBatches(files, { maxBatchChars: 800 });
+    // The small files should be in earlier batches.
+    const allEarlyNames = batches.flat().map((e) => e.filename);
+    expect(allEarlyNames).toContain('a.js');
+    expect(allEarlyNames).toContain('b.js');
+    // BIG.md must be in its own batch (flushed because it's oversized and
+    // follows non-empty batches).
+    const bigBatchIdx = batches.findIndex((b) =>
+      b.some((e) => e.filename === 'docs/BIG.md'),
+    );
+    expect(bigBatchIdx).toBeGreaterThan(0);
+    expect(batches[bigBatchIdx][0].filename).toBe('docs/BIG.md');
+    // The batch BEFORE BIG.md must not contain it.
+    expect(batches[bigBatchIdx - 1].map((e) => e.filename)).not.toContain(
+      'docs/BIG.md',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * createReviewBatches — file-count limit
+ * ------------------------------------------------------------------ */
+describe('createReviewBatches (edge: file-count limit)', () => {
+  test('maxFilesPerBatch=2 with 5 entries → no batch has more than 2 files', () => {
+    const files = [];
+    for (let i = 0; i < 5; i++) {
+      files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(50) }));
+    }
+    const { batches } = createReviewBatches(files, {
+      maxFilesPerBatch: 2,
+      maxBatchChars: 1000000, // high so only the file-count limit binds
+    });
+    for (const batch of batches) {
+      const distinct = new Set(batch.map((e) => e.filename));
+      expect(distinct.size).toBeLessThanOrEqual(2);
+    }
+    // 5 files / 2-per-batch → at least 3 batches.
+    expect(batches.length).toBeGreaterThanOrEqual(3);
+  });
+
+  test('same filename across multiple chunks counts as ONE distinct file', () => {
+    // A file split into 3 chunks contributes 3 entries but only 1 distinct
+    // filename, so maxFilesPerBatch=1 should still allow all 3 chunks in one
+    // batch (the file-count limit counts distinct filenames, not entries).
+    const files = [makeFile({ filename: 'big.js', patch: 'x'.repeat(50) })];
+    const { batches } = createReviewBatches(files, {
+      maxFilesPerBatch: 1,
+      maxPatchChars: 20, // splits into 3 chunks
+      maxBatchChars: 1000000,
+    });
+    expect(batches.length).toBe(1); // all 3 chunks in one batch
+    expect(batches[0].length).toBe(3); // 3 entries
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * runWithConcurrency — order preservation with skewed completion
+ * ------------------------------------------------------------------ */
+describe('runWithConcurrency (edge: order & concurrency)', () => {
+  test('results in input order even when later items resolve first', async () => {
+    // Item 0 is slowest, item 2 is fastest — completion order is reversed
+    // from input order, but the result array must follow input order.
+    const items = [0, 1, 2];
+    const fn = (x) =>
+      new Promise((resolve) => {
+        const delay = (3 - x) * 15; // x=0 → 45ms, x=1 → 30ms, x=2 → 15ms
+        setTimeout(() => resolve(x), delay);
+      });
+    const out = await runWithConcurrency(items, 3, fn);
+    expect(out).toEqual([0, 1, 2]);
+  });
+
+  test('concurrency=2 with 4 items: never more than 2 in flight', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const items = [0, 1, 2, 3];
+    const fn = async (x) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight--;
+      return x * 10;
+    };
+    const out = await runWithConcurrency(items, 2, fn);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    expect(maxInFlight).toBe(2); // with 4 items and limit 2, we hit the cap
+    expect(out).toEqual([0, 10, 20, 30]);
+  });
+
+  test('aborts on first rejection: subsequent items still settle but error surfaces', async () => {
+    // Item 1 rejects fast; item 0 is slow and in flight. The overall
+    // promise rejects with item 1's error, and no item BEYOND the
+    // concurrency window is launched (abort flag stops new launches).
+    const started = [];
+    const items = [0, 1, 2, 3];
+    const fn = async (x) => {
+      started.push(x);
+      if (x === 1) {
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error('reject-from-1');
+      }
+      await new Promise((r) => setTimeout(r, 30));
+      return x;
+    };
+    await expect(runWithConcurrency(items, 2, fn)).rejects.toThrow('reject-from-1');
+    // Items 2 and 3 are beyond the first concurrency window (items 0,1).
+    // The abort flag must prevent them from launching.
+    expect(started).not.toContain(3);
+  });
+
+  test('synchronous throw inside fn rejects the overall promise immediately', async () => {
+    // If fn throws synchronously (not via a rejected promise), the
+    // try/catch around Promise.resolve(fn(...)) catches it and rejects.
+    const fn = (x) => {
+      if (x === 1) throw new Error('sync-throw');
+      return x;
+    };
+    await expect(runWithConcurrency([0, 1, 2], 2, fn)).rejects.toThrow('sync-throw');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * isContextLimitError — message-shape coverage (explicit per-string)
+ * ------------------------------------------------------------------ */
+describe('isContextLimitError (edge: exact message shapes)', () => {
+  // The source matches four lowercased substrings. Pin each one exactly
+  // and confirm case-insensitivity (the message is lowercased first).
+
+  test('matches "maximum context length" (OpenAI-style)', () => {
+    expect(isContextLimitError(new Error('maximum context length exceeded'))).toBe(true);
+  });
+
+  test('matches "input tokens exceeds" (Anthropic-style)', () => {
+    expect(isContextLimitError(new Error('input tokens exceeds the limit'))).toBe(true);
+  });
+
+  test('matches code":413 (HTTP 413 in a JSON body)', () => {
+    expect(isContextLimitError(new Error('{"code":413, "msg":"too large"}'))).toBe(true);
+  });
+
+  test('matches type":"413" (alternative 413 encoding)', () => {
+    expect(isContextLimitError(new Error('{"type":"413"}'))).toBe(true);
+  });
+
+  test('matching is case-insensitive (message is lowercased)', () => {
+    expect(isContextLimitError(new Error('MAXIMUM CONTEXT LENGTH'))).toBe(true);
+    expect(isContextLimitError(new Error('Input Tokens Exceeds'))).toBe(true);
+    expect(isContextLimitError(new Error('CODE":413'))).toBe(true);
+  });
+
+  test('plain HTTP 413 status without the JSON shape → false (not matched)', () => {
+    // The bare number 413 is NOT one of the matched substrings — the
+    // matcher looks for the literal 'code":413' / 'type":"413' JSON shape.
+    expect(isContextLimitError(new Error('413 Request Entity Too Large'))).toBe(false);
+    expect(isContextLimitError(new Error('status 413'))).toBe(false);
+  });
+
+  test('"context length" alone (without "maximum") → false', () => {
+    // Pins that the matcher requires the FULL "maximum context length"
+    // phrase, not just "context length".
+    expect(isContextLimitError(new Error('context length is fine'))).toBe(false);
+  });
+
+  test('non-Error thrown values with a matching message string → true', () => {
+    // isContextLimitError reads error?.message, so a plain object works.
+    expect(isContextLimitError({ message: 'maximum context length' })).toBe(true);
+    expect(isContextLimitError({ message: 'input tokens exceeds' })).toBe(true);
+  });
+
+  test('a plain Error with an unrelated message → false', () => {
+    expect(isContextLimitError(new Error('network timeout'))).toBe(false);
+    expect(isContextLimitError(new Error('rate limited'))).toBe(false);
+    expect(isContextLimitError(new Error('500 internal server error'))).toBe(false);
+  });
+});

@@ -69,8 +69,9 @@ function parseFullHunkHeader(line) {
  *   - A truly empty line is treated as a context line (git emits context as a
  *     leading space, but a bare empty line is also context).
  *
- * For patches with no hunk header (shouldn't happen for real GitHub patches)
- * the walker still runs with counters starting at 1 (best-effort).
+ * For patches with no hunk header (shouldn't happen for real GitHub patches),
+ * the walker returns `[]` — body lines without a preceding valid `@@` header
+ * are skipped, as their line numbers cannot be reliably determined.
  *
  * @param {string} patch
  * @returns {Array<{oldStart:number, oldCount:number, newStart:number, newCount:number, lines:Array<{type:string, newLine:number|null, oldLine:number|null, text:string}>}>}

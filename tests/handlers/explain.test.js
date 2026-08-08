@@ -320,3 +320,103 @@ describe('handleExplainCommand — error path', () => {
     expect(core.warning).toHaveBeenCalled();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * parseRange — edge cases (Task 11)
+ *
+ * These pin behavior for the three supported separators, the single-line
+ * form, start<1 rejection, and non-numeric/reversed inputs. They overlap
+ * the table-driven cases above intentionally to name each invariant.
+ * ------------------------------------------------------------------ */
+
+describe('parseRange — separator forms (edge cases)', () => {
+  it('`..` separator: "10..20" → {start:10, end:20}', () => {
+    expect(parseRange('10..20')).toEqual({ start: 10, end: 20 });
+  });
+
+  it('`-` separator: "10-20" → {start:10, end:20}', () => {
+    expect(parseRange('10-20')).toEqual({ start: 10, end: 20 });
+  });
+
+  it('`:` separator: "10:20" → {start:10, end:20}', () => {
+    expect(parseRange('10:20')).toEqual({ start: 10, end: 20 });
+  });
+
+  it('single line: "10" → {start:10, end:10}', () => {
+    expect(parseRange('10')).toEqual({ start: 10, end: 10 });
+  });
+
+  it('whitespace is trimmed: "  10-20  " → {start:10, end:20}', () => {
+    expect(parseRange('  10-20  ')).toEqual({ start: 10, end: 20 });
+  });
+});
+
+describe('parseRange — start < 1 is rejected (edge cases)', () => {
+  it('"0-10" → null (start is zero)', () => {
+    // The check `start < 1` rejects zero as a valid line number.
+    expect(parseRange('0-10')).toBeNull();
+  });
+
+  it('"-5" → null (looks like a negative range; parses left="" → 0)', () => {
+    // NOTE: Number("") === 0 and Number.isInteger(0) === true, so the left
+    // side parses to 0; the `start < 1` guard then rejects it. This pins the
+    // behavior rather than relying on a throw.
+    expect(parseRange('-5')).toBeNull();
+  });
+
+  it('"0" → null (single-line zero)', () => {
+    expect(parseRange('0')).toBeNull();
+  });
+});
+
+describe('parseRange — invalid input (edge cases)', () => {
+  it('non-numeric range: "abc" → null', () => {
+    expect(parseRange('abc')).toBeNull();
+  });
+
+  it('non-numeric side: "10-abc" → null', () => {
+    expect(parseRange('10-abc')).toBeNull();
+  });
+
+  it('reversed range (start > end): "10-5" → null', () => {
+    expect(parseRange('10-5')).toBeNull();
+  });
+
+  it('reversed range with `:`: "20:10" → null', () => {
+    expect(parseRange('20:10')).toBeNull();
+  });
+
+  it('decimal line numbers are rejected: "1.5-2" → null', () => {
+    // Number.isInteger(1.5) is false → rejected.
+    expect(parseRange('1.5-2')).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * parseExplainArgs — file path with spaces (Task 11)
+ * ------------------------------------------------------------------ */
+
+describe('parseExplainArgs — file path with spaces (edge cases)', () => {
+  it('joins all tokens after the range into the file path', () => {
+    // "10-20 my file.js" → file is "my file.js" (tokens joined by space).
+    expect(parseExplainArgs('10-20 my file.js')).toEqual({
+      range: { start: 10, end: 20 },
+      file: 'my file.js',
+    });
+  });
+
+  it('preserves a subdirectory path containing spaces', () => {
+    expect(parseExplainArgs('10-20 src/my file.js')).toEqual({
+      range: { start: 10, end: 20 },
+      file: 'src/my file.js',
+    });
+  });
+
+  it('collapses multiple spaces between path tokens', () => {
+    // The args are split on /\s+/ then joined with a single space.
+    expect(parseExplainArgs('10-20 my    spaced   file.js')).toEqual({
+      range: { start: 10, end: 20 },
+      file: 'my spaced file.js',
+    });
+  });
+});

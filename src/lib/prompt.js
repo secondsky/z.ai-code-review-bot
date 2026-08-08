@@ -31,8 +31,9 @@ export const UNTRUSTED_PREAMBLE =
 
 /**
  * Escape a string for safe insertion into an XML attribute value
- * (`name="…"`). Neutralizes `"`, `&`, `<`, `>` so a hostile filename cannot
- * break out of the attribute or inject tag structure.
+ * (`name="…"`). Neutralizes `&`, `"`, `'`, `<`, `>` so a hostile filename
+ * cannot break out of the attribute or inject tag structure. Safe for both
+ * single-quoted and double-quoted attribute contexts.
  *
  * @param {string} s
  * @returns {string}
@@ -41,6 +42,7 @@ export function escapeXmlAttribute(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -62,7 +64,7 @@ export function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
     .replace(/\r?\n/g, ' ')
-    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
 /**
@@ -79,7 +81,7 @@ export function escapeDiffFence(s) {
 export function escapeUntrustedMultiline(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
 /**

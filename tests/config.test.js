@@ -63,13 +63,15 @@ describe('loadConfig — excludePatterns', () => {
 });
 
 describe('loadConfig — numeric fields & defaults', () => {
-  test('maxDiffChars: default 100000; 0 means unlimited; NaN/negative -> default', () => {
+  test('maxDiffChars: default 100000; 0 and negatives mean unlimited; NaN -> default', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(100000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(0); // unlimited
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(12);
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(100000); // negative->default
+    // Per action.yml + code comment, negatives mean unlimited (0), NOT the
+    // default cap. The old code returned 100000 here — a doc/code mismatch.
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(0); // negative->unlimited
   });
 
   test('largePrFileThreshold default 50', () => {
