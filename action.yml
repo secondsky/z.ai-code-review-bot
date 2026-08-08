@@ -102,7 +102,10 @@ inputs:
     default: 'false'
 
   ZAI_SCHEDULE_MAX_PRS:
-    description: 'Maximum number of PRs to review per scheduled run.'
+    description: |-
+      Maximum number of PRs to review per scheduled run. Default 10; values
+      above 100 are clamped to 100 (an absolute ceiling to prevent unbounded
+      sequential work on a schedule tick).
     required: false
     default: '10'
 

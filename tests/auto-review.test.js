@@ -1374,13 +1374,15 @@ describe('createReviewBatches (edge: oversized entry isolation)', () => {
   test('oversized entry in the middle does not merge subsequent entries into its batch', () => {
     // a.js, b.js, c.js are high-risk (+24) → priority 25 each.
     // BIG.md is non-high-risk → priority min(40, ceil(3000/800))=4.
-    // Sort order: a.js, b.js, c.js (25), then BIG.md (4). So BIG.md is
-    // processed LAST, after the small files have filled earlier batches.
+    // small.md (added after BIG.md in priority order, lower score) proves a
+    // SUBSEQUENT entry starts a fresh batch rather than being merged into the
+    // oversized entry's batch.
     const files = [
       makeFile({ filename: 'a.js', patch: 'x'.repeat(100) }),
       makeFile({ filename: 'b.js', patch: 'x'.repeat(100) }),
       makeFile({ filename: 'c.js', patch: 'x'.repeat(100) }),
       makeFile({ filename: 'docs/BIG.md', patch: 'x'.repeat(3000) }),
+      makeFile({ filename: 'docs/small.md', patch: 'y'.repeat(50) }),
     ];
     const { batches } = createReviewBatches(files, { maxBatchChars: 800 });
     // The small files should be in earlier batches.
@@ -1398,6 +1400,12 @@ describe('createReviewBatches (edge: oversized entry isolation)', () => {
     expect(batches[bigBatchIdx - 1].map((e) => e.filename)).not.toContain(
       'docs/BIG.md',
     );
+    // The trailing small.md must start a NEW batch distinct from BIG.md's.
+    const smallBatchIdx = batches.findIndex((b) =>
+      b.some((e) => e.filename === 'docs/small.md'),
+    );
+    expect(smallBatchIdx).toBeGreaterThanOrEqual(0);
+    expect(smallBatchIdx).not.toBe(bigBatchIdx);
   });
 });
 

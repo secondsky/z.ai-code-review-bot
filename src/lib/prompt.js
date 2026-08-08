@@ -118,17 +118,32 @@ export function resolveSystemPrompt(config) {
 
 /**
  * Format a single patchable file as a diff block entry, wrapped in an
- * <untrusted_input> tag and with the filename fence-escaped so a hostile
- * filename cannot close the ```diff fence or inject instructions.
+ * <untrusted_input> tag. The filename is XML-attribute-escaped (so a hostile
+ * filename cannot break out of the name="..." attribute), and the patch is
+ * escaped via escapeUntrustedMultiline so it cannot close the wrapper early.
  *
  * @param {{filename: string, status: string, patch: string}} f
  * @returns {string}
  */
 function formatFileEntry(f) {
-  const safeName = escapeDiffFence(f.filename);
+  // The filename is attacker-controlled and goes into BOTH an XML attribute
+  // (name="...") and a markdown-rendered context. Two concerns:
+  //   1. It must not break out of the name="..." attribute → escape `"` (and
+  //      other attribute metachars) via escapeXmlAttribute.
+  //   2. It must not contain raw backticks/newlines that could close the
+  //      ```diff fence or inject a ```ignore-instructions block → collapse
+  //      them via escapeDiffFence.
+  // Apply escapeDiffFence FIRST (collapses newlines/backticks, neutralizes
+  // untrusted_input tags), then escapeXmlAttribute (encodes " ' & < >).
+  const safeName = escapeXmlAttribute(escapeDiffFence(f.filename));
+  // The patch is multi-line UNTRUSTED content placed inside the wrapper, so it
+  // must be escaped with escapeUntrustedMultiline (which neutralizes
+  // </untrusted_input> tag sequences in any case) so a malicious diff cannot
+  // close the wrapper early and inject instructions.
+  const safePatch = escapeUntrustedMultiline(f.patch);
   return (
     `<untrusted_input source="file" name="${safeName}" status="${f.status}">\n` +
-    `\`\`\`diff\n${f.patch}\n\`\`\`\n` +
+    `\`\`\`diff\n${safePatch}\n\`\`\`\n` +
     `</untrusted_input>`
   );
 }

@@ -914,7 +914,7 @@ describe('validateRepoConfig — invalid max_findings types', () => {
     expect(out).not.toHaveProperty('reviews');
   });
 
-  it('keeps a valid max_findings alongside an invalid one in a fresh call', () => {
+  it('keeps a valid max_findings (guard is per-value, not global)', () => {
     // Sanity: the guard is per-value, not global.
     expect(validateRepoConfig({ reviews: { max_findings: 7 } }).reviews.max_findings).toBe(7);
   });

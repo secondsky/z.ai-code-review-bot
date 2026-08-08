@@ -48,7 +48,7 @@ import {
 import { loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
 import { authorize } from './lib/auth.js';
-import { upsertReviewComment, buildCommentBody, MARKER } from './lib/comments.js';
+import { upsertReviewComment, buildCommentBody, appendTrailers, MARKER } from './lib/comments.js';
 import {
   getChangedFiles,
   filterExcludedFiles,
@@ -838,8 +838,7 @@ export async function run(context, deps = {}) {
         reviewMetadata,
       );
       const shaBlock = buildShaBlock(sha);
-      const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
-      const reviewBody = trailer.length > 0 ? `${baseBody}\n${trailer}` : baseBody;
+      const reviewBody = appendTrailers(baseBody, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -914,8 +913,7 @@ export async function run(context, deps = {}) {
     });
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
-    const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
-    const body = trailer.length > 0 ? `${commentBody}\n${trailer}` : commentBody;
+    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
     await upsertReviewCommentFn({
       octokit,
       owner,

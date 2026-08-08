@@ -55,11 +55,12 @@ const MIN_TIMEOUT_MS = 10000; // floor for the progressive timeout
  */
 export function extractStatusCode(message) {
   const str = String(message ?? '');
-  // Require the 3-digit code to be preceded by an HTTP-error keyword or
-  // delimiter: "error ", "status ", "code ", a colon, or a quote+colon.
-  // This rejects "404.js" (preceded by space but followed by ".js") and
-  // "RFC 418" (preceded by "RFC " with no HTTP keyword).
-  const match = str.match(/(?:error|status|code\b|["':])\s*:?\s*([45]\d{2})\b/i);
+  // Require the 3-digit code to be preceded by an HTTP-error keyword
+  // ("error"/"status"/"code") OR a quote+colon (the JSON `code":NNN` form).
+  // A BARE colon is intentionally NOT accepted: a message like
+  // "error while reading file: 500.js" mentions a local file, not HTTP 500,
+  // and must not be misclassified as a retryable provider error.
+  const match = str.match(/(?:error|status|code\b|["'])\s*:?\s*([45]\d{2})\b/i);
   return match ? parseInt(match[1], 10) : null;
 }
 

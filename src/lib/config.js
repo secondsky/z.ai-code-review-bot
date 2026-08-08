@@ -188,7 +188,10 @@ export function loadConfig(inputs = {}, options = {}) {
 
   // Schedule feature (opt-in, off by default).
   const scheduleEnabled = isTruthy(read(inputs, 'ZAI_SCHEDULE_ENABLED'));
-  const scheduleMaxPrs = clampPositive(read(inputs, 'ZAI_SCHEDULE_MAX_PRS'), 10);
+  // scheduleMaxPrs: capped at an absolute maximum (100) so a runaway value
+  // cannot trigger unbounded sequential work on a schedule tick. The default
+  // remains 10; values up to 100 pass through; above 100 is clamped to 100.
+  const scheduleMaxPrs = clampPositiveCapped(read(inputs, 'ZAI_SCHEDULE_MAX_PRS'), 10, 100);
 
   // describe/impact opt-in mutation features (off by default — v1 stays
   // read-only unless the operator explicitly enables them).
