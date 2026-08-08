@@ -53,6 +53,30 @@ export function buildCommentBody({ title, content, marker }) {
 }
 
 /**
+ * Append hidden HTML-comment "trailer" blocks to a body.
+ *
+ * Used to attach the incremental-review hash block and the schedule-dedup SHA
+ * block after a review/comment body. Empty/falsy blocks are dropped; the rest
+ * are joined with newlines and appended after a separating newline. Returns
+ * the body unchanged when no non-empty trailers are supplied.
+ *
+ * Centralized so the separator and empty-filtering logic stays consistent
+ * across every body-construction site (inline review, summary comment,
+ * scheduled review).
+ *
+ * @param {string} body  The base body (already includes the marker).
+ * @param {Array<string|null|undefined>} trailers  Hidden-comment blocks to append.
+ * @returns {string}
+ */
+export function appendTrailers(body, trailers = []) {
+  const list = Array.isArray(trailers)
+    ? trailers.filter((s) => typeof s === 'string' && s.length > 0)
+    : [];
+  if (list.length === 0) return body;
+  return `${body}\n${list.join('\n')}`;
+}
+
+/**
  * Upsert the single summary review comment on a PR.
  *
  * 1. List issue comments, PAGINATING fully (page=1, per_page=100, loop until a

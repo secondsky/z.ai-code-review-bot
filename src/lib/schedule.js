@@ -22,7 +22,7 @@
  * @module src/lib/schedule.js
  */
 
-import { MARKER } from './comments.js';
+import { MARKER, appendTrailers } from './comments.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
 export const DEFAULT_MAX_PRS = 10;
@@ -236,7 +236,7 @@ export async function reviewOnePr({
       // re-reviewed every tick). Appended after the body so the marker scan and
       // rendered review are unaffected.
       const shaBlock = buildShaBlock(pr.headSha);
-      const body = shaBlock ? `${baseBody}\n${shaBlock}` : baseBody;
+      const body = appendTrailers(baseBody, [shaBlock]);
       const comments = buildReviewComments(inline);
       const event = resolveReviewEvent(result.findings, config);
       try {
@@ -285,7 +285,7 @@ export async function reviewOnePr({
     // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
     // cron tick (see the inline branch above for rationale).
     const shaBlock = buildShaBlock(pr.headSha);
-    const body = shaBlock ? `${commentBody}\n${shaBlock}` : commentBody;
+    const body = appendTrailers(commentBody, [shaBlock]);
     await upsertReviewComment({
       octokit,
       owner,

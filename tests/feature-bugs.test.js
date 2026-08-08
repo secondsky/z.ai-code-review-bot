@@ -36,11 +36,11 @@ describe('US-036: MAX_DIFF_CHARS negative value handling', () => {
     expect(cfg.maxDiffChars).toBe(0);
   });
 
-  it('a negative value should behave like the docs promise (unlimited) but currently returns 100000', () => {
+  it('treats a negative value as unlimited (regression: previously returned 100000)', () => {
     // Per action.yml + the code comment, negatives mean unlimited (0).
-    // The CURRENT production code returns 100000 for negatives — a bug.
+    // Previously the code returned 100000 for negatives (a doc/code mismatch);
+    // this guards against that regression.
     const cfg = loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-1' });
-    // EXPECTED after fix: 0 (unlimited). Current buggy value: 100000.
     expect(cfg.maxDiffChars).toBe(0);
   });
 });
@@ -313,7 +313,7 @@ describe('US-059: ZAI_SCHEDULE_MAX_PRS honored above the default', () => {
     return octokit;
   }
 
-  it('config.scheduleMaxPrs=25 reviews up to 25 PRs (currently clamped to 10)', async () => {
+  it('config.scheduleMaxPrs=25 reviews up to 25 PRs (regression: was clamped to default 10)', async () => {
     const prs = Array.from({ length: 25 }, (_, i) => ({
       number: i + 1,
       head: { sha: `sha-${i}` },
@@ -346,8 +346,9 @@ describe('US-059: ZAI_SCHEDULE_MAX_PRS honored above the default', () => {
       resolveReviewEvent: () => 'COMMENT',
       // NOTE: maxPrs intentionally NOT passed, mirroring src/index.js.
     });
-    // EXPECTED after fix: 25 PRs considered (reviewed=25 since all short-circuit
-    // to skipped-no-patchable which counts as ok). Current: clamped to 10.
+    // 25 PRs considered (reviewed=25 since all short-circuit to
+    // skipped-no-patchable which counts as ok). Previously the default maxPrs
+    // (10) silently clamped this to 10; this guards against that regression.
     expect(result.reviewed).toBe(25);
   });
 });

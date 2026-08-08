@@ -79,7 +79,13 @@ export function makePatch(opts = {}) {
     })
     .join('\n');
 
-  return `@@ -${oldStart},${lines.length} +${newStart},${lines.length} @@\n${body}`;
+  // Derive per-side hunk counts from the line types so the @@ header matches
+  // the body. oldCount = context + deleted lines; newCount = context + added
+  // lines. (Using lines.length for both sides is wrong for mixed patches.)
+  const oldCount = lines.filter((l) => l.type === 'ctx' || l.type === 'del').length;
+  const newCount = lines.filter((l) => l.type === 'ctx' || l.type === 'add').length;
+
+  return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@\n${body}`;
 }
 
 /* ------------------------------------------------------------------ *

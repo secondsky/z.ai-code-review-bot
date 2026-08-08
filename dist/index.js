@@ -38614,7 +38614,10 @@ function loadConfig(inputs = {}, options = {}) {
 
   // Schedule feature (opt-in, off by default).
   const scheduleEnabled = isTruthy(read(inputs, 'ZAI_SCHEDULE_ENABLED'));
-  const scheduleMaxPrs = clampPositive(read(inputs, 'ZAI_SCHEDULE_MAX_PRS'), 10);
+  // scheduleMaxPrs: capped at an absolute maximum (100) so a runaway value
+  // cannot trigger unbounded sequential work on a schedule tick. The default
+  // remains 10; values up to 100 pass through; above 100 is clamped to 100.
+  const scheduleMaxPrs = clampPositiveCapped(read(inputs, 'ZAI_SCHEDULE_MAX_PRS'), 10, 100);
 
   // describe/impact opt-in mutation features (off by default — v1 stays
   // read-only unless the operator explicitly enables them).
@@ -38865,11 +38868,12 @@ const MIN_TIMEOUT_MS = 10000; // floor for the progressive timeout
  */
 function extractStatusCode(message) {
   const str = String(message ?? '');
-  // Require the 3-digit code to be preceded by an HTTP-error keyword or
-  // delimiter: "error ", "status ", "code ", a colon, or a quote+colon.
-  // This rejects "404.js" (preceded by space but followed by ".js") and
-  // "RFC 418" (preceded by "RFC " with no HTTP keyword).
-  const match = str.match(/(?:error|status|code\b|["':])\s*:?\s*([45]\d{2})\b/i);
+  // Require the 3-digit code to be preceded by an HTTP-error keyword
+  // ("error"/"status"/"code") OR a quote+colon (the JSON `code":NNN` form).
+  // A BARE colon is intentionally NOT accepted: a message like
+  // "error while reading file: 500.js" mentions a local file, not HTTP 500,
+  // and must not be misclassified as a retryable provider error.
+  const match = str.match(/(?:error|status|code\b|["'])\s*:?\s*([45]\d{2})\b/i);
   return match ? parseInt(match[1], 10) : null;
 }
 
@@ -39745,6 +39749,30 @@ function buildCommentBody({ title, content, marker }) {
 }
 
 /**
+ * Append hidden HTML-comment "trailer" blocks to a body.
+ *
+ * Used to attach the incremental-review hash block and the schedule-dedup SHA
+ * block after a review/comment body. Empty/falsy blocks are dropped; the rest
+ * are joined with newlines and appended after a separating newline. Returns
+ * the body unchanged when no non-empty trailers are supplied.
+ *
+ * Centralized so the separator and empty-filtering logic stays consistent
+ * across every body-construction site (inline review, summary comment,
+ * scheduled review).
+ *
+ * @param {string} body  The base body (already includes the marker).
+ * @param {Array<string|null|undefined>} trailers  Hidden-comment blocks to append.
+ * @returns {string}
+ */
+function appendTrailers(body, trailers = []) {
+  const list = Array.isArray(trailers)
+    ? trailers.filter((s) => typeof s === 'string' && s.length > 0)
+    : [];
+  if (list.length === 0) return body;
+  return `${body}\n${list.join('\n')}`;
+}
+
+/**
  * Upsert the single summary review comment on a PR.
  *
  * 1. List issue comments, PAGINATING fully (page=1, per_page=100, loop until a
@@ -40077,17 +40105,32 @@ function resolveSystemPrompt(config) {
 
 /**
  * Format a single patchable file as a diff block entry, wrapped in an
- * <untrusted_input> tag and with the filename fence-escaped so a hostile
- * filename cannot close the ```diff fence or inject instructions.
+ * <untrusted_input> tag. The filename is XML-attribute-escaped (so a hostile
+ * filename cannot break out of the name="..." attribute), and the patch is
+ * escaped via escapeUntrustedMultiline so it cannot close the wrapper early.
  *
  * @param {{filename: string, status: string, patch: string}} f
  * @returns {string}
  */
 function formatFileEntry(f) {
-  const safeName = escapeDiffFence(f.filename);
+  // The filename is attacker-controlled and goes into BOTH an XML attribute
+  // (name="...") and a markdown-rendered context. Two concerns:
+  //   1. It must not break out of the name="..." attribute → escape `"` (and
+  //      other attribute metachars) via escapeXmlAttribute.
+  //   2. It must not contain raw backticks/newlines that could close the
+  //      ```diff fence or inject a ```ignore-instructions block → collapse
+  //      them via escapeDiffFence.
+  // Apply escapeDiffFence FIRST (collapses newlines/backticks, neutralizes
+  // untrusted_input tags), then escapeXmlAttribute (encodes " ' & < >).
+  const safeName = escapeXmlAttribute(escapeDiffFence(f.filename));
+  // The patch is multi-line UNTRUSTED content placed inside the wrapper, so it
+  // must be escaped with escapeUntrustedMultiline (which neutralizes
+  // </untrusted_input> tag sequences in any case) so a malicious diff cannot
+  // close the wrapper early and inject instructions.
+  const safePatch = escapeUntrustedMultiline(f.patch);
   return (
     `<untrusted_input source="file" name="${safeName}" status="${f.status}">\n` +
-    `\`\`\`diff\n${f.patch}\n\`\`\`\n` +
+    `\`\`\`diff\n${safePatch}\n\`\`\`\n` +
     `</untrusted_input>`
   );
 }
@@ -44520,7 +44563,7 @@ async function reviewOnePr({
       // re-reviewed every tick). Appended after the body so the marker scan and
       // rendered review are unaffected.
       const shaBlock = buildShaBlock(pr.headSha);
-      const body = shaBlock ? `${baseBody}\n${shaBlock}` : baseBody;
+      const body = appendTrailers(baseBody, [shaBlock]);
       const comments = buildReviewComments(inline);
       const event = resolveReviewEvent(result.findings, config);
       try {
@@ -44569,7 +44612,7 @@ async function reviewOnePr({
     // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
     // cron tick (see the inline branch above for rationale).
     const shaBlock = buildShaBlock(pr.headSha);
-    const body = shaBlock ? `${commentBody}\n${shaBlock}` : commentBody;
+    const body = appendTrailers(commentBody, [shaBlock]);
     await upsertReviewComment({
       octokit,
       owner,
@@ -49338,8 +49381,7 @@ async function run(context, deps = {}) {
         reviewMetadata,
       );
       const shaBlock = buildShaBlock(sha);
-      const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
-      const reviewBody = trailer.length > 0 ? `${baseBody}\n${trailer}` : baseBody;
+      const reviewBody = appendTrailers(baseBody, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -49414,8 +49456,7 @@ async function run(context, deps = {}) {
     });
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
-    const trailer = [hashBlock, shaBlock].filter((s) => s.length > 0).join('\n');
-    const body = trailer.length > 0 ? `${commentBody}\n${trailer}` : commentBody;
+    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
     await upsertReviewCommentFn({
       octokit,
       owner,
