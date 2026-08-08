@@ -46,9 +46,10 @@ function parseFullHunkHeader(line) {
   const oldCount = m[2] !== undefined ? parseInt(m[2], 10) : 1;
   const newStart = parseInt(m[3], 10);
   const newCount = m[4] !== undefined ? parseInt(m[4], 10) : 1;
-  if (![oldStart, newStart].every((n) => Number.isFinite(n) && n >= 1)) {
-    return null;
-  }
+  // newStart must be >= 1 (need at least one new line to comment on), but
+  // oldStart may be 0 — git emits `@@ -0,0 +1,N @@` for newly-created files.
+  if (!Number.isFinite(oldStart) || oldStart < 0) return null;
+  if (!Number.isFinite(newStart) || newStart < 1) return null;
   return { oldStart, oldCount, newStart, newCount };
 }
 
@@ -91,6 +92,10 @@ export function parseHunks(patch) {
         newLine = header.newStart;
         cur = { ...header, lines: [] };
         hunks.push(cur);
+      } else {
+        // Reject the hunk header: drop the current hunk context so its body
+        // lines are NOT mis-attributed to the prior valid hunk.
+        cur = null;
       }
       continue;
     }

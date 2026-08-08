@@ -14,6 +14,7 @@
  * throws; no `@actions/core` import; no direct network.
  */
 import { postComment } from './_shared.js';
+import { wrapUntrusted } from '../prompt.js';
 import {
   getChangedFiles,
   filterPatchableFiles,
@@ -45,17 +46,45 @@ const SEVERITY_KEYS = {
 /**
  * Extract the severity from the model's impact assessment. The prompt asks for
  * a severity level on its own first line; this parses the first severity
- * keyword or emoji found in the first ~200 chars. Pure (exported for testing).
+ * keyword or emoji found. Pure (exported for testing).
+ *
+ * Word-form keys (critical/high/medium/low) are matched with word boundaries
+ * so that "highlighted" no longer matches "high" and "noncritical" no longer
+ * matches "critical". Common negation prefixes ("non-critical", "not critical",
+ * "no critical issues", "isn't high") are stripped before matching so a
+ * negated severity word does not false-positive. Emoji keys have no word
+ * boundaries, so they still use `includes`. We prefer the FIRST line (where the
+ * prompt asks for the level), then fall back to the full text.
  *
  * @param {string} text  The model's assessment output.
  * @returns {'critical'|'high'|'medium'|'low'|null}
  */
 export function parseSeverity(text) {
-  const t = String(text ?? '').toLowerCase();
+  const raw = String(text ?? '');
+  // Remove negated severity phrases entirely so "non-critical", "not critical",
+  // "no critical issues", "isn't high risk" don't false-positive. We match
+  // common negators followed by an optional separator and the severity word,
+  // replacing the whole phrase with a neutral placeholder.
+  const SEV_WORDS = 'critical|high|medium|low';
+  const NEGATED_RE = new RegExp(
+    `\\b(?:non-|not\\s+|no\\s+|isn'?t\\s+|aren'?t\\s+|without\\s+)\\s*(?:${SEV_WORDS})\\b`,
+    'gi',
+  );
+  const cleaned = raw.replace(NEGATED_RE, 'neutral');
+  const firstLine = cleaned.split('\n')[0];
   // Check emoji + word forms in priority order (critical first).
   for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
     const mapped = SEVERITY_KEYS[key];
-    if (mapped && t.includes(key.toLowerCase())) return mapped;
+    if (!mapped) continue;
+    if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
+      // Emoji keys have no word boundaries; use includes.
+      if (raw.includes(key)) return mapped;
+    } else {
+      // Word keys: match on a word boundary to avoid false positives
+      // (e.g. "highlighted" → high, "noncritical" → critical).
+      const re = new RegExp(`\\b${key}\\b`, 'i');
+      if (re.test(firstLine) || re.test(cleaned)) return mapped;
+    }
   }
   return null;
 }
@@ -99,8 +128,7 @@ export function buildImpactPrompt(files) {
     'security/auth/data-loss concerns, and anything a reviewer should verify.',
     'Be concise and concrete; cite filenames where relevant.',
     '',
-    '## Changes under review',
-    buildDiffContext(files),
+    wrapUntrusted(`## Changes under review\n${buildDiffContext(files)}`, 'pr-changes'),
   ].join('\n');
 }
 

@@ -65,6 +65,17 @@ export function resolveCachePath(spec) {
   if (typeof version !== 'string' || !version) {
     throw new Error('ensureBinary: version is required');
   }
+  // Defense-in-depth: reject path separators / traversal sequences in name and
+  // version. These are currently hardcoded, but guard against future regressions
+  // and untrusted inputs that could escape the cache dir.
+  for (const label of /** @type {const} */ (['name', 'version'])) {
+    const value = label === 'name' ? name : version;
+    if (/[\\/]/.test(value) || value === '..' || value.includes('..')) {
+      throw new Error(
+        `ensureBinary: ${label} must not contain path separators or ".." (got "${value}")`,
+      );
+    }
+  }
   return join(cacheDir, name, version, `${name}${ext}`);
 }
 

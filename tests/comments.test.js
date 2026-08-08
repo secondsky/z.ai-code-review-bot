@@ -48,9 +48,14 @@ function makeOctokit({ list = [], throwOnList = null, paginated = null } = {}) {
   return { octokit, calls };
 }
 
-function makeComment(id, body) {
-  return { id, body };
+function makeComment(id, body, user = undefined) {
+  return { id, body, ...(user ? { user } : {}) };
 }
+
+/** A typical bot author (GitHub Actions app bot). */
+const BOT_USER = { login: 'github-actions[bot]', type: 'Bot' };
+/** A typical human / drive-by commenter. */
+const HUMAN_USER = { login: 'someuser', type: 'User' };
 
 describe('MARKER', () => {
   test('is the expected hidden HTML comment string', () => {
@@ -111,7 +116,7 @@ describe('upsertReviewComment', () => {
   });
 
   test('updates the existing comment that contains the marker', async () => {
-    const existing = makeComment(7, `prior review\n\n${MARKER}`);
+    const existing = makeComment(7, `prior review\n\n${MARKER}`, BOT_USER);
     const { octokit, calls } = makeOctokit({ list: [makeComment(1, 'noise'), existing] });
     const core = { info() {} };
 
@@ -148,7 +153,7 @@ describe('upsertReviewComment', () => {
     );
     const page2 = [
       ...Array.from({ length: 44 }, (_, i) => makeComment(101 + i, 'noise')),
-      makeComment(145, `buried review\n\n${MARKER}`),
+      makeComment(145, `buried review\n\n${MARKER}`, BOT_USER),
     ];
     const { octokit, calls } = makeOctokit({
       paginated: { perPage: 100, pages: [page1, page2] },
@@ -165,7 +170,7 @@ describe('upsertReviewComment', () => {
   });
 
   test('stops paginating once the marker is found on an early page', async () => {
-    const page1 = [makeComment(5, `early marker\n\n${MARKER}`)];
+    const page1 = [makeComment(5, `early marker\n\n${MARKER}`, BOT_USER)];
     const { octokit, calls } = makeOctokit({
       paginated: { perPage: 100, pages: [page1, [makeComment(6, 'x')]] },
     });
@@ -185,8 +190,8 @@ describe('upsertReviewComment', () => {
   });
 
   test('updates only the FIRST comment matching the marker when several do', async () => {
-    const first = makeComment(11, `one\n\n${MARKER}`);
-    const second = makeComment(22, `two\n\n${MARKER}`);
+    const first = makeComment(11, `one\n\n${MARKER}`, BOT_USER);
+    const second = makeComment(22, `two\n\n${MARKER}`, BOT_USER);
     const { octokit, calls } = makeOctokit({ list: [first, second] });
 
     const result = await upsertReviewComment({ ...base, octokit });
@@ -203,7 +208,7 @@ describe('upsertReviewComment', () => {
   });
 
   test('defaults marker to MARKER constant when not provided', async () => {
-    const existing = makeComment(5, `review\n\n${MARKER}`);
+    const existing = makeComment(5, `review\n\n${MARKER}`, BOT_USER);
     const { octokit, calls } = makeOctokit({ list: [existing] });
 
     const { marker: _omitted, ...rest } = base;
@@ -227,7 +232,7 @@ describe('upsertReviewComment', () => {
   test('core.info is invoked when core is provided (update path)', async () => {
     const infoCalls = [];
     const core = { info: (msg) => infoCalls.push(msg) };
-    const existing = makeComment(3, `${MARKER}`);
+    const existing = makeComment(3, `${MARKER}`, BOT_USER);
     const { octokit } = makeOctokit({ list: [existing] });
 
     await upsertReviewComment({ ...base, octokit, core });
@@ -242,5 +247,60 @@ describe('upsertReviewComment', () => {
       action: 'created',
       commentId: 999,
     });
+  });
+
+  // ----- Security: comment hijack via spoofed marker (F03) -----
+  // A non-bot user posting a comment containing the marker must NOT cause the
+  // bot to overwrite that comment on every run (which would let an attacker
+  // hijack the bot's review thread). Only bot-authored marker comments are
+  // eligible for in-place update.
+  test('does NOT match a marker in a non-bot (User) comment — creates a new comment instead', async () => {
+    const spoofed = makeComment(7, `attacker review\n\n${MARKER}`, HUMAN_USER);
+    const { octokit, calls } = makeOctokit({ list: [spoofed] });
+
+    const result = await upsertReviewComment({ ...base, octokit });
+
+    // Must CREATE (not update): the spoofed comment is ignored.
+    expect(result).toEqual({ action: 'created', commentId: 999 });
+    expect(calls.createComment).toHaveLength(1);
+    expect(calls.updateComment).toHaveLength(0);
+  });
+
+  test('matches a marker in a bot-authored comment (type Bot) — updates in place', async () => {
+    const existing = makeComment(8, `prior review\n\n${MARKER}`, BOT_USER);
+    const { octokit, calls } = makeOctokit({ list: [existing] });
+
+    const result = await upsertReviewComment({ ...base, octokit });
+
+    expect(result).toEqual({ action: 'updated', commentId: 8 });
+    expect(calls.updateComment).toHaveLength(1);
+    expect(calls.updateComment[0].comment_id).toBe(8);
+    expect(calls.createComment).toHaveLength(0);
+  });
+
+  test('matches a marker in a bot-authored comment (login ends with [bot]) — updates in place', async () => {
+    // Covers the login-suffix code path (type field absent).
+    const existing = makeComment(9, `prior review\n\n${MARKER}`, { login: 'z-ai-code-reviewer[bot]' });
+    const { octokit, calls } = makeOctokit({ list: [existing] });
+
+    const result = await upsertReviewComment({ ...base, octokit });
+
+    expect(result).toEqual({ action: 'updated', commentId: 9 });
+    expect(calls.updateComment).toHaveLength(1);
+    expect(calls.createComment).toHaveLength(0);
+  });
+
+  test('ignores a non-bot marker comment but still updates a later bot marker comment', async () => {
+    // Ordering matters: the spoofed (human) comment appears FIRST, but must be
+    // skipped; the bot comment (second) is the one that gets updated.
+    const spoofed = makeComment(10, `fake\n\n${MARKER}`, HUMAN_USER);
+    const real = makeComment(11, `real\n\n${MARKER}`, BOT_USER);
+    const { octokit, calls } = makeOctokit({ list: [spoofed, real] });
+
+    const result = await upsertReviewComment({ ...base, octokit });
+
+    expect(result).toEqual({ action: 'updated', commentId: 11 });
+    expect(calls.updateComment[0].comment_id).toBe(11);
+    expect(calls.createComment).toHaveLength(0);
   });
 });

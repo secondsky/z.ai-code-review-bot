@@ -182,12 +182,13 @@ function escapeXmlAttribute(s) {
 }
 
 /**
- * Escape structural XML close-tags inside patch bodies so an attacker cannot
- * inject `</diff>`, `</file>`, or `</review_batch>` to break out of the
- * wrapping boundary the prompt relies on for structure.
+ * Escape structural XML tags (both open and close) inside patch bodies so an
+ * attacker cannot inject `</diff>`, `</file>`, `</review_batch>`, or their
+ * opening equivalents to break out of the wrapping boundary the prompt relies
+ * on for structure.
  */
 function escapeStructuralTags(s) {
-  return String(s ?? '').replace(/<\/(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
+  return String(s ?? '').replace(/<\/?(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
 }
 
 /**
@@ -333,6 +334,10 @@ export async function runWithConcurrency(items, concurrency, fn) {
 
   let cursor = 0;
   let active = 0;
+  // Abort flag: once any item rejects, stop launching NEW items so we don't
+  // keep consuming resources (e.g. API credits) for a review that will fail.
+  // Items already in flight still settle naturally.
+  let aborted = false;
 
   return new Promise((resolve, reject) => {
     if (list.length === 0) {
@@ -341,14 +346,15 @@ export async function runWithConcurrency(items, concurrency, fn) {
     }
 
     const launchNext = () => {
-      // Stop launching once we've hit the limit or run out of items.
-      while (active < limit && cursor < list.length) {
+      // Stop launching once we've hit the limit, run out of items, or aborted.
+      while (active < limit && cursor < list.length && !aborted) {
         const i = cursor++;
         active++;
         let p;
         try {
           p = Promise.resolve(fn(list[i], i));
         } catch (err) {
+          aborted = true;
           reject(err);
           return;
         }
@@ -363,7 +369,10 @@ export async function runWithConcurrency(items, concurrency, fn) {
             }
           },
           (err) => {
-            // First rejection wins; subsequent rejects are swallowed.
+            // First rejection wins; subsequent rejects are swallowed. Set the
+            // abort flag so success handlers from other in-flight items don't
+            // launch yet more items.
+            aborted = true;
             reject(err);
           },
         );
@@ -407,12 +416,15 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
     const raw = await callApi(state.apiKey, state.model, prompt);
     return [raw];
   } catch (error) {
-    if (
-      !isContextLimitError(error) ||
-      !entries.length ||
-      entries.length === 1
-    ) {
+    if (!isContextLimitError(error) || !entries.length) {
       throw error;
+    }
+    if (entries.length === 1) {
+      // Single entry overflows context — skip it rather than abort the whole
+      // review. Rethrowing here would propagate through runWithConcurrency and
+      // cancel every other batch; returning an empty findings array lets the
+      // caller still get results for the remaining batches.
+      return [];
     }
     const mid = Math.ceil(entries.length / 2);
     const left = entries.slice(0, mid);

@@ -115,6 +115,67 @@ describe('getChangedFiles', () => {
     expect(result).toHaveLength(2);
     expect(result.find((f) => f.filename === 'bin.png').patch).toBeUndefined();
   });
+
+  test('BUG4: pagination caps at MAX_FILES — a runaway PR does not fetch forever', async () => {
+    // Every page returns a full page, so without a cap the loop would never
+    // terminate. The cap must stop fetching once MAX_FILES is reached.
+    const fullPage = Array.from({ length: 100 }, (_, i) => makeFile(`f${i}.js`, 'modified', '@@'));
+    // makePagesOctokit returns the same array reference each call; we want it
+    // to keep returning full pages forever.
+    const infiniteOctokit = {
+      rest: {
+        pulls: {
+          async listFiles() {
+            return { data: fullPage };
+          },
+        },
+      },
+    };
+
+    const result = await getChangedFiles({
+      octokit: infiniteOctokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      perPage: 100,
+    });
+
+    // Cap must be a finite ceiling well below "infinite". The exact value is
+    // MAX_FILES (3000) — assert it is bounded and reasonable.
+    expect(result.length).toBeLessThanOrEqual(3000);
+    expect(result.length).toBeGreaterThan(100); // it did fetch more than one page
+  });
+
+  test('BUG4: pagination caps at MAX_PAGES — does not run past 100 pages', async () => {
+    // Use a tiny perPage so many pages are needed; ensure we stop well before
+    // the page count grows without bound even if every page is full.
+    const fullPage = Array.from({ length: 5 }, (_, i) => makeFile(`f${i}.js`, 'modified', '@@'));
+    const calls = [];
+    let i = 0;
+    const octokit = {
+      rest: {
+        pulls: {
+          async listFiles(params) {
+            calls.push(params);
+            return { data: fullPage };
+          },
+        },
+      },
+    };
+
+    const result = await getChangedFiles({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      perPage: 5,
+    });
+
+    // With MAX_PAGES=100 and MAX_FILES=3000, and pages of 5, the file cap
+    // (3000) would be hit at 600 pages — but the page cap (100) hits first.
+    expect(calls.length).toBeLessThanOrEqual(100);
+    expect(result.length).toBeLessThanOrEqual(3000);
+  });
 });
 
 describe('filterPatchableFiles', () => {

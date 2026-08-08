@@ -550,18 +550,21 @@ describe('executeStructuredBatch', () => {
     expect(out.every((r) => r === 'AFTER_HALVE')).toBe(true);
   });
 
-  test('context-limit on SINGLE entry → rethrows', async () => {
+  test('context-limit on SINGLE entry → returns [] (skip the file, do NOT abort)', async () => {
+    // BUG2: a single entry that overflows the context limit must NOT be rethrown
+    // — that would propagate through runWithConcurrency and abort the whole
+    // review. Instead, return an empty findings array (the file is skipped) so
+    // other batches still get results.
     const callApi = async () => {
       throw new Error('maximum context length exceeded');
     };
     const entries = [{ filename: 'f.js', status: 'modified', patch: 'X', chunkIndex: 1, chunkCount: 1 }];
-    await expect(
-      executeStructuredBatch(
-        entries,
-        { apiKey: 'k', model: 'm', batchNumber: 1, totalBatches: 1 },
-        { callApi },
-      ),
-    ).rejects.toThrow(/maximum context length/);
+    const out = await executeStructuredBatch(
+      entries,
+      { apiKey: 'k', model: 'm', batchNumber: 1, totalBatches: 1 },
+      { callApi },
+    );
+    expect(out).toEqual([]);
   });
 
   test('non-context error → rethrows', async () => {
@@ -757,6 +760,55 @@ describe('runWithConcurrency', () => {
     const fn = (x) => x * 2; // synchronous (non-promise) return
     const out = await runWithConcurrency(items, 2, fn);
     expect(out).toEqual([2, 4, 6]);
+  });
+
+  test('BUG1: after a rejection, stops launching NEW items (does not consume credits)', async () => {
+    // Discriminating scenario for the abort fix:
+    //  - concurrency=2 so only 2 items are in flight at a time.
+    //  - items 0 and 1 launch first. Item 1 REJECTS quickly. Item 0 is still
+    //    in flight, then SUCCEEDS AFTER the rejection.
+    //  - Under the BUGGY code, item 0's post-rejection success calls
+    //    launchNext() and starts item 2 (and beyond). Under the FIX, the
+    //    aborted flag makes launchNext a no-op, so item 2+ never starts.
+    //
+    // Items 2+ block on a gate so that, IF the bug launches them, they're
+    // observable in `started`. We release the gate only after asserting, and
+    // we wait long enough for item 0's post-rejection success (30ms) to have
+    // fired and (under the bug) launched item 2.
+    const items = [0, 1, 2, 3, 4];
+    const started = [];
+    let releaseLate;
+    const lateGate = new Promise((r) => {
+      releaseLate = r;
+    });
+    const fn = async (x) => {
+      started.push(x);
+      if (x === 1) {
+        // Reject quickly so item 0's success happens post-rejection.
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error('boom on 1');
+      }
+      if (x === 0) {
+        // Succeed AFTER item 1 rejects (30ms). Under the bug, this success
+        // launches item 2 once it fires.
+        await new Promise((r) => setTimeout(r, 30));
+        return x;
+      }
+      // Items 2+ (only launched under the bug): block on the gate so they're
+      // observable in `started` before teardown.
+      await lateGate;
+      return x;
+    };
+    await expect(runWithConcurrency(items, 2, fn)).rejects.toThrow('boom on 1');
+    // Wait past item 0's 30ms success delay so that, under the bug, item 2
+    // would have been launched and recorded in `started`.
+    await new Promise((r) => setTimeout(r, 60));
+    // Release any in-flight late items so the process can settle.
+    releaseLate();
+    // The fix must have kept item 0's post-rejection success from launching
+    // items 2..4.
+    expect(started).not.toContain(2);
+    expect(started).not.toContain(4);
   });
 });
 

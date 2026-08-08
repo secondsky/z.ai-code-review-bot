@@ -13,6 +13,7 @@
  *   - callApi rejection → a fixed short error comment (NOT the raw error).
  */
 import { postComment, getPRContext } from './_shared.js';
+import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles, filterPatchableFiles } from '../changed-files.js';
 
 /** Soft cap on the diff context bundled into the prompt. */
@@ -62,12 +63,11 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
 export function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
   const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
+  const prContext = `${title}${body}${buildDiffContext(files)}`;
   return [
     `Question from @${commenterLogin || 'unknown'}: ${question}`,
     '',
-    'PR context:',
-    `${title}${body}`,
-    buildDiffContext(files),
+    wrapUntrusted(prContext, 'pr-context'),
   ].join('\n');
 }
 

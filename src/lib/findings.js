@@ -805,7 +805,7 @@ export function formatFindingsAsSummary(findings, options = {}) {
           lines.push(`  💡 ${suggestion}`);
         }
         if (evidence.length > 0) {
-          lines.push(`  > \`${evidence}\``);
+          lines.push(`  > \`${String(evidence).replace(/`/g, '\\`')}\``);
         }
       }
       lines.push('');

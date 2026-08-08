@@ -14,6 +14,8 @@
  * throws; no `@actions/core` import; no direct network.
  */
 import { postComment, upsertPrDescription } from './_shared.js';
+import { sanitizeModelOutput } from '../sanitize-output.js';
+import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
 
 /** Fixed error comment (no raw error leakage). */
@@ -44,11 +46,10 @@ export function buildDescribePrompt({ commits, files }) {
     'Overview, Features, Bug Fixes, Refactoring, Infrastructure. Do not',
     'include a section header for changes that did not happen.',
     '',
-    '## Commits',
-    commitLines || '(none)',
-    '',
-    '## Changed files',
-    fileLines || '(none)',
+    wrapUntrusted(
+      `## Commits\n${commitLines || '(none)'}\n\n## Changed files\n${fileLines || '(none)'}`,
+      'commits-and-files',
+    ),
   ].join('\n');
 }
 
@@ -116,12 +117,27 @@ export async function handleDescribeCommand(
         : [[], []];
 
     const prompt = buildDescribePrompt({ commits, files });
-    const description = await callApi(config.apiKey, config.model, prompt);
-    await post(description);
+    const raw = await callApi(config.apiKey, config.model, prompt);
+    // Sanitize ONCE before BOTH paths (comment + body upsert). The comment
+    // path would be sanitized again inside postComment (idempotent), but the
+    // body-upsert path (upsertPrDescription → pulls.update) does NOT sanitize
+    // — so without this, raw model output (e.g. injected @mentions or forged
+    // GitHub alert banners from an indirect prompt-injection in the diff) is
+    // written verbatim into the PR body under the bot's trusted identity.
+    // sanitizeModelOutput also caps length at 16000, avoiding GitHub's 65536-
+    // char 422 on the pulls.update call.
+    const safeDescription = sanitizeModelOutput(raw);
+    await post(safeDescription);
     // OPT-IN mutation: when ZAI_DESCRIBE_WRITE_BODY is true, upsert a marked
     // description block into the PR body. Only the marked block is mutated.
     if (config.describeWriteBody && typeof pullNumber === 'number') {
-      await upsertDescription({ octokit, owner, repo, pullNumber, description });
+      await upsertDescription({
+        octokit,
+        owner,
+        repo,
+        pullNumber,
+        description: safeDescription,
+      });
     }
   } catch (error) {
     if (core?.warning) {

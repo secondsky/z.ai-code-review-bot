@@ -39254,10 +39254,14 @@ async function callWithRetry(fn, options = {}) {
 function createApiClient(config = {}) {
   const {
     timeout = DEFAULT_TIMEOUT_MS,
-    maxRetries = DEFAULT_MAX_RETRIES,
     baseDelay = DEFAULT_BASE_DELAY_MS,
     fallbackPrompt: configFallbackPrompt = null,
   } = config;
+  // Clamp maxRetries to [0, 10]. A misconfigured value (e.g. 1000000) would
+  // otherwise cause an enormous number of retry attempts against the provider.
+  const rawRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const safeRetries = Math.min(Math.max(0, rawRetries), 10);
+  const maxRetries = safeRetries;
 
   // Normalize a string fallbackPrompt to the function shape callWithRetry
   // expects. A non-empty string becomes `() => ({ prompt: string })`; a
@@ -39525,6 +39529,11 @@ const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
   let inFence = false; // ``` fence state, tracked across lines
+  // Index in `out` of the most recent OPENING fence line, or -1 when the last
+  // seen fence was properly closed. If the loop ends with inFence === true
+  // (an unclosed fence), we re-neutralize the lines after this opening line so
+  // an attacker cannot smuggle @mentions through by leaving a fence open (C02).
+  let unclosedStart = -1;
   const out = [];
   for (const line of lines) {
     // Toggle fence state if the line opens/closes a ``` block.
@@ -39535,10 +39544,12 @@ function neutralizeMentionsOutsideCode(text) {
     if (/^\s*```/.test(line)) {
       if (inFence) {
         inFence = false;
+        unclosedStart = -1; // this fence closed cleanly
         out.push(line);
         continue;
       }
       inFence = true;
+      unclosedStart = out.length; // index where the opening fence line lands
       out.push(line);
       continue;
     }
@@ -39547,6 +39558,16 @@ function neutralizeMentionsOutsideCode(text) {
       continue;
     }
     out.push(neutralizeMentionsInLine(line));
+  }
+  // C02: a fence was opened but never closed. The lines after the opening fence
+  // line were treated as "inside fence" and pushed verbatim — but a properly
+  // formed review would have closed the fence, so those lines are actually
+  // prose and their @mentions must be neutralized. Re-process them now. The
+  // opening fence line itself is left as-is.
+  if (unclosedStart >= 0) {
+    for (let i = unclosedStart + 1; i < out.length; i++) {
+      out[i] = neutralizeMentionsInLine(out[i]);
+    }
   }
   return out.join('\n');
 }
@@ -39670,6 +39691,23 @@ function sanitizeCommentBody(body) {
 const MARKER = '<!-- zai-code-review -->';
 
 /**
+ * Determine whether a comment was authored by a bot. Used to gate marker-based
+ * matching so a drive-by human commenter cannot post the marker and cause the
+ * bot to overwrite THEIR comment on every run (comment hijack). Accepts EITHER
+ * signal GitHub surfaces for bot accounts: `user.type === 'Bot'` (GitHub Apps
+ * bot accounts) OR `user.login` ending in `[bot]` (actions and other bots).
+ *
+ * @param {{user?: {type?: string, login?: string}}} comment
+ * @returns {boolean}
+ */
+function comments_isBotComment(comment) {
+  const user = comment?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * Build the comment body from a title and content, appending the marker. The
  * model `content` is run through the output sanitizer first so an indirect
  * prompt-injection cannot coax the bot into emitting @mention spam or forged
@@ -39699,7 +39737,11 @@ function buildCommentBody({ title, content, marker }) {
  *    first 100. Without full pagination a PR with >100 comments would lose the
  *    marker comment from the visible window and create a duplicate summary on
  *    every run.
- * 2. Find the first whose body contains `marker` (default {@link MARKER}).
+ * 2. Find the first BOT-AUTHORED comment whose body contains `marker` (default
+ *    {@link MARKER}). The author check (`user.type === 'Bot'` OR `user.login`
+ *    ends with `[bot]`) is mandatory: without it, a non-bot user could post a
+ *    comment containing the marker and the bot would overwrite THEIR comment on
+ *    every run — a comment-hijack that lets an attacker masquerade as the bot.
  * 3. Update it if found, otherwise create a new comment.
  *
  * `listComments` rejections propagate (not swallowed).
@@ -39738,7 +39780,9 @@ async function upsertReviewComment({
       page,
     });
     existing =
-      comments.find((c) => typeof c?.body === 'string' && c.body.includes(marker)) ?? null;
+      comments.find(
+        (c) => comments_isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
+      ) ?? null;
     if (existing) break; // found it — no need to fetch more pages
     if (comments.length < perPage) break; // last page reached
     page += 1;
@@ -39818,12 +39862,24 @@ function matchesAnyPattern(filename, patterns) {
 
 
 /**
+ * Defensive ceilings on pagination. GitHub PRs are bounded in practice, but a
+ * misconfigured octokit stub or a pathological response (every page full,
+ * forever) would loop without end. These caps make that impossible.
+ */
+const MAX_PAGES = 100;
+const MAX_FILES = 3000;
+
+/**
  * Fetch ALL changed files in a PR, paginating `pulls.listFiles`.
  *
  * Pages start at 1 and end as soon as a page returns fewer than `perPage`
  * items (the last page is short). Files without a `patch` (binary blobs or
  * diffs GitHub refuses to render) are still included; callers filter on
  * `.patch` via {@link filterPatchableFiles}.
+ *
+ * Defensive ceilings: fetching also stops once {@link MAX_PAGES} pages or
+ * {@link MAX_FILES} files have been accumulated, so a runaway response cannot
+ * loop forever.
  *
  * @param {object} args
  * @param {object} args.octokit    Octokit instance (rest.pulls.listFiles used).
@@ -39848,6 +39904,12 @@ async function getChangedFiles({ octokit, owner, repo, pullNumber, perPage = 100
       all.push(file);
     }
     if (data.length < perPage) {
+      break;
+    }
+    if (page >= MAX_PAGES) {
+      break;
+    }
+    if (all.length >= MAX_FILES) {
       break;
     }
     page += 1;
@@ -39932,13 +39994,52 @@ function escapeXmlAttribute(s) {
  * filename header. Replaces backticks (which would open/close a fence) and
  * newlines (which could start a new line that escapes the fence context).
  *
+ * Also neutralizes the literal `<untrusted_input` / `</untrusted_input` tag
+ * sequences so a hostile repo-config value cannot close the wrapping
+ * `<untrusted_input>` element early and inject trusted-looking instructions
+ * (C01). Other `<` usage (e.g. `Array<T>` in code examples) is preserved.
+ *
  * @param {string} s
  * @returns {string}
  */
 function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/\r?\n/g, ' ');
+    .replace(/\r?\n/g, ' ')
+    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+}
+
+/**
+ * Escape a MULTI-LINE untrusted string for placement inside an
+ * `<untrusted_input>` wrapper. Unlike {@link escapeDiffFence} (which collapses
+ * newlines for single-line fields), this preserves line breaks so multi-line
+ * content like scanner findings lists retain their structure. It neutralizes
+ * the `<untrusted_input` closing/opening tag sequences (C01) and replaces
+ * backticks (which could close a markdown code fence).
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeUntrustedMultiline(s) {
+  return String(s ?? '')
+    .replace(/`/g, "'")
+    .replace(/<\/?untrusted_input/g, (m) => m.replace(/</g, '&lt;'));
+}
+
+/**
+ * Wrap a block of untrusted content in `<untrusted_input>` tags with the
+ * preamble, for use by command-handler prompts (/zai ask, explain, etc.) that
+ * interpolate PR content (title, body, diff, commit messages, code). The
+ * content is escaped via {@link escapeUntrustedMultiline} so it cannot close
+ * the wrapper early (C01). Multi-line structure is preserved.
+ *
+ * @param {string} content  The untrusted content to wrap.
+ * @param {string} [source]  Optional source label for the wrapper.
+ * @returns {string}
+ */
+function wrapUntrusted(content, source = 'pr-content') {
+  const escaped = escapeUntrustedMultiline(content);
+  return `${UNTRUSTED_PREAMBLE}\n\n<untrusted_input source="${source}">\n${escaped}\n</untrusted_input>`;
 }
 
 /**
@@ -40043,10 +40144,12 @@ function buildStructuredReviewPrompt(files, options = {}) {
   const instruction = `${UNTRUSTED_PREAMBLE}\n\n${STRUCTURED_REVIEW_INSTRUCTION}\n\nEmit at most ${maxFindings} findings, prioritizing the highest-severity issues.`;
 
   // Optional scanner context: deterministic findings already detected — tell
-  // the model NOT to re-report them.
+  // the model NOT to re-report them. The scanner output (attacker-controlled
+  // filenames + diff evidence) is wrapped in <untrusted_input> and escaped,
+  // like every other repo-controlled field (A04).
   const scannerBlock =
     typeof options.scannerContext === 'string' && options.scannerContext.length > 0
-      ? `\n\nThe following issues were already detected deterministically by automated scanners. Do NOT re-report these; focus on logic, architecture, and issues scanners miss.\n\n${options.scannerContext}`
+      ? `\n\nThe following issues were already detected deterministically by automated scanners. Do NOT re-report these; focus on logic, architecture, and issues scanners miss.\n\n<untrusted_input source="scanner">\n${escapeUntrustedMultiline(options.scannerContext)}\n</untrusted_input>`
       : '';
 
   // Optional per-path review guidelines (from .zai.yml — UNTRUSTED, wrapped).
@@ -40945,7 +41048,7 @@ function formatFindingsAsSummary(findings, options = {}) {
           lines.push(`  💡 ${suggestion}`);
         }
         if (evidence.length > 0) {
-          lines.push(`  > \`${evidence}\``);
+          lines.push(`  > \`${String(evidence).replace(/`/g, '\\`')}\``);
         }
       }
       lines.push('');
@@ -41277,12 +41380,13 @@ function auto_review_escapeXmlAttribute(s) {
 }
 
 /**
- * Escape structural XML close-tags inside patch bodies so an attacker cannot
- * inject `</diff>`, `</file>`, or `</review_batch>` to break out of the
- * wrapping boundary the prompt relies on for structure.
+ * Escape structural XML tags (both open and close) inside patch bodies so an
+ * attacker cannot inject `</diff>`, `</file>`, `</review_batch>`, or their
+ * opening equivalents to break out of the wrapping boundary the prompt relies
+ * on for structure.
  */
 function escapeStructuralTags(s) {
-  return String(s ?? '').replace(/<\/(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
+  return String(s ?? '').replace(/<\/?(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
 }
 
 /**
@@ -41428,6 +41532,10 @@ async function runWithConcurrency(items, concurrency, fn) {
 
   let cursor = 0;
   let active = 0;
+  // Abort flag: once any item rejects, stop launching NEW items so we don't
+  // keep consuming resources (e.g. API credits) for a review that will fail.
+  // Items already in flight still settle naturally.
+  let aborted = false;
 
   return new Promise((resolve, reject) => {
     if (list.length === 0) {
@@ -41436,14 +41544,15 @@ async function runWithConcurrency(items, concurrency, fn) {
     }
 
     const launchNext = () => {
-      // Stop launching once we've hit the limit or run out of items.
-      while (active < limit && cursor < list.length) {
+      // Stop launching once we've hit the limit, run out of items, or aborted.
+      while (active < limit && cursor < list.length && !aborted) {
         const i = cursor++;
         active++;
         let p;
         try {
           p = Promise.resolve(fn(list[i], i));
         } catch (err) {
+          aborted = true;
           reject(err);
           return;
         }
@@ -41458,7 +41567,10 @@ async function runWithConcurrency(items, concurrency, fn) {
             }
           },
           (err) => {
-            // First rejection wins; subsequent rejects are swallowed.
+            // First rejection wins; subsequent rejects are swallowed. Set the
+            // abort flag so success handlers from other in-flight items don't
+            // launch yet more items.
+            aborted = true;
             reject(err);
           },
         );
@@ -41502,12 +41614,15 @@ async function executeStructuredBatch(entries, state, deps = {}) {
     const raw = await callApi(state.apiKey, state.model, prompt);
     return [raw];
   } catch (error) {
-    if (
-      !isContextLimitError(error) ||
-      !entries.length ||
-      entries.length === 1
-    ) {
+    if (!isContextLimitError(error) || !entries.length) {
       throw error;
+    }
+    if (entries.length === 1) {
+      // Single entry overflows context — skip it rather than abort the whole
+      // review. Rethrowing here would propagate through runWithConcurrency and
+      // cancel every other batch; returning an empty findings array lets the
+      // caller still get results for the remaining batches.
+      return [];
     }
     const mid = Math.ceil(entries.length / 2);
     const left = entries.slice(0, mid);
@@ -42220,9 +42335,10 @@ function parseFullHunkHeader(line) {
   const oldCount = m[2] !== undefined ? parseInt(m[2], 10) : 1;
   const newStart = parseInt(m[3], 10);
   const newCount = m[4] !== undefined ? parseInt(m[4], 10) : 1;
-  if (![oldStart, newStart].every((n) => Number.isFinite(n) && n >= 1)) {
-    return null;
-  }
+  // newStart must be >= 1 (need at least one new line to comment on), but
+  // oldStart may be 0 — git emits `@@ -0,0 +1,N @@` for newly-created files.
+  if (!Number.isFinite(oldStart) || oldStart < 0) return null;
+  if (!Number.isFinite(newStart) || newStart < 1) return null;
   return { oldStart, oldCount, newStart, newCount };
 }
 
@@ -42265,6 +42381,10 @@ function parseHunks(patch) {
         newLine = header.newStart;
         cur = { ...header, lines: [] };
         hunks.push(cur);
+      } else {
+        // Reject the hunk header: drop the current hunk context so its body
+        // lines are NOT mis-attributed to the prior valid hunk.
+        cur = null;
       }
       continue;
     }
@@ -42807,7 +42927,7 @@ function renderCommentBody(finding) {
   const parts = [];
   parts.push(`${emoji} **${title}**`);
   if (description.length > 0) parts.push(description);
-  if (evidence.length > 0) parts.push(`> \`${evidence}\``);
+  if (evidence.length > 0) parts.push(`> \`${String(evidence).replace(/`/g, '\\`')}\``);
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
   return sanitizeModelOutput(parts.join('\n'));
 }
@@ -43101,17 +43221,11 @@ function parseCommand(text) {
   }
 
   // First token is the command; the rest is args (single trimmed string).
-  const sp = remainder.indexOf(' ');
-  let command;
-  let args;
-  if (sp === -1) {
-    command = remainder;
-    args = '';
-  } else {
-    command = remainder.slice(0, sp);
-    args = remainder.slice(sp + 1).trim();
-  }
-  command = command.toLowerCase();
+  // Split on ANY whitespace (\s, covers spaces/tabs/multiple spaces), not just
+  // a literal ' ', so `/zai\task hi` and `/zai  ask   hi` parse correctly.
+  const match = remainder.match(/^(\S+)(?:\s+(.*))?$/);
+  let command = match ? match[1].toLowerCase() : remainder.toLowerCase();
+  let args = match && match[2] ? match[2].trim() : '';
 
   if (!ALLOWED_SET.has(command)) {
     return { command, args, raw: text, error: 'UNKNOWN_COMMAND' };
@@ -43135,6 +43249,7 @@ function parseCommand(text) {
  *   - No `@actions/core` import; no direct network (callApi + injected octokit).
  *   - callApi rejection → a fixed short error comment (NOT the raw error).
  */
+
 
 
 
@@ -43185,12 +43300,11 @@ function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
 function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
   const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
+  const prContext = `${title}${body}${buildDiffContext(files)}`;
   return [
     `Question from @${commenterLogin || 'unknown'}: ${question}`,
     '',
-    'PR context:',
-    `${title}${body}`,
-    buildDiffContext(files),
+    wrapUntrusted(prContext, 'pr-context'),
   ].join('\n');
 }
 
@@ -43367,10 +43481,13 @@ function buildFileReviewPrompt(file) {
     'Focus on concrete bugs, security issues, risky logic, and architecture',
     'mismatches visible in this diff. Skip trivial style comments.',
     '',
-    `### ${file.filename} (${file.status || 'modified'})`,
-    '```diff',
-    file.patch || '(no textual diff available)',
-    '```',
+    wrapUntrusted(
+      `### ${file.filename} (${file.status || 'modified'})\n` +
+        '```diff\n' +
+        `${file.patch || '(no textual diff available)'}\n` +
+        '```',
+      'file-diff',
+    ),
   ].join('\n');
 }
 
@@ -43431,8 +43548,12 @@ async function handleReviewCommand(
       return;
     }
     const prompt = buildStructuredReviewPrompt(patchable, {
+      // Pass maxDiffChars through when it's a number >= 0. The `0` value is
+      // the config-level sentinel meaning "unlimited" (config.js: 0 disables
+      // truncation), so it must reach buildStructuredReviewPrompt rather than
+      // being replaced by MAX_WHOLE_PR_DIFF_CHARS.
       maxDiffChars:
-        typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
+        typeof config.maxDiffChars === 'number' && config.maxDiffChars >= 0
           ? config.maxDiffChars
           : MAX_WHOLE_PR_DIFF_CHARS,
     });
@@ -43465,6 +43586,7 @@ async function handleReviewCommand(
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
+
 
 
 
@@ -43576,9 +43698,7 @@ function buildExplainPrompt({ file, start, end, window }) {
     'Describe what this code does, why it is there, and any concerns a',
     'reviewer should know about. Be concise.',
     '',
-    '```',
-    window,
-    '```',
+    wrapUntrusted(window, 'code-window'),
   ].join('\n');
 }
 
@@ -43728,6 +43848,8 @@ async function handleExplainCommand(
 
 
 
+
+
 /** Fixed error comment (no raw error leakage). */
 const describe_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
@@ -43756,11 +43878,10 @@ function buildDescribePrompt({ commits, files }) {
     'Overview, Features, Bug Fixes, Refactoring, Infrastructure. Do not',
     'include a section header for changes that did not happen.',
     '',
-    '## Commits',
-    commitLines || '(none)',
-    '',
-    '## Changed files',
-    fileLines || '(none)',
+    wrapUntrusted(
+      `## Commits\n${commitLines || '(none)'}\n\n## Changed files\n${fileLines || '(none)'}`,
+      'commits-and-files',
+    ),
   ].join('\n');
 }
 
@@ -43828,12 +43949,27 @@ async function handleDescribeCommand(
         : [[], []];
 
     const prompt = buildDescribePrompt({ commits, files });
-    const description = await callApi(config.apiKey, config.model, prompt);
-    await post(description);
+    const raw = await callApi(config.apiKey, config.model, prompt);
+    // Sanitize ONCE before BOTH paths (comment + body upsert). The comment
+    // path would be sanitized again inside postComment (idempotent), but the
+    // body-upsert path (upsertPrDescription → pulls.update) does NOT sanitize
+    // — so without this, raw model output (e.g. injected @mentions or forged
+    // GitHub alert banners from an indirect prompt-injection in the diff) is
+    // written verbatim into the PR body under the bot's trusted identity.
+    // sanitizeModelOutput also caps length at 16000, avoiding GitHub's 65536-
+    // char 422 on the pulls.update call.
+    const safeDescription = sanitizeModelOutput(raw);
+    await post(safeDescription);
     // OPT-IN mutation: when ZAI_DESCRIBE_WRITE_BODY is true, upsert a marked
     // description block into the PR body. Only the marked block is mutated.
     if (config.describeWriteBody && typeof pullNumber === 'number') {
-      await upsertDescription({ octokit, owner, repo, pullNumber, description });
+      await upsertDescription({
+        octokit,
+        owner,
+        repo,
+        pullNumber,
+        description: safeDescription,
+      });
     }
   } catch (error) {
     if (core?.warning) {
@@ -43866,6 +44002,7 @@ async function handleDescribeCommand(
 
 
 
+
 /** Fixed error comment (no raw error leakage). */
 const impact_ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
@@ -43892,17 +44029,45 @@ const SEVERITY_KEYS = {
 /**
  * Extract the severity from the model's impact assessment. The prompt asks for
  * a severity level on its own first line; this parses the first severity
- * keyword or emoji found in the first ~200 chars. Pure (exported for testing).
+ * keyword or emoji found. Pure (exported for testing).
+ *
+ * Word-form keys (critical/high/medium/low) are matched with word boundaries
+ * so that "highlighted" no longer matches "high" and "noncritical" no longer
+ * matches "critical". Common negation prefixes ("non-critical", "not critical",
+ * "no critical issues", "isn't high") are stripped before matching so a
+ * negated severity word does not false-positive. Emoji keys have no word
+ * boundaries, so they still use `includes`. We prefer the FIRST line (where the
+ * prompt asks for the level), then fall back to the full text.
  *
  * @param {string} text  The model's assessment output.
  * @returns {'critical'|'high'|'medium'|'low'|null}
  */
 function parseSeverity(text) {
-  const t = String(text ?? '').toLowerCase();
+  const raw = String(text ?? '');
+  // Remove negated severity phrases entirely so "non-critical", "not critical",
+  // "no critical issues", "isn't high risk" don't false-positive. We match
+  // common negators followed by an optional separator and the severity word,
+  // replacing the whole phrase with a neutral placeholder.
+  const SEV_WORDS = 'critical|high|medium|low';
+  const NEGATED_RE = new RegExp(
+    `\\b(?:non-|not\\s+|no\\s+|isn'?t\\s+|aren'?t\\s+|without\\s+)\\s*(?:${SEV_WORDS})\\b`,
+    'gi',
+  );
+  const cleaned = raw.replace(NEGATED_RE, 'neutral');
+  const firstLine = cleaned.split('\n')[0];
   // Check emoji + word forms in priority order (critical first).
   for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
     const mapped = SEVERITY_KEYS[key];
-    if (mapped && t.includes(key.toLowerCase())) return mapped;
+    if (!mapped) continue;
+    if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
+      // Emoji keys have no word boundaries; use includes.
+      if (raw.includes(key)) return mapped;
+    } else {
+      // Word keys: match on a word boundary to avoid false positives
+      // (e.g. "highlighted" → high, "noncritical" → critical).
+      const re = new RegExp(`\\b${key}\\b`, 'i');
+      if (re.test(firstLine) || re.test(cleaned)) return mapped;
+    }
   }
   return null;
 }
@@ -43946,8 +44111,7 @@ function buildImpactPrompt(files) {
     'security/auth/data-loss concerns, and anything a reviewer should verify.',
     'Be concise and concrete; cite filenames where relevant.',
     '',
-    '## Changes under review',
-    impact_buildDiffContext(files),
+    wrapUntrusted(`## Changes under review\n${impact_buildDiffContext(files)}`, 'pr-changes'),
   ].join('\n');
 }
 
@@ -44117,6 +44281,25 @@ const HANDLERS = {
 const DEFAULT_MAX_PRS = 10;
 
 /**
+ * Determine whether a comment was authored by a bot. Used to gate marker-based
+ * dedup so a drive-by human commenter cannot suppress a scheduled review or
+ * hijack the bot's review thread by posting a comment containing the marker.
+ *
+ * Accepts EITHER signal GitHub surfaces for bot accounts: an explicit
+ * `user.type === 'Bot'` (set for GitHub Apps bot accounts) OR a `user.login`
+ * ending in `[bot]` (the convention for actions and other bot identities).
+ *
+ * @param {{user?: {type?: string, login?: string}}} comment
+ * @returns {boolean}
+ */
+function schedule_isBotComment(comment) {
+  const user = comment?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * List open PRs (paginated), returning a minimal shape per PR. Stops once
  * `maxPrs` have been accumulated or the list is exhausted.
  *
@@ -44161,11 +44344,16 @@ async function listOpenPrs({
  * Determine whether a PR already has a Z.ai marker comment for the given head
  * SHA. Paginates `listComments` fully so a buried marker is still found.
  *
- * Returns true if ANY comment body contains both the marker and the head SHA
- * (the upsert updates the marker comment in place, so its body carries the
- * current SHA's review; matching on the SHA means a re-push to an old SHA is
- * detected as "not yet reviewed"). When the SHA is unknown, falls back to
+ * Returns true if a BOT-AUTHORED comment body contains both the marker and the
+ * head SHA (the upsert updates the marker comment in place, so its body carries
+ * the current SHA's review; matching on the SHA means a re-push to an old SHA
+ * is detected as "not yet reviewed"). When the SHA is unknown, falls back to
  * marker-only matching.
+ *
+ * SECURITY: The author check (`user.type === 'Bot'` OR `user.login` ends with
+ * `[bot]`) is mandatory. Without it, any commenter (including NONE-association
+ * drive-by users) could post a comment containing the marker + head SHA and
+ * cause the scheduled review to SKIP that PR — a trivial review-suppression.
  *
  * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker }`
  * @returns {Promise<boolean>}
@@ -44190,6 +44378,7 @@ async function hasReviewForSha({
     });
     const found = comments.some(
       (c) =>
+        schedule_isBotComment(c) &&
         typeof c?.body === 'string' &&
         c.body.includes(marker) &&
         (headSha === '' || c.body.includes(headSha)),
@@ -44625,6 +44814,17 @@ function resolveCachePath(spec) {
   }
   if (typeof version !== 'string' || !version) {
     throw new Error('ensureBinary: version is required');
+  }
+  // Defense-in-depth: reject path separators / traversal sequences in name and
+  // version. These are currently hardcoded, but guard against future regressions
+  // and untrusted inputs that could escape the cache dir.
+  for (const label of /** @type {const} */ (['name', 'version'])) {
+    const value = label === 'name' ? name : version;
+    if (/[\\/]/.test(value) || value === '..' || value.includes('..')) {
+      throw new Error(
+        `ensureBinary: ${label} must not contain path separators or ".." (got "${value}")`,
+      );
+    }
   }
   return (0,external_node_path_namespaceObject.join)(cacheDir, name, version, `${name}${ext}`);
 }
@@ -45670,15 +45870,25 @@ function astGrepPatternToRegex(pattern) {
   let translated = pattern
     .replace(/\$\$\$[A-Z]*/g, PLACEHOLDER) // $$$ARGS, $$$
     .replace(/\$[A-Z]+/g, PLACEHOLDER); // $VALUE, $X
-  // Step 2: escape regex metacharacters in the literal portions. We leave
-  // `{`, `}`, `(`, `)` UN-ESCAPED: in ast-grep patterns these are structural
-  // syntax that should match literally, and JS regex treats literal `{`, `}`,
-  // `(`, `)` that aren't part of a quantifier/group as literal characters.
-  translated = translated.replace(/[.*+?^$|[\]\\]/g, '\\$&');
+  // Step 2: escape regex metacharacters in the literal portions. Parentheses
+  // ARE escaped (they are literal syntax in the source code being scanned, not
+  // regex groups). Curly braces are left unescaped since they are rarely
+  // meaningful in the code patterns we translate and JS regex treats bare
+  // `{`, `}` as literal characters.
+  translated = translated.replace(/[.*+?^$|[\]\\()]/g, '\\$&');
   // Step 3: replace the placeholder with the actual `.*?` wildcard.
   // The placeholder contains \u0000 which is not a regex metachar, so the
   // escape step left it alone.
   translated = translated.split(PLACEHOLDER).join('.*?');
+  // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
+  // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
+  // suffers catastrophic backtracking on long near-miss lines. Strip a leading
+  // `.*?` — `RegExp.test()` already scans every start position, so the rest of
+  // the pattern still matches anywhere in the line, just without the unbounded
+  // backtracking wildcard prefix.
+  if (translated.startsWith('.*?')) {
+    translated = translated.slice(3);
+  }
   try {
     return new RegExp(translated);
   } catch {
@@ -46076,6 +46286,12 @@ const LARGE_FILE_THRESHOLD = 300;
 
 /** Markers counted in added diff lines for the TODO/FIXME/etc. tally. */
 const TODO_MARKERS = ['TODO', 'FIXME', 'HACK', 'XXX'];
+/**
+ * Precompiled word-boundary regexes for each TODO marker. Using `\b` prevents
+ * substring false-positives like "XXXL", "XXX chromosome", or "FIXMEable".
+ * Built once at module load.
+ */
+const TODO_MARKER_RES = TODO_MARKERS.map((m) => new RegExp(`\\b${m}\\b`));
 
 /**
  * Extract the file extension (lowercased, no dot) from a filename.
@@ -46129,7 +46345,8 @@ function isGeneratedFile(filename) {
 /**
  * Count TODO/FIXME/HACK/XXX markers in the ADDED lines of a unified diff patch.
  * Added lines start with `+` (and the `+++` file header is skipped). Markers
- * are matched as substrings; an added line with multiple markers counts once.
+ * are matched with word boundaries (`\b`) so that substrings like "XXXL" or
+ * "XXX chromosome" do NOT count; an added line with multiple markers counts once.
  *
  * Returns 0 for non-string / empty patches.
  *
@@ -46141,7 +46358,7 @@ function countTodosInPatch(patch) {
   let count = 0;
   for (const line of patch.split('\n')) {
     if (!line.startsWith('+') || line.startsWith('+++')) continue;
-    if (TODO_MARKERS.some((m) => line.includes(m))) count++;
+    if (TODO_MARKER_RES.some((re) => re.test(line))) count++;
   }
   return count;
 }
@@ -46672,6 +46889,12 @@ const MAX_REPO_CONFIG_BYTES = 64 * 1024; // 64 KiB
 const MAX_TONE_INSTRUCTIONS_CHARS = 500;
 /** Maximum length of `reviews.language` after validation. */
 const MAX_LANGUAGE_CHARS = 20;
+/** Maximum length of a `path_instructions[].path` after validation. */
+const MAX_PATH_INSTRUCTION_PATH_CHARS = 500;
+/** Maximum length of a `path_instructions[].instructions` after validation. */
+const MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS = 1000;
+/** Maximum number of `path_instructions` entries kept after validation. */
+const MAX_PATH_INSTRUCTION_ENTRIES = 50;
 
 /**
  * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
@@ -46982,7 +47205,8 @@ function validateRepoConfig(parsed) {
     if (Array.isArray(r.path_instructions)) {
       const arr = r.path_instructions
         .map((entry) => normalizePathInstruction(entry))
-        .filter((e) => e !== null);
+        .filter((e) => e !== null)
+        .slice(0, MAX_PATH_INSTRUCTION_ENTRIES);
       if (arr.length > 0) rv.path_instructions = arr;
     }
     if (Array.isArray(r.path_filters)) {
@@ -47030,7 +47254,17 @@ function normalizePathInstruction(entry) {
   const instructions = entry.instructions;
   if (typeof path !== 'string' || path.trim() === '') return null;
   if (typeof instructions !== 'string' || instructions.trim() === '') return null;
-  return { path, instructions };
+  // Cap field lengths (truncate, mirroring tone_instructions/language handling)
+  // so an attacker-controlled .zai.yml cannot bloat the prompt unboundedly.
+  const cappedPath =
+    path.length > MAX_PATH_INSTRUCTION_PATH_CHARS
+      ? path.slice(0, MAX_PATH_INSTRUCTION_PATH_CHARS)
+      : path;
+  const cappedInstructions =
+    instructions.length > MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS
+      ? instructions.slice(0, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS)
+      : instructions;
+  return { path: cappedPath, instructions: cappedInstructions };
 }
 
 /* ------------------------------------------------------------------ *
@@ -47097,11 +47331,13 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
 
   // Scanners: master switch is action-only; repo can only DISABLE.
   const scannersEnabled = a.scannersEnabled !== false;
-  const mergedScanners = {
-    // `false` in repo disables; otherwise the action default applies.
-    gitleaks: scanners.gitleaks === false ? false : true,
-    ast_grep: scanners.ast_grep === false ? false : true,
-  };
+  const mergedScanners = scannersEnabled
+    ? {
+        // `false` in repo disables; otherwise the action default (enabled) applies.
+        gitleaks: scanners.gitleaks !== false,
+        ast_grep: scanners.ast_grep !== false,
+      }
+    : { gitleaks: false, ast_grep: false };
 
   return {
     ...a,
@@ -48325,14 +48561,38 @@ const execFileAsync = (0,external_node_util_.promisify)(external_node_child_proc
  */
 function httpsGet(url, opts = {}) {
   const maxRedirects = typeof opts.maxRedirects === 'number' ? opts.maxRedirects : 5;
+  // Defense-in-depth: cap download size (scanner binaries are <50 MB) to
+  // prevent memory exhaustion from a compromised/malicious CDN response.
+  const maxSize = typeof opts.maxSize === 'number' && opts.maxSize > 0 ? opts.maxSize : 100 * 1024 * 1024;
+  // Defense-in-depth: restrict redirect hosts to known GitHub asset domains so
+  // a compromised redirect cannot SSRF internal endpoints on self-hosted runners.
+  const allowedHosts =
+    Array.isArray(opts.allowedHosts) && opts.allowedHosts.length > 0
+      ? opts.allowedHosts
+      : ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'codeload.github.com'];
   return new Promise((resolve, reject) => {
     if (typeof url !== 'string' || url.length === 0) {
       reject(new Error('httpsGet: url is required'));
       return;
     }
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error(`httpsGet: invalid url (${url})`));
+      return;
+    }
+    if (parsed.protocol !== 'https:') {
+      reject(new Error(`httpsGet: refusing non-https url (${url})`));
+      return;
+    }
+    if (!allowedHosts.includes(parsed.hostname)) {
+      reject(new Error(`httpsGet: refusing redirect to untrusted host (${parsed.hostname})`));
+      return;
+    }
     const req = external_node_https_namespaceObject.get(url, (res) => {
       const status = res.statusCode || 0;
-      // Redirect: follow with the Location header.
+      // Redirect: follow the Location header.
       if (status >= 300 && status < 400 && res.headers.location) {
         if (maxRedirects <= 0) {
           reject(new Error(`httpsGet: too many redirects (${url})`));
@@ -48342,7 +48602,7 @@ function httpsGet(url, opts = {}) {
         // Resolve relative redirects against the current URL.
         const nextUrl = new URL(res.headers.location, url).toString();
         res.resume(); // free the body
-        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1 }));
+        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1, maxSize, allowedHosts }));
         return;
       }
       if (status < 200 || status >= 300) {
@@ -48352,7 +48612,16 @@ function httpsGet(url, opts = {}) {
       }
       /** @type {Buffer[]} */
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      let total = 0;
+      res.on('data', (chunk) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buf.length;
+        if (total > maxSize) {
+          req.destroy(new Error(`httpsGet: response exceeded size limit (${maxSize} bytes)`));
+          return;
+        }
+        chunks.push(buf);
+      });
       res.on('end', () => resolve(Buffer.concat(chunks)));
       res.on('error', reject);
     });
@@ -48597,7 +48866,13 @@ async function run(context, deps = {}) {
 
   // ---- pull_request → auto-review -----------------------------------
   if (event === 'pull_request') {
-    const { owner, repo } = context.repo;
+    const { owner, repo } = context.repo ?? {};
+    if (!owner || !repo) {
+      // Missing context.repo would otherwise throw a TypeError on the
+      // destructuring above; fail gracefully with a status instead.
+      coreDep.setFailed('missing owner/repo in pull_request context');
+      return;
+    }
     const pullNumber = getPullNumber(context);
     if (pullNumber === null) {
       coreDep.setFailed('not a pull request');
@@ -49088,7 +49363,9 @@ async function run(context, deps = {}) {
     if (!isFork && config.allowForkCommands !== true) {
       try {
         const pr = await getPRContextFn({ octokit, context });
-        isFork = Boolean(pr?.isFork);
+        // Fail CLOSED: if getPRContextFn returns null (not throws), treat the
+        // PR as a fork so a broken/empty API response cannot open the gate.
+        isFork = pr ? Boolean(pr.isFork) : true;
       } catch (error) {
         // If the PR lookup fails, fail CLOSED: treat as a fork so a broken API
         // call cannot let a fork command through the gate.

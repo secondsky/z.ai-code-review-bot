@@ -326,7 +326,7 @@ describe('integration: pull_request structured review — idempotent update', ()
     const oldBody = `## Z.ai Code Review\n\nold review\n\n${MARKER}`;
     const octokit = makeFakeOctokit({
       files: [file('src/a.js')],
-      existingComments: [{ id: 555, body: oldBody }],
+      existingComments: [{ id: 555, body: oldBody, user: { login: 'github-actions[bot]', type: 'Bot' } }],
     });
     const callApi = makeFakeCallApi(structuredPayload('fresh', []));
 
@@ -367,7 +367,7 @@ describe('integration: pull_request structured review — idempotent update', ()
     const octokitSecond = makeFakeOctokit({
       files: [file('src/a.js')],
       existingComments: [
-        { id: 1, body: octokitFirst.__calls.createComment[0].body },
+        { id: 1, body: octokitFirst.__calls.createComment[0].body, user: { login: 'github-actions[bot]', type: 'Bot' } },
       ],
     });
     await run(makePRContext(), {

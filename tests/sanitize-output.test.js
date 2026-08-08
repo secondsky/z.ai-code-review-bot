@@ -105,6 +105,24 @@ describe('sanitizeModelOutput — @mention neutralization', () => {
     // ...and the fenced content is left verbatim.
     expect(out).toContain('```\ncode\n```');
   });
+
+  it('neutralizes @mentions after an UNCLOSED code fence (C02)', () => {
+    // A fence opened but never closed must not swallow all subsequent lines as
+    // "inside fence" — otherwise an attacker can smuggle @mention spam through.
+    const input = '```js\nconst x = 1;\nthis fence is never closed\nping @everyone';
+    const out = sanitizeModelOutput(input);
+    // The @mention after the unclosed fence MUST still be neutralized.
+    expect(out).toContain('@\u200beveryone');
+    expect(out).not.toMatch(/@everyone(?!.*\u200b)/);
+  });
+
+  it('neutralizes @mentions on lines after an unclosed fence (C02)', () => {
+    // Multi-line case: the unclosed fence is followed by multiple prose lines.
+    const input = '```\ncode line\nprose line one\n@spam1\n@spam2';
+    const out = sanitizeModelOutput(input);
+    expect(out).toContain('@\u200bspam1');
+    expect(out).toContain('@\u200bspam2');
+  });
 });
 
 describe('sanitizeModelOutput — GitHub alert neutralization', () => {

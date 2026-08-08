@@ -58,6 +58,12 @@ const LARGE_FILE_THRESHOLD = 300;
 
 /** Markers counted in added diff lines for the TODO/FIXME/etc. tally. */
 const TODO_MARKERS = ['TODO', 'FIXME', 'HACK', 'XXX'];
+/**
+ * Precompiled word-boundary regexes for each TODO marker. Using `\b` prevents
+ * substring false-positives like "XXXL", "XXX chromosome", or "FIXMEable".
+ * Built once at module load.
+ */
+const TODO_MARKER_RES = TODO_MARKERS.map((m) => new RegExp(`\\b${m}\\b`));
 
 /**
  * Extract the file extension (lowercased, no dot) from a filename.
@@ -111,7 +117,8 @@ export function isGeneratedFile(filename) {
 /**
  * Count TODO/FIXME/HACK/XXX markers in the ADDED lines of a unified diff patch.
  * Added lines start with `+` (and the `+++` file header is skipped). Markers
- * are matched as substrings; an added line with multiple markers counts once.
+ * are matched with word boundaries (`\b`) so that substrings like "XXXL" or
+ * "XXX chromosome" do NOT count; an added line with multiple markers counts once.
  *
  * Returns 0 for non-string / empty patches.
  *
@@ -123,7 +130,7 @@ export function countTodosInPatch(patch) {
   let count = 0;
   for (const line of patch.split('\n')) {
     if (!line.startsWith('+') || line.startsWith('+++')) continue;
-    if (TODO_MARKERS.some((m) => line.includes(m))) count++;
+    if (TODO_MARKER_RES.some((re) => re.test(line))) count++;
   }
   return count;
 }

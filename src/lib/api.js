@@ -448,10 +448,14 @@ export async function callWithRetry(fn, options = {}) {
 export function createApiClient(config = {}) {
   const {
     timeout = DEFAULT_TIMEOUT_MS,
-    maxRetries = DEFAULT_MAX_RETRIES,
     baseDelay = DEFAULT_BASE_DELAY_MS,
     fallbackPrompt: configFallbackPrompt = null,
   } = config;
+  // Clamp maxRetries to [0, 10]. A misconfigured value (e.g. 1000000) would
+  // otherwise cause an enormous number of retry attempts against the provider.
+  const rawRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const safeRetries = Math.min(Math.max(0, rawRetries), 10);
+  const maxRetries = safeRetries;
 
   // Normalize a string fallbackPrompt to the function shape callWithRetry
   // expects. A non-empty string becomes `() => ({ prompt: string })`; a

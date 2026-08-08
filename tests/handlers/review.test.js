@@ -82,6 +82,38 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
     expect(callApi).not.toHaveBeenCalled();
     expect(octokit.__calls.createComment[0].body).toContain('No textual changes');
   });
+
+  it('L5: passes maxDiffChars=0 (unlimited sentinel) straight through, NOT the 8000 fallback', async () => {
+    // Build two files whose combined patches exceed MAX_WHOLE_PR_DIFF_CHARS
+    // (8000). With maxDiffChars=0 (unlimited) both files must appear in the
+    // prompt; with the buggy 8000 fallback, the second file would be dropped.
+    const big = 'x'.repeat(5000);
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'src/big1.js', status: 'modified', patch: big },
+        { filename: 'src/big2.js', status: 'modified', patch: big },
+      ],
+    });
+    const callApi = vi.fn(async () => 'REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      // maxDiffChars: 0 explicitly means "unlimited" per config.js.
+      config: { apiKey: 'k', model: 'm', maxDiffChars: 0 },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    // Both large files present (no truncation) — proves the 0 sentinel was
+    // passed through rather than being replaced by the 8000 fallback.
+    expect(prompt).toContain('src/big1.js');
+    expect(prompt).toContain('src/big2.js');
+    expect(prompt).toContain(big);
+  });
 });
 
 describe('handleReviewCommand — specific file', () => {

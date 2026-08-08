@@ -148,6 +148,28 @@ describe('buildReviewComments', () => {
     const body = buildReviewComments(inline)[0].body;
     expect(body).not.toContain('💡');
   });
+
+  it('escapes backticks in evidence so the inline-code span is preserved (F05)', () => {
+    // renderCommentBody wraps evidence in backtick code spans. A backtick in
+    // the evidence would close the span early and corrupt the markdown.
+    const inline = [
+      {
+        finding: {
+          severity: 'high',
+          title: 'Bug',
+          description: 'desc',
+          evidence: 'evil`injection',
+          suggestion: null,
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    // The literal unescaped backtick-in-evidence must NOT appear.
+    expect(body).not.toContain('evil`injection');
+    // The escaped form should be present.
+    expect(body).toContain('evil\\`injection');
+  });
 });
 
 describe('buildReviewPayload', () => {

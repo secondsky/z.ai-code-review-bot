@@ -116,6 +116,44 @@ describe('parseCommand — leading whitespace', () => {
   });
 });
 
+describe('parseCommand — L4: splits on any whitespace, not just a literal space', () => {
+  it('parses a TAB between command and args', () => {
+    expect(parseCommand('/zai\task\twhat is this')).toEqual({
+      command: 'ask',
+      args: 'what is this',
+      raw: '/zai\task\twhat is this',
+      error: null,
+    });
+  });
+
+  it('parses a TAB between prefix and command', () => {
+    expect(parseCommand('/zai\task hi')).toEqual({
+      command: 'ask',
+      args: 'hi',
+      raw: '/zai\task hi',
+      error: null,
+    });
+  });
+
+  it('collapses multiple spaces between command and args', () => {
+    expect(parseCommand('/zai  ask    hi there')).toEqual({
+      command: 'ask',
+      args: 'hi there',
+      raw: '/zai  ask    hi there',
+      error: null,
+    });
+  });
+
+  it('parses the command verb with no args after a tab', () => {
+    expect(parseCommand('/zai\thelp')).toEqual({
+      command: 'help',
+      args: '',
+      raw: '/zai\thelp',
+      error: null,
+    });
+  });
+});
+
 describe('parseCommand — error paths', () => {
   it('returns NOT_A_COMMAND for ordinary text', () => {
     expect(parseCommand('nice PR!')).toEqual({

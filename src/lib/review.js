@@ -176,7 +176,7 @@ function renderCommentBody(finding) {
   const parts = [];
   parts.push(`${emoji} **${title}**`);
   if (description.length > 0) parts.push(description);
-  if (evidence.length > 0) parts.push(`> \`${evidence}\``);
+  if (evidence.length > 0) parts.push(`> \`${String(evidence).replace(/`/g, '\\`')}\``);
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
   return sanitizeModelOutput(parts.join('\n'));
 }

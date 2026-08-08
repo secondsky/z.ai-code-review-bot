@@ -168,14 +168,38 @@ const execFileAsync = promisify(execFileCb);
  */
 export function httpsGet(url, opts = {}) {
   const maxRedirects = typeof opts.maxRedirects === 'number' ? opts.maxRedirects : 5;
+  // Defense-in-depth: cap download size (scanner binaries are <50 MB) to
+  // prevent memory exhaustion from a compromised/malicious CDN response.
+  const maxSize = typeof opts.maxSize === 'number' && opts.maxSize > 0 ? opts.maxSize : 100 * 1024 * 1024;
+  // Defense-in-depth: restrict redirect hosts to known GitHub asset domains so
+  // a compromised redirect cannot SSRF internal endpoints on self-hosted runners.
+  const allowedHosts =
+    Array.isArray(opts.allowedHosts) && opts.allowedHosts.length > 0
+      ? opts.allowedHosts
+      : ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'codeload.github.com'];
   return new Promise((resolve, reject) => {
     if (typeof url !== 'string' || url.length === 0) {
       reject(new Error('httpsGet: url is required'));
       return;
     }
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error(`httpsGet: invalid url (${url})`));
+      return;
+    }
+    if (parsed.protocol !== 'https:') {
+      reject(new Error(`httpsGet: refusing non-https url (${url})`));
+      return;
+    }
+    if (!allowedHosts.includes(parsed.hostname)) {
+      reject(new Error(`httpsGet: refusing redirect to untrusted host (${parsed.hostname})`));
+      return;
+    }
     const req = https.get(url, (res) => {
       const status = res.statusCode || 0;
-      // Redirect: follow with the Location header.
+      // Redirect: follow the Location header.
       if (status >= 300 && status < 400 && res.headers.location) {
         if (maxRedirects <= 0) {
           reject(new Error(`httpsGet: too many redirects (${url})`));
@@ -185,7 +209,7 @@ export function httpsGet(url, opts = {}) {
         // Resolve relative redirects against the current URL.
         const nextUrl = new URL(res.headers.location, url).toString();
         res.resume(); // free the body
-        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1 }));
+        resolve(httpsGet(nextUrl, { maxRedirects: maxRedirects - 1, maxSize, allowedHosts }));
         return;
       }
       if (status < 200 || status >= 300) {
@@ -195,7 +219,16 @@ export function httpsGet(url, opts = {}) {
       }
       /** @type {Buffer[]} */
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      let total = 0;
+      res.on('data', (chunk) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buf.length;
+        if (total > maxSize) {
+          req.destroy(new Error(`httpsGet: response exceeded size limit (${maxSize} bytes)`));
+          return;
+        }
+        chunks.push(buf);
+      });
       res.on('end', () => resolve(Buffer.concat(chunks)));
       res.on('error', reject);
     });
@@ -440,7 +473,13 @@ export async function run(context, deps = {}) {
 
   // ---- pull_request → auto-review -----------------------------------
   if (event === 'pull_request') {
-    const { owner, repo } = context.repo;
+    const { owner, repo } = context.repo ?? {};
+    if (!owner || !repo) {
+      // Missing context.repo would otherwise throw a TypeError on the
+      // destructuring above; fail gracefully with a status instead.
+      coreDep.setFailed('missing owner/repo in pull_request context');
+      return;
+    }
     const pullNumber = getPullNumber(context);
     if (pullNumber === null) {
       coreDep.setFailed('not a pull request');
@@ -931,7 +970,9 @@ export async function run(context, deps = {}) {
     if (!isFork && config.allowForkCommands !== true) {
       try {
         const pr = await getPRContextFn({ octokit, context });
-        isFork = Boolean(pr?.isFork);
+        // Fail CLOSED: if getPRContextFn returns null (not throws), treat the
+        // PR as a fork so a broken/empty API response cannot open the gate.
+        isFork = pr ? Boolean(pr.isFork) : true;
       } catch (error) {
         // If the PR lookup fails, fail CLOSED: treat as a fork so a broken API
         // call cannot let a fork command through the gate.

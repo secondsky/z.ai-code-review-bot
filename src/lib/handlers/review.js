@@ -16,7 +16,7 @@ import {
   getChangedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
-import { buildStructuredReviewPrompt } from '../prompt.js';
+import { buildStructuredReviewPrompt, wrapUntrusted } from '../prompt.js';
 
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
@@ -51,10 +51,13 @@ export function buildFileReviewPrompt(file) {
     'Focus on concrete bugs, security issues, risky logic, and architecture',
     'mismatches visible in this diff. Skip trivial style comments.',
     '',
-    `### ${file.filename} (${file.status || 'modified'})`,
-    '```diff',
-    file.patch || '(no textual diff available)',
-    '```',
+    wrapUntrusted(
+      `### ${file.filename} (${file.status || 'modified'})\n` +
+        '```diff\n' +
+        `${file.patch || '(no textual diff available)'}\n` +
+        '```',
+      'file-diff',
+    ),
   ].join('\n');
 }
 
@@ -115,8 +118,12 @@ export async function handleReviewCommand(
       return;
     }
     const prompt = buildStructuredReviewPrompt(patchable, {
+      // Pass maxDiffChars through when it's a number >= 0. The `0` value is
+      // the config-level sentinel meaning "unlimited" (config.js: 0 disables
+      // truncation), so it must reach buildStructuredReviewPrompt rather than
+      // being replaced by MAX_WHOLE_PR_DIFF_CHARS.
       maxDiffChars:
-        typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
+        typeof config.maxDiffChars === 'number' && config.maxDiffChars >= 0
           ? config.maxDiffChars
           : MAX_WHOLE_PR_DIFF_CHARS,
     });
