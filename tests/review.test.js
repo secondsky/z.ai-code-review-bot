@@ -170,6 +170,33 @@ describe('buildReviewComments', () => {
     // The escaped form should be present.
     expect(body).toContain('evil\\`injection');
   });
+
+  it('collapses newlines in evidence so the code span is preserved and links render as literal text (CORE-2)', () => {
+    // A multiline evidence payload containing a markdown link would otherwise
+    // break out of the inline-code span and inject a clickable link. The fix
+    // collapses newlines to spaces (and escapes backticks) before wrapping.
+    const inline = [
+      {
+        finding: {
+          severity: 'high',
+          title: 'Bug',
+          description: 'desc',
+          evidence: 'normal_code\n[Click here](https://evil.com)',
+          suggestion: null,
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    // No raw newline inside the evidence portion (the code span is preserved).
+    // The whole link text should appear on a single line inside the code span.
+    expect(body).not.toMatch(/`normal_code\n/);
+    // The link must NOT be a clickable markdown link — it must appear inside
+    // the inline-code span as literal text.
+    expect(body).toContain('`normal_code [Click here](https://evil.com)`');
+    // And no standalone newline splits the evidence from the link.
+    expect(body).not.toMatch(/normal_code\r?\n\[Click here\]/);
+  });
 });
 
 describe('buildReviewPayload', () => {
@@ -407,25 +434,40 @@ describe('listBotReviews', () => {
     expect(out.map((r) => r.id)).toEqual([2]);
   });
 
-  it('filters by bot login suffix [bot] when marker absent', async () => {
+  it('does NOT match a bare [bot] login when the body lacks the marker (CORE-3)', async () => {
+    // A review from any bot (e.g. zai-code-review[bot]) without the marker in
+    // its body must NOT be matched — the marker is the canonical idempotency
+    // signal. The previous broad `login.endsWith('[bot]')` OR matched ANY bot.
     const reviews = [
       { id: 1, body: 'no marker', user: { login: 'zai-code-review[bot]' } },
       { id: 2, body: 'no marker', user: { login: 'human' } },
     ];
     const { octokit } = makeReviewOctokit({ reviews });
     const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
-    expect(out.map((r) => r.id)).toEqual([1]);
+    expect(out.map((r) => r.id)).toEqual([]);
   });
 
-  it('returns reviews matching marker OR bot login', async () => {
+  it('returns only marker-matching reviews (marker is sufficient for idempotency)', async () => {
     const reviews = [
       { id: 1, body: `m\n\n${MARKER}`, user: { login: 'human' } }, // marker
-      { id: 2, body: 'x', user: { login: 'github-actions[bot]' } }, // bot login
+      { id: 2, body: 'x', user: { login: 'github-actions[bot]' } }, // bot login only — excluded
       { id: 3, body: 'x', user: { login: 'human2' } }, // neither — excluded
     ];
     const { octokit } = makeReviewOctokit({ reviews });
     const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
-    expect(out.map((r) => r.id).sort()).toEqual([1, 2]);
+    expect(out.map((r) => r.id).sort()).toEqual([1]);
+  });
+
+  it('excludes dependabot[bot] reviews that lack the marker (CORE-3)', async () => {
+    // Dependabot posts reviews without our marker; they must NOT be dismissed
+    // as stale Z.ai reviews. Only marker-bearing reviews are touched.
+    const reviews = [
+      { id: 7, body: 'Bump lodash from 4.17.20 to 4.17.21', user: { login: 'dependabot[bot]' } },
+      { id: 8, body: `zai review\n\n${MARKER}`, user: { login: 'zai-code-review[bot]' } },
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id)).toEqual([8]);
   });
 
   it('stops paginating once a short page is seen (no infinite loop)', async () => {

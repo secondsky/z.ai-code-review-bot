@@ -5,10 +5,10 @@
  * asking for a structured description (Overview / Features / Bug Fixes /
  * Refactoring / Infra), and posts the result as a COMMENT.
  *
- * v1 READ-ONLY INVARIANT: this handler does NOT mutate the PR body. The fork
- * did (via `pulls.update`) — that is a side effect we deliberately reject for
- * v1. The generated description is posted as a comment only; a human can copy
- * it into the PR body if they choose. No `pulls.update` is ever called here.
+ * READ-ONLY by default. OPT-IN mutation gated by `ZAI_DESCRIBE_WRITE_BODY`
+ * (default off): when that flag is on, the generated description is also
+ * upserted into a marked block in the PR body via `pulls.update` — only the
+ * marked block is ever mutated, the rest of the body is preserved verbatim.
  *
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.

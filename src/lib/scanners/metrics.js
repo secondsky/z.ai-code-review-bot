@@ -17,6 +17,8 @@
  * @module src/lib/scanners/metrics.js
  */
 
+import { parseAddedLines } from './_patch.js';
+
 /** Source-code extensions used to classify a file as a source file. */
 const SOURCE_EXTENSIONS = new Set([
   'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte', 'astro',
@@ -116,8 +118,9 @@ export function isGeneratedFile(filename) {
 
 /**
  * Count TODO/FIXME/HACK/XXX markers in the ADDED lines of a unified diff patch.
- * Added lines start with `+` (and the `+++` file header is skipped). Markers
- * are matched with word boundaries (`\b`) so that substrings like "XXXL" or
+ * Delegates to {@link parseAddedLines} so the line filter (which hunk lines are
+ * real additions vs. pre-hunk diff metadata) stays in one place. Markers are
+ * matched with word boundaries (`\b`) so that substrings like "XXXL" or
  * "XXX chromosome" do NOT count; an added line with multiple markers counts once.
  *
  * Returns 0 for non-string / empty patches.
@@ -126,11 +129,11 @@ export function isGeneratedFile(filename) {
  * @returns {number}
  */
 export function countTodosInPatch(patch) {
-  if (typeof patch !== 'string' || patch.length === 0) return 0;
+  if (!patch) return 0;
+  const additions = parseAddedLines(patch);
   let count = 0;
-  for (const line of patch.split('\n')) {
-    if (!line.startsWith('+') || line.startsWith('+++')) continue;
-    if (TODO_MARKER_RES.some((re) => re.test(line))) count++;
+  for (const a of additions) {
+    if (TODO_MARKER_RES.some((re) => re.test(a.text))) count++;
   }
   return count;
 }

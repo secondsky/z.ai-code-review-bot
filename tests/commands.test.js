@@ -232,6 +232,41 @@ describe('parseCommand — multi-line input', () => {
   });
 });
 
+describe('parseCommand — CMD-1: CR / CRLF / LFCR line endings', () => {
+  // CMD-1: the parser used to split on '\n' only. CR-only (old MacOS) or LFCR
+  // line breaks were not handled, so the whole comment bled into the first
+  // "line" and the command verb/args got mangled.
+  it('CMD-1: splits on CRLF (\\r\\n) — first line is the command', () => {
+    const input = '/zai ask hi\r\nmore context';
+    expect(parseCommand(input)).toEqual({
+      command: 'ask',
+      args: 'hi',
+      raw: input,
+      error: null,
+    });
+  });
+
+  it('CMD-1: splits on a lone CR (\\r) — first line is the command', () => {
+    const input = '/zai ask hi\rmore context';
+    expect(parseCommand(input)).toEqual({
+      command: 'ask',
+      args: 'hi',
+      raw: input,
+      error: null,
+    });
+  });
+
+  it('CMD-1: a bare /zai with only a CR after it is still MALFORMED_INPUT', () => {
+    // After normalizing CR, the first line is just "/zai" → no command verb.
+    expect(parseCommand('/zai\rmore')).toEqual({
+      command: null,
+      args: null,
+      raw: '/zai\rmore',
+      error: 'MALFORMED_INPUT',
+    });
+  });
+});
+
 describe('parseCommand — defensive inputs', () => {
   it('returns MALFORMED_INPUT for a non-string input (number)', () => {
     expect(parseCommand(42)).toEqual({

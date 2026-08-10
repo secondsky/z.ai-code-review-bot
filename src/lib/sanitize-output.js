@@ -63,7 +63,16 @@ const ALERT_RE = new RegExp(
  * We require a non-word boundary before the `@` (so `foo@bar` emails, and
  * identifiers like `array@head`, are not treated as mentions).
  */
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
+// SCN-17: a backtick is intentionally included in the negated boundary class so
+// ``foo`@user`` (an identifier-like token) is not treated as a mention. But that
+// also meant a backtick IMMEDIATELY before `@` (e.g. "see `@evilspammer") left
+// the `@` without a usable boundary and the mention survived. The fix: also
+// match a leading backtick as a boundary, but capture it separately so it is
+// preserved verbatim in the replacement (the backtick is not part of the
+// mention). The replacement re-emits the backtick followed by the neutralized
+// mention. This keeps the original text visually identical while inserting the
+// ZWSP that breaks GitHub's mention parser.
+const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -124,7 +133,12 @@ function neutralizeMentionsInLine(line) {
     .map((seg, i) => {
       // Inline code segments start and end with a backtick.
       if (i % 2 === 1) return seg;
-      return seg.replace(MENTION_RE, (full, pre, name) => {
+      return seg.replace(MENTION_RE, (full, pre, name, bt, btName) => {
+        // Two alternatives in MENTION_RE:
+        //   1. (^|[^\w`\\/])@(name)   — boundary char (or start) then @
+        //   2. (`)@(btName)           — SCN-17: a backtick immediately before @
+        // Re-emit the boundary/backtick verbatim, insert ZWSP after @.
+        if (bt !== undefined) return `${bt}@\u200b${btName}`;
         return `${pre}@\u200b${name}`;
       });
     })
@@ -143,6 +157,39 @@ function neutralizeAlerts(text) {
     // casing GitHub accepted on input.
     return `${boundary}${quotePrefix}!${type.toUpperCase()}`;
   });
+}
+
+/**
+ * Defense-in-depth (SCN-15 / W2-2): strip any forged `<!-- zai-... -->` HTML
+ * comment from model output.
+ *
+ * `parseFindingsHashBlock` and friends trust these comments when reading PRIOR
+ * bot reviews. The scheduled-review path also trusts `<!-- zai-sha:... -->`
+ * (via `hasReviewForSha`). An attacker who can plant prompt-injection in a PR
+ * diff could coax the model into emitting a forged marker in its OWN review
+ * output, which would then be parsed as a trusted prior-review marker on the
+ * next run (suppressing legitimate findings or scheduled reviews). Stripping
+ * such markers from model output BEFORE it is posted closes that vector.
+ *
+ * W2-2: the original implementation only stripped `zai-hashes` and
+ * `zai-description` and only on a line-anchored match. A forged `<!-- zai-sha:
+ * ... -->` survived, and so did a marker embedded mid-line. The regex now
+ * matches ANY `zai-`-prefixed HTML comment ANYWHERE in the text (not line
+ * anchored), so all current and future `zai-*` markers are covered and a
+ * forger cannot escape by placing the comment mid-line.
+ *
+ * Legitimate (non-`zai-`) HTML comments are preserved.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripForgedHashBlocks(text) {
+  // Drop any HTML comment containing a `zai-` prefix. Apply globally (not line-
+  // anchored) so a mid-line forgery like `text <!-- zai-sha:x --> more` is also
+  // stripped (W2-SEC-2A). `[^>]*` is sufficient here: HTML comment bodies do not
+  // contain `>` in practice, and we are sanitizing untrusted model output, not
+  // parsing arbitrary HTML.
+  return text.replace(/<!--\s*zai-[^>]*-->/g, '');
 }
 
 /**
@@ -168,6 +215,10 @@ export function sanitizeModelOutput(text, options = {}) {
   //    spam can't escape the sanitizer via truncation timing.
   let out = neutralizeMentionsOutsideCode(text);
   out = neutralizeAlerts(out);
+  // SCN-15 / W2-2: strip any forged zai-* HTML comment markers that an attacker
+  // might coax the model into emitting via prompt injection (hashes, description,
+  // sha, etc.). Applied globally so mid-line forgeries are also caught.
+  out = stripForgedHashBlocks(out);
 
   // 2. Length cap. Compare on the post-sanitization length.
   if (out.length > maxChars) {
@@ -211,4 +262,4 @@ export function sanitizeCommentBody(body) {
 }
 
 // Export internals for targeted unit tests.
-export { neutralizeMentionsOutsideCode, neutralizeMentionsInLine, neutralizeAlerts };
+export { neutralizeMentionsOutsideCode, neutralizeMentionsInLine, neutralizeAlerts, stripForgedHashBlocks };

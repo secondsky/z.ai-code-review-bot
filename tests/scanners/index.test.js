@@ -49,9 +49,19 @@ describe('formatScannerContext', () => {
     const out = formatScannerContext(findings, null);
     expect(out.split('\n')).toEqual([
       'Already detected by automated scanners (do NOT re-report these):',
-      '- src/auth.js:42 [gitleaks:aws-access-key] AWS access key ID detected',
-      '- src/db.js:18 [astgrep:sql-concat] SQL query via string concatenation',
+      '- `src/auth.js`:42 [gitleaks:aws-access-key] AWS access key ID detected',
+      '- `src/db.js`:18 [astgrep:sql-concat] SQL query via string concatenation',
     ]);
+  });
+
+  // SCN-18: filenames are wrapped in backticks so they are delimited from the
+  // surrounding prompt text (defense against prompt injection via filenames).
+  it('wraps the filename in backticks', () => {
+    const findings = [
+      { file: 'src/auth.js', line: 42, rule: 'gitleaks:x', title: 't' },
+    ];
+    const out = formatScannerContext(findings, null);
+    expect(out).toContain('`src/auth.js`');
   });
 
   it('omits :line when line is null', () => {
@@ -59,7 +69,7 @@ describe('formatScannerContext', () => {
       { file: 'package-lock.json', line: null, rule: 'metrics:generated-file', title: 'Generated/lock file modified' },
     ];
     const out = formatScannerContext(findings, null);
-    expect(out).toContain('- package-lock.json [metrics:generated-file]');
+    expect(out).toContain('- `package-lock.json` [metrics:generated-file]');
   });
 
   it('appends a metrics line at the end (separated by blank line)', () => {

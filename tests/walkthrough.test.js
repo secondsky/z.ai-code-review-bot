@@ -129,6 +129,20 @@ describe('classifyFile', () => {
     expect(classifyFile('tests/findings.test.js')).toBe('tests');
     expect(classifyFile('foo.spec.js')).toBe('tests');
   });
+
+  // CMD-6: classifyFile must iterate COHORT_ORDER (where 'config' is at index 3,
+  // BEFORE 'ui' at index 4), NOT the COHORT_RULES array (where 'config' sits at
+  // index 5, AFTER 'ui'). A path that matches BOTH config and ui cohorts must
+  // resolve to config because COHORT_ORDER ranks config as more foundational.
+  it('CMD-6: classifyFile follows COHORT_ORDER — config beats ui (pages/settings.json → config)', () => {
+    // pages/ matches ui; .json matches config. COHORT_ORDER has config (rank 3)
+    // before ui (rank 4), so config wins.
+    expect(classifyFile('pages/settings.json')).toBe('config');
+    // A .yml file under views/ — both ui (views/) and config (.yml) match.
+    expect(classifyFile('views/config.yml')).toBe('config');
+    // .tsx under a config dir (.github) — both config (.github) and ui (.tsx).
+    expect(classifyFile('.github/workflows/ui.yml')).toBe('config');
+  });
 });
 
 /* ------------------------------------------------------------------ *

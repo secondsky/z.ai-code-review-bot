@@ -38352,7 +38352,8 @@ function eventName(context) {
 
 /** @returns {boolean} */
 function isPullRequestEvent(context) {
-  return eventName(context) === 'pull_request';
+  const name = eventName(context);
+  return name === 'pull_request' || name === 'pull_request_target';
 }
 
 /** @returns {boolean} */
@@ -38457,7 +38458,14 @@ function read(inputs, name) {
 }
 
 function toInt(v) {
-  const n = parseInt(v, 10);
+  // CFG-8: parseInt alone happily accepts scientific notation ("1e5" → 1),
+  // numeric separators ("1_000" → 1), and hex ("0x10" → 16), silently
+  // truncating misconfigured inputs. Require the trimmed raw string to be a
+  // pure optional-sign + digits integer; otherwise return null so callers
+  // fall back to their default.
+  const raw = typeof v === 'string' ? v.trim() : String(v ?? '').trim();
+  if (!/^[+-]?\d+$/.test(raw)) return null;
+  const n = parseInt(raw, 10);
   return Number.isNaN(n) ? null : n;
 }
 
@@ -39117,7 +39125,7 @@ function makeApiRequest(params, deps = {}) {
             return;
           }
           const content = parsed?.choices?.[0]?.message?.content;
-          if (!content) {
+          if (!content || typeof content !== 'string') {
             settled = true;
             reject(new Error('Z.ai API returned an empty response'));
             return;
@@ -39217,6 +39225,13 @@ async function callWithRetry(fn, options = {}) {
           if (onFallback) {
             onFallback({ attempt, originalError: error, fallbackInfo: fb });
           }
+          // CORE-5: sleep before the fallback attempt so we don't immediately
+          // hammer a struggling provider. The fallback only fires once per
+          // call, so this is at most one extra backoff, and it keeps the
+          // retry cadence consistent with the normal retry path.
+          const fbDelay = baseDelay * 2 ** attempt + Math.floor(Math.random() * 1000);
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(fbDelay);
           attempt += 1;
           continue;
         }
@@ -39543,7 +39558,16 @@ const ALERT_RE = new RegExp(
  * We require a non-word boundary before the `@` (so `foo@bar` emails, and
  * identifiers like `array@head`, are not treated as mentions).
  */
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
+// SCN-17: a backtick is intentionally included in the negated boundary class so
+// ``foo`@user`` (an identifier-like token) is not treated as a mention. But that
+// also meant a backtick IMMEDIATELY before `@` (e.g. "see `@evilspammer") left
+// the `@` without a usable boundary and the mention survived. The fix: also
+// match a leading backtick as a boundary, but capture it separately so it is
+// preserved verbatim in the replacement (the backtick is not part of the
+// mention). The replacement re-emits the backtick followed by the neutralized
+// mention. This keeps the original text visually identical while inserting the
+// ZWSP that breaks GitHub's mention parser.
+const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -39604,7 +39628,12 @@ function neutralizeMentionsInLine(line) {
     .map((seg, i) => {
       // Inline code segments start and end with a backtick.
       if (i % 2 === 1) return seg;
-      return seg.replace(MENTION_RE, (full, pre, name) => {
+      return seg.replace(MENTION_RE, (full, pre, name, bt, btName) => {
+        // Two alternatives in MENTION_RE:
+        //   1. (^|[^\w`\\/])@(name)   — boundary char (or start) then @
+        //   2. (`)@(btName)           — SCN-17: a backtick immediately before @
+        // Re-emit the boundary/backtick verbatim, insert ZWSP after @.
+        if (bt !== undefined) return `${bt}@\u200b${btName}`;
         return `${pre}@\u200b${name}`;
       });
     })
@@ -39623,6 +39652,39 @@ function neutralizeAlerts(text) {
     // casing GitHub accepted on input.
     return `${boundary}${quotePrefix}!${type.toUpperCase()}`;
   });
+}
+
+/**
+ * Defense-in-depth (SCN-15 / W2-2): strip any forged `<!-- zai-... -->` HTML
+ * comment from model output.
+ *
+ * `parseFindingsHashBlock` and friends trust these comments when reading PRIOR
+ * bot reviews. The scheduled-review path also trusts `<!-- zai-sha:... -->`
+ * (via `hasReviewForSha`). An attacker who can plant prompt-injection in a PR
+ * diff could coax the model into emitting a forged marker in its OWN review
+ * output, which would then be parsed as a trusted prior-review marker on the
+ * next run (suppressing legitimate findings or scheduled reviews). Stripping
+ * such markers from model output BEFORE it is posted closes that vector.
+ *
+ * W2-2: the original implementation only stripped `zai-hashes` and
+ * `zai-description` and only on a line-anchored match. A forged `<!-- zai-sha:
+ * ... -->` survived, and so did a marker embedded mid-line. The regex now
+ * matches ANY `zai-`-prefixed HTML comment ANYWHERE in the text (not line
+ * anchored), so all current and future `zai-*` markers are covered and a
+ * forger cannot escape by placing the comment mid-line.
+ *
+ * Legitimate (non-`zai-`) HTML comments are preserved.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripForgedHashBlocks(text) {
+  // Drop any HTML comment containing a `zai-` prefix. Apply globally (not line-
+  // anchored) so a mid-line forgery like `text <!-- zai-sha:x --> more` is also
+  // stripped (W2-SEC-2A). `[^>]*` is sufficient here: HTML comment bodies do not
+  // contain `>` in practice, and we are sanitizing untrusted model output, not
+  // parsing arbitrary HTML.
+  return text.replace(/<!--\s*zai-[^>]*-->/g, '');
 }
 
 /**
@@ -39648,6 +39710,10 @@ function sanitizeModelOutput(text, options = {}) {
   //    spam can't escape the sanitizer via truncation timing.
   let out = neutralizeMentionsOutsideCode(text);
   out = neutralizeAlerts(out);
+  // SCN-15 / W2-2: strip any forged zai-* HTML comment markers that an attacker
+  // might coax the model into emitting via prompt injection (hashes, description,
+  // sha, etc.). Applied globally so mid-line forgeries are also caught.
+  out = stripForgedHashBlocks(out);
 
   // 2. Length cap. Compare on the post-sanitization length.
   if (out.length > maxChars) {
@@ -39708,6 +39774,16 @@ function sanitizeCommentBody(body) {
 
 /** Hidden HTML comment marker used to find the existing review comment. */
 const MARKER = '<!-- zai-code-review -->';
+
+/**
+ * Hard cap on pagination depth for the marker lookup in
+ * {@link upsertReviewComment}. Defense-in-depth (CORE-4): the loop terminates
+ * on a short page OR when the marker comment is found, but a misbehaving
+ * endpoint that always returns full pages AND never contains the marker would
+ * loop forever. 100 pages × 100 per page = 10,000 comments — beyond any real
+ * PR's comment history.
+ */
+const MAX_COMMENT_PAGES = 100;
 
 /**
  * Determine whether a comment was authored by a bot. Used to gate marker-based
@@ -39812,9 +39888,10 @@ async function upsertReviewComment({
 }) {
   // Paginate fully: the marker comment can be anywhere in the history, and a
   // single page would miss it on high-traffic PRs (creating a duplicate).
+  // CORE-4: cap at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us
+  // in an unbounded loop when the marker is absent.
   let existing = null;
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
       repo,
@@ -39828,7 +39905,6 @@ async function upsertReviewComment({
       ) ?? null;
     if (existing) break; // found it — no need to fetch more pages
     if (comments.length < perPage) break; // last page reached
-    page += 1;
   }
 
   if (existing) {
@@ -39869,6 +39945,14 @@ var picomatch = __nccwpck_require__(4006);
  * filenames and non-array pattern lists are tolerated (return false) and never
  * throw.
  *
+ * A leading `!` (picomatch negation) is STRIPPED before testing. This
+ * predicate is an "include if any pattern matches" check used by
+ * `filterExcludedFiles` as an exclude-list: picomatch negation semantics
+ * ("match any file NOT matching this pattern") would invert the intent,
+ * causing `!dist/**` to exclude every file outside `dist/`. Stripping
+ * the `!` makes `!dist/**` behave as `dist/**`, which is what callers
+ * documenting the `!dist/**` exclude syntax expect. (CFG-1 / SCN-13.)
+ *
  * @param {string} filename - Full path or basename of the file to test.
  * @param {string[]} patterns - Glob patterns (picomatch syntax).
  * @returns {boolean}
@@ -39888,7 +39972,11 @@ function matchesAnyPattern(filename, patterns) {
     if (trimmed === '') {
       continue;
     }
-    if (picomatch.isMatch(filename, trimmed) || picomatch.isMatch(base, trimmed)) {
+    // Strip a leading `!` (picomatch negation). Negation is not meaningful
+    // for an "include if any matches" / exclude-list predicate and would
+    // invert the caller's intent (CFG-1 / SCN-13).
+    const positive = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
+    if (picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive)) {
       return true;
     }
   }
@@ -41100,7 +41188,13 @@ function formatFindingsAsSummary(findings, options = {}) {
           typeof f.suggestion === 'string' && f.suggestion.length > 0 ? f.suggestion : null;
 
         const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
-        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        // W2-SEC-6: filenames are attacker-controlled and were rendered raw as
+        // markdown. A filename containing markdown metacharacters (e.g.
+        // weird**name.js) would inject formatting (bold) into the summary.
+        // Render the filename as inline code (backticks) which neutralizes
+        // all markdown special characters. The line suffix is appended OUTSIDE
+        // the code span so the :L42 anchor link is still parsed by GitHub.
+        lines.push(`- \`${file}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }
@@ -41150,10 +41244,17 @@ const HASH_BLOCK_SUFFIX = ' -->';
  *
  * The hash is SHA-256 (hex) of the canonical key
  * `${file}:${line ?? 'null'}:${severity}:${title}:${description}`. Only those
- * five fields participate — `evidence`, `suggestion`, `rule`, `confidence`,
- * and `category` are intentionally excluded so a re-review that only changed
- * the suggestion text does NOT re-surface the finding as "new" (the location
- * and the issue identity are unchanged).
+ * five fields participate by default — `evidence`, `suggestion`, `rule`,
+ * `confidence`, and `category` are intentionally excluded so a re-review that
+ * only changed the suggestion text does NOT re-surface the finding as "new"
+ * (the location and the issue identity are unchanged).
+ *
+ * SCN-3 / W2-5: for findings produced by deterministic scanners (rule starts
+ * with `regex:`, `gitleaks:`, `secret:`, or `astgrep:`), `evidence` is ALSO
+ * included in the hash. A rotated secret (or a different offending line for an
+ * astgrep rule like eval/sql-concat) has a different evidence value and must
+ * hash differently so the new occurrence is re-surfaced instead of being
+ * suppressed as "unchanged".
  *
  * Defensive: missing/non-string fields are coerced to '' (or 'null' for line)
  * so a malformed finding never throws — it just hashes to a stable value.
@@ -41169,7 +41270,20 @@ function hashFinding(finding) {
   const severity = typeof f.severity === 'string' ? f.severity : '';
   const title = typeof f.title === 'string' ? f.title : '';
   const description = typeof f.description === 'string' ? f.description : '';
-  const key = `${file}:${line}:${severity}:${title}:${description}`;
+  let key = `${file}:${line}:${severity}:${title}:${description}`;
+  // SCN-3 / W2-5: include evidence for findings produced by deterministic
+  // scanners so a different match (rotated secret, different offending line)
+  // hashes differently and is re-surfaced instead of suppressed as
+  // "unchanged". This covers regex:/gitleaks:/secret: (secret scanners) and
+  // astgrep: (deterministic pattern rules like eval, sql-concat). LLM
+  // findings (no rule or rule: 'llm') keep evidence excluded for stability.
+  if (
+    f.rule &&
+    typeof f.rule === 'string' &&
+    /^(regex|gitleaks|secret|astgrep):/i.test(f.rule)
+  ) {
+    key += ':' + (typeof f.evidence === 'string' ? f.evidence : '');
+  }
   return (0,external_node_crypto_.createHash)('sha256').update(key, 'utf8').digest('hex');
 }
 
@@ -41553,7 +41667,8 @@ function isContextLimitError(error) {
     message.includes('maximum context length') ||
     message.includes('input tokens exceeds') ||
     message.includes('code":413') ||
-    message.includes('type":"413')
+    message.includes('type":"413') ||
+    message.includes('error 413')
   );
 }
 
@@ -42092,8 +42207,13 @@ const COHORT_RULES = [
  */
 function classifyFile(filename) {
   if (typeof filename !== 'string' || filename.length === 0) return 'other';
-  for (const { cohort, matchers } of COHORT_RULES) {
-    if (matchers.some((re) => re.test(filename))) return cohort;
+  // Iterate in COHORT_ORDER (the canonical dependency rank), looking up each
+  // cohort's rule, so the documented "first-match-wins by dependency rank"
+  // holds — NOT the COHORT_RULES array order (which differs: e.g. 'config'
+  // sits AFTER 'ui' in the array but BEFORE it in COHORT_ORDER).
+  for (const cohort of COHORT_ORDER) {
+    const rule = COHORT_RULES.find((r) => r.cohort === cohort);
+    if (rule && rule.matchers.some((re) => re.test(filename))) return cohort;
   }
   return 'other';
 }
@@ -42784,7 +42904,14 @@ async function upsertPrDescription(
 
   const pr = await getPr({ owner, repo, pull_number: pullNumber });
   const currentBody = typeof pr?.body === 'string' ? pr.body : '';
-  const block = `${DESCRIBE_MARKER_START}\n${description}\n${DESCRIBE_MARKER_END}`;
+  // CMD-8: strip any model-emitted marker strings from the description before
+  // interpolating, so an indirect prompt-injection cannot break out of the
+  // upsert block or duplicate the markers.
+  const safeDescription = String(description ?? '').replace(
+    /<!--\s*\/?zai-description\s*-->/g,
+    '',
+  );
+  const block = `${DESCRIBE_MARKER_START}\n${safeDescription}\n${DESCRIBE_MARKER_END}`;
 
   let newBody;
   const startIdx = currentBody.indexOf(DESCRIBE_MARKER_START);
@@ -42797,8 +42924,10 @@ async function upsertPrDescription(
         block +
         currentBody.slice(endIdx + DESCRIBE_MARKER_END.length);
     } else {
-      // Malformed (start without end): replace from start to end of body.
-      newBody = currentBody.slice(0, startIdx) + block;
+      // CMD-7: orphan start marker (start without a matching end). Treat as
+      // "no block found" and append, instead of slicing everything after the
+      // orphan marker (which would destroy human-written body text).
+      newBody = currentBody ? `${currentBody}\n\n${block}` : block;
     }
   } else {
     // No existing block: append.
@@ -42823,8 +42952,8 @@ async function upsertPrDescription(
  *
  * Idempotency model (mirrors `comments.js`): the review body carries the
  * {@link MARKER} HTML comment. On each run, {@link upsertReview} lists prior
- * bot reviews (matched by marker OR bot login), DISMISSES them (so stale
- * inline comments disappear on re-push), then creates the fresh review. This
+ * reviews whose body includes the marker, DISMISSES them (so stale inline
+ * comments disappear on re-push), then creates the fresh review. This
  * "dismiss-stale-then-post" sequence keeps exactly one active bot review per
  * PR head SHA without piling up duplicates.
  *
@@ -42979,16 +43108,30 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
 function renderCommentBody(finding) {
   const severity = typeof finding.severity === 'string' ? finding.severity : 'info';
   const emoji = review_SEVERITY_EMOJI[severity] ?? '➖';
-  const title = typeof finding.title === 'string' ? finding.title : '';
-  const description = typeof finding.description === 'string' ? finding.description : '';
+  // CORE-2: collapse newlines in title/description/suggestion so model output
+  // carrying stray newlines can't break the markdown structure or inject
+  // unescaped markdown (e.g. a newline mid-title would split the bold span).
+  const stripNewlines = (s) => String(s).replace(/\r?\n/g, ' ');
+  const title =
+    typeof finding.title === 'string' ? stripNewlines(finding.title) : '';
+  const description =
+    typeof finding.description === 'string' ? stripNewlines(finding.description) : '';
   const evidence = typeof finding.evidence === 'string' ? finding.evidence : '';
   const suggestion =
-    typeof finding.suggestion === 'string' && finding.suggestion.length > 0 ? finding.suggestion : null;
+    typeof finding.suggestion === 'string' && finding.suggestion.length > 0
+      ? stripNewlines(finding.suggestion)
+      : null;
 
   const parts = [];
   parts.push(`${emoji} **${title}**`);
   if (description.length > 0) parts.push(description);
-  if (evidence.length > 0) parts.push(`> \`${String(evidence).replace(/`/g, '\\`')}\``);
+  if (evidence.length > 0) {
+    // CORE-2: escape backticks AND collapse newlines in evidence so the inline
+    // code span is preserved. A newline would close the span early and let the
+    // remaining content render as markdown (e.g. a clickable malicious link).
+    const safeEvidence = evidence.replace(/`/g, '\\`').replace(/\r?\n/g, ' ');
+    parts.push(`> \`${safeEvidence}\``);
+  }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
   return sanitizeModelOutput(parts.join('\n'));
 }
@@ -43070,12 +43213,25 @@ function resolveReviewEvent(findings, config) {
 }
 
 /**
+ * Hard cap on pagination depth for {@link listBotReviews}. Defense-in-depth
+ * (CORE-4): the loop already terminates on a short page, but a misbehaving
+ * endpoint that always returns full pages would loop forever. 100 pages × 100
+ * per page = 10,000 reviews — far beyond any real PR's review history.
+ */
+const MAX_REVIEW_PAGES = 100;
+
+/**
  * List prior reviews posted by the bot on a PR.
  *
  * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
- * page). Filters to reviews whose `body` includes `marker` OR whose `user.login`
- * ends with `[bot]`. This dual filter catches both the marker-bearing reviews
- * we posted AND any legacy bot-posted reviews that predate the marker.
+ * page). Filters to reviews whose `body` includes `marker`. The marker is the
+ * canonical idempotency signal — every review this action posts carries it —
+ * so the broad `[bot]`-login fallback that previously matched ANY bot (e.g.
+ * dependabot, github-actions) was removed to avoid dismissing reviews this
+ * action never posted (CORE-3).
+ *
+ * CORE-4: pagination is also capped at {@link MAX_REVIEW_PAGES} as a safety
+ * net against a misbehaving endpoint that never returns a short page.
  *
  * @param {{octokit:object, context:object, marker?:string}} args
  * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
@@ -43089,8 +43245,7 @@ async function listBotReviews({ octokit, context, marker = MARKER }) {
   /** @type {Array} */
   const all = [];
   const perPage = 100;
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
     const { data } = await octokit.rest.pulls.listReviews({
       owner,
       repo,
@@ -43100,14 +43255,17 @@ async function listBotReviews({ octokit, context, marker = MARKER }) {
     });
     const rows = Array.isArray(data) ? data : [];
     all.push(...rows);
-    if (rows.length < perPage) break;
-    page += 1;
+    if (rows.length < perPage) break; // short page → done
   }
 
   return all.filter((r) => {
     const body = typeof r?.body === 'string' ? r.body : '';
-    const login = typeof r?.user?.login === 'string' ? r.user.login : '';
-    return body.includes(marker) || login.endsWith('[bot]');
+    // CORE-3: the marker is the canonical idempotency signal. The previous
+    // `|| login.endsWith('[bot]')` OR matched ANY bot review (including
+    // dependabot, github-actions, etc.), causing upsertReview to dismiss
+    // reviews this action never posted. The marker alone is sufficient for
+    // idempotency (every review we post carries it).
+    return body.includes(marker);
   });
 }
 
@@ -43156,7 +43314,7 @@ async function dismissStaleReviews({ octokit, context, reviews, reason, core }) 
  * reviews first, then creates the new one.
  *
  * Flow:
- *   1. `listBotReviews` → prior reviews (marker OR bot login).
+ *   1. `listBotReviews` → prior reviews (matched by marker in body).
  *   2. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`.
  *   3. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
  *
@@ -43264,8 +43422,12 @@ function parseCommand(text) {
     return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
   }
 
+  // CMD-1: normalize line endings before splitting. Handle CRLF (Windows),
+  // LFCR (rare), and lone CR (old MacOS) so the "first line" is correct
+  // regardless of the client's line-ending convention.
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   // Only the first line is parsed.
-  const firstLine = text.split('\n')[0];
+  const firstLine = normalized.split('\n')[0];
   const trimmed = firstLine.trim();
   const lower = trimmed.toLowerCase();
 
@@ -43284,7 +43446,9 @@ function parseCommand(text) {
   // First token is the command; the rest is args (single trimmed string).
   // Split on ANY whitespace (\s, covers spaces/tabs/multiple spaces), not just
   // a literal ' ', so `/zai\task hi` and `/zai  ask   hi` parse correctly.
-  const match = remainder.match(/^(\S+)(?:\s+(.*))?$/);
+  // CMD-1: use `[\s\S]*` (not `.*`) as defense-in-depth so a stray CR in the
+  // args cannot truncate the capture (`.` does not match `\r`).
+  const match = remainder.match(/^(\S+)(?:\s+([\s\S]*))?$/);
   let command = match ? match[1].toLowerCase() : remainder.toLowerCase();
   let args = match && match[2] ? match[2].trim() : '';
 
@@ -43316,6 +43480,12 @@ function parseCommand(text) {
 
 /** Soft cap on the diff context bundled into the prompt. */
 const MAX_CONTEXT_CHARS = 8000;
+
+/**
+ * CMD-9: hard cap on the user-supplied question length. Prevents a
+ * cost/quota brute-force via an enormous `/zai ask` body.
+ */
+const MAX_QUESTION_CHARS = 4000;
 
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
@@ -43362,8 +43532,18 @@ function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
   const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
   const prContext = `${title}${body}${buildDiffContext(files)}`;
+  // W2-SEC-1: the user's question is the most direct prompt-injection vector
+  // and must be wrapped in <untrusted_input> tags before being interpolated
+  // into the prompt (the PR context was already wrapped via wrapUntrusted;
+  // the question — the user's literal text — must receive the same defense).
+  // The commenter login comes from the GitHub API (safe) and stays outside
+  // the wrapper so the model can still address the user.
+  const login = commenterLogin || 'unknown';
+  const wrappedQuestion = wrapUntrusted(question, 'user-question');
   return [
-    `Question from @${commenterLogin || 'unknown'}: ${question}`,
+    `Question from @${login}:`,
+    '',
+    wrappedQuestion,
     '',
     wrapUntrusted(prContext, 'pr-context'),
   ].join('\n');
@@ -43389,7 +43569,12 @@ async function handleAskCommand(
     getChangedFiles: getFiles = (o) => getChangedFiles(o),
   } = deps;
 
-  const question = typeof args === 'string' ? args.trim() : '';
+  // CMD-9: cap the question length before building the prompt so an enormous
+  // `/zai ask` body cannot brute-force the model's cost/quota.
+  const question = (typeof args === 'string' ? args.trim() : '').slice(
+    0,
+    MAX_QUESTION_CHARS,
+  );
   if (question === '') {
     await post(EMPTY_ARGS_COMMENT);
     return;
@@ -43701,16 +43886,22 @@ function parseRange(token) {
       const left = t.slice(0, idx);
       const right =
         sep === '..' ? t.slice(idx + 2) : t.slice(idx + sep.length);
+      // CMD-3: strict numeric pre-check. `Number()` accepts hex (0x10),
+      // scientific (1e3), decimals, and leading/trailing whitespace; reject
+      // anything that is not a bare run of ASCII digits.
+      if (!/^\d+$/.test(left) || !/^\d+$/.test(right)) return null;
       const start = Number(left);
       const end = Number(right);
-      if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return null;
       if (start < 1 || end < 1 || end < start) return null;
       return { start, end };
     }
   }
 
+  // CMD-3: strict numeric pre-check for the single-line form too.
+  if (!/^\d+$/.test(t)) return null;
   const n = Number(t);
-  if (!Number.isInteger(n) || n < 1) return null;
+  if (!Number.isSafeInteger(n) || n < 1) return null;
   return { start: n, end: n };
 }
 
@@ -43767,8 +43958,15 @@ function extractLineWindow(content, start, end) {
  * @returns {string}
  */
 function buildExplainPrompt({ file, start, end, window }) {
+  // W2-SEC-4: the filename is attacker-controlled and is interpolated into a
+  // backtick code span. A filename containing a backtick (e.g. weird`name.js)
+  // would break out of the code span and inject prose into the instruction.
+  // Sanitize via escapeDiffFence (replaces backticks with single quotes and
+  // collapses newlines) — the same defense used for filename headers in the
+  // structured-review prompt.
+  const safeFile = escapeDiffFence(file);
   return [
-    `Explain lines ${start}-${end} of \`${file}\` in this pull request.`,
+    `Explain lines ${start}-${end} of \`${safeFile}\` in this pull request.`,
     'Describe what this code does, why it is there, and any concerns a',
     'reviewer should know about. Be concise.',
     '',
@@ -43875,6 +44073,13 @@ async function handleExplainCommand(
     }
 
     const content = await fetch({ octokit, owner, repo, path: target, ref });
+    // CMD-12: when the file has no textual content (binary file, directory
+    // entry, or a file too large for the API to return), post a guidance
+    // comment instead of calling the API with an empty code window.
+    if (!content || content.trim() === '') {
+      await post(`> No textual content available for \`${target}\`.`);
+      return;
+    }
     // Clamp the requested range to a sane window so a `/zai explain 1-50000`
     // on a huge file cannot build a giant prompt (cost/quota guard). The
     // visible range reported to the model reflects the clamp.
@@ -43911,10 +44116,10 @@ async function handleExplainCommand(
  * asking for a structured description (Overview / Features / Bug Fixes /
  * Refactoring / Infra), and posts the result as a COMMENT.
  *
- * v1 READ-ONLY INVARIANT: this handler does NOT mutate the PR body. The fork
- * did (via `pulls.update`) — that is a side effect we deliberately reject for
- * v1. The generated description is posted as a comment only; a human can copy
- * it into the PR body if they choose. No `pulls.update` is ever called here.
+ * READ-ONLY by default. OPT-IN mutation gated by `ZAI_DESCRIBE_WRITE_BODY`
+ * (default off): when that flag is on, the generated description is also
+ * upserted into a marked block in the PR body via `pulls.update` — only the
+ * marked block is ever mutated, the rest of the body is preserved verbatim.
  *
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
@@ -44065,10 +44270,10 @@ async function handleDescribeCommand(
  * risk assessment with a severity level (🟢 low / 🟡 medium / 🟠 high / 🔴
  * critical) and rationale, and posts the result as a COMMENT.
  *
- * v1 READ-ONLY INVARIANT: this handler does NOT apply labels. The fork did
- * (via `issues.addLabels`) — that is a side effect we deliberately reject for
- * v1. The assessment is posted as a comment only; a human can act on it. No
- * `issues.addLabels` is ever called here.
+ * READ-ONLY by default. OPT-IN mutation gated by `ZAI_IMPACT_LABELS`
+ * (default off): when that flag is on, a severity label (mapped via
+ * `ZAI_IMPACT_LABEL_MAP`) is applied to the PR via `issues.addLabels`, and any
+ * prior managed label is removed for idempotency.
  *
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
@@ -44103,15 +44308,21 @@ const SEVERITY_KEYS = {
 /**
  * Extract the severity from the model's impact assessment. The prompt asks for
  * a severity level on its own first line; this parses the first severity
- * keyword or emoji found. Pure (exported for testing).
+ * keyword or emoji found on that first line ONLY. Pure (exported for testing).
  *
- * Word-form keys (critical/high/medium/low) are matched with word boundaries
- * so that "highlighted" no longer matches "high" and "noncritical" no longer
- * matches "critical". Common negation prefixes ("non-critical", "not critical",
+ * Word-form keys (critical/high/medium/low) are matched with negative
+ * lookbehind/lookahead for word chars AND hyphens, so "highlighted" no longer
+ * matches "high", "noncritical" no longer matches "critical", and
+ * "high-availability" no longer matches "high" (a hyphen is NOT treated as a
+ * word boundary). Common negation prefixes ("non-critical", "not critical",
  * "no critical issues", "isn't high") are stripped before matching so a
  * negated severity word does not false-positive. Emoji keys have no word
- * boundaries, so they still use `includes`. We prefer the FIRST line (where the
- * prompt asks for the level), then fall back to the full text.
+ * boundaries, so they still use `includes`.
+ *
+ * Only the FIRST line is consulted for word-form matches — the prompt puts the
+ * severity level on its own first line, and severity words appearing in the
+ * rationale body (e.g. "high confidence", "high-availability") must NOT
+ * override the declared level.
  *
  * @param {string} text  The model's assessment output.
  * @returns {'critical'|'high'|'medium'|'low'|null}
@@ -44137,10 +44348,12 @@ function parseSeverity(text) {
       // Emoji keys have no word boundaries; use includes.
       if (raw.includes(key)) return mapped;
     } else {
-      // Word keys: match on a word boundary to avoid false positives
-      // (e.g. "highlighted" → high, "noncritical" → critical).
-      const re = new RegExp(`\\b${key}\\b`, 'i');
-      if (re.test(firstLine) || re.test(cleaned)) return mapped;
+      // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
+      // so "highlighted" → no match, "noncritical" → no match, and
+      // "high-availability" → no match (hyphen is NOT a word boundary here).
+      // Only match on the FIRST line (where the prompt puts the level).
+      const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
+      if (re.test(firstLine)) return mapped;
     }
   }
   return null;
@@ -44190,10 +44403,12 @@ function buildImpactPrompt(files) {
 }
 
 /**
- * Apply (or replace) the `zai:`-scoped severity label on the issue. Only labels
- * with the configured prefix (`zai:` by default via the label map) are managed:
- * existing `zai:*` labels are removed and the new one is set, so re-runs are
- * idempotent and human labels are never touched.
+ * Apply (or replace) the severity label on the issue. ALL labels whose name
+ * appears as a value in the configured `labelMap` are considered "managed":
+ * any existing managed label (other than the target) is removed and the new
+ * one is set, so re-runs are idempotent and human labels are never touched.
+ * This works for any label-map shape — `zai:`-prefixed maps AND flat value
+ * sets like `{ critical: 'P0', high: 'P1', ... }`.
  *
  * Injected via deps so tests never touch the GitHub API.
  *
@@ -44205,16 +44420,18 @@ async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, 
   const targetLabel = labelMap?.[severity];
   if (!targetLabel) return false;
 
-  // Fetch current labels and remove any existing zai:* labels (idempotent).
+  // Fetch current labels and remove any existing managed labels (idempotent).
+  // A label is "managed" if it appears as a value in the labelMap; this is
+  // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
     issue_number: issueNumber,
   });
-  const zaiPrefix = (targetLabel.split(':')[0] + ':').toLowerCase();
+  const managed = new Set(Object.values(labelMap || {}));
   for (const label of current) {
     const name = label?.name ?? '';
-    if (name.toLowerCase().startsWith(zaiPrefix) && name !== targetLabel) {
+    if (managed.has(name) && name !== targetLabel) {
       try {
         await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
       } catch {
@@ -44406,28 +44623,43 @@ async function listOpenPrs({
   maxPrs,
   perPage = 50,
 }) {
+  // CFG-3: drafts are NOT counted toward the maxPrs cap. Previously a batch of
+  // stale drafts could fill the cap and starve real (non-draft) PRs of a
+  // scheduled review. We skip drafts entirely during accumulation — they are
+  // filtered again in runScheduledReview, but excluding them here means the
+  // cap reflects only reviewable PRs.
   const out = [];
   let page = 1;
   for (;;) {
+    // W2-1: capture the ACTUAL per_page sent to the API and compare data.length
+    // against THAT value (not the original `perPage` parameter). The previous
+    // code compared `data.length < perPage` (the parameter), which broke when
+    // the dynamic per_page was clamped down by maxPrs: e.g. maxPrs=10, perPage=50
+    // → requested 10; if page 1 returned 10 drafts (all skipped), 10 < 50 was
+    // true so the loop terminated after page 1 even though page 2 had reviewable
+    // PRs. Comparing against the requested size (10 < 10 → false) makes
+    // pagination continue until the API truly returns a short page.
+    const requestedPerPage = Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage);
     const { data } = await octokit.rest.pulls.list({
       owner,
       repo,
       state: 'open',
       sort: 'updated',
       direction: 'desc',
-      per_page: Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage),
+      per_page: requestedPerPage,
       page,
     });
     for (const pr of data) {
+      if (pr?.draft === true) continue; // drafts don't count toward the cap
       out.push({
         number: pr.number,
         headSha: pr?.head?.sha ?? '',
-        draft: pr?.draft === true,
+        draft: false,
         title: typeof pr?.title === 'string' ? pr.title : '',
       });
       if (out.length >= maxPrs) return out;
     }
-    if (data.length < perPage) break;
+    if (data.length < requestedPerPage) break;
     page += 1;
   }
   return out;
@@ -44459,6 +44691,10 @@ async function hasReviewForSha({
   headSha,
   marker = MARKER,
 }) {
+  // INT-3: an empty head SHA cannot confirm SHA-level dedup — previously the
+  // `headSha === '' ||` short-circuit matched ANY bot marker comment and
+  // suppressed the PR. Returning false here ensures the PR is reviewed.
+  if (headSha === '') return false; // can't confirm SHA-level dedup; review it
   let page = 1;
   const perPage = 100;
   for (;;) {
@@ -44474,7 +44710,7 @@ async function hasReviewForSha({
         schedule_isBotComment(c) &&
         typeof c?.body === 'string' &&
         c.body.includes(marker) &&
-        (headSha === '' || c.body.includes(headSha)),
+        c.body.includes(headSha),
     );
     if (found) return true;
     if (comments.length < perPage) return false;
@@ -44791,7 +45027,10 @@ function parseHunkHeader(line) {
   const m = line.match(/\+(\d+)(?:,(\d+))?/);
   if (!m) return null;
   const start = parseInt(m[1], 10);
-  return Number.isFinite(start) && start >= 1 ? start : null;
+  // SCN-5: accept `start >= 0` (was `>= 1`). Git emits `+0,0` for pure-deletion
+  // hunks; rejecting them dropped all subsequent line tracking. When start is 0,
+  // the first added line lands at line 1.
+  return Number.isFinite(start) && start >= 0 ? start : null;
 }
 
 /**
@@ -44823,11 +45062,21 @@ function parseAddedLines(patch) {
   const out = [];
   let newLine = 1; // updated by hunk header
   let inHunk = false;
-  for (const raw of patch.split('\n')) {
+  for (const splitLine of patch.split('\n')) {
+    // SCN-12: strip a single trailing `\r` so CRLF patches don't leak `\r`
+    // into the returned `text` fields.
+    const raw = splitLine.endsWith('\r') ? splitLine.slice(0, -1) : splitLine;
     if (raw.startsWith('@@')) {
       const start = parseHunkHeader(raw);
       if (start !== null) {
         newLine = start;
+        inHunk = true;
+      } else {
+        // SCN-4: a malformed `@@`-prefixed line previously left `inHunk`
+        // untouched (false if this is the first hunk), silently dropping ALL
+        // subsequent additions. Recover by entering hunk mode with the current
+        // (approximate) line counter so secrets/patterns are still captured.
+        // Line numbers will be approximate but we don't silently drop content.
         inHunk = true;
       }
       continue;
@@ -45012,6 +45261,18 @@ function resolveChmod(deps = {}) {
  */
 function resolveReaddir(deps = {}) {
   return typeof deps.readdir === 'function' ? deps.readdir : (p) => promises_namespaceObject.readdir(p);
+}
+
+/**
+ * Pick the system `readFile` dep, defaulting to `fs/promises.readFile`.
+ *
+ * @param {{ readFile?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveReadFile(deps = {}) {
+  return typeof deps.readFile === 'function'
+    ? deps.readFile
+    : (p) => promises_namespaceObject.readFile(p);
 }
 
 /**
@@ -45301,13 +45562,39 @@ async function ensureBinary(opts, deps = {}) {
 
   const cachePath = resolveCachePath(spec);
   const stat = deps.stat;
+  const readFile = resolveReadFile(deps);
+  const rm = resolveRm(deps);
   if (typeof stat === 'function') {
+    let cacheHit = false;
     try {
       await stat(cachePath);
-      // Cache hit — file exists. No fetch, no verify.
-      return cachePath;
+      cacheHit = true;
     } catch {
       // File doesn't exist → fall through to fetch.
+    }
+    if (cacheHit) {
+      // SCN-10: re-hash the cached file and compare to expectedChecksum. A
+      // cached file whose hash no longer matches (tampering, partial write,
+      // a different binary that overwrote the path) must NOT be trusted.
+      try {
+        const cached = await readFile(cachePath);
+        const cachedBuf = Buffer.isBuffer(cached)
+          ? cached
+          : Buffer.from(/** @type {any} */ (cached));
+        if (sha256Hex(cachedBuf).toLowerCase() === expectedChecksum.toLowerCase()) {
+          // Cache hit + checksum verified — no fetch needed.
+          return cachePath;
+        }
+        // Checksum mismatch on cache hit → invalidate and re-fetch below.
+      } catch {
+        // Read failed — fall through to re-fetch (treat as a cache miss).
+      }
+      // Best-effort delete of the stale/tampered cached file before re-fetch.
+      try {
+        await rm(cachePath);
+      } catch {
+        /* best-effort — re-fetch proceeds regardless */
+      }
     }
   }
 
@@ -45456,9 +45743,11 @@ const SECRET_PATTERNS = [
   },
   {
     name: 'github-pat',
-    regex: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/,
+    // SCN-1: also match fine-grained PATs `github_pat_<82 chars>` (the default
+    // since Oct 2022). Classic PATs are gh[pousr]_ + 36-255 alphanumerics.
+    regex: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{82,})\b/,
     title: 'GitHub personal access token detected',
-    description: 'A GitHub PAT (ghp_/gho_/ghu_/ghs_/ghr_) was found in the diff.',
+    description: 'A GitHub PAT (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_) was found in the diff.',
     suggestion: 'Remove the token and revoke it at github.com/settings/tokens.',
   },
   {
@@ -45507,7 +45796,8 @@ const SECRET_PATTERNS = [
     // A base64-ish token ≥ 32 chars with Shannon entropy ≥ 4.5 — very
     // conservative, only flags obvious secrets. The regex captures the candidate
     // (alphanumeric + /+=); the entropy check filters out non-secret strings.
-    regex: /\b([A-Za-z0-9+/]{32,}={0,2})\b/,
+    // SCN-2: include `-` and `_` so URL-safe base64 secrets are matched.
+    regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
     captureGroup: 1,
     minEntropy: 4.5,
     title: 'High-entropy string (possible secret)',
@@ -45543,16 +45833,19 @@ function buildFinding({ file, line, value, pattern }) {
 
 /**
  * Mask a secret value for the `evidence` field, keeping the first 4 and last 2
- * chars visible and replacing the middle with `…`. Short values are masked
- * entirely (first char + `…`). Used so the evidence field doesn't re-leak the
- * full secret in the review comment.
+ * chars visible and replacing the middle with `…`. Short values (≤ 12 chars)
+ * are masked entirely (first char + `…`) to avoid over-revealing. Used so the
+ * evidence field doesn't re-leak the full secret in the review comment.
+ *
+ * SCN-6: threshold raised from 8 to 12 — for 9-12 char secrets, first4+last2
+ * exposes 6 of 9-12 chars, which is too much. Mask to first char only.
  *
  * @param {string} value
  * @returns {string}
  */
 function maskSecret(value) {
   if (typeof value !== 'string') return '';
-  if (value.length <= 8) return value.length > 0 ? `${value[0]}…` : '';
+  if (value.length <= 12) return value.length > 0 ? `${value[0]}…` : '';
   return `${value.slice(0, 4)}…${value.slice(-2)}`;
 }
 
@@ -45982,19 +46275,32 @@ function astGrepPatternToRegex(pattern) {
   if (typeof pattern !== 'string' || pattern.length === 0) return null;
   // Step 1: replace wildcard tokens with an unlikely placeholder.
   const PLACEHOLDER = '\u0000WILD\u0000';
+  // SCN-8: collapse runs of literal whitespace to a separate placeholder so the
+  // final regex uses `\s*` instead of literal spaces (catches `innerHTML=x` as
+  // well as `innerHTML = x`). `\s*` (zero-or-more) is used so the unspaced
+  // form still matches. Done BEFORE escaping so the inserted chars aren't
+  // escaped; the placeholder carries no regex metachars.
+  const WS_PLACEHOLDER = '\u0000WS\u0000';
   let translated = pattern
     .replace(/\$\$\$[A-Z]*/g, PLACEHOLDER) // $$$ARGS, $$$
-    .replace(/\$[A-Z]+/g, PLACEHOLDER); // $VALUE, $X
+    .replace(/\$[A-Z]+/g, PLACEHOLDER) // $VALUE, $X
+    .replace(/[ \t]+/g, WS_PLACEHOLDER); // collapse literal whitespace runs
   // Step 2: escape regex metacharacters in the literal portions. Parentheses
   // ARE escaped (they are literal syntax in the source code being scanned, not
-  // regex groups). Curly braces are left unescaped since they are rarely
-  // meaningful in the code patterns we translate and JS regex treats bare
-  // `{`, `}` as literal characters.
-  translated = translated.replace(/[.*+?^$|[\]\\()]/g, '\\$&');
-  // Step 3: replace the placeholder with the actual `.*?` wildcard.
-  // The placeholder contains \u0000 which is not a regex metachar, so the
-  // escape step left it alone.
+  // regex groups). SCN-9: curly braces `{` `}` are ALSO escaped so a pattern
+  // like `foo{2}` matches the literal string and isn't treated as a quantifier.
+  translated = translated.replace(/[.*+?^$|[\]\\(){}]/g, '\\$&');
+  // Step 3: replace the placeholders with their actual regex tokens.
+  // The placeholders contain \u0000 which is not a regex metachar, so the
+  // escape step left them alone.
   translated = translated.split(PLACEHOLDER).join('.*?');
+  translated = translated.split(WS_PLACEHOLDER).join('\\s*');
+  // SCN-7: if the pattern begins with a literal identifier, prepend `\b` so a
+  // pattern like `eval($$$ARGS)` doesn't substring-match `medieval(x)`.
+  const startsWithIdentifier = /^[A-Za-z_][A-Za-z0-9_]*/.test(pattern);
+  if (startsWithIdentifier) {
+    translated = '\\b' + translated;
+  }
   // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
   // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
   // suffers catastrophic backtracking on long near-miss lines. Strip a leading
@@ -46360,6 +46666,8 @@ async function scanPatterns(opts, deps = {}) {
  * @module src/lib/scanners/metrics.js
  */
 
+
+
 /** Source-code extensions used to classify a file as a source file. */
 const SOURCE_EXTENSIONS = new Set([
   'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte', 'astro',
@@ -46459,8 +46767,9 @@ function isGeneratedFile(filename) {
 
 /**
  * Count TODO/FIXME/HACK/XXX markers in the ADDED lines of a unified diff patch.
- * Added lines start with `+` (and the `+++` file header is skipped). Markers
- * are matched with word boundaries (`\b`) so that substrings like "XXXL" or
+ * Delegates to {@link parseAddedLines} so the line filter (which hunk lines are
+ * real additions vs. pre-hunk diff metadata) stays in one place. Markers are
+ * matched with word boundaries (`\b`) so that substrings like "XXXL" or
  * "XXX chromosome" do NOT count; an added line with multiple markers counts once.
  *
  * Returns 0 for non-string / empty patches.
@@ -46469,11 +46778,11 @@ function isGeneratedFile(filename) {
  * @returns {number}
  */
 function countTodosInPatch(patch) {
-  if (typeof patch !== 'string' || patch.length === 0) return 0;
+  if (!patch) return 0;
+  const additions = parseAddedLines(patch);
   let count = 0;
-  for (const line of patch.split('\n')) {
-    if (!line.startsWith('+') || line.startsWith('+++')) continue;
-    if (TODO_MARKER_RES.some((re) => re.test(line))) count++;
+  for (const a of additions) {
+    if (TODO_MARKER_RES.some((re) => re.test(a.text))) count++;
   }
   return count;
 }
@@ -46691,7 +47000,9 @@ function formatScannerContext(findings, metrics) {
       const line = typeof f.line === 'number' && f.line > 0 ? `:${f.line}` : '';
       const rule = typeof f.rule === 'string' && f.rule ? `[${f.rule}]` : '';
       const title = typeof f.title === 'string' ? f.title : '';
-      lines.push(`- ${file}${line} ${rule} ${title}`.trim());
+      // SCN-18: wrap the filename in backticks so an attacker-controlled
+      // filename can't run on into the prompt text (delimits it from prose).
+      lines.push(`- \`${file}\`${line} ${rule} ${title}`.trim());
     }
   }
   if (metrics && typeof metrics === 'object') {
@@ -46874,6 +47185,13 @@ const STATUS_CONTEXT = 'Z.ai Code Review';
 const MAX_DESCRIPTION_LEN = 140;
 
 /**
+ * The set of valid GitHub commit-status states. Used to validate `state`
+ * before it reaches the API so a typo (e.g. 'completed') does not produce a
+ * noisy 422. GitHub only accepts these four values.
+ */
+const VALID_STATES = new Set(['pending', 'success', 'failure', 'error']);
+
+/**
  * Truncate a description to GitHub's 140-character limit. Returns the input
  * unchanged when it already fits.
  *
@@ -46935,6 +47253,10 @@ function buildStatusDescription({
  */
 async function setReviewStatus(opts, deps = {}) {
   const { octokit, context, sha, state, description, targetUrl } = opts || {};
+
+  // CFG-7: validate the state enum BEFORE any other check so an invalid state
+  // short-circuits without hitting the API. GitHub only accepts these four.
+  if (!VALID_STATES.has(state)) return false;
 
   // Defense: missing octokit, SHA, or context.repo is a no-op. The caller in
   // src/index.js guards the sha too, but be belt-and-suspenders so a misuse
@@ -47027,8 +47349,15 @@ function stripComment(line) {
   let inDouble = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === "'" && !inDouble) inSingle = !inSingle;
-    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    if (ch === "'" && !inDouble) {
+      // Only treat `'` as a quote toggle when NOT embedded in a word. A `'`
+      // glued to a letter/digit — like the apostrophe in `it's` — is not a
+      // delimiter; treating it as one would flip `inSingle` permanently.
+      const prev = i > 0 ? line[i - 1] : '';
+      if (!/[A-Za-z0-9]/.test(prev)) {
+        inSingle = !inSingle;
+      }
+    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
       // A `#` only starts a comment when it's at the start of the line or
       // preceded by whitespace. `value#frag` is NOT a comment.
@@ -47445,9 +47774,19 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
   const toneInstructions = toneParts.join(' ');
 
   // excludePatterns UNION repo path_filters (repo can exclude MORE, never fewer).
+  // A leading `!` in a path_filters entry is picomatch negation syntax, which
+  // would invert the exclude-list semantics downstream in matchesAnyPattern.
+  // The documented `.zai.yml` `!dist/**` form means "exclude dist/", so we
+  // strip the leading `!` here to produce the positive `dist/**` form. This
+  // is a defensive normalization: matchesAnyPattern ALSO strips `!`, but
+  // doing it here keeps excludePatterns observable/correct at the merge
+  // boundary. (CFG-1 / SCN-13.)
   const actionPatterns = Array.isArray(a.excludePatterns) ? a.excludePatterns : [];
   const repoFilters = Array.isArray(reviews.path_filters) ? reviews.path_filters : [];
-  const excludePatterns = Array.from(new Set([...actionPatterns, ...repoFilters]));
+  const stripNegation = (p) => (typeof p === 'string' && p.startsWith('!') ? p.slice(1) : p);
+  const excludePatterns = Array.from(
+    new Set([...actionPatterns, ...repoFilters.map(stripNegation)]),
+  );
 
   // minSeverity: action input wins, BUT the repo `profile` may NARROW it.
   // `profile: chill` means "only surface critical+high" — i.e. raise the
@@ -47719,6 +48058,7 @@ function codeowners_stripComment(line) {
  *   - blank lines (after comment-strip) are skipped
  *   - the first whitespace-separated token is the `pattern`; trailing tokens
  *     starting with `@` are the `owners`. A line with no pattern is skipped.
+ *     Backslash-escaped spaces (`\ `) are preserved within a token.
  *   - a pattern with no `@`-owners yields `owners: []` (still a valid rule —
  *     CODEOWNERS permits unowned patterns; they "match" with empty owners).
  *
@@ -47734,12 +48074,16 @@ function parseCodeowners(text) {
   for (const raw of lines) {
     const stripped = codeowners_stripComment(raw).trim();
     if (stripped === '') continue;
-    // Split on runs of whitespace. The first token is the pattern; everything
-    // after is the owners list. CODEOWNERS tokens are separated by spaces/tabs.
-    const tokens = stripped.split(/\s+/);
+    // Split on UN-escaped runs of whitespace (so `src/foo\ bar/` stays one
+    // token). A backslash-escaped space (`\ `) is part of the path; replace
+    // it with a literal space after splitting.
+    const tokens = stripped
+      .split(/(?<!\\)\s+/)
+      .map((t) => t.replace(/\\ /g, ' '));
     const pattern = tokens[0];
     if (!pattern) continue;
-    const owners = tokens.slice(1).filter((t) => t.length > 0);
+    // Only `@`-prefixed tokens are owners; bare emails/handles are dropped.
+    const owners = tokens.slice(1).filter((t) => t.startsWith('@'));
     out.push({ pattern, owners });
   }
   return out;
@@ -48918,15 +49262,34 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
  * summary with the note appended. Kept as a pure helper so it can be unit
  * tested in isolation if needed.
  *
+ * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
+ * only the incremental count was reported, so a run that suppressed 5 findings
+ * via learnings showed no note at all — reviewers had no signal that the bot
+ * had intentionally dropped findings. Both suppression reasons now contribute
+ * to a single note so the summary reflects the total elided count.
+ *
  * @param {string} summary  The model's original summary prose.
- * @param {number} suppressedCount  How many findings were suppressed.
+ * @param {number} suppressedCount  How many findings were suppressed (incremental).
+ * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
  * @returns {string}
  */
-function appendIncrementalNote(summary, suppressedCount) {
+function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
   const base = typeof summary === 'string' ? summary : '';
-  const count = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
-  if (count === 0) return base;
-  const note = `_${count} previously-reported finding${count === 1 ? '' : 's'} suppressed (incremental review)._`;
+  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
+  const total = inc + lrn;
+  if (total === 0) return base;
+  // Compose a note that reflects BOTH suppression reasons when both fired.
+  const parts = [];
+  if (inc > 0) {
+    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
+  }
+  if (lrn > 0) {
+    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
+  }
+  // English join: "a and b" or just "a".
+  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  const note = `_${what} suppressed (incremental review)._`;
   return base.length === 0 ? note : `${base}\n\n${note}`;
 }
 
@@ -49014,8 +49377,45 @@ async function run(context, deps = {}) {
 
   const event = eventName(context);
 
-  // ---- pull_request → auto-review -----------------------------------
-  if (event === 'pull_request') {
+  // ---- pull_request / pull_request_target → auto-review -------------
+  // W2-3: route `pull_request_target` through the same review pipeline as
+  // `pull_request`. events.js (CFG-6) already recognizes both as PR events via
+  // isPullRequestEvent(), but this router previously only matched the literal
+  // `pull_request` event name, so `pull_request_target` was silently dropped
+  // ("Ignoring event: pull_request_target"). Both events now share the same
+  // path so the action can be wired to either trigger in a workflow.
+  //
+  // SECURITY CONSIDERATION (pull_request_target): this event runs with the
+  // base-branch's secrets AND write access to the repo (unlike `pull_request`,
+  // which runs in a fork-sandboxed context). The review pipeline below only
+  // (a) reads the PR diff via the GitHub API, (b) sends the diff to the LLM
+  // via callApi, and (c) posts a review/comment back to GitHub. It does NOT
+  // execute PR-supplied code, run build scripts, or check out the PR head — so
+  // routing `pull_request_target` here does NOT introduce code-execution risk.
+  // The write access is already required to post reviews on `pull_request`
+  // anyway, and the same auth/permission surface applies. The only new
+  // capability unlocked is that the review fires for fork PRs WITH secrets
+  // available — operators who wire `pull_request_target` are responsible for
+  // ensuring their config does not leak secrets into review output (the
+  // sanitizer + prompt-hardening layers remain the controls there).
+  if (event === 'pull_request' || event === 'pull_request_target') {
+    // INT-2: only react to PR actions that warrant a fresh review. Without
+    // this filter the action also fires on `closed`, `labeled`, `edited`, etc.
+    // — burning API credits and posting duplicate reviews. Mirrors the
+    // `issue_comment` action guard below. `prAction &&` keeps a missing action
+    // field proceeding (defense-in-depth for unusual payload shapes).
+    const prAction = context?.payload?.action;
+    const ALLOWED_PR_ACTIONS = new Set([
+      'opened',
+      'synchronize',
+      'reopened',
+      'ready_for_review',
+    ]);
+    if (prAction && !ALLOWED_PR_ACTIONS.has(prAction)) {
+      coreDep.info(`Ignoring pull_request action: ${prAction}`);
+      return;
+    }
+
     const { owner, repo } = context.repo ?? {};
     if (!owner || !repo) {
       // Missing context.repo would otherwise throw a TypeError on the
@@ -49269,10 +49669,12 @@ async function run(context, deps = {}) {
 
     // Append a "previously-resolved" note to the model's summary so reviewers
     // know what was elided. Only when suppression actually happened.
+    // INT-11: surface BOTH incremental-suppressed and learnings-suppressed
+    // counts so a run that only suppressed via learnings still reports it.
     const baseSummary = typeof result.summary === 'string' ? result.summary : '';
     const summaryWithIncrementalNote =
-      suppressedCount > 0
-        ? appendIncrementalNote(baseSummary, suppressedCount)
+      suppressedCount > 0 || learningsSuppressed > 0
+        ? appendIncrementalNote(baseSummary, suppressedCount, learningsSuppressed)
         : baseSummary;
 
     // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default

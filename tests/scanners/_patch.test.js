@@ -25,6 +25,12 @@ describe('parseHunkHeader', () => {
   it('returns null when the + portion is missing', () => {
     expect(parseHunkHeader('@@ -10,5 @@')).toBeNull();
   });
+
+  it('returns 0 for a +0,0 pure-deletion hunk header [SCN-5]', () => {
+    // Git emits `+0,0` for pure-deletion hunks. Previously rejected (start<1),
+    // which dropped all subsequent line tracking in multi-hunk patches.
+    expect(parseHunkHeader('@@ -1,3 +0,0 @@')).toBe(0);
+  });
 });
 
 describe('parseAddedLines', () => {
@@ -98,5 +104,59 @@ describe('parseAddedLines', () => {
       '+added at 1',
     ].join('\n');
     expect(parseAddedLines(patch)).toEqual([{ line: 1, text: 'added at 1' }]);
+  });
+
+  it('recovers from a malformed @@ header and still captures later additions [SCN-4]', () => {
+    // A `@@`-prefixed line that fails to parse (no +c portion) as the FIRST
+    // hunk previously left `inHunk` false, dropping ALL subsequent additions.
+    // After the fix we recover (treat as a hunk with approximate line numbers)
+    // so secrets/patterns in later additions are not silently dropped.
+    const patch = [
+      '@@ this is not a valid hunk header',
+      '+secret line',
+    ].join('\n');
+    const out = parseAddedLines(patch);
+    const texts = out.map((o) => o.text);
+    expect(texts).withContext('malformed first @@ must not drop later additions').toContain('secret line');
+  });
+
+  it('recovers from a malformed @@ header appearing after a valid hunk [SCN-4]', () => {
+    // Once inHunk is true, a later malformed @@ header must not reset it.
+    const patch = [
+      '@@ -1,3 +1,3 @@',
+      '+first at 1',
+      '@@ malformed',
+      '+second at 2',
+    ].join('\n');
+    const out = parseAddedLines(patch);
+    const texts = out.map((o) => o.text);
+    expect(texts).toContain('first at 1');
+    expect(texts).toContain('second at 2');
+  });
+
+  it('tracks lines across a multi-hunk patch whose first hunk is +0,0 [SCN-5]', () => {
+    // Pure-deletion first hunk (`+0,0`) followed by a normal second hunk.
+    // The second hunk's lines must be tracked at the correct absolute number.
+    const patch = [
+      '@@ -1,3 +0,0 @@',
+      '-removed',
+      '@@ -5,2 +10,2 @@',
+      '+added at 10',
+      ' ctx',
+    ].join('\n');
+    const out = parseAddedLines(patch);
+    expect(out).toEqual([{ line: 10, text: 'added at 10' }]);
+  });
+
+  it('strips a trailing \\r from CRLF patches so text has no \\r [SCN-12]', () => {
+    // A CRLF patch: each line ends with \r\n. After split('\n') the lines
+    // carry a trailing \r that must be stripped from the returned `text`.
+    // Build the patch with an explicit trailing CRLF so the addition line
+    // carries a \r after split('\n').
+    const patch = '@@ -1,1 +1,1 @@\r\n+added line\r\n';
+    const out = parseAddedLines(patch);
+    expect(out).toHaveLength(1);
+    expect(out[0].text).toBe('added line');
+    expect(out[0].text).not.toContain('\r');
   });
 });

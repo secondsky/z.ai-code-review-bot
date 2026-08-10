@@ -12,6 +12,14 @@ import picomatch from 'picomatch';
  * filenames and non-array pattern lists are tolerated (return false) and never
  * throw.
  *
+ * A leading `!` (picomatch negation) is STRIPPED before testing. This
+ * predicate is an "include if any pattern matches" check used by
+ * `filterExcludedFiles` as an exclude-list: picomatch negation semantics
+ * ("match any file NOT matching this pattern") would invert the intent,
+ * causing `!dist/**` to exclude every file outside `dist/`. Stripping
+ * the `!` makes `!dist/**` behave as `dist/**`, which is what callers
+ * documenting the `!dist/**` exclude syntax expect. (CFG-1 / SCN-13.)
+ *
  * @param {string} filename - Full path or basename of the file to test.
  * @param {string[]} patterns - Glob patterns (picomatch syntax).
  * @returns {boolean}
@@ -31,7 +39,11 @@ export function matchesAnyPattern(filename, patterns) {
     if (trimmed === '') {
       continue;
     }
-    if (picomatch.isMatch(filename, trimmed) || picomatch.isMatch(base, trimmed)) {
+    // Strip a leading `!` (picomatch negation). Negation is not meaningful
+    // for an "include if any matches" / exclude-list predicate and would
+    // invert the caller's intent (CFG-1 / SCN-13).
+    const positive = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
+    if (picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive)) {
       return true;
     }
   }

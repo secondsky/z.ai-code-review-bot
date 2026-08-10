@@ -61,6 +61,14 @@ src/api/** @be-team
       { pattern: 'src/api/**', owners: ['@be-team'] },
     ]);
   });
+
+  // CFG-4: backslash-escaped spaces in paths (e.g. `src/my\ project/`)
+  it('handles backslash-escaped spaces in a pattern', () => {
+    const rules = parseCodeowners('src/my\\ project/ @alice');
+    expect(rules).toEqual([
+      { pattern: 'src/my project/', owners: ['@alice'] },
+    ]);
+  });
 });
 
 describe('parseCodeowners — comments', () => {
@@ -162,6 +170,12 @@ describe('parseCodeowners — empty / malformed input', () => {
     expect(parseCodeowners('   src/ @alice\n')).toEqual([
       { pattern: 'src/', owners: ['@alice'] },
     ]);
+  });
+
+  // CFG-5: only @-prefixed tokens are owners; bare emails/handles are dropped
+  it('keeps only @-prefixed tokens as owners', () => {
+    const rules = parseCodeowners('src/ @alice bob@example.com');
+    expect(rules).toEqual([{ pattern: 'src/', owners: ['@alice'] }]);
   });
 });
 

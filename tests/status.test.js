@@ -315,3 +315,48 @@ describe('setReviewStatus — missing inputs (graceful)', () => {
     ).resolves.toBe(false);
   });
 });
+
+describe('setReviewStatus — invalid state (CFG-7)', () => {
+  test('invalid state "completed" → returns false, no API call', async () => {
+    const { octokit, calls } = makeOctokit();
+    const ok = await setReviewStatus({
+      octokit,
+      context: makeContext(),
+      sha: 'abc123',
+      state: 'completed',
+      description: 'done',
+    });
+    expect(ok).toBe(false);
+    expect(calls.createCommitStatus).toHaveLength(0);
+  });
+
+  test('undefined state → returns false, no API call', async () => {
+    const { octokit, calls } = makeOctokit();
+    const ok = await setReviewStatus({
+      octokit,
+      context: makeContext(),
+      sha: 'abc123',
+      state: undefined,
+      description: 'd',
+    });
+    expect(ok).toBe(false);
+    expect(calls.createCommitStatus).toHaveLength(0);
+  });
+
+  test('valid states still pass through to the API', async () => {
+    // Sanity: the new guard must not break the four valid GitHub states.
+    for (const state of ['pending', 'success', 'failure', 'error']) {
+      const { octokit, calls } = makeOctokit();
+      const ok = await setReviewStatus({
+        octokit,
+        context: makeContext(),
+        sha: 'abc123',
+        state,
+        description: 'd',
+      });
+      expect(ok).toBe(true);
+      expect(calls.createCommitStatus).toHaveLength(1);
+      expect(calls.createCommitStatus[0].state).toBe(state);
+    }
+  });
+});

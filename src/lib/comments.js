@@ -14,6 +14,16 @@ import { sanitizeCommentBody } from './sanitize-output.js';
 export const MARKER = '<!-- zai-code-review -->';
 
 /**
+ * Hard cap on pagination depth for the marker lookup in
+ * {@link upsertReviewComment}. Defense-in-depth (CORE-4): the loop terminates
+ * on a short page OR when the marker comment is found, but a misbehaving
+ * endpoint that always returns full pages AND never contains the marker would
+ * loop forever. 100 pages × 100 per page = 10,000 comments — beyond any real
+ * PR's comment history.
+ */
+const MAX_COMMENT_PAGES = 100;
+
+/**
  * Determine whether a comment was authored by a bot. Used to gate marker-based
  * matching so a drive-by human commenter cannot post the marker and cause the
  * bot to overwrite THEIR comment on every run (comment hijack). Accepts EITHER
@@ -116,9 +126,10 @@ export async function upsertReviewComment({
 }) {
   // Paginate fully: the marker comment can be anywhere in the history, and a
   // single page would miss it on high-traffic PRs (creating a duplicate).
+  // CORE-4: cap at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us
+  // in an unbounded loop when the marker is absent.
   let existing = null;
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
       repo,
@@ -132,7 +143,6 @@ export async function upsertReviewComment({
       ) ?? null;
     if (existing) break; // found it — no need to fetch more pages
     if (comments.length < perPage) break; // last page reached
-    page += 1;
   }
 
   if (existing) {

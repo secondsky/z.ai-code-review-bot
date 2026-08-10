@@ -70,6 +70,7 @@ function stripComment(line) {
  *   - blank lines (after comment-strip) are skipped
  *   - the first whitespace-separated token is the `pattern`; trailing tokens
  *     starting with `@` are the `owners`. A line with no pattern is skipped.
+ *     Backslash-escaped spaces (`\ `) are preserved within a token.
  *   - a pattern with no `@`-owners yields `owners: []` (still a valid rule —
  *     CODEOWNERS permits unowned patterns; they "match" with empty owners).
  *
@@ -85,12 +86,16 @@ export function parseCodeowners(text) {
   for (const raw of lines) {
     const stripped = stripComment(raw).trim();
     if (stripped === '') continue;
-    // Split on runs of whitespace. The first token is the pattern; everything
-    // after is the owners list. CODEOWNERS tokens are separated by spaces/tabs.
-    const tokens = stripped.split(/\s+/);
+    // Split on UN-escaped runs of whitespace (so `src/foo\ bar/` stays one
+    // token). A backslash-escaped space (`\ `) is part of the path; replace
+    // it with a literal space after splitting.
+    const tokens = stripped
+      .split(/(?<!\\)\s+/)
+      .map((t) => t.replace(/\\ /g, ' '));
     const pattern = tokens[0];
     if (!pattern) continue;
-    const owners = tokens.slice(1).filter((t) => t.length > 0);
+    // Only `@`-prefixed tokens are owners; bare emails/handles are dropped.
+    const owners = tokens.slice(1).filter((t) => t.startsWith('@'));
     out.push({ pattern, owners });
   }
   return out;

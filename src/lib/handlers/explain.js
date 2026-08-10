@@ -13,7 +13,7 @@
  * throws; no `@actions/core` import; no direct network.
  */
 import { postComment, getPRContext } from './_shared.js';
-import { wrapUntrusted } from '../prompt.js';
+import { wrapUntrusted, escapeDiffFence } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
 
 /** Fixed error comment (no raw error leakage). */
@@ -53,16 +53,22 @@ export function parseRange(token) {
       const left = t.slice(0, idx);
       const right =
         sep === '..' ? t.slice(idx + 2) : t.slice(idx + sep.length);
+      // CMD-3: strict numeric pre-check. `Number()` accepts hex (0x10),
+      // scientific (1e3), decimals, and leading/trailing whitespace; reject
+      // anything that is not a bare run of ASCII digits.
+      if (!/^\d+$/.test(left) || !/^\d+$/.test(right)) return null;
       const start = Number(left);
       const end = Number(right);
-      if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return null;
       if (start < 1 || end < 1 || end < start) return null;
       return { start, end };
     }
   }
 
+  // CMD-3: strict numeric pre-check for the single-line form too.
+  if (!/^\d+$/.test(t)) return null;
   const n = Number(t);
-  if (!Number.isInteger(n) || n < 1) return null;
+  if (!Number.isSafeInteger(n) || n < 1) return null;
   return { start: n, end: n };
 }
 
@@ -119,8 +125,15 @@ export function extractLineWindow(content, start, end) {
  * @returns {string}
  */
 export function buildExplainPrompt({ file, start, end, window }) {
+  // W2-SEC-4: the filename is attacker-controlled and is interpolated into a
+  // backtick code span. A filename containing a backtick (e.g. weird`name.js)
+  // would break out of the code span and inject prose into the instruction.
+  // Sanitize via escapeDiffFence (replaces backticks with single quotes and
+  // collapses newlines) — the same defense used for filename headers in the
+  // structured-review prompt.
+  const safeFile = escapeDiffFence(file);
   return [
-    `Explain lines ${start}-${end} of \`${file}\` in this pull request.`,
+    `Explain lines ${start}-${end} of \`${safeFile}\` in this pull request.`,
     'Describe what this code does, why it is there, and any concerns a',
     'reviewer should know about. Be concise.',
     '',
@@ -227,6 +240,13 @@ export async function handleExplainCommand(
     }
 
     const content = await fetch({ octokit, owner, repo, path: target, ref });
+    // CMD-12: when the file has no textual content (binary file, directory
+    // entry, or a file too large for the API to return), post a guidance
+    // comment instead of calling the API with an empty code window.
+    if (!content || content.trim() === '') {
+      await post(`> No textual content available for \`${target}\`.`);
+      return;
+    }
     // Clamp the requested range to a sane window so a `/zai explain 1-50000`
     // on a huge file cannot build a giant prompt (cost/quota guard). The
     // visible range reported to the model reflects the clamp.

@@ -24,7 +24,7 @@ const SAMPLE_SHA = sha256Hex(SAMPLE_BYTES);
 
 /** A minimal fake `deps` kit. Each method is wrapped to track invocations. */
 function fakeDeps(overrides = {}) {
-  const calls = { stat: 0, fetch: 0, writeFile: 0, chmod: 0 };
+  const calls = { stat: 0, fetch: 0, writeFile: 0, chmod: 0, readFile: 0, rm: 0 };
   const defaultStat = async () => { throw new Error('ENOENT'); };
   const defaultFetch = async () => SAMPLE_BYTES;
   const defaultWriteFile = async (path, bytes) => {
@@ -33,10 +33,12 @@ function fakeDeps(overrides = {}) {
   const defaultChmod = async (path, mode) => {
     calls.lastChmod = { path, mode };
   };
+  const defaultReadFile = async () => { throw new Error('ENOENT'); };
+  const defaultRm = async () => {};
   return {
     calls,
     stat: async (path) => { calls.stat++; return overrides.stat ? overrides.stat(path) : defaultStat(); },
-    fetch: async (url) => { calls.fetch++; return overrides.fetch ? overrides.fetch(url) : defaultFetch(); },
+    fetch: async (url) => { calls.fetch++; return overrides.fetch ? overrides.fetch(url) : defaultFetch(url); },
     writeFile: async (path, bytes) => {
       calls.writeFile++;
       return overrides.writeFile ? overrides.writeFile(path, bytes) : defaultWriteFile(path, bytes);
@@ -44,6 +46,15 @@ function fakeDeps(overrides = {}) {
     chmod: async (path, mode) => {
       calls.chmod++;
       return overrides.chmod ? overrides.chmod(path, mode) : defaultChmod(path, mode);
+    },
+    readFile: async (path) => {
+      calls.readFile++;
+      return overrides.readFile ? overrides.readFile(path) : defaultReadFile(path);
+    },
+    rm: async (path) => {
+      calls.rm++;
+      calls.lastRm = { path };
+      return overrides.rm ? overrides.rm(path) : defaultRm(path);
     },
     platform: overrides.platform ?? 'linux',
     arch: overrides.arch ?? 'x64',
@@ -171,12 +182,29 @@ describe('ensureBinary — cache hit', () => {
   it('returns the cache path without fetching when stat resolves', async () => {
     const deps = fakeDeps({
       stat: async () => ({ size: 1234 }), // exists
+      readFile: async () => SAMPLE_BYTES, // hash matches
     });
     const path = await ensureBinary(baseSpec(), deps);
     expect(path.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
     expect(deps.calls.stat).toBe(1);
     expect(deps.calls.fetch).toBe(0);
     expect(deps.calls.writeFile).toBe(0);
+  });
+
+  // SCN-10: a cached file whose hash no longer matches expectedChecksum must be
+  // invalidated (deleted) and re-downloaded.
+  it('re-downloads when the cached file hash does not match expectedChecksum', async () => {
+    const deps = fakeDeps({
+      stat: async () => ({ size: 1234 }), // cache file exists
+      readFile: async () => Buffer.from('tampered\n'), // wrong hash
+    });
+    const path = await ensureBinary(baseSpec(), deps);
+    expect(path.endsWith('/gitleaks/8.21.2/gitleaks')).toBe(true);
+    // Cache was invalidated: readFile ran, fetch re-ran, writeFile re-ran.
+    expect(deps.calls.readFile).toBe(1);
+    expect(deps.calls.rm).toBe(1); // stale cached file deleted
+    expect(deps.calls.fetch).toBe(1);
+    expect(deps.calls.writeFile).toBe(1);
   });
 });
 

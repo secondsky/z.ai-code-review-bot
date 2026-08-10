@@ -172,19 +172,32 @@ export function astGrepPatternToRegex(pattern) {
   if (typeof pattern !== 'string' || pattern.length === 0) return null;
   // Step 1: replace wildcard tokens with an unlikely placeholder.
   const PLACEHOLDER = '\u0000WILD\u0000';
+  // SCN-8: collapse runs of literal whitespace to a separate placeholder so the
+  // final regex uses `\s*` instead of literal spaces (catches `innerHTML=x` as
+  // well as `innerHTML = x`). `\s*` (zero-or-more) is used so the unspaced
+  // form still matches. Done BEFORE escaping so the inserted chars aren't
+  // escaped; the placeholder carries no regex metachars.
+  const WS_PLACEHOLDER = '\u0000WS\u0000';
   let translated = pattern
     .replace(/\$\$\$[A-Z]*/g, PLACEHOLDER) // $$$ARGS, $$$
-    .replace(/\$[A-Z]+/g, PLACEHOLDER); // $VALUE, $X
+    .replace(/\$[A-Z]+/g, PLACEHOLDER) // $VALUE, $X
+    .replace(/[ \t]+/g, WS_PLACEHOLDER); // collapse literal whitespace runs
   // Step 2: escape regex metacharacters in the literal portions. Parentheses
   // ARE escaped (they are literal syntax in the source code being scanned, not
-  // regex groups). Curly braces are left unescaped since they are rarely
-  // meaningful in the code patterns we translate and JS regex treats bare
-  // `{`, `}` as literal characters.
-  translated = translated.replace(/[.*+?^$|[\]\\()]/g, '\\$&');
-  // Step 3: replace the placeholder with the actual `.*?` wildcard.
-  // The placeholder contains \u0000 which is not a regex metachar, so the
-  // escape step left it alone.
+  // regex groups). SCN-9: curly braces `{` `}` are ALSO escaped so a pattern
+  // like `foo{2}` matches the literal string and isn't treated as a quantifier.
+  translated = translated.replace(/[.*+?^$|[\]\\(){}]/g, '\\$&');
+  // Step 3: replace the placeholders with their actual regex tokens.
+  // The placeholders contain \u0000 which is not a regex metachar, so the
+  // escape step left them alone.
   translated = translated.split(PLACEHOLDER).join('.*?');
+  translated = translated.split(WS_PLACEHOLDER).join('\\s*');
+  // SCN-7: if the pattern begins with a literal identifier, prepend `\b` so a
+  // pattern like `eval($$$ARGS)` doesn't substring-match `medieval(x)`.
+  const startsWithIdentifier = /^[A-Za-z_][A-Za-z0-9_]*/.test(pattern);
+  if (startsWithIdentifier) {
+    translated = '\\b' + translated;
+  }
   // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
   // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
   // suffers catastrophic backtracking on long near-miss lines. Strip a leading

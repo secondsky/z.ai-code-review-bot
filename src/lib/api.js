@@ -304,7 +304,7 @@ export function makeApiRequest(params, deps = {}) {
             return;
           }
           const content = parsed?.choices?.[0]?.message?.content;
-          if (!content) {
+          if (!content || typeof content !== 'string') {
             settled = true;
             reject(new Error('Z.ai API returned an empty response'));
             return;
@@ -404,6 +404,13 @@ export async function callWithRetry(fn, options = {}) {
           if (onFallback) {
             onFallback({ attempt, originalError: error, fallbackInfo: fb });
           }
+          // CORE-5: sleep before the fallback attempt so we don't immediately
+          // hammer a struggling provider. The fallback only fires once per
+          // call, so this is at most one extra backoff, and it keeps the
+          // retry cadence consistent with the normal retry path.
+          const fbDelay = baseDelay * 2 ** attempt + Math.floor(Math.random() * 1000);
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(fbDelay);
           attempt += 1;
           continue;
         }

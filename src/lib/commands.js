@@ -57,8 +57,12 @@ export function parseCommand(text) {
     return { command: null, args: null, raw: text, error: 'MALFORMED_INPUT' };
   }
 
+  // CMD-1: normalize line endings before splitting. Handle CRLF (Windows),
+  // LFCR (rare), and lone CR (old MacOS) so the "first line" is correct
+  // regardless of the client's line-ending convention.
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   // Only the first line is parsed.
-  const firstLine = text.split('\n')[0];
+  const firstLine = normalized.split('\n')[0];
   const trimmed = firstLine.trim();
   const lower = trimmed.toLowerCase();
 
@@ -77,7 +81,9 @@ export function parseCommand(text) {
   // First token is the command; the rest is args (single trimmed string).
   // Split on ANY whitespace (\s, covers spaces/tabs/multiple spaces), not just
   // a literal ' ', so `/zai\task hi` and `/zai  ask   hi` parse correctly.
-  const match = remainder.match(/^(\S+)(?:\s+(.*))?$/);
+  // CMD-1: use `[\s\S]*` (not `.*`) as defense-in-depth so a stray CR in the
+  // args cannot truncate the capture (`.` does not match `\r`).
+  const match = remainder.match(/^(\S+)(?:\s+([\s\S]*))?$/);
   let command = match ? match[1].toLowerCase() : remainder.toLowerCase();
   let args = match && match[2] ? match[2].trim() : '';
 

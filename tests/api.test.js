@@ -339,6 +339,28 @@ describe('makeApiRequest', () => {
     ).rejects.toThrow('empty response');
   });
 
+  test('2xx with non-string content (array) → rejects, never resolves with array (CORE-6)', async () => {
+    // Some providers return `content` as an array of typed segments
+    // (`[{type:'text', text:'...'}]`). The guard must reject this; previously
+    // the truthy array slipped past `if (!content)` and resolved raw.
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes(
+        [
+          JSON.stringify({
+            choices: [{ message: { content: [{ type: 'text', text: 'hi' }] } }],
+          }),
+        ],
+        { statusCode: 200 },
+      ),
+    }));
+    await expect(
+      makeApiRequest(
+        { apiKey: 'k', model: 'm', systemPrompt: 's', userPrompt: 'u', timeout: 1000 },
+        { request },
+      ),
+    ).rejects.toThrow(/empty response|invalid response|non-string/i);
+  });
+
   test('non-2xx → rejects with "Z.ai API error ${status}: ${body.slice(0,200)}"', async () => {
     const body = 'nope';
     const request = makeFakeRequest(() => ({
@@ -658,6 +680,35 @@ describe('callWithRetry', () => {
     expect(out.data).toBe('FALLBACK_OK');
     expect(out.usedFallback).toBe(true);
     expect(fallbackCalled).toBe(1);
+  });
+
+  // CORE-5: the fallback path previously did `attempt += 1; continue;` WITHOUT
+  // calling sleep(), so the post-fallback attempt fired immediately with no
+  // backoff. This test instruments `sleep` and asserts that sleep IS called
+  // between the fallback-triggering attempt and the fallback attempt itself.
+  test('fallback path sleeps before the fallback attempt (CORE-5 backoff)', async () => {
+    const sleepCalls = [];
+    const fn = recordingFn([
+      new Error('Request timed out'), // attempt 0 — timeout, attempt < 1, no fallback
+      new Error('Request timed out'), // attempt 1 — timeout + attempt>=1 → fallback triggers
+      'FALLBACK_OK', // attempt 2 — succeeds with fallback prompt
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async (ms) => { sleepCalls.push(ms); },
+      fallbackPrompt: () => ({ prompt: 'FALLBACK_PROMPT' }),
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+    // sleep was called at least once: the normal retry after attempt 0's
+    // timeout (attempt 0 → 1) AND the fallback backoff (attempt 1 → 2).
+    expect(sleepCalls.length).toBeGreaterThanOrEqual(2);
+    // All sleep durations should be positive (backoff, not zero).
+    for (const ms of sleepCalls) {
+      expect(ms).toBeGreaterThan(0);
+    }
   });
 
   test('fallback does NOT trigger on a 5xx error', async () => {

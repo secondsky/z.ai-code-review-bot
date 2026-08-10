@@ -15,7 +15,8 @@ export function eventName(context) {
 
 /** @returns {boolean} */
 export function isPullRequestEvent(context) {
-  return eventName(context) === 'pull_request';
+  const name = eventName(context);
+  return name === 'pull_request' || name === 'pull_request_target';
 }
 
 /** @returns {boolean} */

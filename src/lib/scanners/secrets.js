@@ -68,9 +68,11 @@ export const SECRET_PATTERNS = [
   },
   {
     name: 'github-pat',
-    regex: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/,
+    // SCN-1: also match fine-grained PATs `github_pat_<82 chars>` (the default
+    // since Oct 2022). Classic PATs are gh[pousr]_ + 36-255 alphanumerics.
+    regex: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{82,})\b/,
     title: 'GitHub personal access token detected',
-    description: 'A GitHub PAT (ghp_/gho_/ghu_/ghs_/ghr_) was found in the diff.',
+    description: 'A GitHub PAT (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_) was found in the diff.',
     suggestion: 'Remove the token and revoke it at github.com/settings/tokens.',
   },
   {
@@ -119,7 +121,8 @@ export const SECRET_PATTERNS = [
     // A base64-ish token ≥ 32 chars with Shannon entropy ≥ 4.5 — very
     // conservative, only flags obvious secrets. The regex captures the candidate
     // (alphanumeric + /+=); the entropy check filters out non-secret strings.
-    regex: /\b([A-Za-z0-9+/]{32,}={0,2})\b/,
+    // SCN-2: include `-` and `_` so URL-safe base64 secrets are matched.
+    regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
     captureGroup: 1,
     minEntropy: 4.5,
     title: 'High-entropy string (possible secret)',
@@ -155,16 +158,19 @@ function buildFinding({ file, line, value, pattern }) {
 
 /**
  * Mask a secret value for the `evidence` field, keeping the first 4 and last 2
- * chars visible and replacing the middle with `…`. Short values are masked
- * entirely (first char + `…`). Used so the evidence field doesn't re-leak the
- * full secret in the review comment.
+ * chars visible and replacing the middle with `…`. Short values (≤ 12 chars)
+ * are masked entirely (first char + `…`) to avoid over-revealing. Used so the
+ * evidence field doesn't re-leak the full secret in the review comment.
+ *
+ * SCN-6: threshold raised from 8 to 12 — for 9-12 char secrets, first4+last2
+ * exposes 6 of 9-12 chars, which is too much. Mask to first char only.
  *
  * @param {string} value
  * @returns {string}
  */
 export function maskSecret(value) {
   if (typeof value !== 'string') return '';
-  if (value.length <= 8) return value.length > 0 ? `${value[0]}…` : '';
+  if (value.length <= 12) return value.length > 0 ? `${value[0]}…` : '';
   return `${value.slice(0, 4)}…${value.slice(-2)}`;
 }
 

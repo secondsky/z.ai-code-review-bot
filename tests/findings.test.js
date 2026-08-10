@@ -546,7 +546,9 @@ describe('formatFindingsAsSummary', () => {
       },
     ]);
     expect(out).toContain('#### 🔴 Critical (1)');
-    expect(out).toContain('- **src/index.js**:L42 — Critical bug');
+    // W2-SEC-6: filename is now rendered as inline code (backticks) instead
+    // of bold, to neutralize markdown injection from hostile filenames.
+    expect(out).toContain('- `src/index.js`:L42 — Critical bug');
     expect(out).toContain('A critical issue.');
     expect(out).toContain('💡 Fix it.');
     expect(out).toContain('> `bad = code;`');
@@ -569,7 +571,8 @@ describe('formatFindingsAsSummary', () => {
 
   it('renders file-level findings without the :L suffix when line is null', () => {
     const out = formatFindingsAsSummary([{ ...validFinding(), line: null }]);
-    expect(out).toContain('- **src/index.js** — Possible null dereference');
+    // W2-SEC-6: filename rendered as inline code.
+    expect(out).toContain('- `src/index.js` — Possible null dereference');
     expect(out).not.toContain(':Lnull');
   });
 
@@ -678,6 +681,58 @@ describe('formatFindingsAsSummary', () => {
     expect(out).not.toContain('foo`bar');
     // The escaped form should be present.
     expect(out).toContain('foo\\`bar');
+  });
+
+  it('W2-SEC-6: neutralizes markdown injection from a filename with ** (bold)', () => {
+    // A filename containing markdown metacharacters (e.g. weird**name.js)
+    // would render as bold text and corrupt the summary layout. Filenames
+    // must be rendered safely (as inline code or with escaped metacharacters).
+    const out = formatFindingsAsSummary([
+      {
+        ...validFinding(),
+        file: 'weird**name.js',
+        title: 'T',
+        description: 'D',
+      },
+    ]);
+    // The raw bold-inducing substring must NOT appear outside an inline-code
+    // span. Either the file is wrapped in backticks (preferred) or the
+    // asterisks are escaped.
+    // Reject the raw "weird**name.js" appearing as a non-code fragment.
+    // We do this by ensuring every occurrence of the filename is inside a
+    // backtick code span OR the asterisks are backslash-escaped.
+    const rawIdx = out.indexOf('weird**name.js');
+    if (rawIdx >= 0) {
+      // If it appears raw, the surrounding chars must be backticks (inline code).
+      const before = out[rawIdx - 1];
+      const after = out[rawIdx + 'weird**name.js'.length];
+      const isInlineCode = before === '`' && after === '`';
+      // As a fallback, allow backslash-escaped asterisks.
+      const escapedPresent = out.includes('weird\\*\\*name.js');
+      expect(isInlineCode || escapedPresent).toBe(true);
+    }
+    // Strong assertion: the filename rendered with raw bold markers must not
+    // appear as "**weird**name.js**" style bolded text. The original
+    // pre-fix bug rendered "- **weird**name.js** — T" which markdown would
+    // bold part of. After the fix, the file is wrapped as inline code.
+    expect(out).not.toContain('**weird**');
+  });
+
+  it('W2-SEC-6: renders the filename as inline code (preferred neutralization)', () => {
+    // Preferred fix: wrap the filename in backticks so it renders as inline
+    // code and all markdown metacharacters are neutralized.
+    const out = formatFindingsAsSummary([
+      {
+        ...validFinding(),
+        file: 'weird**name.js',
+      },
+    ]);
+    // Look for the file as inline code: "`weird**name.js`".
+    // The pre-fix code rendered "- **weird**name.js**:L42 — ..."; after the
+    // fix, the file should appear inside backticks instead of bold markers.
+    expect(out).toContain('`weird**name.js`');
+    // The pre-fix bold-wrapped form must be gone.
+    expect(out).not.toMatch(/- \*\*weird\*\*name\.js\*\*/);
   });
 });
 
@@ -925,6 +980,53 @@ describe('hashFinding', () => {
     const { line: _omit, ...withoutLine } = validFinding();
     void _omit;
     expect(hashFinding(withNull)).toBe(hashFinding({ ...withoutLine, line: null }));
+  });
+
+  it('includes evidence in the hash for secret/security rules (regex:/gitleaks:/secret:) [SCN-3]', () => {
+    // Two findings at the same file:line:severity:title:description but with
+    // DIFFERENT evidence, where rule starts with `regex:`. A rotated secret
+    // has different evidence and must hash differently so it is re-surfaced.
+    const base = { ...validFinding(), rule: 'regex:github-pat' };
+    const a = hashFinding(base);
+    const b = hashFinding({ ...base, evidence: 'ghp_…different' });
+    expect(a).not.toBe(b);
+  });
+
+  it('keeps the same hash for non-security findings when only evidence changes [SCN-3]', () => {
+    // For non-security findings (rule not matching regex:/gitleaks:/secret:),
+    // evidence remains excluded for stability.
+    const base = { ...validFinding(), rule: 'llm' };
+    const a = hashFinding(base);
+    const b = hashFinding({ ...base, evidence: 'different evidence' });
+    expect(a).toBe(b);
+  });
+
+  it('W2-5: includes evidence in the hash for astgrep: security rules', () => {
+    // astgrep: rules are deterministic scanner findings (eval, sql-concat,
+    // etc.). Like regex:/gitleaks:/secret: rules, when the evidence changes
+    // the finding must hash differently so a new occurrence is re-surfaced
+    // rather than suppressed as "unchanged".
+    const base = { ...validFinding(), rule: 'astgrep:eval' };
+    const a = hashFinding(base);
+    const b = hashFinding({ ...base, evidence: 'eval("different")' });
+    expect(a).not.toBe(b);
+  });
+
+  it('W2-5: includes evidence in the hash for astgrep:sql-concat', () => {
+    const base = { ...validFinding(), rule: 'astgrep:sql-concat' };
+    const a = hashFinding(base);
+    const b = hashFinding({ ...base, evidence: 'query("SELECT " + id)' });
+    expect(a).not.toBe(b);
+  });
+
+  it('W2-5: keeps llm findings evidence-excluded for stability (regression)', () => {
+    // LLM findings (no rule or rule: 'llm') keep the old behavior: evidence
+    // is excluded so a re-review that only changed the suggestion/evidence
+    // text does not re-surface the finding.
+    const base = { ...validFinding(), rule: 'llm' };
+    const a = hashFinding(base);
+    const b = hashFinding({ ...base, evidence: 'different evidence' });
+    expect(a).toBe(b);
   });
 });
 

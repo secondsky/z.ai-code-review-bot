@@ -1534,6 +1534,15 @@ describe('isContextLimitError (edge: exact message shapes)', () => {
     expect(isContextLimitError(new Error('{"type":"413"}'))).toBe(true);
   });
 
+  test('matches "error 413" (production Z.ai API error format)', () => {
+    // The production makeApiRequest emits `Z.ai API error 413: ...` which none
+    // of the JSON-shape matchers catch. The bare "error 413" substring must
+    // also trigger the context-limit path so large batches halve on a 413.
+    expect(
+      isContextLimitError(new Error('Z.ai API error 413: Request Entity Too Large')),
+    ).toBe(true);
+  });
+
   test('matching is case-insensitive (message is lowercased)', () => {
     expect(isContextLimitError(new Error('MAXIMUM CONTEXT LENGTH'))).toBe(true);
     expect(isContextLimitError(new Error('Input Tokens Exceeds'))).toBe(true);

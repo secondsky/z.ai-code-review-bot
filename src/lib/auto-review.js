@@ -295,7 +295,8 @@ export function isContextLimitError(error) {
     message.includes('maximum context length') ||
     message.includes('input tokens exceeds') ||
     message.includes('code":413') ||
-    message.includes('type":"413')
+    message.includes('type":"413') ||
+    message.includes('error 413')
   );
 }
 

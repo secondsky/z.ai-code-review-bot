@@ -1,4 +1,4 @@
-import { loadConfig } from '../src/lib/config.js';
+import { loadConfig, toInt } from '../src/lib/config.js';
 
 // Helper: build an inputs object from a plain object (only defined keys).
 const inputs = (obj) => obj;
@@ -68,7 +68,10 @@ describe('loadConfig — numeric fields & defaults', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(0); // unlimited
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(12);
+    // CFG-8: a non-integer numeric string (float) is now rejected by toInt's
+    // strict validation and falls back to the default, rather than being
+    // silently truncated to 12.
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(100000);
     // Per action.yml + code comment, negatives mean unlimited (0), NOT the
     // default cap. The old code returned 100000 here — a doc/code mismatch.
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(0); // negative->unlimited
@@ -634,5 +637,49 @@ describe('learningsEnabled (Phase 8.2 — .zai/learnings.yml)', () => {
   test('empty/whitespace → false (opt-in, never auto-enabled)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '' }).learningsEnabled).toBe(false);
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_LEARNINGS_ENABLED: '   ' }).learningsEnabled).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * toInt — strict integer validation (CFG-8)
+ *
+ * Previously toInt relied on parseInt alone, which happily accepts scientific
+ * notation (1e5 → 1), numeric separators (1_000 → 1), and hex (0x10 → 16).
+ * The fix validates the trimmed raw string against ^[+-]?\d+$ so those forms
+ * return null (falling back to the default) instead of silently truncating.
+ * ------------------------------------------------------------------ */
+describe('toInt — strict integer validation (CFG-8)', () => {
+  test('plain integer string → the integer', () => {
+    expect(toInt('42')).toBe(42);
+    expect(toInt('0')).toBe(0);
+    expect(toInt('  7  ')).toBe(7); // trimmed
+  });
+
+  test('negative integer → the integer', () => {
+    expect(toInt('-5')).toBe(-5);
+    expect(toInt('+12')).toBe(12);
+  });
+
+  test('"1e5" (scientific notation) → null (not 1)', () => {
+    expect(toInt('1e5')).toBeNull();
+  });
+
+  test('"1_000" (numeric separator) → null (not 1)', () => {
+    expect(toInt('1_000')).toBeNull();
+  });
+
+  test('"0x10" (hex) → null (not 16)', () => {
+    expect(toInt('0x10')).toBeNull();
+  });
+
+  test('non-numeric → null', () => {
+    expect(toInt('abc')).toBeNull();
+    expect(toInt('')).toBeNull();
+    expect(toInt('   ')).toBeNull();
+    expect(toInt('12abc')).toBeNull();
+  });
+
+  test('float → null (not truncated to int)', () => {
+    expect(toInt('3.14')).toBeNull();
   });
 });

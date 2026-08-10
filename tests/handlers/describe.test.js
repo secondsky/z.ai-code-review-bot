@@ -7,6 +7,11 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { handleDescribeCommand } from '../../src/lib/handlers/describe.js';
+import {
+  upsertPrDescription,
+  DESCRIBE_MARKER_START,
+  DESCRIBE_MARKER_END,
+} from '../../src/lib/handlers/_shared.js';
 
 function makeOctokit({
   commits = [{ commit: { message: 'feat: add x' } }],
@@ -298,5 +303,126 @@ describe('handleDescribeCommand — error path', () => {
     expect(body).toContain('Z.ai request failed');
     expect(body).not.toContain('nope');
     expect(core.warning).toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * upsertPrDescription — direct unit tests (CMD-7, CMD-8)
+ * ------------------------------------------------------------------ */
+
+describe('upsertPrDescription — CMD-7: orphan start marker', () => {
+  // CMD-7: when the body has a start marker but NO end marker, the previous
+  // code sliced everything after the start marker, destroying human-written
+  // body text. The fix treats an orphan start marker as "no block found" and
+  // appends instead.
+  it('CMD-7: preserves body content after an orphan start marker (appends the block)', async () => {
+    const calls = { get: [], update: [] };
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: 'before\n<!-- zai-description -->\nafter' } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'NEW',
+    });
+
+    expect(calls.update).toHaveLength(1);
+    const newBody = calls.update[0].body;
+    // The text after the orphan marker ('after') MUST be preserved.
+    expect(newBody).toContain('after');
+    // The new block was appended (not inserted at the orphan marker).
+    expect(newBody).toContain('NEW');
+    // The orphan start marker is still present (we did not delete surrounding
+    // text), and exactly one new START/END marker pair was added.
+    const startCount = (newBody.match(/<!-- zai-description -->/g) || []).length;
+    const endCount = (newBody.match(/<!-- \/zai-description -->/g) || []).length;
+    expect(startCount).toBe(2); // original orphan + new block's start
+    expect(endCount).toBe(1); // new block's end
+  });
+});
+
+describe('upsertPrDescription — CMD-8: strip model-emitted markers', () => {
+  // CMD-8: if the model emits the marker strings (e.g. via prompt injection),
+  // those markers must be stripped from the description BEFORE interpolating,
+  // so they cannot break out of the upsert block or duplicate markers.
+  it('CMD-8: strips "<!-- /zai-description -->" from the description text', async () => {
+    const calls = { get: [], update: [] };
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: '' } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'evil <!-- /zai-description --> injected',
+    });
+
+    expect(calls.update).toHaveLength(1);
+    const newBody = calls.update[0].body;
+    // The model-emitted END marker inside the description is gone.
+    const endCount = (newBody.match(/<!-- \/zai-description -->/g) || []).length;
+    expect(endCount).toBe(1); // only the legitimate one we add ourselves
+    // The start marker count is also exactly 1 (no injected start markers).
+    const startCount = (newBody.match(/<!-- zai-description -->/g) || []).length;
+    expect(startCount).toBe(1);
+    // The benign surrounding words are still there.
+    expect(newBody).toContain('evil');
+    expect(newBody).toContain('injected');
+  });
+
+  it('CMD-8: strips "<!-- zai-description -->" (start marker) from the description text', async () => {
+    const calls = { update: [] };
+    const octokit = {
+      rest: {
+        pulls: {
+          async get() {
+            return { data: { body: '' } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'x <!-- zai-description --> y',
+    });
+
+    const newBody = calls.update[0].body;
+    // Only one start marker (the legitimate one we add).
+    expect((newBody.match(/<!-- zai-description -->/g) || []).length).toBe(1);
   });
 });

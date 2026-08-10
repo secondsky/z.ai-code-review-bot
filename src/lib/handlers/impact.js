@@ -5,10 +5,10 @@
  * risk assessment with a severity level (🟢 low / 🟡 medium / 🟠 high / 🔴
  * critical) and rationale, and posts the result as a COMMENT.
  *
- * v1 READ-ONLY INVARIANT: this handler does NOT apply labels. The fork did
- * (via `issues.addLabels`) — that is a side effect we deliberately reject for
- * v1. The assessment is posted as a comment only; a human can act on it. No
- * `issues.addLabels` is ever called here.
+ * READ-ONLY by default. OPT-IN mutation gated by `ZAI_IMPACT_LABELS`
+ * (default off): when that flag is on, a severity label (mapped via
+ * `ZAI_IMPACT_LABEL_MAP`) is applied to the PR via `issues.addLabels`, and any
+ * prior managed label is removed for idempotency.
  *
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
@@ -46,15 +46,21 @@ const SEVERITY_KEYS = {
 /**
  * Extract the severity from the model's impact assessment. The prompt asks for
  * a severity level on its own first line; this parses the first severity
- * keyword or emoji found. Pure (exported for testing).
+ * keyword or emoji found on that first line ONLY. Pure (exported for testing).
  *
- * Word-form keys (critical/high/medium/low) are matched with word boundaries
- * so that "highlighted" no longer matches "high" and "noncritical" no longer
- * matches "critical". Common negation prefixes ("non-critical", "not critical",
+ * Word-form keys (critical/high/medium/low) are matched with negative
+ * lookbehind/lookahead for word chars AND hyphens, so "highlighted" no longer
+ * matches "high", "noncritical" no longer matches "critical", and
+ * "high-availability" no longer matches "high" (a hyphen is NOT treated as a
+ * word boundary). Common negation prefixes ("non-critical", "not critical",
  * "no critical issues", "isn't high") are stripped before matching so a
  * negated severity word does not false-positive. Emoji keys have no word
- * boundaries, so they still use `includes`. We prefer the FIRST line (where the
- * prompt asks for the level), then fall back to the full text.
+ * boundaries, so they still use `includes`.
+ *
+ * Only the FIRST line is consulted for word-form matches — the prompt puts the
+ * severity level on its own first line, and severity words appearing in the
+ * rationale body (e.g. "high confidence", "high-availability") must NOT
+ * override the declared level.
  *
  * @param {string} text  The model's assessment output.
  * @returns {'critical'|'high'|'medium'|'low'|null}
@@ -80,10 +86,12 @@ export function parseSeverity(text) {
       // Emoji keys have no word boundaries; use includes.
       if (raw.includes(key)) return mapped;
     } else {
-      // Word keys: match on a word boundary to avoid false positives
-      // (e.g. "highlighted" → high, "noncritical" → critical).
-      const re = new RegExp(`\\b${key}\\b`, 'i');
-      if (re.test(firstLine) || re.test(cleaned)) return mapped;
+      // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
+      // so "highlighted" → no match, "noncritical" → no match, and
+      // "high-availability" → no match (hyphen is NOT a word boundary here).
+      // Only match on the FIRST line (where the prompt puts the level).
+      const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
+      if (re.test(firstLine)) return mapped;
     }
   }
   return null;
@@ -133,10 +141,12 @@ export function buildImpactPrompt(files) {
 }
 
 /**
- * Apply (or replace) the `zai:`-scoped severity label on the issue. Only labels
- * with the configured prefix (`zai:` by default via the label map) are managed:
- * existing `zai:*` labels are removed and the new one is set, so re-runs are
- * idempotent and human labels are never touched.
+ * Apply (or replace) the severity label on the issue. ALL labels whose name
+ * appears as a value in the configured `labelMap` are considered "managed":
+ * any existing managed label (other than the target) is removed and the new
+ * one is set, so re-runs are idempotent and human labels are never touched.
+ * This works for any label-map shape — `zai:`-prefixed maps AND flat value
+ * sets like `{ critical: 'P0', high: 'P1', ... }`.
  *
  * Injected via deps so tests never touch the GitHub API.
  *
@@ -148,16 +158,18 @@ async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, 
   const targetLabel = labelMap?.[severity];
   if (!targetLabel) return false;
 
-  // Fetch current labels and remove any existing zai:* labels (idempotent).
+  // Fetch current labels and remove any existing managed labels (idempotent).
+  // A label is "managed" if it appears as a value in the labelMap; this is
+  // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
     issue_number: issueNumber,
   });
-  const zaiPrefix = (targetLabel.split(':')[0] + ':').toLowerCase();
+  const managed = new Set(Object.values(labelMap || {}));
   for (const label of current) {
     const name = label?.name ?? '';
-    if (name.toLowerCase().startsWith(zaiPrefix) && name !== targetLabel) {
+    if (managed.has(name) && name !== targetLabel) {
       try {
         await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
       } catch {

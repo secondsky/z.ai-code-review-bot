@@ -139,6 +139,16 @@ describe('astGrepPatternToRegex', () => {
     const re = astGrepPatternToRegex('$CONN.query("$$$" + $VAR)');
     expect(re.test('const r = conn.query("SELECT * FROM users" + userId)')).toBe(true);
   });
+
+  it('escapes { and } in literal portions so {2} is not a quantifier [SCN-9]', () => {
+    // A custom pattern with `{2}` must match the LITERAL string `foo{2}`,
+    // not behave as the regex quantifier `foo{2}` (== `fooo`).
+    const re = astGrepPatternToRegex('foo{2}');
+    expect(re).toBeInstanceOf(RegExp);
+    expect(re.test('foo{2}')).toBe(true);
+    // If `{2}` were treated as a quantifier, this would match `fooo` — it must NOT.
+    expect(re.test('fooo')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -189,6 +199,33 @@ describe('scanPatternsRegex — rule coverage', () => {
     expect(evalFinding).toBeTruthy();
     expect(evalFinding.severity).toBe('high');
     expect(evalFinding.category).toBe('security');
+  });
+
+  it('does NOT flag eval() on substring like medieval(castle) [SCN-7]', () => {
+    // Without a leading word boundary, `eval($$$ARGS)` → `/eval\(.*?\)/`
+    // matches `medieval(castle)` because `eval(` is a substring. The fix
+    // prepends `\b` when the pattern begins with a literal identifier.
+    const findings = scanPatternsRegex([
+      { filename: 'src/castle.js', patch: buildPatch(['medieval(castle)']) },
+    ]);
+    const evalFinding = findings.find((f) => f.rule === 'astgrep:eval');
+    expect(evalFinding).withContext('medieval(castle) is not eval()').toBeUndefined();
+
+    // And a real eval() still fires.
+    const findings2 = scanPatternsRegex([
+      { filename: 'src/x.js', patch: buildPatch(['eval(x)']) },
+    ]);
+    expect(findings2.find((f) => f.rule === 'astgrep:eval')).toBeTruthy();
+  });
+
+  it('detects innerHTML assignment with NO spaces (innerHTML=value) [SCN-8]', () => {
+    // The pattern `innerHTML = $VALUE` has literal spaces; without whitespace
+    // collapsing it misses `innerHTML=untrusted`. The fix collapses runs of
+    // literal whitespace to `\s+`.
+    const re = astGrepPatternToRegex('innerHTML = $VALUE');
+    expect(re.test('innerHTML=untrusted')).toBe(true);
+    // And the spaced form still works.
+    expect(re.test('innerHTML = untrusted')).toBe(true);
   });
 
   it('detects innerHTML assignment', () => {

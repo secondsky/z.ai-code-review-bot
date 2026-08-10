@@ -19,6 +19,12 @@ import { getChangedFiles, filterPatchableFiles } from '../changed-files.js';
 /** Soft cap on the diff context bundled into the prompt. */
 const MAX_CONTEXT_CHARS = 8000;
 
+/**
+ * CMD-9: hard cap on the user-supplied question length. Prevents a
+ * cost/quota brute-force via an enormous `/zai ask` body.
+ */
+const MAX_QUESTION_CHARS = 4000;
+
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
@@ -64,8 +70,18 @@ export function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
   const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
   const prContext = `${title}${body}${buildDiffContext(files)}`;
+  // W2-SEC-1: the user's question is the most direct prompt-injection vector
+  // and must be wrapped in <untrusted_input> tags before being interpolated
+  // into the prompt (the PR context was already wrapped via wrapUntrusted;
+  // the question — the user's literal text — must receive the same defense).
+  // The commenter login comes from the GitHub API (safe) and stays outside
+  // the wrapper so the model can still address the user.
+  const login = commenterLogin || 'unknown';
+  const wrappedQuestion = wrapUntrusted(question, 'user-question');
   return [
-    `Question from @${commenterLogin || 'unknown'}: ${question}`,
+    `Question from @${login}:`,
+    '',
+    wrappedQuestion,
     '',
     wrapUntrusted(prContext, 'pr-context'),
   ].join('\n');
@@ -91,7 +107,12 @@ export async function handleAskCommand(
     getChangedFiles: getFiles = (o) => getChangedFiles(o),
   } = deps;
 
-  const question = typeof args === 'string' ? args.trim() : '';
+  // CMD-9: cap the question length before building the prompt so an enormous
+  // `/zai ask` body cannot brute-force the model's cost/quota.
+  const question = (typeof args === 'string' ? args.trim() : '').slice(
+    0,
+    MAX_QUESTION_CHARS,
+  );
   if (question === '') {
     await post(EMPTY_ARGS_COMMENT);
     return;

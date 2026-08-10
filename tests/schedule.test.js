@@ -38,12 +38,33 @@ function makeOctokit({ prs = [], commentsByPr = {} } = {}) {
     createComment: [],
     updateComment: [],
   };
+  // Convert the simplified mkPr shape ({number, headSha, draft, title}) into
+  // the GitHub API shape listOpenPrs reads ({number, head:{sha}, draft, title})
+  // so the round-trip through pulls.list preserves the head SHA.
+  const apiPrs = prs.map((p) => ({
+    number: p.number,
+    head: { sha: p.headSha ?? p?.head?.sha ?? '' },
+    draft: p.draft === true,
+    title: typeof p.title === 'string' ? p.title : '',
+  }));
   const octokit = {
     rest: {
       pulls: {
         async list(params) {
           calls.pullsList.push(params);
-          return { data: prs };
+          // Simulate real GitHub pagination: slice the full list by the
+          // requested page/per_page so the loop sees a short final page and
+          // terminates. Without this, the full array is returned on every call
+          // and a correctly-paginating loop would re-read the same PRs forever.
+          const perPage = typeof params?.per_page === 'number' && params.per_page > 0
+            ? params.per_page
+            : 50;
+          const page = typeof params?.page === 'number' && params.page > 0
+            ? params.page
+            : 1;
+          const start = (page - 1) * perPage;
+          const slice = apiPrs.slice(start, start + perPage);
+          return { data: slice };
         },
       },
       issues: {
@@ -82,7 +103,9 @@ function makeConfig(overrides = {}) {
 /* ---------- listOpenPrs ---------- */
 
 describe('listOpenPrs', () => {
-  it('returns a minimal shape per PR and respects the maxPrs cap', async () => {
+  it('returns a minimal shape per PR and respects the maxPrs cap (drafts skipped)', async () => {
+    // CFG-3: drafts are excluded from the output (and so do not count toward
+    // the cap). The cap applies to non-draft PRs only.
     const prs = [
       { number: 1, head: { sha: 'aaa' }, draft: false, title: 'A' },
       { number: 2, head: { sha: 'bbb' }, draft: true, title: 'B' },
@@ -92,7 +115,7 @@ describe('listOpenPrs', () => {
     const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 2 });
     expect(out).toHaveLength(2);
     expect(out[0]).toEqual({ number: 1, headSha: 'aaa', draft: false, title: 'A' });
-    expect(out[1]).toEqual({ number: 2, headSha: 'bbb', draft: true, title: 'B' });
+    expect(out[1]).toEqual({ number: 3, headSha: 'ccc', draft: false, title: 'C' });
   });
 
   it('paginates until a short page', async () => {
@@ -111,6 +134,81 @@ describe('listOpenPrs', () => {
     };
     const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 100, perPage: 50 });
     expect(out.length).toBe(51);
+  });
+
+  it('does NOT count drafts toward the maxPrs cap (CFG-3)', async () => {
+    // 10 drafts + 5 non-drafts, maxPrs=10. Drafts must be skipped entirely
+    // (not pushed, not counted) so the result contains the 5 non-draft PRs
+    // rather than being filled with drafts and starving real PRs.
+    const drafts = Array.from({ length: 10 }, (_, i) => ({
+      number: 100 + i,
+      head: { sha: `d${i}` },
+      draft: true,
+      title: `draft ${i}`,
+    }));
+    const real = Array.from({ length: 5 }, (_, i) => ({
+      number: 200 + i,
+      head: { sha: `r${i}` },
+      draft: false,
+      title: `real ${i}`,
+    }));
+    const octokit = makeOctokit({ prs: [...drafts, ...real] });
+    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10 });
+    expect(out).toHaveLength(5);
+    expect(out.every((pr) => pr.draft === false)).toBe(true);
+    expect(out.map((pr) => pr.number).sort()).toEqual([200, 201, 202, 203, 204]);
+  });
+
+  // ----- W2-1: pagination termination must compare against the ACTUAL page size
+  // sent to the API, not the original `perPage` parameter. When maxPrs=10 and
+  // page 1 returns 10 drafts (all skipped), the dynamic per_page is
+  // min(50, 10-0)=10. After skipping, data.length=10 must be compared against
+  // the REQUESTED 10 (not 50) so we keep paginating to find reviewable PRs.
+  // The buggy version compared data.length (10) against the original perPage
+  // (50), concluded "10 < 50 → last page", and broke after page 1, returning 0
+  // PRs even though page 2 had reviewable PRs.
+  it('continues paginating when page 1 is all drafts (W2-1 regression)', async () => {
+    // Page 1: 10 drafts (all skipped). Page 2: 5 non-draft PRs + a short page
+    // to terminate (3 items). maxPrs=10 so the requested per_page for page 1 is
+    // min(50, 10) = 10; for page 2 it is min(50, 10-0) = 10 (out.length is still
+    // 0 after page 1's drafts were all skipped).
+    const page1 = Array.from({ length: 10 }, (_, i) => ({
+      number: 100 + i,
+      head: { sha: `d${i}` },
+      draft: true,
+      title: `draft ${i}`,
+    }));
+    const page2 = Array.from({ length: 5 }, (_, i) => ({
+      number: 200 + i,
+      head: { sha: `r${i}` },
+      draft: false,
+      title: `real ${i}`,
+    }));
+    let call = 0;
+    const pullsListCalls = [];
+    const octokit = {
+      rest: {
+        pulls: {
+          async list(params) {
+            call += 1;
+            pullsListCalls.push(params);
+            // Page 3 returns an empty array to terminate pagination cleanly.
+            if (call === 1) return { data: page1 };
+            if (call === 2) return { data: page2 };
+            return { data: [] };
+          },
+        },
+      },
+    };
+    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10 });
+    // Must return the 5 non-draft PRs from page 2 — NOT an empty array.
+    expect(out).toHaveLength(5);
+    expect(out.every((pr) => pr.draft === false)).toBe(true);
+    expect(out.map((pr) => pr.number).sort()).toEqual([200, 201, 202, 203, 204]);
+    // And it must have actually requested page 2 (proving it did not terminate
+    // after page 1).
+    expect(pullsListCalls.length).toBeGreaterThanOrEqual(2);
+    expect(pullsListCalls[1].page).toBe(2);
   });
 });
 
@@ -206,6 +304,25 @@ describe('hasReviewForSha', () => {
     const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: '' });
     expect(found).toBe(false);
   });
+
+  // ----- INT-3: empty headSha must NOT short-circuit to "already reviewed" -----
+  // A bot marker comment with an empty headSha previously caused hasReviewForSha
+  // to return true (suppressing the PR). The fix: empty SHA can't confirm
+  // SHA-level dedup, so the PR must be reviewed.
+  it('returns FALSE when headSha is "" even with a bot marker comment (INT-3)', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: {
+        42: [
+          {
+            body: `real review\n\n${MARKER}`,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+          },
+        ],
+      },
+    });
+    const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: '' });
+    expect(found).toBe(false);
+  });
 });
 
 /* ---------- runScheduledReview ---------- */
@@ -255,7 +372,9 @@ describe('runScheduledReview', () => {
     expect(s.upsertReviewComment).toHaveBeenCalledTimes(2);
   });
 
-  it('skips drafts', async () => {
+  it('skips drafts (excluded by listOpenPrs, never reach the batch)', async () => {
+    // CFG-3: drafts are filtered out by listOpenPrs before runScheduledReview
+    // sees them, so they do not count toward the cap and are not reviewed.
     const octokit = makeOctokit({
       prs: [mkPr(1, 'sha1', { draft: true }), mkPr(2, 'sha2')],
       commentsByPr: {},
@@ -266,7 +385,7 @@ describe('runScheduledReview', () => {
       octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info() {}, warning() {} }, callApi, ...s,
     });
     expect(result.reviewed).toBe(1);
-    expect(result.skipped).toBe(1);
+    expect(result.skipped).toBe(0); // draft filtered upstream, not counted as skipped
     expect(s.runStructuredReview).toHaveBeenCalledTimes(1);
   });
 

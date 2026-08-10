@@ -14,6 +14,7 @@ import {
   handleExplainCommand,
   parseRange,
   parseExplainArgs,
+  buildExplainPrompt,
 } from '../../src/lib/handlers/explain.js';
 
 // Helper: encode plain text as the GitHub API would (base64).
@@ -322,6 +323,54 @@ describe('handleExplainCommand — error path', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * CMD-12: empty content (binary / directory / too-large file)
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — CMD-12: empty content guidance', () => {
+  // CMD-12: when fetchFileContent returns '' (binary file, directory entry, or
+  // a file too large for the API to return), the handler must NOT call the API
+  // with an empty code window — it should post a short guidance comment.
+  it('CMD-12: empty content → posts guidance, does NOT call callApi', async () => {
+    const octokit = makeOctokit({ content: { content: b64('') } });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available');
+    expect(body).toContain('src/a.js');
+  });
+
+  it('CMD-12: whitespace-only content → posts guidance, does NOT call callApi', async () => {
+    const octokit = makeOctokit({ content: { content: b64('   \n  \n') } });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment[0].body).toContain(
+      'No textual content available',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * parseRange — edge cases (Task 11)
  *
  * These pin behavior for the three supported separators, the single-line
@@ -393,6 +442,43 @@ describe('parseRange — invalid input (edge cases)', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * parseRange — CMD-3: strict numeric pre-check (reject hex/scientific/
+ * unsafe integers that Number.isInteger would otherwise accept).
+ * ------------------------------------------------------------------ */
+
+describe('parseRange — CMD-3: strict numeric pre-check (edge cases)', () => {
+  it('rejects hex literals: "0x10-0x20" → null', () => {
+    // Number("0x10") === 16 and Number.isInteger(16) === true, so the old
+    // check accepted it. The strict pre-check (/^\d+$/) rejects "0x10".
+    expect(parseRange('0x10-0x20')).toBeNull();
+  });
+
+  it('rejects scientific notation: "1e3-2e3" → null', () => {
+    // Number("1e3") === 1000 (integer), so the old check accepted it.
+    expect(parseRange('1e3-2e3')).toBeNull();
+  });
+
+  it('rejects unsafe integers beyond MAX_SAFE_INTEGER', () => {
+    // 9999999999999999999 > Number.MAX_SAFE_INTEGER; Number.isInteger() returns
+    // true but the value is not safe. The fix uses Number.isSafeInteger.
+    expect(parseRange('1-9999999999999999999')).toBeNull();
+  });
+
+  it('rejects a single hex literal: "0x10" → null', () => {
+    expect(parseRange('0x10')).toBeNull();
+  });
+
+  it('rejects a single scientific-notation literal: "1e3" → null', () => {
+    expect(parseRange('1e3')).toBeNull();
+  });
+
+  it('still accepts plain decimal integers (regression guard)', () => {
+    expect(parseRange('10-20')).toEqual({ start: 10, end: 20 });
+    expect(parseRange('1')).toEqual({ start: 1, end: 1 });
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * parseExplainArgs — file path with spaces (Task 11)
  * ------------------------------------------------------------------ */
 
@@ -418,5 +504,43 @@ describe('parseExplainArgs — file path with spaces (edge cases)', () => {
       range: { start: 10, end: 20 },
       file: 'my spaced file.js',
     });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * buildExplainPrompt — W2-SEC-4: filename sanitization in code span
+ *
+ * The filename is interpolated into a backtick code span:
+ *   Explain lines ${start}-${end} of `${file}` in this pull request.
+ * A filename containing a backtick (e.g. weird`name.js) breaks out of the
+ * code span and injects prose into the instruction. The filename must be
+ * sanitized (backticks removed/escaped) before interpolation.
+ * ------------------------------------------------------------------ */
+describe('buildExplainPrompt — W2-SEC-4: filename backtick sanitization', () => {
+  it('sanitizes a filename containing a backtick (no fence breakout)', () => {
+    const prompt = buildExplainPrompt({
+      file: 'weird`name.js',
+      start: 10,
+      end: 20,
+      window: 'code here',
+    });
+    // The raw filename with a backtick must NOT appear, because it would
+    // close the inline-code span and let the suffix inject prose.
+    expect(prompt).not.toContain('`weird`name.js`');
+    // The injected "name.js`" suffix (which would become prose after the
+    // code-span break) must not appear as a raw backtick-terminated fragment
+    // immediately following the breakout.
+    expect(prompt).not.toMatch(/weird`name\.js/);
+  });
+
+  it('still renders a normal filename inside a code span', () => {
+    const prompt = buildExplainPrompt({
+      file: 'src/a.js',
+      start: 1,
+      end: 5,
+      window: 'code',
+    });
+    expect(prompt).toContain('`src/a.js`');
+    expect(prompt).toContain('Explain lines 1-5');
   });
 });

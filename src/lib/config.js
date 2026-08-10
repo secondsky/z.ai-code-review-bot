@@ -30,8 +30,15 @@ function read(inputs, name) {
   return raw === undefined || raw === null ? '' : String(raw);
 }
 
-function toInt(v) {
-  const n = parseInt(v, 10);
+export function toInt(v) {
+  // CFG-8: parseInt alone happily accepts scientific notation ("1e5" → 1),
+  // numeric separators ("1_000" → 1), and hex ("0x10" → 16), silently
+  // truncating misconfigured inputs. Require the trimmed raw string to be a
+  // pure optional-sign + digits integer; otherwise return null so callers
+  // fall back to their default.
+  const raw = typeof v === 'string' ? v.trim() : String(v ?? '').trim();
+  if (!/^[+-]?\d+$/.test(raw)) return null;
+  const n = parseInt(raw, 10);
   return Number.isNaN(n) ? null : n;
 }
 

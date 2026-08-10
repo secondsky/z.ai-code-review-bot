@@ -150,6 +150,18 @@ function resolveReaddir(deps = {}) {
 }
 
 /**
+ * Pick the system `readFile` dep, defaulting to `fs/promises.readFile`.
+ *
+ * @param {{ readFile?: Function }} [deps]
+ * @returns {Function}
+ */
+function resolveReadFile(deps = {}) {
+  return typeof deps.readFile === 'function'
+    ? deps.readFile
+    : (p) => fs.readFile(p);
+}
+
+/**
  * Pick the system `rename` dep, defaulting to `fs/promises.rename`.
  *
  * @param {{ rename?: Function }} [deps]
@@ -436,13 +448,39 @@ export async function ensureBinary(opts, deps = {}) {
 
   const cachePath = resolveCachePath(spec);
   const stat = deps.stat;
+  const readFile = resolveReadFile(deps);
+  const rm = resolveRm(deps);
   if (typeof stat === 'function') {
+    let cacheHit = false;
     try {
       await stat(cachePath);
-      // Cache hit — file exists. No fetch, no verify.
-      return cachePath;
+      cacheHit = true;
     } catch {
       // File doesn't exist → fall through to fetch.
+    }
+    if (cacheHit) {
+      // SCN-10: re-hash the cached file and compare to expectedChecksum. A
+      // cached file whose hash no longer matches (tampering, partial write,
+      // a different binary that overwrote the path) must NOT be trusted.
+      try {
+        const cached = await readFile(cachePath);
+        const cachedBuf = Buffer.isBuffer(cached)
+          ? cached
+          : Buffer.from(/** @type {any} */ (cached));
+        if (sha256Hex(cachedBuf).toLowerCase() === expectedChecksum.toLowerCase()) {
+          // Cache hit + checksum verified — no fetch needed.
+          return cachePath;
+        }
+        // Checksum mismatch on cache hit → invalidate and re-fetch below.
+      } catch {
+        // Read failed — fall through to re-fetch (treat as a cache miss).
+      }
+      // Best-effort delete of the stale/tampered cached file before re-fetch.
+      try {
+        await rm(cachePath);
+      } catch {
+        /* best-effort — re-fetch proceeds regardless */
+      }
     }
   }
 

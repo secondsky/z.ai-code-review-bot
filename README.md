@@ -198,13 +198,13 @@ pull_request event
 | **Inline comments** | ✅ | ✅ | ✅ |
 | **Repo config file** | ✅ `.zai.yml` | ✅ `.coderabbit.yaml` | ❌ |
 | **Cost** | your Z.ai API cost only | subscription | subscription |
-| **Auditable core** | ✅ ~10k LOC, 3 deps, 1337 tests | black box | black box |
+| **Auditable core** | ✅ ~11k LOC, 3 deps, 1794 tests | black box | black box |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (1337 tests)
+npm test            # vitest suite (1794 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 npm audit           # 0 vulnerabilities

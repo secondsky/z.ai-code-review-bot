@@ -139,7 +139,14 @@ export async function upsertPrDescription(
 
   const pr = await getPr({ owner, repo, pull_number: pullNumber });
   const currentBody = typeof pr?.body === 'string' ? pr.body : '';
-  const block = `${DESCRIBE_MARKER_START}\n${description}\n${DESCRIBE_MARKER_END}`;
+  // CMD-8: strip any model-emitted marker strings from the description before
+  // interpolating, so an indirect prompt-injection cannot break out of the
+  // upsert block or duplicate the markers.
+  const safeDescription = String(description ?? '').replace(
+    /<!--\s*\/?zai-description\s*-->/g,
+    '',
+  );
+  const block = `${DESCRIBE_MARKER_START}\n${safeDescription}\n${DESCRIBE_MARKER_END}`;
 
   let newBody;
   const startIdx = currentBody.indexOf(DESCRIBE_MARKER_START);
@@ -152,8 +159,10 @@ export async function upsertPrDescription(
         block +
         currentBody.slice(endIdx + DESCRIBE_MARKER_END.length);
     } else {
-      // Malformed (start without end): replace from start to end of body.
-      newBody = currentBody.slice(0, startIdx) + block;
+      // CMD-7: orphan start marker (start without a matching end). Treat as
+      // "no block found" and append, instead of slicing everything after the
+      // orphan marker (which would destroy human-written body text).
+      newBody = currentBody ? `${currentBody}\n\n${block}` : block;
     }
   } else {
     // No existing block: append.

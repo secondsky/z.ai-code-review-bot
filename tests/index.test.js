@@ -691,6 +691,157 @@ describe('run — pull_request auto-review', () => {
     ).resolves.toBeUndefined();
     expect(core.setFailed).toHaveBeenCalled();
   });
+
+  /* ---- INT-2: pull_request action allowlist ---- */
+
+  it('payload.action=closed: returns early (no review), no callApi', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = prContext();
+    ctx.payload.action = 'closed';
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring pull_request action: closed'),
+    );
+    expect(octokit.__calls.createComment).toHaveLength(0);
+  });
+
+  it('payload.action=labeled: returns early (no review), no callApi', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = prContext();
+    ctx.payload.action = 'labeled';
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring pull_request action: labeled'),
+    );
+  });
+
+  it('payload.action=opened: proceeds with the review (allowed action)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = prContext();
+    ctx.payload.action = 'opened';
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('payload.action=synchronize: proceeds with the review (allowed action)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = prContext();
+    ctx.payload.action = 'synchronize';
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+  });
+
+  // ----- W2-3: pull_request_target must be routed through the review pipeline,
+  // not silently dropped. events.js (CFG-6) recognizes it as a PR event, but
+  // index.js only checked `event === 'pull_request'`, so pull_request_target
+  // events fell through to "Ignoring event" and were lost.
+  it('eventName=pull_request_target: proceeds through the review pipeline (W2-3)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = {
+      eventName: 'pull_request_target',
+      repo: { owner: 'owner', repo: 'repo' },
+      payload: {
+        action: 'opened',
+        pull_request: {
+          number: 42,
+          head: { repo: { fork: false }, sha: 'abc123' },
+        },
+      },
+    };
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // The review pipeline ran (callApi invoked once for the single batch).
+    expect(callApi).toHaveBeenCalledTimes(1);
+    // A comment was posted (the no-findings summary path).
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    // And the event was NOT ignored.
+    expect(core.info).not.toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring event: pull_request_target'),
+    );
+  });
+
+  it('eventName=pull_request_target with action=closed: still respects the action allowlist', async () => {
+    // The action allowlist applies equally to pull_request_target so a `closed`
+    // event does not burn API credits on a re-review.
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () => JSON.stringify({ summary: 's', findings: [] }));
+    const ctx = {
+      eventName: 'pull_request_target',
+      repo: { owner: 'owner', repo: 'repo' },
+      payload: {
+        action: 'closed',
+        pull_request: {
+          number: 42,
+          head: { repo: { fork: false }, sha: 'abc123' },
+        },
+      },
+    };
+
+    await run(ctx, {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring pull_request action: closed'),
+    );
+  });
 });
 
 /* ------------------------------------------------------------------ *

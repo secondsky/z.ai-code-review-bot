@@ -506,3 +506,195 @@ describe('integration: pull_request structured review — callApi failure', () =
     expect(octokit.__calls.createReview).toHaveLength(0);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Scanners enabled (INT-4): at least one integration test wires a fake
+ * runScanners through the REAL router + REAL runStructuredReview so the
+ * end-to-end composition (scanner findings → merge into review → summary
+ * "deterministic" line) is exercised, not just the unit-level call.
+ * ------------------------------------------------------------------ */
+
+describe('integration: pull_request structured review — scanners enabled (INT-4)', () => {
+  it('wires a fake runScanners end-to-end: deterministic findings reach the review and the prompt', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = 1;')],
+    });
+    // A deterministic scanner finding at the SAME file:line as the LLM finding
+    // but with a DIFFERENT title — mergeFindings keeps both.
+    const scannerFinding = {
+      file: 'src/a.js',
+      line: 1,
+      severity: 'critical',
+      confidence: 'high',
+      category: 'security',
+      title: 'Hardcoded secret detected by gitleaks',
+      description: 'A secret was found.',
+      evidence: '+const a = 1;',
+      suggestion: 'Remove the secret.',
+      rule: 'gitleaks:generic-api-key',
+    };
+    const fakeScanner = async () => ({
+      findings: [scannerFinding],
+      metrics: { loc: 1, files: 1, todos: 0 },
+      scannerNames: ['gitleaks'],
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('LLM reviewed.', [
+        finding('src/a.js', { severity: 'medium' }),
+      ]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig({ scannersEnabled: true }),
+      core,
+      octokit,
+      callApi,
+      runScanners: fakeScanner,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // The prompt sent to the LLM carries the scanner context (telling the model
+    // not to re-report the deterministic finding).
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('already detected deterministically');
+    expect(prompt).toContain('Hardcoded secret detected by gitleaks');
+
+    // The deterministic finding reached the review: a REVIEW is posted (the
+    // critical scanner finding maps to line 1, an added line) carrying BOTH
+    // the critical scanner finding and the medium LLM finding as inline
+    // comments. Assert the review body surfaces the deterministic count.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const review = octokit.__calls.createReview[0];
+    expect(review.body).toContain('🔍 Scanners found 1 deterministic issues.');
+    // Two inline comments: one critical (scanner) + one medium (LLM).
+    expect(review.comments).toHaveLength(2);
+    const bodies = review.comments.map((c) => c.body);
+    expect(bodies.some((b) => b.includes('🔴'))).toBe(true); // critical scanner
+    expect(bodies.some((b) => b.includes('🟡'))).toBe(true); // medium LLM
+  });
+
+  it('scannersEnabled=false: runScanners still called (returns []) and no scanner line appears', async () => {
+    // Verifies the master-switch-off path: runScanners is invoked but its
+    // (empty) result produces no "🔍 Scanners found" line in the review body.
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = 1;')],
+    });
+    let scannerCalled = false;
+    const fakeScanner = async (args) => {
+      scannerCalled = true;
+      // Even when called, a disabled master switch yields no findings.
+      expect(args.config.scannersEnabled).toBe(false);
+      return { findings: [], metrics: { loc: 1, files: 1, todos: 0 }, scannerNames: [] };
+    };
+    const callApi = makeFakeCallApi(structuredPayload('ok', []));
+
+    await run(makePRContext(), {
+      config: makeConfig({ scannersEnabled: false }),
+      core,
+      octokit,
+      callApi,
+      runScanners: fakeScanner,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    expect(scannerCalled).toBe(true);
+    // No findings → summary comment path.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).not.toContain('🔍 Scanners found');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Learnings suppression (INT-5): an end-to-end test that wires a fake
+ * loadLearnings + the REAL filterFindingsByLearnings + REAL
+ * runStructuredReview, asserting that a learning-suppressed finding is
+ * dropped from the posted review AND the suppression is surfaced in the
+ * summary note (INT-11).
+ * ------------------------------------------------------------------ */
+
+describe('integration: pull_request structured review — learnings suppression (INT-5)', () => {
+  it('drops findings matching a learning and surfaces the suppressed count in the summary (INT-11)', async () => {
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+    });
+    // The LLM emits TWO findings: one the learning suppresses, one it doesn't.
+    const suppressible = finding('src/a.js', {
+      title: 'Known issue we accepted',
+      severity: 'low',
+    });
+    const kept = finding('src/a.js', {
+      title: 'Real new bug',
+      severity: 'high',
+      description: 'A genuine bug.',
+    });
+    const callApi = makeFakeCallApi(
+      structuredPayload('Two issues.', [suppressible, kept]),
+    );
+    // A learning that matches the suppressible finding's file glob + a
+    // substring of its title. filterFindingsByLearnings drops only the
+    // matching finding (case-insensitive substring on the title).
+    const fakeLoadLearnings = async () => [
+      {
+        file: '**/a.js',
+        pattern: 'known issue',
+        reason: 'Accepted risk; tracked separately.',
+      },
+    ];
+
+    await run(makePRContext(), {
+      config: makeConfig({ learningsEnabled: true }),
+      core,
+      octokit,
+      callApi,
+      loadLearnings: fakeLoadLearnings,
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // A review is posted (the kept finding maps to line 1).
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const review = octokit.__calls.createReview[0];
+    // Only ONE inline comment (the kept high-severity finding).
+    expect(review.comments).toHaveLength(1);
+    expect(review.comments[0].body).toContain('Real new bug');
+    // The suppressed finding's title must NOT appear anywhere in the review.
+    expect(review.body).not.toContain('Known issue we accepted');
+    // INT-11: the summary surfaces the learnings-suppressed count.
+    expect(review.body).toContain('1 previously-accepted learning suppressed');
+  });
+
+  it('learningsEnabled=false: no loadLearnings call and no suppression', async () => {
+    // Master switch off: loadLearnings is never invoked, so nothing is
+    // suppressed even if a matching learning would exist.
+    const core = makeFakeCore();
+    const octokit = makeFakeOctokit({
+      files: [file('src/a.js', '@@ -1 +1 @@\n+const a = null;')],
+    });
+    let loadCalled = false;
+    const callApi = makeFakeCallApi(
+      structuredPayload('ok', [finding('src/a.js', { severity: 'low' })]),
+    );
+
+    await run(makePRContext(), {
+      config: makeConfig({ learningsEnabled: false }),
+      core,
+      octokit,
+      callApi,
+      loadLearnings: async () => {
+        loadCalled = true;
+        return [];
+      },
+      apiClient: { call: () => Promise.resolve({ success: true, data: '' }) },
+    });
+
+    // When learningsEnabled is false, index.js passes [] without calling
+    // loadLearnings at all (short-circuit).
+    expect(loadCalled).toBe(false);
+    // The finding survives — no suppression.
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    expect(octokit.__calls.createReview[0].comments).toHaveLength(1);
+  });
+});

@@ -23,7 +23,10 @@ export function parseHunkHeader(line) {
   const m = line.match(/\+(\d+)(?:,(\d+))?/);
   if (!m) return null;
   const start = parseInt(m[1], 10);
-  return Number.isFinite(start) && start >= 1 ? start : null;
+  // SCN-5: accept `start >= 0` (was `>= 1`). Git emits `+0,0` for pure-deletion
+  // hunks; rejecting them dropped all subsequent line tracking. When start is 0,
+  // the first added line lands at line 1.
+  return Number.isFinite(start) && start >= 0 ? start : null;
 }
 
 /**
@@ -55,11 +58,21 @@ export function parseAddedLines(patch) {
   const out = [];
   let newLine = 1; // updated by hunk header
   let inHunk = false;
-  for (const raw of patch.split('\n')) {
+  for (const splitLine of patch.split('\n')) {
+    // SCN-12: strip a single trailing `\r` so CRLF patches don't leak `\r`
+    // into the returned `text` fields.
+    const raw = splitLine.endsWith('\r') ? splitLine.slice(0, -1) : splitLine;
     if (raw.startsWith('@@')) {
       const start = parseHunkHeader(raw);
       if (start !== null) {
         newLine = start;
+        inHunk = true;
+      } else {
+        // SCN-4: a malformed `@@`-prefixed line previously left `inHunk`
+        // untouched (false if this is the first hunk), silently dropping ALL
+        // subsequent additions. Recover by entering hunk mode with the current
+        // (approximate) line counter so secrets/patterns are still captured.
+        // Line numbers will be approximate but we don't silently drop content.
         inHunk = true;
       }
       continue;

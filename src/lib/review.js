@@ -11,8 +11,8 @@
  *
  * Idempotency model (mirrors `comments.js`): the review body carries the
  * {@link MARKER} HTML comment. On each run, {@link upsertReview} lists prior
- * bot reviews (matched by marker OR bot login), DISMISSES them (so stale
- * inline comments disappear on re-push), then creates the fresh review. This
+ * reviews whose body includes the marker, DISMISSES them (so stale inline
+ * comments disappear on re-push), then creates the fresh review. This
  * "dismiss-stale-then-post" sequence keeps exactly one active bot review per
  * PR head SHA without piling up duplicates.
  *
@@ -167,16 +167,30 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
 function renderCommentBody(finding) {
   const severity = typeof finding.severity === 'string' ? finding.severity : 'info';
   const emoji = SEVERITY_EMOJI[severity] ?? '➖';
-  const title = typeof finding.title === 'string' ? finding.title : '';
-  const description = typeof finding.description === 'string' ? finding.description : '';
+  // CORE-2: collapse newlines in title/description/suggestion so model output
+  // carrying stray newlines can't break the markdown structure or inject
+  // unescaped markdown (e.g. a newline mid-title would split the bold span).
+  const stripNewlines = (s) => String(s).replace(/\r?\n/g, ' ');
+  const title =
+    typeof finding.title === 'string' ? stripNewlines(finding.title) : '';
+  const description =
+    typeof finding.description === 'string' ? stripNewlines(finding.description) : '';
   const evidence = typeof finding.evidence === 'string' ? finding.evidence : '';
   const suggestion =
-    typeof finding.suggestion === 'string' && finding.suggestion.length > 0 ? finding.suggestion : null;
+    typeof finding.suggestion === 'string' && finding.suggestion.length > 0
+      ? stripNewlines(finding.suggestion)
+      : null;
 
   const parts = [];
   parts.push(`${emoji} **${title}**`);
   if (description.length > 0) parts.push(description);
-  if (evidence.length > 0) parts.push(`> \`${String(evidence).replace(/`/g, '\\`')}\``);
+  if (evidence.length > 0) {
+    // CORE-2: escape backticks AND collapse newlines in evidence so the inline
+    // code span is preserved. A newline would close the span early and let the
+    // remaining content render as markdown (e.g. a clickable malicious link).
+    const safeEvidence = evidence.replace(/`/g, '\\`').replace(/\r?\n/g, ' ');
+    parts.push(`> \`${safeEvidence}\``);
+  }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
   return sanitizeModelOutput(parts.join('\n'));
 }
@@ -258,12 +272,25 @@ export function resolveReviewEvent(findings, config) {
 }
 
 /**
+ * Hard cap on pagination depth for {@link listBotReviews}. Defense-in-depth
+ * (CORE-4): the loop already terminates on a short page, but a misbehaving
+ * endpoint that always returns full pages would loop forever. 100 pages × 100
+ * per page = 10,000 reviews — far beyond any real PR's review history.
+ */
+const MAX_REVIEW_PAGES = 100;
+
+/**
  * List prior reviews posted by the bot on a PR.
  *
  * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
- * page). Filters to reviews whose `body` includes `marker` OR whose `user.login`
- * ends with `[bot]`. This dual filter catches both the marker-bearing reviews
- * we posted AND any legacy bot-posted reviews that predate the marker.
+ * page). Filters to reviews whose `body` includes `marker`. The marker is the
+ * canonical idempotency signal — every review this action posts carries it —
+ * so the broad `[bot]`-login fallback that previously matched ANY bot (e.g.
+ * dependabot, github-actions) was removed to avoid dismissing reviews this
+ * action never posted (CORE-3).
+ *
+ * CORE-4: pagination is also capped at {@link MAX_REVIEW_PAGES} as a safety
+ * net against a misbehaving endpoint that never returns a short page.
  *
  * @param {{octokit:object, context:object, marker?:string}} args
  * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
@@ -277,8 +304,7 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
   /** @type {Array} */
   const all = [];
   const perPage = 100;
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
     const { data } = await octokit.rest.pulls.listReviews({
       owner,
       repo,
@@ -288,14 +314,17 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
     });
     const rows = Array.isArray(data) ? data : [];
     all.push(...rows);
-    if (rows.length < perPage) break;
-    page += 1;
+    if (rows.length < perPage) break; // short page → done
   }
 
   return all.filter((r) => {
     const body = typeof r?.body === 'string' ? r.body : '';
-    const login = typeof r?.user?.login === 'string' ? r.user.login : '';
-    return body.includes(marker) || login.endsWith('[bot]');
+    // CORE-3: the marker is the canonical idempotency signal. The previous
+    // `|| login.endsWith('[bot]')` OR matched ANY bot review (including
+    // dependabot, github-actions, etc.), causing upsertReview to dismiss
+    // reviews this action never posted. The marker alone is sufficient for
+    // idempotency (every review we post carries it).
+    return body.includes(marker);
   });
 }
 
@@ -344,7 +373,7 @@ export async function dismissStaleReviews({ octokit, context, reviews, reason, c
  * reviews first, then creates the new one.
  *
  * Flow:
- *   1. `listBotReviews` → prior reviews (marker OR bot login).
+ *   1. `listBotReviews` → prior reviews (matched by marker in body).
  *   2. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`.
  *   3. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
  *

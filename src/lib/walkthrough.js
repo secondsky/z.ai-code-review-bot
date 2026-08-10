@@ -245,8 +245,13 @@ const COHORT_RULES = [
  */
 export function classifyFile(filename) {
   if (typeof filename !== 'string' || filename.length === 0) return 'other';
-  for (const { cohort, matchers } of COHORT_RULES) {
-    if (matchers.some((re) => re.test(filename))) return cohort;
+  // Iterate in COHORT_ORDER (the canonical dependency rank), looking up each
+  // cohort's rule, so the documented "first-match-wins by dependency rank"
+  // holds — NOT the COHORT_RULES array order (which differs: e.g. 'config'
+  // sits AFTER 'ui' in the array but BEFORE it in COHORT_ORDER).
+  for (const cohort of COHORT_ORDER) {
+    const rule = COHORT_RULES.find((r) => r.cohort === cohort);
+    if (rule && rule.matchers.some((re) => re.test(filename))) return cohort;
   }
   return 'other';
 }

@@ -71,7 +71,9 @@ export function formatScannerContext(findings, metrics) {
       const line = typeof f.line === 'number' && f.line > 0 ? `:${f.line}` : '';
       const rule = typeof f.rule === 'string' && f.rule ? `[${f.rule}]` : '';
       const title = typeof f.title === 'string' ? f.title : '';
-      lines.push(`- ${file}${line} ${rule} ${title}`.trim());
+      // SCN-18: wrap the filename in backticks so an attacker-controlled
+      // filename can't run on into the prompt text (delimits it from prose).
+      lines.push(`- \`${file}\`${line} ${rule} ${title}`.trim());
     }
   }
   if (metrics && typeof metrics === 'object') {

@@ -156,6 +156,23 @@ describe('parseSeverity', () => {
   it('M2: matches "critical" on its own first line even with surrounding text', () => {
     expect(parseSeverity('critical\nlarge blast radius')).toBe('critical');
   });
+
+  // CMD-4: severity words must only be matched on the FIRST line (the prompt
+  // explicitly asks the model to put the level on its own first line). Matching
+  // anywhere in the rationale causes false positives when the rationale happens
+  // to mention a severity word.
+  it('CMD-4: does NOT match severity words appearing only in later (rationale) lines', () => {
+    // First line says low; rationale mentions "high confidence" — must stay low.
+    expect(parseSeverity('🟢 low\nrationale mentions high confidence')).toBe('low');
+    expect(parseSeverity('🟢 low risk\nThis module provides high-availability guarantees.')).toBe('low');
+  });
+
+  // CMD-4: a hyphen is NOT a word boundary for severity words. The previous
+  // `\b` treated `-` as a boundary, so "high-availability" matched "high".
+  it('CMD-4: does NOT match severity words inside hyphenated compounds', () => {
+    expect(parseSeverity('high-availability changes')).toBeNull();
+    expect(parseSeverity('low-level optimization')).toBeNull();
+  });
 });
 
 describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)', () => {
@@ -240,6 +257,49 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
       callApi,
     });
     expect(octokit.__calls.addLabels).toHaveLength(0);
+  });
+
+  // CMD-5: the previous prefix-based removal (`zai:`) broke for label maps
+  // whose values do NOT share a common `prefix:`. With a flat value set
+  // (P0/P1/P2/P3), the handler must still remove prior managed labels.
+  it('CMD-5: removes prior managed labels for non-`prefix:` label maps', async () => {
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'P0' }, { name: 'P1' }] });
+    const callApi = vi.fn(async () => '🟡 medium\n...');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    // Both prior managed labels (P0, P1) removed; P2 added.
+    const removed = octokit.__calls.removeLabel.map((c) => c.name).sort();
+    expect(removed).toEqual(['P0', 'P1']);
+    expect(octokit.__calls.addLabels[0].labels).toEqual(['P2']);
+  });
+
+  it('CMD-5: still leaves non-managed (human) labels alone with flat label map', async () => {
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'bug' }, { name: 'P0' }] });
+    const callApi = vi.fn(async () => '🟢 low');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    // Only the managed P0 is removed; human "bug" label is untouched.
+    const removed = octokit.__calls.removeLabel.map((c) => c.name);
+    expect(removed).toEqual(['P0']);
+    expect(octokit.__calls.addLabels[0].labels).toEqual(['P3']);
   });
 });
 

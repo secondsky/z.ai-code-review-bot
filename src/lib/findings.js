@@ -797,7 +797,13 @@ export function formatFindingsAsSummary(findings, options = {}) {
           typeof f.suggestion === 'string' && f.suggestion.length > 0 ? f.suggestion : null;
 
         const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
-        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        // W2-SEC-6: filenames are attacker-controlled and were rendered raw as
+        // markdown. A filename containing markdown metacharacters (e.g.
+        // weird**name.js) would inject formatting (bold) into the summary.
+        // Render the filename as inline code (backticks) which neutralizes
+        // all markdown special characters. The line suffix is appended OUTSIDE
+        // the code span so the :L42 anchor link is still parsed by GitHub.
+        lines.push(`- \`${file}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }
@@ -847,10 +853,17 @@ const HASH_BLOCK_SUFFIX = ' -->';
  *
  * The hash is SHA-256 (hex) of the canonical key
  * `${file}:${line ?? 'null'}:${severity}:${title}:${description}`. Only those
- * five fields participate — `evidence`, `suggestion`, `rule`, `confidence`,
- * and `category` are intentionally excluded so a re-review that only changed
- * the suggestion text does NOT re-surface the finding as "new" (the location
- * and the issue identity are unchanged).
+ * five fields participate by default — `evidence`, `suggestion`, `rule`,
+ * `confidence`, and `category` are intentionally excluded so a re-review that
+ * only changed the suggestion text does NOT re-surface the finding as "new"
+ * (the location and the issue identity are unchanged).
+ *
+ * SCN-3 / W2-5: for findings produced by deterministic scanners (rule starts
+ * with `regex:`, `gitleaks:`, `secret:`, or `astgrep:`), `evidence` is ALSO
+ * included in the hash. A rotated secret (or a different offending line for an
+ * astgrep rule like eval/sql-concat) has a different evidence value and must
+ * hash differently so the new occurrence is re-surfaced instead of being
+ * suppressed as "unchanged".
  *
  * Defensive: missing/non-string fields are coerced to '' (or 'null' for line)
  * so a malformed finding never throws — it just hashes to a stable value.
@@ -866,7 +879,20 @@ export function hashFinding(finding) {
   const severity = typeof f.severity === 'string' ? f.severity : '';
   const title = typeof f.title === 'string' ? f.title : '';
   const description = typeof f.description === 'string' ? f.description : '';
-  const key = `${file}:${line}:${severity}:${title}:${description}`;
+  let key = `${file}:${line}:${severity}:${title}:${description}`;
+  // SCN-3 / W2-5: include evidence for findings produced by deterministic
+  // scanners so a different match (rotated secret, different offending line)
+  // hashes differently and is re-surfaced instead of suppressed as
+  // "unchanged". This covers regex:/gitleaks:/secret: (secret scanners) and
+  // astgrep: (deterministic pattern rules like eval, sql-concat). LLM
+  // findings (no rule or rule: 'llm') keep evidence excluded for stability.
+  if (
+    f.rule &&
+    typeof f.rule === 'string' &&
+    /^(regex|gitleaks|secret|astgrep):/i.test(f.rule)
+  ) {
+    key += ':' + (typeof f.evidence === 'string' ? f.evidence : '');
+  }
   return createHash('sha256').update(key, 'utf8').digest('hex');
 }
 

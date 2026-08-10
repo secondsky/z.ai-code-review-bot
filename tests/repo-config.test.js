@@ -13,6 +13,7 @@ import {
   mergeRepoConfig,
   loadRepoConfig,
 } from '../src/lib/repo-config.js';
+import { filterExcludedFiles } from '../src/lib/changed-files.js';
 
 /* ------------------------------------------------------------------ *
  * parseZaiYml
@@ -408,7 +409,9 @@ describe('mergeRepoConfig — pathFilters (union)', () => {
       { excludePatterns: ['*.lock'] },
       { reviews: { path_filters: ['!dist/**', '!build/**'] } },
     );
-    expect(merged.excludePatterns.sort()).toEqual(['!build/**', '!dist/**', '*.lock']);
+    // CFG-1: a leading `!` is stripped at merge time (it is picomatch
+    // negation syntax that would invert exclude semantics downstream).
+    expect(merged.excludePatterns.sort()).toEqual(['*.lock', 'build/**', 'dist/**']);
   });
   it('keeps action excludePatterns when repo has none', () => {
     const merged = mergeRepoConfig({ excludePatterns: ['*.lock'] }, {});
@@ -421,6 +424,41 @@ describe('mergeRepoConfig — pathFilters (union)', () => {
       { reviews: { path_filters: [] } },
     );
     expect(merged.excludePatterns).toEqual(['*.lock', 'dist/**']);
+  });
+
+  // ----------------------------------------------------------------
+  // CFG-1 / SCN-13: `.zai.yml` documents `path_filters: ['!dist/**']`
+  // as "exclude dist/". The leading `!` is picomatch negation syntax,
+  // which inverts semantics when passed through to the exclude-list
+  // matcher. The merge layer must STRIP the leading `!` so the
+  // resulting `excludePatterns` contains the positive form.
+  // ----------------------------------------------------------------
+
+  it('CFG-1: strips a leading ! from repo path_filters at merge time', () => {
+    const merged = mergeRepoConfig(
+      { excludePatterns: ['*.lock'] },
+      { reviews: { path_filters: ['!dist/**', '!build/**'] } },
+    );
+    expect(merged.excludePatterns.sort()).toEqual(['*.lock', 'build/**', 'dist/**']);
+  });
+
+  it('CFG-1: stripped path_filters flow through filterExcludedFiles correctly', () => {
+    // End-to-end: a `.zai.yml` with `!dist/**` should result in files
+    // under dist/ being EXCLUDED and files outside dist/ being KEPT.
+    // Before the fix, the `!dist/**` pattern matched every non-dist file
+    // and excluded them all — the exact opposite of intent.
+    const merged = mergeRepoConfig(
+      {},
+      { reviews: { path_filters: ['!dist/**'] } },
+    );
+    const files = [
+      { filename: 'dist/bundle.js' },
+      { filename: 'src/app.js' },
+      { filename: 'dist/sub/dep.js' },
+      { filename: 'README.md' },
+    ];
+    const kept = filterExcludedFiles(files, merged.excludePatterns);
+    expect(kept.map((f) => f.filename).sort()).toEqual(['README.md', 'src/app.js']);
   });
 });
 
@@ -708,6 +746,13 @@ describe('parseZaiYml — comment stripping edge cases', () => {
     // Edge case: the entire value is a quoted "#..." — must not be eaten.
     const text = 'reviews:\n  tone_instructions: "#hashtag"\n';
     expect(parseZaiYml(text).reviews.tone_instructions).toBe('#hashtag');
+  });
+
+  // CFG-2: a lone apostrophe in an unquoted value (e.g. "it's") must not flip
+  // the single-quote state permanently and swallow the rest of the line.
+  it('does not treat a lone apostrophe in a word as a quote toggle', () => {
+    const text = 'reviews:\n  tone_instructions: it\'s important # be strict\n';
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('it\'s important');
   });
 });
 

@@ -19,6 +19,13 @@ export const STATUS_CONTEXT = 'Z.ai Code Review';
 const MAX_DESCRIPTION_LEN = 140;
 
 /**
+ * The set of valid GitHub commit-status states. Used to validate `state`
+ * before it reaches the API so a typo (e.g. 'completed') does not produce a
+ * noisy 422. GitHub only accepts these four values.
+ */
+const VALID_STATES = new Set(['pending', 'success', 'failure', 'error']);
+
+/**
  * Truncate a description to GitHub's 140-character limit. Returns the input
  * unchanged when it already fits.
  *
@@ -80,6 +87,10 @@ export function buildStatusDescription({
  */
 export async function setReviewStatus(opts, deps = {}) {
   const { octokit, context, sha, state, description, targetUrl } = opts || {};
+
+  // CFG-7: validate the state enum BEFORE any other check so an invalid state
+  // short-circuits without hitting the API. GitHub only accepts these four.
+  if (!VALID_STATES.has(state)) return false;
 
   // Defense: missing octokit, SHA, or context.repo is a no-op. The caller in
   // src/index.js guards the sha too, but be belt-and-suspenders so a misuse

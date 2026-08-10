@@ -375,15 +375,34 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
  * summary with the note appended. Kept as a pure helper so it can be unit
  * tested in isolation if needed.
  *
+ * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
+ * only the incremental count was reported, so a run that suppressed 5 findings
+ * via learnings showed no note at all — reviewers had no signal that the bot
+ * had intentionally dropped findings. Both suppression reasons now contribute
+ * to a single note so the summary reflects the total elided count.
+ *
  * @param {string} summary  The model's original summary prose.
- * @param {number} suppressedCount  How many findings were suppressed.
+ * @param {number} suppressedCount  How many findings were suppressed (incremental).
+ * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
  * @returns {string}
  */
-function appendIncrementalNote(summary, suppressedCount) {
+function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
   const base = typeof summary === 'string' ? summary : '';
-  const count = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
-  if (count === 0) return base;
-  const note = `_${count} previously-reported finding${count === 1 ? '' : 's'} suppressed (incremental review)._`;
+  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
+  const total = inc + lrn;
+  if (total === 0) return base;
+  // Compose a note that reflects BOTH suppression reasons when both fired.
+  const parts = [];
+  if (inc > 0) {
+    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
+  }
+  if (lrn > 0) {
+    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
+  }
+  // English join: "a and b" or just "a".
+  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  const note = `_${what} suppressed (incremental review)._`;
   return base.length === 0 ? note : `${base}\n\n${note}`;
 }
 
@@ -471,8 +490,45 @@ export async function run(context, deps = {}) {
 
   const event = eventName(context);
 
-  // ---- pull_request → auto-review -----------------------------------
-  if (event === 'pull_request') {
+  // ---- pull_request / pull_request_target → auto-review -------------
+  // W2-3: route `pull_request_target` through the same review pipeline as
+  // `pull_request`. events.js (CFG-6) already recognizes both as PR events via
+  // isPullRequestEvent(), but this router previously only matched the literal
+  // `pull_request` event name, so `pull_request_target` was silently dropped
+  // ("Ignoring event: pull_request_target"). Both events now share the same
+  // path so the action can be wired to either trigger in a workflow.
+  //
+  // SECURITY CONSIDERATION (pull_request_target): this event runs with the
+  // base-branch's secrets AND write access to the repo (unlike `pull_request`,
+  // which runs in a fork-sandboxed context). The review pipeline below only
+  // (a) reads the PR diff via the GitHub API, (b) sends the diff to the LLM
+  // via callApi, and (c) posts a review/comment back to GitHub. It does NOT
+  // execute PR-supplied code, run build scripts, or check out the PR head — so
+  // routing `pull_request_target` here does NOT introduce code-execution risk.
+  // The write access is already required to post reviews on `pull_request`
+  // anyway, and the same auth/permission surface applies. The only new
+  // capability unlocked is that the review fires for fork PRs WITH secrets
+  // available — operators who wire `pull_request_target` are responsible for
+  // ensuring their config does not leak secrets into review output (the
+  // sanitizer + prompt-hardening layers remain the controls there).
+  if (event === 'pull_request' || event === 'pull_request_target') {
+    // INT-2: only react to PR actions that warrant a fresh review. Without
+    // this filter the action also fires on `closed`, `labeled`, `edited`, etc.
+    // — burning API credits and posting duplicate reviews. Mirrors the
+    // `issue_comment` action guard below. `prAction &&` keeps a missing action
+    // field proceeding (defense-in-depth for unusual payload shapes).
+    const prAction = context?.payload?.action;
+    const ALLOWED_PR_ACTIONS = new Set([
+      'opened',
+      'synchronize',
+      'reopened',
+      'ready_for_review',
+    ]);
+    if (prAction && !ALLOWED_PR_ACTIONS.has(prAction)) {
+      coreDep.info(`Ignoring pull_request action: ${prAction}`);
+      return;
+    }
+
     const { owner, repo } = context.repo ?? {};
     if (!owner || !repo) {
       // Missing context.repo would otherwise throw a TypeError on the
@@ -726,10 +782,12 @@ export async function run(context, deps = {}) {
 
     // Append a "previously-resolved" note to the model's summary so reviewers
     // know what was elided. Only when suppression actually happened.
+    // INT-11: surface BOTH incremental-suppressed and learnings-suppressed
+    // counts so a run that only suppressed via learnings still reports it.
     const baseSummary = typeof result.summary === 'string' ? result.summary : '';
     const summaryWithIncrementalNote =
-      suppressedCount > 0
-        ? appendIncrementalNote(baseSummary, suppressedCount)
+      suppressedCount > 0 || learningsSuppressed > 0
+        ? appendIncrementalNote(baseSummary, suppressedCount, learningsSuppressed)
         : baseSummary;
 
     // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default

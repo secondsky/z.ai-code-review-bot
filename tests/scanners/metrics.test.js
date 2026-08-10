@@ -117,6 +117,7 @@ describe('countTodosInPatch', () => {
 
   it('counts HACK and XXX markers too', () => {
     const patch = [
+      '@@ -1,2 +1,3 @@',
       '+// HACK: workaround',
       '+// XXX: ugly',
     ].join('\n');
@@ -127,6 +128,7 @@ describe('countTodosInPatch', () => {
     // `XXXL` and `XXXY` are NOT TODO markers (XXX glued to other word chars);
     // only a standalone `XXX` (with word boundaries) should count.
     const patch = [
+      '@@ -1,2 +1,3 @@',
       '+const size = "XXXL"', // clothing size — not a marker
       '+const code = "XXXY"', // not a marker
     ].join('\n');
@@ -135,17 +137,18 @@ describe('countTodosInPatch', () => {
 
   it('still counts a real XXX marker with word boundaries', () => {
     // A genuine `// XXX:` comment must still register.
-    expect(countTodosInPatch('+// XXX: ugly hack')).toBe(1);
-    expect(countTodosInPatch('+// XXX hack here')).toBe(1);
+    expect(countTodosInPatch('@@ -1,1 +1,1 @@\n+// XXX: ugly hack')).toBe(1);
+    expect(countTodosInPatch('@@ -1,1 +1,1 @@\n+// XXX hack here')).toBe(1);
   });
 
   it('counts only ONE per line even with multiple markers', () => {
-    const patch = '+// TODO and FIXME both here';
+    const patch = '@@ -1,1 +1,1 @@\n+// TODO and FIXME both here';
     expect(countTodosInPatch(patch)).toBe(1);
   });
 
   it('skips removed (–) and context (space) lines', () => {
     const patch = [
+      '@@ -1,3 +1,3 @@',
       '-// TODO: in removed line',
       ' // FIXME: in context line',
       '+// HACK: real added marker',
@@ -155,8 +158,22 @@ describe('countTodosInPatch', () => {
 
   it('skips the +++ file header', () => {
     const patch = [
+      '@@ -1,1 +1,2 @@',
       '+++ b/foo.js',
       '+// TODO: real todo',
+    ].join('\n');
+    expect(countTodosInPatch(patch)).toBe(1);
+  });
+
+  // SCN-16: a `+` line that appears BEFORE any hunk header is diff metadata,
+  // not an added line — parseAddedLines skips pre-hunk lines, so the TODO
+  // counter must not count it.
+  it('does NOT count a TODO on a pre-hunk + line', () => {
+    const patch = [
+      '+// TODO: this is in the diff metadata, not a real hunk',
+      '@@ -1,1 +1,1 @@',
+      ' context',
+      '+// FIXME: real added marker',
     ].join('\n');
     expect(countTodosInPatch(patch)).toBe(1);
   });
@@ -276,8 +293,8 @@ describe('computeMetrics', () => {
 
   it('counts TODOs across patches', () => {
     const m = computeMetrics([
-      { filename: 'a.js', patch: '+// TODO: a\n+// FIXME: a2' },
-      { filename: 'b.js', patch: ' context\n-// TODO removed\n+// TODO: b' },
+      { filename: 'a.js', patch: '@@ -1,1 +1,2 @@\n+// TODO: a\n+// FIXME: a2' },
+      { filename: 'b.js', patch: '@@ -1,2 +1,2 @@\n context\n-// TODO removed\n+// TODO: b' },
     ]);
     expect(m.todoCount).toBe(3); // a + a2 + b
   });
@@ -317,7 +334,7 @@ describe('formatMetricsForPrompt', () => {
 
   it('pluralizes "files" vs "file" and "TODOs" vs "TODO"', () => {
     const m1 = computeMetrics([
-      { filename: 'a.js', patch: '+// TODO: x' },
+      { filename: 'a.js', patch: '@@ -1,1 +1,1 @@\n+// TODO: x' },
     ]);
     expect(formatMetricsForPrompt(m1)).toContain('1 files');
     expect(formatMetricsForPrompt(m1)).toContain('1 TODO.');

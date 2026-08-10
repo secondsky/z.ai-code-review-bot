@@ -55,8 +55,15 @@ function stripComment(line) {
   let inDouble = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === "'" && !inDouble) inSingle = !inSingle;
-    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    if (ch === "'" && !inDouble) {
+      // Only treat `'` as a quote toggle when NOT embedded in a word. A `'`
+      // glued to a letter/digit — like the apostrophe in `it's` — is not a
+      // delimiter; treating it as one would flip `inSingle` permanently.
+      const prev = i > 0 ? line[i - 1] : '';
+      if (!/[A-Za-z0-9]/.test(prev)) {
+        inSingle = !inSingle;
+      }
+    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
       // A `#` only starts a comment when it's at the start of the line or
       // preceded by whitespace. `value#frag` is NOT a comment.
@@ -473,9 +480,19 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
   const toneInstructions = toneParts.join(' ');
 
   // excludePatterns UNION repo path_filters (repo can exclude MORE, never fewer).
+  // A leading `!` in a path_filters entry is picomatch negation syntax, which
+  // would invert the exclude-list semantics downstream in matchesAnyPattern.
+  // The documented `.zai.yml` `!dist/**` form means "exclude dist/", so we
+  // strip the leading `!` here to produce the positive `dist/**` form. This
+  // is a defensive normalization: matchesAnyPattern ALSO strips `!`, but
+  // doing it here keeps excludePatterns observable/correct at the merge
+  // boundary. (CFG-1 / SCN-13.)
   const actionPatterns = Array.isArray(a.excludePatterns) ? a.excludePatterns : [];
   const repoFilters = Array.isArray(reviews.path_filters) ? reviews.path_filters : [];
-  const excludePatterns = Array.from(new Set([...actionPatterns, ...repoFilters]));
+  const stripNegation = (p) => (typeof p === 'string' && p.startsWith('!') ? p.slice(1) : p);
+  const excludePatterns = Array.from(
+    new Set([...actionPatterns, ...repoFilters.map(stripNegation)]),
+  );
 
   // minSeverity: action input wins, BUT the repo `profile` may NARROW it.
   // `profile: chill` means "only surface critical+high" — i.e. raise the

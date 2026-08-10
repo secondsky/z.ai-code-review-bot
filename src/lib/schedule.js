@@ -79,28 +79,43 @@ export async function listOpenPrs({
   maxPrs,
   perPage = 50,
 }) {
+  // CFG-3: drafts are NOT counted toward the maxPrs cap. Previously a batch of
+  // stale drafts could fill the cap and starve real (non-draft) PRs of a
+  // scheduled review. We skip drafts entirely during accumulation — they are
+  // filtered again in runScheduledReview, but excluding them here means the
+  // cap reflects only reviewable PRs.
   const out = [];
   let page = 1;
   for (;;) {
+    // W2-1: capture the ACTUAL per_page sent to the API and compare data.length
+    // against THAT value (not the original `perPage` parameter). The previous
+    // code compared `data.length < perPage` (the parameter), which broke when
+    // the dynamic per_page was clamped down by maxPrs: e.g. maxPrs=10, perPage=50
+    // → requested 10; if page 1 returned 10 drafts (all skipped), 10 < 50 was
+    // true so the loop terminated after page 1 even though page 2 had reviewable
+    // PRs. Comparing against the requested size (10 < 10 → false) makes
+    // pagination continue until the API truly returns a short page.
+    const requestedPerPage = Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage);
     const { data } = await octokit.rest.pulls.list({
       owner,
       repo,
       state: 'open',
       sort: 'updated',
       direction: 'desc',
-      per_page: Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage),
+      per_page: requestedPerPage,
       page,
     });
     for (const pr of data) {
+      if (pr?.draft === true) continue; // drafts don't count toward the cap
       out.push({
         number: pr.number,
         headSha: pr?.head?.sha ?? '',
-        draft: pr?.draft === true,
+        draft: false,
         title: typeof pr?.title === 'string' ? pr.title : '',
       });
       if (out.length >= maxPrs) return out;
     }
-    if (data.length < perPage) break;
+    if (data.length < requestedPerPage) break;
     page += 1;
   }
   return out;
@@ -132,6 +147,10 @@ export async function hasReviewForSha({
   headSha,
   marker = MARKER,
 }) {
+  // INT-3: an empty head SHA cannot confirm SHA-level dedup — previously the
+  // `headSha === '' ||` short-circuit matched ANY bot marker comment and
+  // suppressed the PR. Returning false here ensures the PR is reviewed.
+  if (headSha === '') return false; // can't confirm SHA-level dedup; review it
   let page = 1;
   const perPage = 100;
   for (;;) {
@@ -147,7 +166,7 @@ export async function hasReviewForSha({
         isBotComment(c) &&
         typeof c?.body === 'string' &&
         c.body.includes(marker) &&
-        (headSha === '' || c.body.includes(headSha)),
+        c.body.includes(headSha),
     );
     if (found) return true;
     if (comments.length < perPage) return false;

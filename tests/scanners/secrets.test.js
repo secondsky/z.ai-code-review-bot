@@ -64,6 +64,15 @@ describe('maskSecret', () => {
     expect(maskSecret('abc')).toBe('a…');
     expect(maskSecret('abcdef')).toBe('a…');
     expect(maskSecret('12345678')).toBe('1…');
+    // SCN-6: threshold is now <= 12 (was <= 8). 9-12 char secrets used to
+    // leak first4+last2; they now mask to first char only.
+    expect(maskSecret('ABCDEFGHI')).toBe('A…');
+    expect(maskSecret('ABCDEFGHIJKL')).toBe('A…'); // exactly 12 chars
+  });
+
+  it('masks values longer than 12 chars to <first4>…<last2>', () => {
+    // SCN-6: 13+ char secrets use the first4+last2 shape.
+    expect(maskSecret('ABCDEFGHIJKLM')).toBe('ABCD…LM'); // 13 chars
   });
 
   it('masks long values to <first4>…<last2>', () => {
@@ -114,6 +123,14 @@ describe('scanSecretsRegex — pattern coverage', () => {
     );
     expect(findings).toHaveLength(1);
     expect(findings[0].rule).toBe('regex:github-pat');
+  });
+
+  it('detects fine-grained GitHub PATs (github_pat_ + 82 chars) [SCN-1]', () => {
+    // Fine-grained PATs are the default since Oct 2022: github_pat_ + 82 chars.
+    const token = 'github_pat_' + 'a'.repeat(82);
+    const findings = scanSecretsRegex(file(buildPatch([`token = "${token}"`])));
+    const pat = findings.find((f) => f.rule === 'regex:github-pat');
+    expect(pat).withContext('github_pat_ fine-grained PAT should match').toBeTruthy();
   });
 
   it('detects PEM private key blocks', () => {
@@ -210,6 +227,16 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     const findings = scanSecretsRegex(file(buildPatch([`x = "${value}"`])));
     const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
     expect(he).toBeUndefined();
+  });
+
+  it('detects URL-safe base64 high-entropy strings containing - or _ [SCN-2]', () => {
+    // 36-char URL-safe base64 string containing `-` and `_`. Without the fix
+    // the high-entropy regex `[A-Za-z0-9+/]{32,}` stops at the `-`/`_`, so the
+    // candidate is too short to match.
+    const value = 'Z9xQ8pLm4BnK2-vRt7aS3cD1eF6gH5_jK8';
+    const findings = scanSecretsRegex(file(buildPatch([`config = "${value}"`])));
+    const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
+    expect(he).withContext('URL-safe base64 string should match').toBeTruthy();
   });
 
   it('detects api-key variants (api-key, apikey, apiKey, secret, token, auth_token, access_token, client_secret)', () => {

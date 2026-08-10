@@ -29,6 +29,11 @@ describe('event-type predicates', () => {
     expect(isPullRequestEvent(undefined)).toBe(false);
   });
 
+  // CFG-6: pull_request_target is also a PR-shaped event
+  test('isPullRequestEvent recognizes pull_request_target', () => {
+    expect(isPullRequestEvent({ eventName: 'pull_request_target' })).toBe(true);
+  });
+
   test('isIssueCommentEvent', () => {
     expect(isIssueCommentEvent({ eventName: 'issue_comment' })).toBe(true);
     expect(isIssueCommentEvent({ eventName: 'pull_request' })).toBe(false);
@@ -53,6 +58,15 @@ describe('getPullNumber', () => {
   test('pull_request event with missing pull_request returns null', () => {
     const ctx = { eventName: 'pull_request', payload: {} };
     expect(getPullNumber(ctx)).toBeNull();
+  });
+
+  // CFG-6: pull_request_target payload has the same shape as pull_request
+  test('pull_request_target event returns pull_request.number', () => {
+    const ctx = {
+      eventName: 'pull_request_target',
+      payload: { pull_request: { number: 99 } },
+    };
+    expect(getPullNumber(ctx)).toBe(99);
   });
 
   test('issue_comment on a PR returns issue.number', () => {
