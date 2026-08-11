@@ -486,7 +486,8 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
             : null;
 
         const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
-        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        // W6-4: filenames are attacker-controlled — render as inline code.
+        lines.push(`- \`${file}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }

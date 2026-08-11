@@ -50,6 +50,23 @@ describe('buildReviewBody', () => {
     expect(body).not.toContain('Additional findings');
   });
 
+  // W6-4: filenames are attacker-controlled and must be rendered as inline code
+  // (backticks), not raw markdown bold. A filename containing markdown
+  // metacharacters (e.g. **[click](https://evil.com)**.js) would otherwise
+  // inject forged bold text and clickable phishing links. Sibling of W2-SEC-6
+  // (fixed in findings.js but missing here).
+  it('W6-4: renders filenames as inline code, not raw markdown', () => {
+    const summaryOnly = [
+      { file: '**[click](https://evil.com)**.js', title: 'Bug', severity: 'high' },
+    ];
+    const body = buildReviewBody('Summary.', summaryOnly, {});
+    // The filename must appear inside backticks (inline code), which neutralizes
+    // markdown formatting. The raw bold/Link syntax must NOT appear unescaped.
+    expect(body).toContain('`**[click](https://evil.com)**.js`');
+    // The unescaped `**filename**` bold pattern must not be present.
+    expect(body).not.toMatch(/\*\*\*\*\[click\]/);
+  });
+
   it('includes the marker byte-exact at the end (idempotency detection)', () => {
     const body = buildReviewBody('s', [], {});
     expect(body.endsWith(MARKER)).toBe(true);

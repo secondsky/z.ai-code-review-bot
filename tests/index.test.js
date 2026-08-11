@@ -504,6 +504,90 @@ describe('run — pull_request auto-review', () => {
     expect(octokit.__calls.createComment).toHaveLength(1);
   });
 
+  // ------------------------------------------------------------------
+  // W6-1: .zai.yml `path_filters` must actually filter files. The merge
+  // computes repoConfig.excludePatterns (action patterns UNION repo
+  // path_filters), but it was never applied — filtering happened BEFORE the
+  // merge using only config.excludePatterns. Files the operator excluded via
+  // .zai.yml were still sent to the LLM and scanned.
+  // ------------------------------------------------------------------
+  it('W6-1: .zai.yml path_filters are applied to exclude files from review', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js'), file('generated/out.js')],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: 'structured review',
+      metadata: { totalBatches: 1, totalFindingsBeforeCap: 0, deterministicFindingsCount: 0, batchMetadata: [] },
+    }));
+    // Inject mergeRepoConfig to return excludePatterns that drop generated/**.
+    const mergeRepoConfigSpy = vi.fn(() => ({
+      excludePatterns: ['generated/**'],
+      maxFindings: 8,
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ repoConfigEnabled: true }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+      mergeRepoConfig: mergeRepoConfigSpy,
+      loadRepoConfig: vi.fn(async () => ({})),
+    });
+
+    const [spyFiles] = runStructuredReviewSpy.mock.calls[0];
+    // generated/out.js must be filtered out; only src/a.js remains.
+    expect(spyFiles).toHaveLength(1);
+    expect(spyFiles[0].filename).toBe('src/a.js');
+  });
+
+  // ------------------------------------------------------------------
+  // W6-2: .zai.yml `profile: chill` sets minSeverity='high' in the merged
+  // config, but it was never passed to runStructuredReview — the spread
+  // `...config` carried the action's minSeverity ('info'), overriding the
+  // repo's narrowing. Medium/low/info findings that chill should have filtered
+  // were still posted.
+  // ------------------------------------------------------------------
+  it('W6-2: .zai.yml profile:chill narrows minSeverity passed to runStructuredReview', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: 'structured review',
+      metadata: { totalBatches: 1, totalFindingsBeforeCap: 0, deterministicFindingsCount: 0, batchMetadata: [] },
+    }));
+    // chill narrows the floor: minSeverity becomes 'high'.
+    const mergeRepoConfigSpy = vi.fn(() => ({
+      minSeverity: 'high',
+      profile: 'chill',
+      maxFindings: 8,
+    }));
+
+    await run(prContext(), {
+      config: makeConfig({ repoConfigEnabled: true, minSeverity: 'info' }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+      mergeRepoConfig: mergeRepoConfigSpy,
+      loadRepoConfig: vi.fn(async () => ({})),
+    });
+
+    const [, spyConfig] = runStructuredReviewSpy.mock.calls[0];
+    // The chill-narrowed minSeverity must reach runStructuredReview.
+    expect(spyConfig.minSeverity).toBe('high');
+  });
+
   it('no patchable files: short-circuits with NO callApi and NO upsert', async () => {
     const core = makeCore();
     const octokit = makeOctokit({

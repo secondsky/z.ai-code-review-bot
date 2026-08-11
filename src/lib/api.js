@@ -239,7 +239,11 @@ export function makeApiRequest(params, deps = {}) {
     // options object as arg 1.
     const req = request(ZAI_API_URL, options);
 
-    let responseBody = '';
+    // W6-3: accumulate response chunks as Buffers and decode ONCE at the end.
+    // Decoding each chunk independently via chunk.toString() corrupts multi-byte
+    // UTF-8 sequences (emoji, CJK, accented chars) split across TCP boundaries.
+    const responseChunks = [];
+    let responseBytes = 0;
     let destroyed = false;
 
     /**
@@ -286,13 +290,19 @@ export function makeApiRequest(params, deps = {}) {
 
     req.on('response', (res) => {
       res.on('data', (chunk) => {
-        responseBody += chunk.toString();
-        if (responseBody.length > MAX_RESPONSE_SIZE) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        responseBytes += buf.length;
+        if (responseBytes > MAX_RESPONSE_SIZE) {
           destroyWithError(new Error('Z.ai API response exceeded size limit'));
+          return;
         }
+        responseChunks.push(buf);
       });
       res.on('end', () => {
         if (settled) return;
+        // W6-3: decode the concatenated Buffers once, so multi-byte UTF-8
+        // sequences split across chunks are reconstructed correctly.
+        const responseBody = Buffer.concat(responseChunks).toString('utf8');
         const status = res.statusCode;
         if (status >= 200 && status < 300) {
           let parsed;

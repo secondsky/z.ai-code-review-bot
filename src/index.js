@@ -361,7 +361,8 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
       const file = typeof f?.file === 'string' ? f.file : '';
       const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
       const title = typeof f?.title === 'string' ? f.title : '';
-      parts.push(`- **${file}${line}** — ${title}`);
+      // W6-4: filenames are attacker-controlled — render as inline code.
+      parts.push(`- \`${file}${line}\` — ${title}`);
     }
   }
   return parts.join('\n');
@@ -544,7 +545,7 @@ export async function run(context, deps = {}) {
 
     let files = await getChangedFilesFn({ octokit, owner, repo, pullNumber });
     files = filterExcludedFilesFn(files, config.excludePatterns);
-    const patchable = filterPatchableFilesFn(files);
+    let patchable = filterPatchableFilesFn(files);
 
     // Zero-patchable-files short-circuit: avoids a wasted synthesis call.
     if (patchable.length === 0) {
@@ -592,6 +593,20 @@ export async function run(context, deps = {}) {
       ? await loadRepoConfigFn({ octokit, context, headSha: sha }, { core: coreDep })
       : {};
     const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
+
+    // W6-1: .zai.yml `path_filters` are merged into repoConfig.excludePatterns
+    // (UNION with action patterns). The initial filter at line 546 ran BEFORE
+    // the merge, so it used only config.excludePatterns and silently ignored
+    // repo-defined filters. Re-filter the patchable set here so files the
+    // operator excluded via .zai.yml are actually dropped before review/scanner
+    // processing. Mirrors the schedule.js path which filters after merge.
+    if (Array.isArray(repoConfig.excludePatterns) && repoConfig.excludePatterns.length > 0) {
+      patchable = filterExcludedFilesFn(patchable, repoConfig.excludePatterns);
+      if (patchable.length === 0) {
+        coreDep.info('All patchable files excluded by .zai.yml path_filters; skipping.');
+        return;
+      }
+    }
 
     // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The file records
     // "previously-reviewed / won't-fix" patterns so the bot doesn't re-raise
@@ -659,6 +674,10 @@ export async function run(context, deps = {}) {
       {
         ...config,
         maxFindings: repoConfig.maxFindings,
+        // W6-2: the chill profile narrows minSeverity in mergeRepoConfig; that
+        // value was computed but never propagated, so the spread `...config`
+        // carried the action's minSeverity and chill silently did nothing.
+        minSeverity: repoConfig.minSeverity ?? config.minSeverity,
         pathInstructions: repoConfig.pathInstructions,
         toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,

@@ -330,6 +330,17 @@ describe('formatWalkthroughSummary', () => {
     expect(out).toContain('## Z.ai Code Review');
   });
 
+  // W6-4: filenames must be rendered as inline code, not raw markdown (sibling
+  // of W2-SEC-6 in findings.js). A malicious filename with markdown
+  // metacharacters would inject formatting/links.
+  it('W6-4: renders filenames as inline code, not raw markdown', () => {
+    const evil = '**[phish](https://evil.com)**.js';
+    const out = formatWalkthroughSummary([baseFinding({ file: evil })], [evil], {
+      reviewerName: 'Z.ai Code Review',
+    });
+    expect(out).toContain('`**[phish](https://evil.com)**.js`');
+  });
+
   it('renders the Overview line with counts and cohort count', () => {
     const findings = [
       baseFinding({ file: 'db/schema.sql', severity: 'critical' }),
@@ -383,7 +394,7 @@ describe('formatWalkthroughSummary', () => {
       }),
     ];
     const out = formatWalkthroughSummary(findings, [findings[0].file], {});
-    expect(out).toContain('**db/schema.sql**:L42 — Missing index');
+    expect(out).toContain('`db/schema.sql`:L42 — Missing index');
     expect(out).toContain('Add an index.');
     expect(out).toContain('💡 CREATE INDEX ...');
   });
@@ -391,7 +402,7 @@ describe('formatWalkthroughSummary', () => {
   it('omits the line suffix when line is null', () => {
     const findings = [baseFinding({ line: null })];
     const out = formatWalkthroughSummary(findings, [findings[0].file], {});
-    expect(out).toContain('**db/schema.sql** — Missing index');
+    expect(out).toContain('`db/schema.sql` — Missing index');
     expect(out).not.toContain(':L');
   });
 

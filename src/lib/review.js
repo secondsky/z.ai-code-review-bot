@@ -133,7 +133,9 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
       for (const f of summaryOnly) {
         const file = typeof f?.file === 'string' ? f.file : '';
         const title = typeof f?.title === 'string' ? f.title : '';
-        lines.push(`- **${file}** — ${title}`);
+        // W6-4: filenames are attacker-controlled — render as inline code so
+        // markdown metacharacters in a filename cannot inject formatting/links.
+        lines.push(`- \`${file}\` — ${title}`);
       }
       lines.push('');
     }

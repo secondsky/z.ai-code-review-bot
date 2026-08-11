@@ -313,6 +313,30 @@ describe('makeApiRequest', () => {
     expect(content).toBe('hello world');
   });
 
+  // W6-3: a multi-byte UTF-8 character (emoji, CJK, accented) split across TCP
+  // chunk boundaries corrupts when each chunk is decoded independently via
+  // chunk.toString(). The 4-byte UTF-8 encoding of 😀 (F0 9F 98 80) split into
+  // [F0 9F] + [98 80] produces U+FFFD replacement chars if decoded per-chunk.
+  // Fix: accumulate Buffer chunks and decode once at the end.
+  test('W6-3: multi-byte UTF-8 split across chunks decodes correctly', async () => {
+    // 😀 = U+1F600 = F0 9F 98 80 in UTF-8. Split into two chunks mid-character.
+    const fullJson = JSON.stringify({ choices: [{ message: { content: 'review 😀 emoji' } }] });
+    const buf = Buffer.from(fullJson, 'utf8');
+    // Find a split point inside the 😀 bytes (offset of F0 in the buffer).
+    const emojiOffset = buf.indexOf('😀');
+    const splitAt = emojiOffset + 2; // mid-character (after F0 9F, before 98 80)
+    const chunk1 = buf.slice(0, splitAt);
+    const chunk2 = buf.slice(splitAt);
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([chunk1, chunk2], { statusCode: 200 }),
+    }));
+    const content = await makeApiRequest(
+      { apiKey: 'k', model: 'm', systemPrompt: 's', userPrompt: 'u', timeout: 1000 },
+      { request },
+    );
+    expect(content).toBe('review 😀 emoji');
+  });
+
   test('2xx invalid JSON → rejects "invalid JSON"', async () => {
     const request = makeFakeRequest(() => ({
       res: buildFakeRes(['{not json}'], { statusCode: 200 }),

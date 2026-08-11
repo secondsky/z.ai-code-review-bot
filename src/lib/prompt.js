@@ -83,7 +83,13 @@ export function escapeDiffFence(s) {
 export function escapeUntrustedMultiline(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'))
+    // W6-5: the structured-review prompt wraps file entries in a
+    // <review_batch>/<file>/<diff> envelope. A malicious patch containing these
+    // structural tags would break the envelope and confuse the model about
+    // batch boundaries. Neutralize them (mirrors escapeStructuralTags in
+    // auto-review.js, which was only applied to the length-calc path).
+    .replace(/<\/?(diff|file|review_batch)>/gi, '<\\/$1>');
 }
 
 /**
@@ -270,8 +276,14 @@ export function buildStructuredReviewPrompt(files, options = {}) {
   }
 
   const maxDiffChars = typeof options.maxDiffChars === 'number' ? options.maxDiffChars : 0;
+  // W6-6: in the batched path, createReviewBatches already packed entries
+  // within a char budget (maxBatchChars). Applying maxDiffChars truncation on
+  // top would silently drop trailing entries — they're counted in the batch
+  // metadata but never sent to the model. Skip truncation when batched.
+  const isBatched =
+    typeof options.batchNumber === 'number' && typeof options.totalBatches === 'number';
 
-  if (maxDiffChars > 0) {
+  if (maxDiffChars > 0 && !isBatched) {
     // Truncate from the END: drop trailing entries until the joined body fits
     // within maxDiffChars.
     while (entries.length > 0) {
