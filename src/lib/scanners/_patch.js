@@ -99,10 +99,6 @@ export function parseAddedLines(patch) {
       // Removal — counter unchanged.
       continue;
     }
-    if (raw.startsWith('-')) {
-      // Removal — counter unchanged.
-      continue;
-    }
     if (raw.startsWith('\\')) {
       // "\ No newline at end of file" — metadata, counter unchanged.
       continue;
