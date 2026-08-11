@@ -39060,7 +39060,11 @@ function makeApiRequest(params, deps = {}) {
     // options object as arg 1.
     const req = request(ZAI_API_URL, options);
 
-    let responseBody = '';
+    // W6-3: accumulate response chunks as Buffers and decode ONCE at the end.
+    // Decoding each chunk independently via chunk.toString() corrupts multi-byte
+    // UTF-8 sequences (emoji, CJK, accented chars) split across TCP boundaries.
+    const responseChunks = [];
+    let responseBytes = 0;
     let destroyed = false;
 
     /**
@@ -39107,13 +39111,19 @@ function makeApiRequest(params, deps = {}) {
 
     req.on('response', (res) => {
       res.on('data', (chunk) => {
-        responseBody += chunk.toString();
-        if (responseBody.length > MAX_RESPONSE_SIZE) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        responseBytes += buf.length;
+        if (responseBytes > MAX_RESPONSE_SIZE) {
           destroyWithError(new Error('Z.ai API response exceeded size limit'));
+          return;
         }
+        responseChunks.push(buf);
       });
       res.on('end', () => {
         if (settled) return;
+        // W6-3: decode the concatenated Buffers once, so multi-byte UTF-8
+        // sequences split across chunks are reconstructed correctly.
+        const responseBody = Buffer.concat(responseChunks).toString('utf8');
         const status = res.statusCode;
         if (status >= 200 && status < 300) {
           let parsed;
@@ -39207,10 +39217,16 @@ async function callWithRetry(fn, options = {}) {
       const { category, retryable } = categorizeError(error);
 
       // Fallback fires ONLY on a timeout-category error at attempt >= 1,
-      // when a fallback is configured and hasn't been used yet.
+      // when a fallback is configured and hasn't been used yet, AND there is
+      // at least one remaining loop iteration to actually run the fallback
+      // attempt. W5-2: previously, firing the fallback on the final attempt
+      // did `attempt += 1; continue;` which pushed attempt past maxRetries,
+      // exited the loop, and threw the internal "unreachable" error instead
+      // of returning a clean failure.
       if (
         category === 'timeout' &&
         attempt >= 1 &&
+        attempt < maxRetries &&
         fallbackPrompt &&
         !usedFallback
       ) {
@@ -39818,6 +39834,17 @@ function comments_isBotComment(comment) {
 function buildCommentBody({ title, content, marker }) {
   // Sanitize the model output only; the title/marker are operator-controlled.
   const safeContent = sanitizeCommentBody(String(content ?? ''));
+  // W5-9: some callers (formatFindingsAsSummary, formatWalkthroughSummary)
+  // emit content that ALREADY starts with `## <reviewerName>` and ends with
+  // the marker. Re-wrapping would produce a duplicate H2 heading and a
+  // duplicate trailing marker on the rendered PR comment. When the sanitized
+  // content already carries both, return it verbatim instead of re-wrapping.
+  const trimmed = safeContent.trimEnd();
+  const hasHeading = !!title && trimmed.startsWith(`## ${title}\n`);
+  const hasMarker = trimmed.endsWith(marker);
+  if (hasHeading && hasMarker) {
+    return trimmed;
+  }
   if (title) {
     return `## ${title}\n\n${safeContent}\n\n${marker}`;
   }
@@ -39976,9 +40003,22 @@ function matchesAnyPattern(filename, patterns) {
     // for an "include if any matches" / exclude-list predicate and would
     // invert the caller's intent (CFG-1 / SCN-13).
     const positive = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
-    if (picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive)) {
-      return true;
+    // W5-1: a bare `!` (or `!   `) yields an empty positive after stripping.
+    // picomatch throws on empty patterns, which would crash the review when
+    // this predicate is fed untrusted globs (.zai.yml path_filters,
+    // .zai/learnings.yml file globs). Skip empties; never throw.
+    if (positive === '') continue;
+    // Defense in depth: picomatch can also throw on syntactically invalid
+    // patterns (e.g. an unmatched `[`). Treat a compile error as "no match"
+    // so a malformed untrusted pattern can never break the review pipeline.
+    let isMatch;
+    try {
+      isMatch =
+        picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive);
+    } catch {
+      continue;
     }
+    if (isMatch) return true;
   }
   return false;
 }
@@ -40138,7 +40178,9 @@ function escapeXmlAttribute(s) {
 function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/\r?\n/g, ' ')
+    // W5-10: collapse any mix of \r and \n (including a bare \r with no \n,
+    // which /\r?\n/ missed) so a value cannot split across a perceived line.
+    .replace(/[\r\n]+/g, ' ')
     .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
@@ -40156,7 +40198,15 @@ function escapeDiffFence(s) {
 function escapeUntrustedMultiline(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
+    .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'))
+    // W6-5 / W7-1 / W7-3: the structured-review prompt wraps file entries in a
+    // <review_batch>/<file>/<diff> envelope. A malicious patch containing these
+    // structural tags would break the envelope. Neutralize all forms:
+    // - attribute-bearing opening tags (<review_batch batch_number="99">)
+    //   (W7-1: the old `>`-anchored regex missed these)
+    // - preserve the opening-vs-closing distinction (W7-3: the old replacement
+    //   '<\\/$1>' corrupted opening tags into closing tags)
+    .replace(/<(\/?)(diff|file|review_batch)(?:\s[^>]*)?>/gi, '<\\/$1$2>');
 }
 
 /**
@@ -40319,11 +40369,13 @@ function buildStructuredReviewPrompt(files, options = {}) {
 
   // Phase 8.2: optional learnings context (from .zai/learnings.yml — UNTRUSTED,
   // wrapped). The pre-rendered block already lists the accepted patterns; we
-  // fence-escape the whole block so an attacker cannot close the wrapping tag
-  // or inject instructions via the file/pattern strings.
+  // escape the whole block so an attacker cannot close the wrapping tag or
+  // inject instructions via the file/pattern strings. W5-11: use
+  // escapeUntrustedMultiline (preserves newlines) so the multi-line bulleted
+  // list keeps its structure — escapeDiffFence would collapse it to one line.
   const learningsBlock =
     typeof options.learningsContext === 'string' && options.learningsContext.length > 0
-      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeDiffFence(options.learningsContext)}\n</untrusted_input>`
+      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeUntrustedMultiline(options.learningsContext)}\n</untrusted_input>`
       : '';
 
   const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}${learningsBlock}`;
@@ -40341,8 +40393,14 @@ function buildStructuredReviewPrompt(files, options = {}) {
   }
 
   const maxDiffChars = typeof options.maxDiffChars === 'number' ? options.maxDiffChars : 0;
+  // W6-6: in the batched path, createReviewBatches already packed entries
+  // within a char budget (maxBatchChars). Applying maxDiffChars truncation on
+  // top would silently drop trailing entries — they're counted in the batch
+  // metadata but never sent to the model. Skip truncation when batched.
+  const isBatched =
+    typeof options.batchNumber === 'number' && typeof options.totalBatches === 'number';
 
-  if (maxDiffChars > 0) {
+  if (maxDiffChars > 0 && !isBatched) {
     // Truncate from the END: drop trailing entries until the joined body fits
     // within maxDiffChars.
     while (entries.length > 0) {
@@ -40508,7 +40566,10 @@ const SEVERITY_LABEL = {
  */
 function coerceEnum(value, allowed) {
   if (typeof value !== 'string') return null;
-  const lower = value.toLowerCase();
+  // W7-2: trim incidental whitespace. LLMs commonly emit "critical " (trailing
+  // space) which would otherwise fail the exact match and silently drop the
+  // finding — losing exactly the severe findings the bot exists to surface.
+  const lower = value.trim().toLowerCase();
   for (const candidate of allowed) {
     if (candidate === lower) return candidate;
   }
@@ -40628,6 +40689,11 @@ function normalizeFinding(finding) {
   // produce a valid normalized finding from a too-long title. So we truncate
   // first, then validate the truncated form.
   let title = typeof f.title === 'string' ? f.title : '';
+  // W7-5: titles are LLM-emitted and attacker-influenceable. In the walkthrough
+  // path they render inside <details> blocks, so HTML structural tags
+  // (</details>, <details>, <summary>, etc.) would break the collapsible
+  // section. Strip them.
+  title = title.replace(/<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)(?:\s[^>]*)?>/gi, '');
   if (title.length > TITLE_MAX) {
     title = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length) + TITLE_TRUNC_SUFFIX;
   }
@@ -41194,7 +41260,9 @@ function formatFindingsAsSummary(findings, options = {}) {
         // Render the filename as inline code (backticks) which neutralizes
         // all markdown special characters. The line suffix is appended OUTSIDE
         // the code span so the :L42 anchor link is still parsed by GitHub.
-        lines.push(`- \`${file}\`${locSuffix} — ${title}`);
+        // W8-1: replace backticks in the filename (escapes don't work in code spans).
+        const safeFile = String(file).replace(/`/g, "'");
+        lines.push(`- \`${safeFile}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }
@@ -41202,7 +41270,7 @@ function formatFindingsAsSummary(findings, options = {}) {
           lines.push(`  💡 ${suggestion}`);
         }
         if (evidence.length > 0) {
-          lines.push(`  > \`${String(evidence).replace(/`/g, '\\`')}\``);
+          lines.push(`  > \`${String(evidence).replace(/`/g, "'")}\``);
         }
       }
       lines.push('');
@@ -41560,7 +41628,14 @@ function auto_review_escapeXmlAttribute(s) {
  * on for structure.
  */
 function escapeStructuralTags(s) {
-  return String(s ?? '').replace(/<\/?(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
+  // W7-1/W7-3: tolerate attribute-bearing tags (<review_batch batch_number="N">)
+  // and preserve the opening-vs-closing slash distinction. The old `>`-anchored
+  // regex missed attribute-bearing tags and the '<\\/$1>' replacement corrupted
+  // opening tags into closing tags.
+  return String(s ?? '').replace(
+    /<(\/?)(diff|file|review_batch|untrusted_input)(?:\s[^>]*)?>/gi,
+    '<\\/$1$2>',
+  );
 }
 
 /**
@@ -41666,6 +41741,8 @@ function isContextLimitError(error) {
   return (
     message.includes('maximum context length') ||
     message.includes('input tokens exceeds') ||
+    // W5-12: modern OpenAI/Z.ai error code string for context overflow.
+    message.includes('context_length_exceeded') ||
     message.includes('code":413') ||
     message.includes('type":"413') ||
     message.includes('error 413')
@@ -42448,7 +42525,10 @@ function formatWalkthroughSummary(findings, files, options = {}) {
             : null;
 
         const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
-        lines.push(`- **${file}**${locSuffix} — ${title}`);
+        // W6-4: filenames are attacker-controlled — render as inline code.
+        // W8-1: replace backticks (escapes don't work in code spans).
+        const safeFile = String(file).replace(/`/g, "'");
+        lines.push(`- \`${safeFile}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }
@@ -42573,8 +42653,11 @@ function parseHunks(patch) {
       // Lines before the first hunk (diff metadata) are skipped entirely.
       continue;
     }
-    if (raw.startsWith('+++') || raw.startsWith('---')) {
-      // File headers — not real additions/removals.
+    if (/^(?:\+\+\+|---)(?:\s|$)/.test(raw)) {
+      // File headers — `+++ b/path` or `--- a/path` (space-delimited), or a
+      // bare `+++`/`---` at end-of-line. NOT an added/removed line whose
+      // content happens to start with `++`/`--` (e.g. `++i;` → `+++i;` has
+      // no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {
@@ -43074,7 +43157,12 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
       for (const f of summaryOnly) {
         const file = typeof f?.file === 'string' ? f.file : '';
         const title = typeof f?.title === 'string' ? f.title : '';
-        lines.push(`- **${file}** — ${title}`);
+        // W6-4: filenames are attacker-controlled — render as inline code so
+        // markdown metacharacters in a filename cannot inject formatting/links.
+        // W8-1: replace backticks with "'" (backslash escapes do NOT work
+        // inside CommonMark code spans, so the W7-4 \` escape was illusory).
+        const safeFile = file.replace(/`/g, "'");
+        lines.push(`- \`${safeFile}\` — ${title}`);
       }
       lines.push('');
     }
@@ -43129,7 +43217,7 @@ function renderCommentBody(finding) {
     // CORE-2: escape backticks AND collapse newlines in evidence so the inline
     // code span is preserved. A newline would close the span early and let the
     // remaining content render as markdown (e.g. a clickable malicious link).
-    const safeEvidence = evidence.replace(/`/g, '\\`').replace(/\r?\n/g, ' ');
+    const safeEvidence = evidence.replace(/`/g, "'").replace(/\r?\n/g, ' ');
     parts.push(`> \`${safeEvidence}\``);
   }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
@@ -44345,8 +44433,11 @@ function parseSeverity(text) {
     const mapped = SEVERITY_KEYS[key];
     if (!mapped) continue;
     if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
-      // Emoji keys have no word boundaries; use includes.
-      if (raw.includes(key)) return mapped;
+      // Emoji keys have no word boundaries; use includes. W5-7: restrict to
+      // the FIRST line (where the prompt puts the level), consistent with the
+      // word-form match below. Previously `raw.includes(key)` scanned the whole
+      // body, so a 🔴 appearing in the rationale overrode the declared level.
+      if (firstLine.includes(key)) return mapped;
     } else {
       // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
       // so "highlighted" → no match, "noncritical" → no match, and
@@ -44695,8 +44786,30 @@ async function hasReviewForSha({
   // `headSha === '' ||` short-circuit matched ANY bot marker comment and
   // suppressed the PR. Returning false here ensures the PR is reviewed.
   if (headSha === '') return false; // can't confirm SHA-level dedup; review it
-  let page = 1;
+
+  // Helper: does a single comment/review object count as our marker for this SHA?
+  // W5-8: require the EXACT structured SHA block this action emits
+  // (<!-- zai-sha: <sha> -->), not a bare substring mention of the SHA. The
+  // marker and the SHA are public literals, so a different bot with comment
+  // access could trivially post both as bare substrings and suppress the
+  // review. Requiring the structured block raises the bar without breaking any
+  // legitimate marker (which always carries it via buildShaBlock).
+  const shaBlock = buildShaBlock(headSha);
+  const matches = (c) =>
+    schedule_isBotComment(c) &&
+    typeof c?.body === 'string' &&
+    c.body.includes(marker) &&
+    c.body.includes(shaBlock);
+
+  // W5-3: the marker + SHA block can live in EITHER an issue comment
+  // (summary-comment path) OR a review (inline-review path via
+  // pulls.createReview). Previously we searched only issue comments, so every
+  // cron tick re-reviewed PRs whose findings mapped to diff lines — defeating
+  // the SHA dedup. Search both, paginating each fully.
   const perPage = 100;
+
+  // 1. Issue comments (issues.listComments).
+  let page = 1;
   for (;;) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
@@ -44705,29 +44818,49 @@ async function hasReviewForSha({
       per_page: perPage,
       page,
     });
-    const found = comments.some(
-      (c) =>
-        schedule_isBotComment(c) &&
-        typeof c?.body === 'string' &&
-        c.body.includes(marker) &&
-        c.body.includes(headSha),
-    );
-    if (found) return true;
-    if (comments.length < perPage) return false;
+    if (comments.some(matches)) return true;
+    if (comments.length < perPage) break;
     page += 1;
   }
+
+  // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
+  // Guard for environments where the endpoint is absent (older mocks).
+  if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
+    page = 1;
+    for (;;) {
+      const { data: reviews } = await octokit.rest.pulls.listReviews({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: perPage,
+        page,
+      });
+      if (reviews.some(matches)) return true;
+      if (reviews.length < perPage) break;
+      page += 1;
+    }
+  }
+
+  return false;
 }
 
 /**
- * Review a single PR using the structured-review pipeline. Mirrors the
- * `pull_request` branch of `run()` in src/index.js: fetch changed files, filter
- * excludes + patchable, short-circuit on zero patchable, run the structured
- * review, then post via the v2 inline-review pipeline (partition findings →
- * buildReviewBody/buildReviewComments → upsertReview) when at least one finding
- * maps to a diff line. Falls back to the legacy single summary comment when no
- * finding is line-mappable (all file-level or unmappable), and again to
- * postFallbackComment if the review submission itself fails — the review is
- * never silently lost.
+ * Review a single PR using the structured-review pipeline. Partially mirrors
+ * the `pull_request` branch of `run()` in src/index.js: fetch changed files,
+ * filter excludes + patchable, short-circuit on zero patchable, run the
+ * structured review, then post via the v2 inline-review pipeline (partition
+ * findings → buildReviewBody/buildReviewComments → upsertReview) when at least
+ * one finding maps to a diff line. Falls back to the legacy single summary
+ * comment when no finding is line-mappable (all file-level or unmappable), and
+ * again to postFallbackComment if the review submission itself fails — the
+ * review is never silently lost.
+ *
+ * KNOWN LIMITATION (W8-3): unlike the `pull_request` path, the scheduled path
+ * does not currently load `.zai.yml` repo config or run deterministic scanners
+ * (gitleaks/ast-grep). This means `path_filters`, `path_instructions`,
+ * `tone_instructions`, the `chill` profile, and deterministic secret/pattern
+ * findings are absent on scheduled reviews. Schedule is opt-in; this gap is
+ * tracked for a future enhancement.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -45085,8 +45218,10 @@ function parseAddedLines(patch) {
       // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
       continue;
     }
-    if (raw.startsWith('+++')) {
-      // File header — not an addition. Skip.
+    if (/^\+\+\+(?:\s|$)/.test(raw)) {
+      // File header — `+++ b/path` (space-delimited), or bare `+++` at EOL.
+      // NOT an added line whose content starts with `++` (e.g. `++secret`
+      // → `+++secret` has no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {
@@ -45094,7 +45229,7 @@ function parseAddedLines(patch) {
       newLine++;
       continue;
     }
-    if (raw.startsWith('---')) {
+    if (/^---(?:\s|$)/.test(raw)) {
       continue;
     }
     if (raw.startsWith('-')) {
@@ -47332,6 +47467,15 @@ const MAX_PATH_INSTRUCTION_PATH_CHARS = 500;
 const MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS = 1000;
 /** Maximum number of `path_instructions` entries kept after validation. */
 const MAX_PATH_INSTRUCTION_ENTRIES = 50;
+/**
+ * W5-4: Cap on the number of `path_filters` entries accepted from `.zai.yml`.
+ * `path_filters` are UNION-ed into `excludePatterns` and tested via
+ * `matchesAnyPattern` against every changed file, so a large list amplifies
+ * per-file matching cost. The 64 KiB config budget allows thousands of short
+ * entries, which a fork-PR attacker could use to slow the review into a DoS.
+ * Mirrors the `MAX_PATH_INSTRUCTION_ENTRIES` guard on `path_instructions`.
+ */
+const MAX_PATH_FILTER_ENTRIES = 100;
 
 /**
  * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
@@ -47654,9 +47798,9 @@ function validateRepoConfig(parsed) {
       if (arr.length > 0) rv.path_instructions = arr;
     }
     if (Array.isArray(r.path_filters)) {
-      const arr = r.path_filters.filter(
-        (p) => typeof p === 'string' && p.trim() !== '',
-      );
+      const arr = r.path_filters
+        .filter((p) => typeof p === 'string' && p.trim() !== '')
+        .slice(0, MAX_PATH_FILTER_ENTRIES);
       if (arr.length > 0) rv.path_filters = arr;
     }
     if (typeof r.tone_instructions === 'string') {
@@ -48017,8 +48161,14 @@ async function loadRepoConfig(opts = {}, deps = {}) {
 /** Hard cap on the size of a CODEOWNERS file we will parse (cost/DoS guard). */
 const MAX_CODEOWNERS_BYTES = 256 * 1024; // 256 KiB
 
-/** Candidate CODEOWNERS paths, searched in this order (GitHub's order). */
-const CODEOWNERS_PATHS = ['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS'];
+/**
+ * Candidate CODEOWNERS paths, searched in this order (GitHub's documented
+ * precedence: .github/CODEOWNERS first, then root CODEOWNERS, then
+ * docs/CODEOWNERS). W5-6: the previous order checked root first, which
+ * diverged from GitHub when both root and .github copies exist.
+ * See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+ */
+const CODEOWNERS_PATHS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
 
 /* ------------------------------------------------------------------ *
  * parseCodeowners
@@ -48114,6 +48264,13 @@ function toGlob(pattern) {
   let p = pattern;
   // Strip leading `!` (CODEOWNERS has no negation; picomatch would mis-read it).
   p = p.replace(/^!+/, '');
+  // W5-13: GitHub CODEOWNERS allows a leading `/` to root-anchor a pattern
+  // (e.g. `/src/`). picomatch treats a leading `/` as significant and the
+  // compiled regex then fails to match `src/deep/file.js`. CODEOWNERS paths
+  // are always repo-relative, so a leading `/` carries no information beyond
+  // "anchored at root" — which is already the default for picomatch paths
+  // without a leading `**/`. Strip it.
+  p = p.replace(/^\/+/, '');
   if (p.endsWith('/')) return `${p}**`;
   return p;
 }
@@ -48476,8 +48633,17 @@ function learnings_stripComment(line) {
   let inDouble = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === "'" && !inDouble) inSingle = !inSingle;
-    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    if (ch === "'" && !inDouble) {
+      // W8-4: only treat `'` as a quote toggle when NOT embedded in a word.
+      // An apostrophe glued to a letter/digit (like in `don't` or `it's`)
+      // is not a delimiter; treating it as one flips inSingle permanently and
+      // disables comment stripping for the rest of the line. Mirrors the guard
+      // in repo-config.js stripComment.
+      const prev = i > 0 ? line[i - 1] : '';
+      if (!/[A-Za-z0-9]/.test(prev)) {
+        inSingle = !inSingle;
+      }
+    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {
@@ -49248,7 +49414,9 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
       const file = typeof f?.file === 'string' ? f.file : '';
       const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
       const title = typeof f?.title === 'string' ? f.title : '';
-      parts.push(`- **${file}${line}** — ${title}`);
+      // W6-4: filenames are attacker-controlled — render as inline code.
+      // W8-1: replace backticks (escapes don't work in code spans).
+      parts.push(`- \`${String(file).replace(/`/g, "'")}${line}\` — ${title}`);
     }
   }
   return parts.join('\n');
@@ -49431,7 +49599,7 @@ async function run(context, deps = {}) {
 
     let files = await getChangedFilesFn({ octokit, owner, repo, pullNumber });
     files = filterExcludedFilesFn(files, config.excludePatterns);
-    const patchable = filterPatchableFilesFn(files);
+    let patchable = filterPatchableFilesFn(files);
 
     // Zero-patchable-files short-circuit: avoids a wasted synthesis call.
     if (patchable.length === 0) {
@@ -49479,6 +49647,20 @@ async function run(context, deps = {}) {
       ? await loadRepoConfigFn({ octokit, context, headSha: sha }, { core: coreDep })
       : {};
     const repoConfig = mergeRepoConfigFn(config, rawRepoConfig);
+
+    // W6-1: .zai.yml `path_filters` are merged into repoConfig.excludePatterns
+    // (UNION with action patterns). The initial filter at line 546 ran BEFORE
+    // the merge, so it used only config.excludePatterns and silently ignored
+    // repo-defined filters. Re-filter the patchable set here so files the
+    // operator excluded via .zai.yml are actually dropped before review/scanner
+    // processing. Mirrors the schedule.js path which filters after merge.
+    if (Array.isArray(repoConfig.excludePatterns) && repoConfig.excludePatterns.length > 0) {
+      patchable = filterExcludedFilesFn(patchable, repoConfig.excludePatterns);
+      if (patchable.length === 0) {
+        coreDep.info('All patchable files excluded by .zai.yml path_filters; skipping.');
+        return;
+      }
+    }
 
     // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The file records
     // "previously-reviewed / won't-fix" patterns so the bot doesn't re-raise
@@ -49546,6 +49728,10 @@ async function run(context, deps = {}) {
       {
         ...config,
         maxFindings: repoConfig.maxFindings,
+        // W6-2: the chill profile narrows minSeverity in mergeRepoConfig; that
+        // value was computed but never propagated, so the spread `...config`
+        // carried the action's minSeverity and chill silently did nothing.
+        minSeverity: repoConfig.minSeverity ?? config.minSeverity,
         pathInstructions: repoConfig.pathInstructions,
         toneInstructions: repoConfig.toneInstructions,
         deterministicFindings: scannerResult.findings,
