@@ -30,10 +30,11 @@ const mkPr = (number, headSha, { draft = false, title = 'PR' } = {}) => ({
   title,
 });
 
-function makeOctokit({ prs = [], commentsByPr = {} } = {}) {
+function makeOctokit({ prs = [], commentsByPr = {}, reviewsByPr = {} } = {}) {
   const calls = {
     pullsList: [],
     listComments: [],
+    listReviews: [],
     listFiles: [],
     createComment: [],
     updateComment: [],
@@ -65,6 +66,11 @@ function makeOctokit({ prs = [], commentsByPr = {} } = {}) {
           const start = (page - 1) * perPage;
           const slice = apiPrs.slice(start, start + perPage);
           return { data: slice };
+        },
+        async listReviews(params) {
+          calls.listReviews.push(params);
+          const list = reviewsByPr[params.pull_number] ?? [];
+          return { data: list };
         },
       },
       issues: {
@@ -217,7 +223,7 @@ describe('listOpenPrs', () => {
 describe('hasReviewForSha', () => {
   it('returns true when a comment contains the marker AND the head SHA', async () => {
     const octokit = makeOctokit({
-      commentsByPr: { 42: [{ body: `## Z.ai Code Review\n...sha-abc...\n\n${MARKER}`, user: { login: 'github-actions[bot]', type: 'Bot' } }] },
+      commentsByPr: { 42: [{ body: `## Z.ai Code Review\n\n${MARKER}\n<!-- zai-sha: sha-abc -->`, user: { login: 'github-actions[bot]', type: 'Bot' } }] },
     });
     const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-abc' });
     expect(found).toBe(true);
@@ -225,7 +231,7 @@ describe('hasReviewForSha', () => {
 
   it('returns false when a marker exists but for a DIFFERENT SHA (re-push)', async () => {
     const octokit = makeOctokit({
-      commentsByPr: { 42: [{ body: `old review for sha-old\n\n${MARKER}`, user: { login: 'github-actions[bot]', type: 'Bot' } }] },
+      commentsByPr: { 42: [{ body: `old review\n\n${MARKER}\n<!-- zai-sha: sha-old -->`, user: { login: 'github-actions[bot]', type: 'Bot' } }] },
     });
     const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-new' });
     expect(found).toBe(false);
@@ -261,7 +267,7 @@ describe('hasReviewForSha', () => {
       commentsByPr: {
         42: [
           {
-            body: `real review\n\n${MARKER}\n\nsha-abc`,
+            body: `real review\n\n${MARKER}\n<!-- zai-sha: sha-abc -->`,
             user: { login: 'z-ai-code-reviewer[bot]', type: 'Bot' },
           },
         ],
@@ -278,7 +284,7 @@ describe('hasReviewForSha', () => {
       commentsByPr: {
         42: [
           {
-            body: `real review\n\n${MARKER}\n\nsha-abc`,
+            body: `real review\n\n${MARKER}\n<!-- zai-sha: sha-abc -->`,
             user: { login: 'github-actions[bot]' },
           },
         ],
@@ -321,6 +327,92 @@ describe('hasReviewForSha', () => {
       },
     });
     const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: '' });
+    expect(found).toBe(false);
+  });
+
+  // ----- W5-3: dedup must search REVIEWS, not just issue comments -----
+  // When findings map to diff lines, reviewOnePr posts a REVIEW via
+  // pulls.createReview (not an issue comment). The SHA marker block is embedded
+  // in the REVIEW body. hasReviewForSha previously searched ONLY issue comments
+  // (issues.listComments), so it never found the marker in a review → every
+  // cron tick re-reviewed the same PR at the same SHA.
+  it('W5-3: returns TRUE when the marker + SHA lives in a REVIEW (not an issue comment)', async () => {
+    const shaBlock = `<!-- zai-sha: sha-abc -->`;
+    const octokit = makeOctokit({
+      commentsByPr: {}, // no issue comments at all
+      reviewsByPr: {
+        42: [
+          {
+            body: `## Z.ai Code Review\n...findings...\n\n${MARKER}\n${shaBlock}`,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+          },
+        ],
+      },
+    });
+    const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-abc' });
+    expect(found).toBe(true);
+  });
+
+  it('W5-3: returns FALSE when a review exists but for a DIFFERENT SHA', async () => {
+    const octokit = makeOctokit({
+      reviewsByPr: {
+        42: [
+          {
+            body: `old review\n\n${MARKER}\n<!-- zai-sha: sha-old -->`,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+          },
+        ],
+      },
+    });
+    const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-new' });
+    expect(found).toBe(false);
+  });
+
+  it('W5-3: paginates reviews fully (marker on a later page is still found)', async () => {
+    // Simulate >100 reviews is unrealistic, but the pagination contract must
+    // hold: a short first page must NOT terminate the search early.
+    const shaBlock = `<!-- zai-sha: sha-abc -->`;
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      body: `review ${i}`,
+      user: { login: 'github-actions[bot]', type: 'Bot' },
+    }));
+    const octokit = {
+      rest: {
+        pulls: {
+          async listReviews(params) {
+            const page = params.page ?? 1;
+            return { data: page === 1 ? page1 : [{ body: `${MARKER}\n${shaBlock}`, user: { login: 'github-actions[bot]', type: 'Bot' } }] };
+          },
+        },
+        issues: {
+          async listComments() { return { data: [] }; },
+        },
+      },
+    };
+    const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-abc' });
+    expect(found).toBe(true);
+  });
+
+  // ----- W5-8: spoofing defense-in-depth -----
+  // The marker + head SHA are public literals. A DIFFERENT bot with comment
+  // access could post a comment containing both and suppress the review.
+  // Defense-in-depth: require the EXACT structured SHA block this action emits
+  // (<!-- zai-sha: <sha> -->), not a bare substring mention of the SHA. A
+  // spoofing bot must now match the exact format, raising the bar without
+  // breaking any legitimate marker (which always carries the structured block).
+  it('W5-8: a bot comment with a bare SHA substring but NO structured sha block is NOT a match', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: {
+        42: [
+          {
+            // Spoof: marker + bare SHA mention, but no <!-- zai-sha: ... --> block.
+            body: `${MARKER}\nmentioned sha-abc in passing`,
+            user: { login: 'other-bot[bot]', type: 'Bot' },
+          },
+        ],
+      },
+    });
+    const found = await hasReviewForSha({ octokit, owner: 'o', repo: 'r', pullNumber: 42, headSha: 'sha-abc' });
     expect(found).toBe(false);
   });
 });
@@ -393,7 +485,7 @@ describe('runScheduledReview', () => {
     const octokit = makeOctokit({
       prs: [mkPr(1, 'sha1'), mkPr(2, 'sha2')],
       commentsByPr: {
-        1: [{ body: `review for sha1\n\n${MARKER}`, user: { login: 'github-actions[bot]', type: 'Bot' } }], // already reviewed
+        1: [{ body: `review for sha1\n\n${MARKER}\n<!-- zai-sha: sha1 -->`, user: { login: 'github-actions[bot]', type: 'Bot' } }], // already reviewed
       },
     });
     const callApi = vi.fn(async () => 'review');

@@ -77,6 +77,23 @@ describe('parseAddedLines', () => {
     expect(parseAddedLines(patch)).toEqual([{ line: 1, text: 'real addition' }]);
   });
 
+  // W5-5: an ADDED line whose content starts with `++` (e.g. `++secret = ...`)
+  // is emitted in the diff as `+++secret = ...` — which the old
+  // `raw.startsWith('+++')` check misclassified as a file header, silently
+  // dropping the line so the secret scanner never saw it. The genuine git
+  // header form is `+++ b/path` (space-delimited). Only treat `+++` as a
+  // header when a space or end-of-line follows.
+  it('W5-5: an added line whose text starts with ++ is scanned (not a header)', () => {
+    const patch = [
+      '@@ -1,1 +1,2 @@',
+      '-old();',
+      '+++secret = "AKIAIOSFODNN7EXAMPLE";',
+    ].join('\n');
+    expect(parseAddedLines(patch)).toEqual([
+      { line: 1, text: '++secret = "AKIAIOSFODNN7EXAMPLE";' },
+    ]);
+  });
+
   it('skips removed (–) and context lines', () => {
     // Hunk starts new-file at 1; `-removed` doesn't advance new counter;
     // ` context` advances to 2; `+added` is new line 2.

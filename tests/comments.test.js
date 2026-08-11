@@ -93,6 +93,28 @@ describe('buildCommentBody', () => {
     });
     expect(out).not.toContain('[!WARNING]');
   });
+
+  // W5-9: when `content` already starts with the `## <title>` heading and ends
+  // with the marker (as formatFindingsAsSummary/formatWalkthroughSummary emit),
+  // buildCommentBody must NOT prepend another heading or append another marker.
+  // Previously the summary path rendered a PR comment with a duplicate H2
+  // heading and a duplicate trailing HTML-comment marker.
+  test('W5-9: does not duplicate heading when content already starts with it', () => {
+    const marker = '<!-- zai-code-review -->';
+    const content = `## Z.ai Code Review\n\n### Summary\n\n- a\n\n${marker}`;
+    const out = buildCommentBody({ title: 'Z.ai Code Review', content, marker });
+    const headingCount = (out.match(/^## /gm) || []).length;
+    const markerCount = (out.match(/<!-- zai-code-review -->/g) || []).length;
+    expect(headingCount).toBe(1);
+    expect(markerCount).toBe(1);
+  });
+
+  test('W5-9: still adds heading when content does NOT start with it', () => {
+    // Regression guard: plain content (no embedded heading) still gets one.
+    const marker = '<!-- m -->';
+    const out = buildCommentBody({ title: 'Summary', content: 'body text', marker });
+    expect(out).toBe(`## Summary\n\nbody text\n\n${marker}`);
+  });
 });
 
 describe('upsertReviewComment', () => {

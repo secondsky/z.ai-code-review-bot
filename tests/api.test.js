@@ -729,6 +729,48 @@ describe('callWithRetry', () => {
     expect(fallbackCalled).toBe(0);
   });
 
+  // W5-2: when a timeout triggers the fallback on the FINAL allowed attempt
+  // (attempt === maxRetries), the old code did `attempt += 1; continue;` which
+  // pushed attempt past maxRetries, exited the loop, and threw the internal
+  // "unreachable" error — instead of returning a clean failure. The fallback
+  // attempt was never executed. Realistic scenario: rate-limited 429s that
+  // transition to a timeout on the last retry, with ZAI_FALLBACK_PROMPT set.
+  test('W5-2: timeout on the final attempt does not crash with "unreachable"', async () => {
+    const fn = recordingFn([
+      new Error('Z.ai API error 429: rate limited'), // attempt 0 — retryable
+      new Error('Request timed out'), // attempt 1 (=== maxRetries) — timeout → fallback would fire
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 1, // only attempts 0 and 1 are allowed
+      baseDelay: 10,
+      baseTimeout: 1000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+    });
+    // Must return a structured failure, NOT throw "unreachable".
+    expect(out.success).toBe(false);
+    expect(out.error).toBeDefined();
+  });
+
+  test('W5-2: timeout on a non-final attempt still uses the fallback successfully', async () => {
+    // Regression guard: the fix must not break the normal fallback path
+    // (timeout before the last attempt → fallback attempt succeeds).
+    const fn = recordingFn([
+      new Error('Request timed out'), // attempt 0 — timeout, attempt < 1, no fallback
+      new Error('Request timed out'), // attempt 1 — timeout → fallback
+      'FB_OK', // attempt 2 — fallback attempt succeeds
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 10,
+      baseTimeout: 1000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+  });
+
   test('progressive timeout: currentTimeout decreases across attempts (100/67/50/33, floored at 10000)', async () => {
     const fn = recordingFn([
       new Error('Z.ai API error 500: 0'),

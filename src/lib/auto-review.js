@@ -294,6 +294,8 @@ export function isContextLimitError(error) {
   return (
     message.includes('maximum context length') ||
     message.includes('input tokens exceeds') ||
+    // W5-12: modern OpenAI/Z.ai error code string for context overflow.
+    message.includes('context_length_exceeded') ||
     message.includes('code":413') ||
     message.includes('type":"413') ||
     message.includes('error 413')

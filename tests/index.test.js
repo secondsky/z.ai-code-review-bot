@@ -1228,9 +1228,10 @@ describe('run — pull_request CODEOWNERS reviewer suggestions (Phase 8.1)', () 
       apiClient: { call: vi.fn() },
     });
 
-    // CODEOWNERS was fetched from the head SHA.
+    // CODEOWNERS was fetched from the head SHA. W5-6: precedence is
+    // .github/CODEOWNERS first (matching GitHub's documented order).
     expect(octokit.__calls.getContent[0]).toMatchObject({
-      path: 'CODEOWNERS',
+      path: '.github/CODEOWNERS',
     });
     // Suggestion line appears in the summary comment body, with BOTH owners
     // (README → @alice via `*`; src/a.js → @bob via `src/**` last-wins). The

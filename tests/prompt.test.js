@@ -119,6 +119,17 @@ describe('escapeDiffFence', () => {
     expect(escapeDiffFence(null)).toBe('');
     expect(escapeDiffFence(undefined)).toBe('');
   });
+
+  // W5-10: a bare carriage return (\r, no following \n) is NOT matched by
+  // /\r?\n/g and survived verbatim. Some LLM tokenizers treat a bare \r as a
+  // line break, allowing a value to split across what the model perceives as
+  // two logical lines. Collapse any mix of \r and \n.
+  test('W5-10: collapses a bare carriage return (\\r with no \\n)', () => {
+    expect(escapeDiffFence('evil\rINJECTED')).toBe('evil INJECTED');
+    expect(escapeDiffFence('a\rb\rc')).toBe('a b c');
+    // Mixed CRLF + lone CR + LF all collapse to a single space per run.
+    expect(escapeDiffFence('a\r\nb\rc\nd')).toBe('a b c d');
+  });
 });
 
 // Helper that mirrors the hardened formatFileEntry output (the diff fence is
@@ -134,6 +145,20 @@ describe('buildStructuredReviewPrompt', () => {
       { filename: 'a.js', status: 'modified', patch: '@@ a @@' },
     ]);
     expect(out.startsWith(UNTRUSTED_PREAMBLE)).toBe(true);
+  });
+
+  // W5-11: learningsContext is a multi-line bulleted list. The block must use
+  // escapeUntrustedMultiline (preserves newlines) — NOT escapeDiffFence (which
+  // collapses newlines to spaces, turning the list into an unreadable run-on
+  // line). Verify the rendered prompt preserves the newlines.
+  test('W5-11: learningsContext preserves multi-line structure in the prompt', () => {
+    const learningsContext = '- src/auth.js: accepted SQL pattern\n- "**/*.lock": outdated dep';
+    const out = buildStructuredReviewPrompt(
+      [{ filename: 'a.js', status: 'modified', patch: '@@ a @@' }],
+      { learningsContext },
+    );
+    // Both original newlines between the bullets must survive.
+    expect(out).toContain('- src/auth.js: accepted SQL pattern\n- "**/*.lock": outdated dep');
   });
 
   test('contains the JSON schema instruction (object with summary + findings array)', () => {

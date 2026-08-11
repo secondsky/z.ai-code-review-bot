@@ -43,9 +43,22 @@ export function matchesAnyPattern(filename, patterns) {
     // for an "include if any matches" / exclude-list predicate and would
     // invert the caller's intent (CFG-1 / SCN-13).
     const positive = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
-    if (picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive)) {
-      return true;
+    // W5-1: a bare `!` (or `!   `) yields an empty positive after stripping.
+    // picomatch throws on empty patterns, which would crash the review when
+    // this predicate is fed untrusted globs (.zai.yml path_filters,
+    // .zai/learnings.yml file globs). Skip empties; never throw.
+    if (positive === '') continue;
+    // Defense in depth: picomatch can also throw on syntactically invalid
+    // patterns (e.g. an unmatched `[`). Treat a compile error as "no match"
+    // so a malformed untrusted pattern can never break the review pipeline.
+    let isMatch;
+    try {
+      isMatch =
+        picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive);
+    } catch {
+      continue;
     }
+    if (isMatch) return true;
   }
   return false;
 }

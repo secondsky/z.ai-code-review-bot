@@ -56,6 +56,17 @@ function isBotComment(comment) {
 export function buildCommentBody({ title, content, marker }) {
   // Sanitize the model output only; the title/marker are operator-controlled.
   const safeContent = sanitizeCommentBody(String(content ?? ''));
+  // W5-9: some callers (formatFindingsAsSummary, formatWalkthroughSummary)
+  // emit content that ALREADY starts with `## <reviewerName>` and ends with
+  // the marker. Re-wrapping would produce a duplicate H2 heading and a
+  // duplicate trailing marker on the rendered PR comment. When the sanitized
+  // content already carries both, return it verbatim instead of re-wrapping.
+  const trimmed = safeContent.trimEnd();
+  const hasHeading = !!title && trimmed.startsWith(`## ${title}\n`);
+  const hasMarker = trimmed.endsWith(marker);
+  if (hasHeading && hasMarker) {
+    return trimmed;
+  }
   if (title) {
     return `## ${title}\n\n${safeContent}\n\n${marker}`;
   }

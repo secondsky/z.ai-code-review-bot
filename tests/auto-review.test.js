@@ -495,6 +495,14 @@ describe('isContextLimitError', () => {
   test('matches type":"413', () => {
     expect(isContextLimitError(new Error('blah "type":"413" blah'))).toBe(true);
   });
+  // W5-12: modern OpenAI/Z.ai error shape uses the code string
+  // `context_length_exceeded`. Without this, executeStructuredBatch's
+  // recursive-halving never fires on that error and a single oversized batch
+  // aborts the whole review.
+  test('W5-12: matches the modern "context_length_exceeded" code', () => {
+    expect(isContextLimitError(new Error('{"error":{"code":"context_length_exceeded"}}'))).toBe(true);
+    expect(isContextLimitError(new Error('context_length_exceeded'))).toBe(true);
+  });
   test('non-matching error → false', () => {
     expect(isContextLimitError(new Error('some other error'))).toBe(false);
     expect(isContextLimitError(new Error('412'))).toBe(false);

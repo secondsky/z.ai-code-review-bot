@@ -111,4 +111,33 @@ describe('matchesAnyPattern', () => {
     expect(matchesAnyPattern('dist/secret.js', ['dist/**'])).toBe(true);
     expect(matchesAnyPattern('src/a.js', ['dist/**'])).toBe(false);
   });
+
+  // ------------------------------------------------------------------
+  // W5-1: a bare `!` pattern (no following glob) must not throw. After the
+  // leading-`!` strip the positive form is the empty string, and picomatch
+  // throws "Expected pattern to be a non-empty string" on empty patterns.
+  // matchesAnyPattern's contract is to never throw on untrusted input (it
+  // is fed .zai/learnings.yml and .zai.yml glob values from fork PRs).
+  // ------------------------------------------------------------------
+
+  test('W5-1: a bare "!" pattern does not throw and matches nothing', () => {
+    expect(() => matchesAnyPattern('foo.js', ['!'])).not.toThrow();
+    expect(matchesAnyPattern('foo.js', ['!'])).toBe(false);
+  });
+
+  test('W5-1: a whitespace-only "!" pattern does not throw', () => {
+    expect(() => matchesAnyPattern('foo.js', ['!   '])).not.toThrow();
+    expect(matchesAnyPattern('foo.js', ['!   '])).toBe(false);
+  });
+
+  test('W5-1: bare "!" does not mask a valid sibling pattern', () => {
+    // The empty positive from `!` is skipped; the real pattern still matches.
+    expect(matchesAnyPattern('foo.lock', ['!', '*.lock'])).toBe(true);
+  });
+
+  test('W5-1: a picomatch-invalid pattern is tolerated (no throw, no match)', () => {
+    // Defense in depth: even patterns picomatch rejects at compile time
+    // (e.g. unmatched `[`) must not crash the review pipeline.
+    expect(() => matchesAnyPattern('foo.js', ['[unclosed'])).not.toThrow();
+  });
 });

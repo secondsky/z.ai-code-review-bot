@@ -81,8 +81,10 @@ export function parseAddedLines(patch) {
       // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
       continue;
     }
-    if (raw.startsWith('+++')) {
-      // File header — not an addition. Skip.
+    if (/^\+\+\+(?:\s|$)/.test(raw)) {
+      // File header — `+++ b/path` (space-delimited), or bare `+++` at EOL.
+      // NOT an added line whose content starts with `++` (e.g. `++secret`
+      // → `+++secret` has no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {
@@ -90,7 +92,7 @@ export function parseAddedLines(patch) {
       newLine++;
       continue;
     }
-    if (raw.startsWith('---')) {
+    if (/^---(?:\s|$)/.test(raw)) {
       continue;
     }
     if (raw.startsWith('-')) {

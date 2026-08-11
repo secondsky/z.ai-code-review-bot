@@ -104,8 +104,11 @@ export function parseHunks(patch) {
       // Lines before the first hunk (diff metadata) are skipped entirely.
       continue;
     }
-    if (raw.startsWith('+++') || raw.startsWith('---')) {
-      // File headers — not real additions/removals.
+    if (/^(?:\+\+\+|---)(?:\s|$)/.test(raw)) {
+      // File headers — `+++ b/path` or `--- a/path` (space-delimited), or a
+      // bare `+++`/`---` at end-of-line. NOT an added/removed line whose
+      // content happens to start with `++`/`--` (e.g. `++i;` → `+++i;` has
+      // no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {

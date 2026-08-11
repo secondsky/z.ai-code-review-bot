@@ -167,6 +167,21 @@ describe('parseSeverity', () => {
     expect(parseSeverity('🟢 low risk\nThis module provides high-availability guarantees.')).toBe('low');
   });
 
+  // W5-7: the CMD-4 first-line restriction applied to WORD-form severity but
+  // NOT to emoji-form — `raw.includes(key)` scanned the entire body. Since the
+  // emoji iteration order checks 🔴 (critical) first, a 🔴 appearing anywhere
+  // in the rationale overrode the declared severity. Emoji must be restricted
+  // to the first line, mirroring word-form matching.
+  it('W5-7: does NOT match emoji severity appearing only in the rationale', () => {
+    expect(parseSeverity('🟢 low\nThe changes touch the 🔴 auth module.')).toBe('low');
+    expect(parseSeverity('🟢 low risk\n🔴 decorative emoji in rationale')).toBe('low');
+  });
+
+  it('W5-7: emoji severity on the first line still wins', () => {
+    expect(parseSeverity('🔴 critical\nrationale')).toBe('critical');
+    expect(parseSeverity('🟡 medium\nrationale mentions 🟢')).toBe('medium');
+  });
+
   // CMD-4: a hyphen is NOT a word boundary for severity words. The previous
   // `\b` treated `-` as a boundary, so "high-availability" matched "high".
   it('CMD-4: does NOT match severity words inside hyphenated compounds', () => {

@@ -151,8 +151,30 @@ export async function hasReviewForSha({
   // `headSha === '' ||` short-circuit matched ANY bot marker comment and
   // suppressed the PR. Returning false here ensures the PR is reviewed.
   if (headSha === '') return false; // can't confirm SHA-level dedup; review it
-  let page = 1;
+
+  // Helper: does a single comment/review object count as our marker for this SHA?
+  // W5-8: require the EXACT structured SHA block this action emits
+  // (<!-- zai-sha: <sha> -->), not a bare substring mention of the SHA. The
+  // marker and the SHA are public literals, so a different bot with comment
+  // access could trivially post both as bare substrings and suppress the
+  // review. Requiring the structured block raises the bar without breaking any
+  // legitimate marker (which always carries it via buildShaBlock).
+  const shaBlock = buildShaBlock(headSha);
+  const matches = (c) =>
+    isBotComment(c) &&
+    typeof c?.body === 'string' &&
+    c.body.includes(marker) &&
+    c.body.includes(shaBlock);
+
+  // W5-3: the marker + SHA block can live in EITHER an issue comment
+  // (summary-comment path) OR a review (inline-review path via
+  // pulls.createReview). Previously we searched only issue comments, so every
+  // cron tick re-reviewed PRs whose findings mapped to diff lines — defeating
+  // the SHA dedup. Search both, paginating each fully.
   const perPage = 100;
+
+  // 1. Issue comments (issues.listComments).
+  let page = 1;
   for (;;) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
@@ -161,17 +183,30 @@ export async function hasReviewForSha({
       per_page: perPage,
       page,
     });
-    const found = comments.some(
-      (c) =>
-        isBotComment(c) &&
-        typeof c?.body === 'string' &&
-        c.body.includes(marker) &&
-        c.body.includes(headSha),
-    );
-    if (found) return true;
-    if (comments.length < perPage) return false;
+    if (comments.some(matches)) return true;
+    if (comments.length < perPage) break;
     page += 1;
   }
+
+  // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
+  // Guard for environments where the endpoint is absent (older mocks).
+  if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
+    page = 1;
+    for (;;) {
+      const { data: reviews } = await octokit.rest.pulls.listReviews({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: perPage,
+        page,
+      });
+      if (reviews.some(matches)) return true;
+      if (reviews.length < perPage) break;
+      page += 1;
+    }
+  }
+
+  return false;
 }
 
 /**

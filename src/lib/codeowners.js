@@ -29,8 +29,14 @@ import picomatch from 'picomatch';
 /** Hard cap on the size of a CODEOWNERS file we will parse (cost/DoS guard). */
 const MAX_CODEOWNERS_BYTES = 256 * 1024; // 256 KiB
 
-/** Candidate CODEOWNERS paths, searched in this order (GitHub's order). */
-export const CODEOWNERS_PATHS = ['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS'];
+/**
+ * Candidate CODEOWNERS paths, searched in this order (GitHub's documented
+ * precedence: .github/CODEOWNERS first, then root CODEOWNERS, then
+ * docs/CODEOWNERS). W5-6: the previous order checked root first, which
+ * diverged from GitHub when both root and .github copies exist.
+ * See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+ */
+export const CODEOWNERS_PATHS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
 
 /* ------------------------------------------------------------------ *
  * parseCodeowners
@@ -126,6 +132,13 @@ function toGlob(pattern) {
   let p = pattern;
   // Strip leading `!` (CODEOWNERS has no negation; picomatch would mis-read it).
   p = p.replace(/^!+/, '');
+  // W5-13: GitHub CODEOWNERS allows a leading `/` to root-anchor a pattern
+  // (e.g. `/src/`). picomatch treats a leading `/` as significant and the
+  // compiled regex then fails to match `src/deep/file.js`. CODEOWNERS paths
+  // are always repo-relative, so a leading `/` carries no information beyond
+  // "anchored at root" — which is already the default for picomatch paths
+  // without a leading `**/`. Strip it.
+  p = p.replace(/^\/+/, '');
   if (p.endsWith('/')) return `${p}**`;
   return p;
 }

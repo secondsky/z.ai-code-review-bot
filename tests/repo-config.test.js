@@ -273,6 +273,25 @@ describe('validateRepoConfig — path_filters', () => {
     const out = validateRepoConfig({ reviews: { path_filters: '!dist/**' } });
     expect(out).not.toHaveProperty('reviews');
   });
+
+  // ----------------------------------------------------------------
+  // W5-4: path_filters is UNION-ed into excludePatterns and tested by
+  // matchesAnyPattern against every changed file. Without a count cap a
+  // fork-PR attacker can commit thousands of entries (within the 64 KiB
+  // .zai.yml budget) and amplify per-file matching cost into a DoS.
+  // path_instructions already caps at MAX_PATH_INSTRUCTION_ENTRIES (50);
+  // path_filters needs the same guard.
+  // ----------------------------------------------------------------
+  it('W5-4: caps path_filters count to defend against DoS amplification', () => {
+    const many = Array.from({ length: 500 }, (_, i) => `!pkg${i}/**`);
+    const out = validateRepoConfig({ reviews: { path_filters: many } });
+    // The cap is much smaller than 500; the exact bound is enforced by the
+    // source constant, here we only assert the cap takes effect.
+    expect(out.reviews.path_filters.length).toBeLessThan(500);
+    expect(out.reviews.path_filters.length).toBeGreaterThan(0);
+    // And the FIRST entries are preserved (deterministic ordering).
+    expect(out.reviews.path_filters[0]).toBe('!pkg0/**');
+  });
 });
 
 describe('validateRepoConfig — tone_instructions', () => {

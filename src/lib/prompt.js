@@ -63,7 +63,9 @@ export function escapeXmlAttribute(s) {
 export function escapeDiffFence(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
-    .replace(/\r?\n/g, ' ')
+    // W5-10: collapse any mix of \r and \n (including a bare \r with no \n,
+    // which /\r?\n/ missed) so a value cannot split across a perceived line.
+    .replace(/[\r\n]+/g, ' ')
     .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'));
 }
 
@@ -244,11 +246,13 @@ export function buildStructuredReviewPrompt(files, options = {}) {
 
   // Phase 8.2: optional learnings context (from .zai/learnings.yml — UNTRUSTED,
   // wrapped). The pre-rendered block already lists the accepted patterns; we
-  // fence-escape the whole block so an attacker cannot close the wrapping tag
-  // or inject instructions via the file/pattern strings.
+  // escape the whole block so an attacker cannot close the wrapping tag or
+  // inject instructions via the file/pattern strings. W5-11: use
+  // escapeUntrustedMultiline (preserves newlines) so the multi-line bulleted
+  // list keeps its structure — escapeDiffFence would collapse it to one line.
   const learningsBlock =
     typeof options.learningsContext === 'string' && options.learningsContext.length > 0
-      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeDiffFence(options.learningsContext)}\n</untrusted_input>`
+      ? `\n\n<untrusted_input source="repo-config" kind="learnings">\n${escapeUntrustedMultiline(options.learningsContext)}\n</untrusted_input>`
       : '';
 
   const header = `${instruction}${scannerBlock}${pathBlock}${toneBlock}${learningsBlock}`;

@@ -38,6 +38,15 @@ const MAX_PATH_INSTRUCTION_PATH_CHARS = 500;
 const MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS = 1000;
 /** Maximum number of `path_instructions` entries kept after validation. */
 const MAX_PATH_INSTRUCTION_ENTRIES = 50;
+/**
+ * W5-4: Cap on the number of `path_filters` entries accepted from `.zai.yml`.
+ * `path_filters` are UNION-ed into `excludePatterns` and tested via
+ * `matchesAnyPattern` against every changed file, so a large list amplifies
+ * per-file matching cost. The 64 KiB config budget allows thousands of short
+ * entries, which a fork-PR attacker could use to slow the review into a DoS.
+ * Mirrors the `MAX_PATH_INSTRUCTION_ENTRIES` guard on `path_instructions`.
+ */
+const MAX_PATH_FILTER_ENTRIES = 100;
 
 /**
  * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
@@ -360,9 +369,9 @@ export function validateRepoConfig(parsed) {
       if (arr.length > 0) rv.path_instructions = arr;
     }
     if (Array.isArray(r.path_filters)) {
-      const arr = r.path_filters.filter(
-        (p) => typeof p === 'string' && p.trim() !== '',
-      );
+      const arr = r.path_filters
+        .filter((p) => typeof p === 'string' && p.trim() !== '')
+        .slice(0, MAX_PATH_FILTER_ENTRIES);
       if (arr.length > 0) rv.path_filters = arr;
     }
     if (typeof r.tone_instructions === 'string') {

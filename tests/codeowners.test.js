@@ -197,6 +197,27 @@ describe('matchCodeowners — matching semantics', () => {
     expect(m.get('src/lib/b.js')).toEqual(['@fe']);
   });
 
+  // W5-13: GitHub CODEOWNERS allows a leading `/` to root-anchor a pattern
+  // (e.g. `/src/` means "src directory at repo root, recursively"). picomatch
+  // treats the leading `/` as significant and the compiled regex fails to
+  // match nested files, so root-anchored directory rules silently matched
+  // nothing. The leading `/` must be stripped before compiling.
+  it('W5-13: a root-anchored /src/ directory rule matches nested files', () => {
+    const rules = parseCodeowners('/src/ @fe');
+    const m = matchCodeowners(rules, ['src/a.js', 'src/lib/b.js', 'test/c.js']);
+    expect(m.get('src/a.js')).toEqual(['@fe']);
+    expect(m.get('src/lib/b.js')).toEqual(['@fe']);
+    expect(m.has('test/c.js')).toBe(false);
+  });
+
+  it('W5-13: a root-anchored /src/** globstar rule matches nested files', () => {
+    const rules = parseCodeowners('/src/** @fe');
+    const m = matchCodeowners(rules, ['src/a.js', 'src/lib/b.js', 'test/c.js']);
+    expect(m.get('src/a.js')).toEqual(['@fe']);
+    expect(m.get('src/lib/b.js')).toEqual(['@fe']);
+    expect(m.has('test/c.js')).toBe(false);
+  });
+
   it('matches a globstar (**)', () => {
     const rules = parseCodeowners('src/** @fe');
     const m = matchCodeowners(rules, ['src/a.js', 'src/lib/b.js', 'test/c.js']);
@@ -449,8 +470,11 @@ function makeCore() {
 }
 
 describe('loadCodeowners — happy path', () => {
-  it('fetches CODEOWNERS from the root path first', async () => {
-    const octokit = makeOctokitWithContent('* @alice\n', { foundPath: 'CODEOWNERS' });
+  it('fetches .github/CODEOWNERS first (GitHub precedence: .github > root > docs)', async () => {
+    // W5-6: GitHub's documented precedence is .github/CODEOWNERS > root
+    // CODEOWNERS > docs/CODEOWNERS. The bot must match GitHub so reviewer
+    // suggestions use the same ruleset the platform enforces.
+    const octokit = makeOctokitWithContent('* @alice\n', { foundPath: '.github/CODEOWNERS' });
     const { core } = makeCore();
     const rules = await loadCodeowners(
       { octokit, context: makeContext('sha-1') },
@@ -459,15 +483,15 @@ describe('loadCodeowners — happy path', () => {
     expect(octokit.__calls.getContent[0]).toMatchObject({
       owner: 'owner',
       repo: 'repo',
-      path: 'CODEOWNERS',
+      path: '.github/CODEOWNERS',
       ref: 'sha-1',
     });
     expect(rules).toEqual([{ pattern: '*', owners: ['@alice'] }]);
   });
 
-  it('falls back to .github/CODEOWNERS when root is absent', async () => {
+  it('falls back to root CODEOWNERS when .github is absent', async () => {
     const octokit = makeOctokitWithContent('src/** @fe\n', {
-      foundPath: '.github/CODEOWNERS',
+      foundPath: 'CODEOWNERS',
     });
     const { core } = makeCore();
     const rules = await loadCodeowners(
@@ -475,11 +499,11 @@ describe('loadCodeowners — happy path', () => {
       { core },
     );
     const paths = octokit.__calls.getContent.map((c) => c.path);
-    expect(paths).toEqual(['CODEOWNERS', '.github/CODEOWNERS']);
+    expect(paths).toEqual(['.github/CODEOWNERS', 'CODEOWNERS']);
     expect(rules).toEqual([{ pattern: 'src/**', owners: ['@fe'] }]);
   });
 
-  it('falls back to docs/CODEOWNERS when root and .github are absent', async () => {
+  it('falls back to docs/CODEOWNERS when .github and root are absent', async () => {
     const octokit = makeOctokitWithContent('docs/** @docs\n', {
       foundPath: 'docs/CODEOWNERS',
     });
@@ -489,7 +513,7 @@ describe('loadCodeowners — happy path', () => {
       { core },
     );
     const paths = octokit.__calls.getContent.map((c) => c.path);
-    expect(paths).toEqual(['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS']);
+    expect(paths).toEqual(['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']);
     expect(rules).toEqual([{ pattern: 'docs/**', owners: ['@docs'] }]);
   });
 });

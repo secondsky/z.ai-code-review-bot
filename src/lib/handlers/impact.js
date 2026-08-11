@@ -83,8 +83,11 @@ export function parseSeverity(text) {
     const mapped = SEVERITY_KEYS[key];
     if (!mapped) continue;
     if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
-      // Emoji keys have no word boundaries; use includes.
-      if (raw.includes(key)) return mapped;
+      // Emoji keys have no word boundaries; use includes. W5-7: restrict to
+      // the FIRST line (where the prompt puts the level), consistent with the
+      // word-form match below. Previously `raw.includes(key)` scanned the whole
+      // body, so a 🔴 appearing in the rationale overrode the declared level.
+      if (firstLine.includes(key)) return mapped;
     } else {
       // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
       // so "highlighted" → no match, "noncritical" → no match, and

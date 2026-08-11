@@ -130,6 +130,63 @@ describe('parseHunks', () => {
     ]);
   });
 
+  // ------------------------------------------------------------------
+  // W5-5: an ADDED line whose content starts with `++` (e.g. `++i;`) is
+  // emitted in the diff as `+++i;`. The old `raw.startsWith('+++')` check
+  // misclassified it as a file header and silently dropped it, corrupting
+  // the line-number mapping for all subsequent lines in the hunk. Real git
+  // file headers are `+++ b/path` (space-delimited); an added line's content
+  // is `+++content` (no space). Only treat `+++`/`---` as a header when a
+  // space (or end-of-line) follows the third `+`/`-`.
+  // ------------------------------------------------------------------
+  it('W5-5: an added line whose text starts with ++ is kept (not a header)', () => {
+    const patch = [
+      '@@ -1,2 +1,4 @@',
+      ' context',
+      '+++i;',
+      '+added',
+      ' context',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks[0].lines).toEqual([
+      { type: 'ctx', newLine: 1, oldLine: 1, text: 'context' },
+      { type: 'add', newLine: 2, oldLine: null, text: '++i;' },
+      { type: 'add', newLine: 3, oldLine: null, text: 'added' },
+      { type: 'ctx', newLine: 4, oldLine: 2, text: 'context' },
+    ]);
+  });
+
+  it('W5-5: a removed line whose text starts with -- is kept (not a header)', () => {
+    // The diff line is `---deprecated_flag` (1 `-` prefix + `--deprecated_flag`
+    // content). The old `startsWith('---')` check misclassified it as a header.
+    const patch = [
+      '@@ -1,3 +1,2 @@',
+      '---deprecated_flag = true;',
+      ' context',
+      '+added',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks[0].lines).toEqual([
+      { type: 'del', newLine: null, oldLine: 1, text: '--deprecated_flag = true;' },
+      { type: 'ctx', newLine: 1, oldLine: 2, text: 'context' },
+      { type: 'add', newLine: 2, oldLine: null, text: 'added' },
+    ]);
+  });
+
+  it('W5-5: a real +++ b/file header inside the hunk body is still skipped', () => {
+    // Regression guard: the genuine git header form (space after +++) must
+    // still be treated as a header and NOT as an addition.
+    const patch = [
+      '@@ -1,2 +1,2 @@',
+      '+++ b/foo.js',
+      ' context',
+    ].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks[0].lines).toEqual([
+      { type: 'ctx', newLine: 1, oldLine: 1, text: 'context' },
+    ]);
+  });
+
   it('treats an empty line (truly empty) as a context line', () => {
     // Unified diff context lines are " text" but a truly empty line is also
     // treated as context by git. We should emit it with the stripped text ''.

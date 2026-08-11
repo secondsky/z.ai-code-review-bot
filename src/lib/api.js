@@ -386,10 +386,16 @@ export async function callWithRetry(fn, options = {}) {
       const { category, retryable } = categorizeError(error);
 
       // Fallback fires ONLY on a timeout-category error at attempt >= 1,
-      // when a fallback is configured and hasn't been used yet.
+      // when a fallback is configured and hasn't been used yet, AND there is
+      // at least one remaining loop iteration to actually run the fallback
+      // attempt. W5-2: previously, firing the fallback on the final attempt
+      // did `attempt += 1; continue;` which pushed attempt past maxRetries,
+      // exited the loop, and threw the internal "unreachable" error instead
+      // of returning a clean failure.
       if (
         category === 'timeout' &&
         attempt >= 1 &&
+        attempt < maxRetries &&
         fallbackPrompt &&
         !usedFallback
       ) {
