@@ -39553,10 +39553,14 @@ const TRUNCATION_MARKER = '\n\n> …(output truncated by Z.ai safety filter)';
  * case-insensitive (GitHub accepts any casing).
  */
 const ALERT_TYPES = ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'];
+// W11-2: GitHub renders alert banners at any blockquote nesting depth
+// (`> [!WARNING]`, `>> [!WARNING]`, `> > [!NOTE]`, …). The regex used to match
+// exactly one `>`; it now matches one-or-more (`>+`) so nested banners are
+// neutralized too.
 const ALERT_RE = new RegExp(
-  // An optional blockquote prefix, then the [!TYPE] marker at line start.
+  // An optional blockquote prefix (one or more `>`), then the [!TYPE] marker.
   // We anchor on start-of-line so a quoted `[!NOTE]` mid-paragraph is unaffected.
-  String.raw`(^|\n)(\s*>\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  String.raw`(^|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
   'gi',
 );
 
@@ -39583,7 +39587,13 @@ const ALERT_RE = new RegExp(
 // mention). The replacement re-emits the backtick followed by the neutralized
 // mention. This keeps the original text visually identical while inserting the
 // ZWSP that breaks GitHub's mention parser.
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
+// W11-1: the org/team alternative used to include \s in its char class
+// (`(?:\/[A-Za-z0-9_\s-]+)?`). The greedy match swallowed the space between a
+// slash-team mention and a following plain mention (e.g. `@org/x @lead`), so
+// the second `@lead` lost its leading boundary char and survived neutralization
+// — a real notification-spam bypass. GitHub team names cannot contain
+// whitespace, so \s has been removed from both alternatives.
+const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -39616,7 +39626,10 @@ function neutralizeMentionsOutsideCode(text) {
       out.push(line); // inside fence: never touch
       continue;
     }
-    out.push(neutralizeMentionsInLine(line));
+    // W11-2: apply alert-banner neutralization on the same non-fence lines as
+    // mentions, so alert syntax inside a fenced code block is preserved (it is
+    // not rendered as a banner by GitHub inside code).
+    out.push(neutralizeAlertsLine(neutralizeMentionsInLine(line)));
   }
   // C02: a fence was opened but never closed. The lines after the opening fence
   // line were treated as "inside fence" and pushed verbatim — but a properly
@@ -39625,7 +39638,7 @@ function neutralizeMentionsOutsideCode(text) {
   // opening fence line itself is left as-is.
   if (unclosedStart >= 0) {
     for (let i = unclosedStart + 1; i < out.length; i++) {
-      out[i] = neutralizeMentionsInLine(out[i]);
+      out[i] = neutralizeAlertsLine(neutralizeMentionsInLine(out[i]));
     }
   }
   return out.join('\n');
@@ -39656,10 +39669,37 @@ function neutralizeMentionsInLine(line) {
     .join('');
 }
 
+// Line-scoped alert-banner regex: matches `>`-prefix banner markers at the
+// start of a single line (no `\n` boundary). Used by neutralizeAlertsLine so
+// we can apply alert neutralization per-line inside the fence-aware loop.
+const ALERT_LINE_RE = new RegExp(
+  String.raw`^(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  'i',
+);
+
+/**
+ * Neutralize GitHub alert-banner syntax on a single line. Returns the line
+ * with the leading `[` of a `> [!TYPE]` marker dropped (at any blockquote
+ * nesting depth), so GitHub renders it as plain quoted text instead of an
+ * official callout banner.
+ */
+function neutralizeAlertsLine(line) {
+  return line.replace(ALERT_LINE_RE, (full, quotePrefix, type) => {
+    return `${quotePrefix}!${type.toUpperCase()}`;
+  });
+}
+
 /**
  * Neutralize GitHub alert-banner syntax. Rewrites `> [!WARNING]` (case-
- * insensitive, optional blockquote) so the leading `[` is dropped; GitHub then
- * renders it as plain quoted text instead of the official callout banner.
+ * insensitive, optional blockquote, any nesting depth) so the leading `[` is
+ * dropped; GitHub then renders it as plain quoted text instead of the official
+ * callout banner.
+ *
+ * NOTE: this full-text variant is NOT fence-aware. Callers that need to skip
+ * fenced code blocks (the default sanitize path) go through
+ * `neutralizeMentionsOutsideCode`, which calls `neutralizeAlertsLine` per
+ * non-fence line. This function is kept for the exported surface and for tests
+ * that exercise the alert regex in isolation.
  */
 function neutralizeAlerts(text) {
   return text.replace(ALERT_RE, (full, boundary, quotePrefix, type) => {
@@ -39723,9 +39763,11 @@ function sanitizeModelOutput(text, options = {}) {
   if (text === '') return '';
 
   // 1. Neutralize mentions + alerts BEFORE truncating, so a long payload of
-  //    spam can't escape the sanitizer via truncation timing.
+  //    spam can't escape the sanitizer via truncation timing. Both passes are
+  //    applied inside neutralizeMentionsOutsideCode's fence-aware loop, so
+  //    neither touches text inside ``` blocks (W11-2: alert syntax inside a
+  //    fenced code block is not rendered as a banner and must be preserved).
   let out = neutralizeMentionsOutsideCode(text);
-  out = neutralizeAlerts(out);
   // SCN-15 / W2-2: strip any forged zai-* HTML comment markers that an attacker
   // might coax the model into emitting via prompt injection (hashes, description,
   // sha, etc.). Applied globally so mid-line forgeries are also caught.
@@ -39839,8 +39881,13 @@ function buildCommentBody({ title, content, marker }) {
   // the marker. Re-wrapping would produce a duplicate H2 heading and a
   // duplicate trailing marker on the rendered PR comment. When the sanitized
   // content already carries both, return it verbatim instead of re-wrapping.
+  // W11-8: tolerate trailing horizontal whitespace after the heading text
+  // (`## Title \n`), which used to fail the exact-string check and produced a
+  // duplicate H2 heading. Compare on the first line with trailing whitespace
+  // stripped.
   const trimmed = safeContent.trimEnd();
-  const hasHeading = !!title && trimmed.startsWith(`## ${title}\n`);
+  const firstLine = trimmed.slice(0, Math.max(0, trimmed.indexOf('\n')));
+  const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
     return trimmed;
@@ -41561,8 +41608,24 @@ function splitTextByLines(text, maxChars) {
     if (line.length > maxChars) {
       // A single oversized line: flush pending, then slice this line.
       flush();
-      for (let i = 0; i < line.length; i += maxChars) {
-        chunks.push(line.slice(i, i + maxChars));
+      let i = 0;
+      while (i < line.length) {
+        let end = Math.min(i + maxChars, line.length);
+        // W11-9: don't split a UTF-16 surrogate pair. If the char at end-1 is
+        // a high surrogate and `end` is still inside the string (followed by a
+        // low surrogate), back up by one so the pair stays in the same chunk.
+        // Without this, the two halves land in separate chunks and serialize
+        // as U+FFFD when sent to the LLM — silent corruption of diff content.
+        if (end < line.length) {
+          const code = line.charCodeAt(end - 1);
+          if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+        }
+        // Safety: if maxChars is 1 and the char at i is a high surrogate, end
+        // would equal i and we'd loop forever. Force at least one char of
+        // progress so the lone surrogate moves into a chunk on its own.
+        if (end === i) end = i + 1;
+        chunks.push(line.slice(i, end));
+        i = end;
       }
       continue;
     }
@@ -42902,7 +42965,37 @@ async function postComment({ octokit, context, body }) {
   if (!owner || !repo || typeof issueNumber !== 'number') {
     return null;
   }
-  const safeBody = sanitizeModelOutput(body);
+  // W11-11: sanitizeModelOutput strips ALL zai-* HTML comments (the forgeries
+  // we defend against come from MODEL output). But the fallback-review path
+  // embeds TRUSTED trailers assembled by our own code — the idempotency marker
+  // (<!-- zai-code-review -->), the incremental-review hash block
+  // (<!-- zai-hashes: ... -->), and the schedule-dedup SHA block
+  // (<!-- zai-sha: ... -->). Stripping those breaks idempotent upsert on the
+  // next run and defeats SHA-level dedup.
+  //
+  // The trusted trailers are always appended by `appendTrailers` AFTER the
+  // body prose, so they form a contiguous tail of zai-* comments. A model
+  // forgery can appear ANYWHERE in the prose. So we split the body into a
+  // prose region (sanitized, forgeries stripped) and a trailing-trailer
+  // region (trusted, preserved), and reassemble. This never preserves a
+  // forgery embedded in the prose — only the contiguous tail of zai-* comments
+  // that our own code appended.
+  let prose = typeof body === 'string' ? body : '';
+  let trailers = '';
+  if (prose) {
+    // Capture the trailing run of `<!-- zai-* -->` comments (each optionally
+    // preceded by a newline), working backwards from the end.
+    const tailRe = /(\s*<!--\s*zai-[^\n>]*-->)+\s*$/;
+    const tailMatch = prose.match(tailRe);
+    if (tailMatch) {
+      trailers = tailMatch[0];
+      prose = prose.slice(0, tailMatch.index);
+    }
+  }
+  let safeBody = sanitizeModelOutput(prose);
+  if (trailers) {
+    safeBody = `${safeBody.replace(/\n+$/, '')}${trailers}`;
+  }
   const { data } = await octokit.rest.issues.createComment({
     owner,
     repo,
@@ -43010,8 +43103,23 @@ async function upsertPrDescription(
       // CMD-7: orphan start marker (start without a matching end). Treat as
       // "no block found" and append, instead of slicing everything after the
       // orphan marker (which would destroy human-written body text).
-      newBody = currentBody ? `${currentBody}\n\n${block}` : block;
+      // W11-7: STRIP the orphan marker(s) before appending. Without this, the
+      // body carries a dangling START; the NEXT run finds it via indexOf(START)
+      // and pairs it with the appended block's END, so the in-place replace
+      // spans the whole gap and deletes the human-written text between them.
+      const stripped = currentBody
+        .replace(/<!--\s*\/?zai-description\s*-->\n?/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trimEnd();
+      newBody = stripped ? `${stripped}\n\n${block}` : block;
     }
+  } else if (currentBody.includes(DESCRIBE_MARKER_END)) {
+    // Orphan END marker (end without a matching start). Strip it and append.
+    const stripped = currentBody
+      .replace(/<!--\s*\/?zai-description\s*-->\n?/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trimEnd();
+    newBody = stripped ? `${stripped}\n\n${block}` : block;
   } else {
     // No existing block: append.
     newBody = currentBody ? `${currentBody}\n\n${block}` : block;
@@ -44719,9 +44827,15 @@ async function listOpenPrs({
   // scheduled review. We skip drafts entirely during accumulation — they are
   // filtered again in runScheduledReview, but excluding them here means the
   // cap reflects only reviewable PRs.
+  // W11-12: CORE-4 added MAX_PAGES caps to changed-files.js, comments.js, and
+  // review.js to prevent a pathological endpoint from trapping pagination in an
+  // unbounded loop. schedule.js was missed. A repo with many open DRAFT PRs
+  // (all skipped) and the cap unfilled would paginate without a ceiling. The
+  // same cap is applied to hasReviewForSha below.
+  const MAX_LIST_PAGES = 100;
   const out = [];
   let page = 1;
-  for (;;) {
+  for (; page <= MAX_LIST_PAGES; page++) {
     // W2-1: capture the ACTUAL per_page sent to the API and compare data.length
     // against THAT value (not the original `perPage` parameter). The previous
     // code compared `data.length < perPage` (the parameter), which broke when
@@ -44751,7 +44865,6 @@ async function listOpenPrs({
       if (out.length >= maxPrs) return out;
     }
     if (data.length < requestedPerPage) break;
-    page += 1;
   }
   return out;
 }
@@ -44807,10 +44920,12 @@ async function hasReviewForSha({
   // cron tick re-reviewed PRs whose findings mapped to diff lines — defeating
   // the SHA dedup. Search both, paginating each fully.
   const perPage = 100;
+  // W11-12: cap pagination so a PR with a very large comment/review history
+  // cannot stall a scheduled run (consistent with CORE-4 caps elsewhere).
+  const MAX_COMMENT_PAGES = 100;
 
   // 1. Issue comments (issues.listComments).
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
       repo,
@@ -44820,14 +44935,12 @@ async function hasReviewForSha({
     });
     if (comments.some(matches)) return true;
     if (comments.length < perPage) break;
-    page += 1;
   }
 
   // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
   // Guard for environments where the endpoint is absent (older mocks).
   if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
-    page = 1;
-    for (;;) {
+    for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
       const { data: reviews } = await octokit.rest.pulls.listReviews({
         owner,
         repo,
@@ -44837,7 +44950,6 @@ async function hasReviewForSha({
       });
       if (reviews.some(matches)) return true;
       if (reviews.length < perPage) break;
-      page += 1;
     }
   }
 
@@ -44898,6 +45010,18 @@ async function reviewOnePr({
     const patchable = filterPatchableFiles(files);
     if (patchable.length === 0) {
       return { ok: true, action: 'skipped-no-patchable' };
+    }
+
+    // W11-10: `largePrFileThreshold` used to be parsed in config, exported as
+    // `isLargePr`, and wired through dependencies, but never called — a pure
+    // config-wiring no-op (same class as W6-1/W6-2). Now we call it and log
+    // when a PR exceeds the threshold, so the knob has an observable effect.
+    // Batched review runs either way (batching handles both small and large
+    // PRs), but the log line helps operators tune the threshold.
+    if (typeof isLargePr === 'function' && isLargePr(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
+      if (core?.info) {
+        core.info(`Scheduled review: PR #${pr.number} is large (${patchable.length} patchable files > threshold ${config.largePrFileThreshold}); using batched review.`);
+      }
     }
 
     const result = await runStructuredReview(patchable, config, { callApi, core });
@@ -45886,8 +46010,16 @@ const SECRET_PATTERNS = [
     suggestion: 'Remove the token and revoke it at github.com/settings/tokens.',
   },
   {
+    // W11-3: the regex used to require the literal suffix `PRIVATE KEY-----`
+    // immediately after an optional type prefix, which missed two common PEM
+    // headers: `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PKCS#8 encrypted keys,
+    // where "ENCRYPTED " was absent from the type alternation) and
+    // `-----BEGIN PGP PRIVATE KEY BLOCK-----` (GnuPG keys, where the trailing
+    // ` BLOCK` broke the `PRIVATE KEY-----` suffix). The pattern now accepts
+    // any optional uppercase prefix before `PRIVATE KEY` and an optional
+    // ` BLOCK` suffix, covering every PEM private-key header in the wild.
     name: 'private-key-block',
-    regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----/,
+    regex: /-----BEGIN (?:[A-Z ]*)PRIVATE KEY(?: BLOCK)?-----/,
     title: 'Private key block detected',
     description: 'A PEM-encoded private key block was found in the diff.',
     suggestion: 'Remove the key and rotate any credentials it protected.',
@@ -46954,7 +47086,9 @@ function computeMetrics(files) {
     largeFiles: [],
     generatedFiles: [],
     todoCount: 0,
-    byStatus: {},
+    // W11-6: use a null-prototype object so status strings like "__proto__" or
+    // "constructor" cannot corrupt the counter via the inherited prototype.
+    byStatus: Object.create(null),
   };
   if (!Array.isArray(files)) return out;
 
@@ -46966,7 +47100,12 @@ function computeMetrics(files) {
 
     const additions = Number.isFinite(f.additions) ? Math.max(0, Math.floor(f.additions)) : 0;
     const deletions = Number.isFinite(f.deletions) ? Math.max(0, Math.floor(f.deletions)) : 0;
-    const changes = Number.isFinite(f.changes) ? Math.max(0, Math.floor(f.changes)) : additions + deletions;
+    // W11-5: `changes` from GitHub is additions+deletions, but a malformed or
+    // stale payload can report a value smaller than the true diff size. Use the
+    // reported value only when it is at least as large as additions+deletions,
+    // so the large-file check reflects the real diff footprint either way.
+    const reported = Number.isFinite(f.changes) ? Math.max(0, Math.floor(f.changes)) : 0;
+    const changes = Math.max(reported, additions + deletions);
 
     out.additions += additions;
     out.deletions += deletions;
@@ -46980,7 +47119,11 @@ function computeMetrics(files) {
     out.todoCount += countTodosInPatch(typeof f.patch === 'string' ? f.patch : '');
 
     const status = typeof f.status === 'string' && f.status.length > 0 ? f.status : 'modified';
-    out.byStatus[status] = (out.byStatus[status] || 0) + 1;
+    // W11-6: a status of "__proto__" or "constructor" would corrupt the counter
+    // via prototype pollution on a plain `{}`. Use Object.hasOwn to read the
+    // own-property count, never the inherited value.
+    const prev = Object.hasOwn(out.byStatus, status) ? out.byStatus[status] : 0;
+    out.byStatus[status] = prev + 1;
   }
 
   out.testToSourceRatio = out.sourceFiles > 0 ? out.testFiles / out.sourceFiles : 0;
@@ -47137,7 +47280,11 @@ function formatScannerContext(findings, metrics) {
       const title = typeof f.title === 'string' ? f.title : '';
       // SCN-18: wrap the filename in backticks so an attacker-controlled
       // filename can't run on into the prompt text (delimits it from prose).
-      lines.push(`- \`${file}\`${line} ${rule} ${title}`.trim());
+      // W11-4: replace backticks in the filename with ' before wrapping, so a
+      // filename like `evil`code`.js` can't close the code span early (sibling
+      // of the W8-1 fix applied to the other code-span renderers).
+      const safeFile = file.replace(/`/g, "'");
+      lines.push(`- \`${safeFile}\`${line} ${rule} ${title}`.trim());
     }
   }
   if (metrics && typeof metrics === 'object') {
