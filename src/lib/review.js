@@ -135,7 +135,10 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
         const title = typeof f?.title === 'string' ? f.title : '';
         // W6-4: filenames are attacker-controlled — render as inline code so
         // markdown metacharacters in a filename cannot inject formatting/links.
-        lines.push(`- \`${file}\` — ${title}`);
+        // W7-4: escape backticks in the filename so they cannot close the code
+        // span early.
+        const safeFile = file.replace(/`/g, '\\`');
+        lines.push(`- \`${safeFile}\` — ${title}`);
       }
       lines.push('');
     }

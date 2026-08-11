@@ -188,7 +188,14 @@ function escapeXmlAttribute(s) {
  * on for structure.
  */
 function escapeStructuralTags(s) {
-  return String(s ?? '').replace(/<\/?(diff|file|review_batch|untrusted_input)>/gi, '<\\/$1>');
+  // W7-1/W7-3: tolerate attribute-bearing tags (<review_batch batch_number="N">)
+  // and preserve the opening-vs-closing slash distinction. The old `>`-anchored
+  // regex missed attribute-bearing tags and the '<\\/$1>' replacement corrupted
+  // opening tags into closing tags.
+  return String(s ?? '').replace(
+    /<(\/?)(diff|file|review_batch|untrusted_input)\b[^>]*>/gi,
+    '<\\/$1$2>',
+  );
 }
 
 /**

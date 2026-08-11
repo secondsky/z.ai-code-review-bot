@@ -117,7 +117,10 @@ const SEVERITY_LABEL = {
  */
 function coerceEnum(value, allowed) {
   if (typeof value !== 'string') return null;
-  const lower = value.toLowerCase();
+  // W7-2: trim incidental whitespace. LLMs commonly emit "critical " (trailing
+  // space) which would otherwise fail the exact match and silently drop the
+  // finding — losing exactly the severe findings the bot exists to surface.
+  const lower = value.trim().toLowerCase();
   for (const candidate of allowed) {
     if (candidate === lower) return candidate;
   }
@@ -237,6 +240,11 @@ export function normalizeFinding(finding) {
   // produce a valid normalized finding from a too-long title. So we truncate
   // first, then validate the truncated form.
   let title = typeof f.title === 'string' ? f.title : '';
+  // W7-5: titles are LLM-emitted and attacker-influenceable. In the walkthrough
+  // path they render inside <details> blocks, so HTML structural tags
+  // (</details>, <details>, <summary>, etc.) would break the collapsible
+  // section. Strip them.
+  title = title.replace(/<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)\b[^>]*>/gi, '');
   if (title.length > TITLE_MAX) {
     title = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length) + TITLE_TRUNC_SUFFIX;
   }
@@ -803,7 +811,10 @@ export function formatFindingsAsSummary(findings, options = {}) {
         // Render the filename as inline code (backticks) which neutralizes
         // all markdown special characters. The line suffix is appended OUTSIDE
         // the code span so the :L42 anchor link is still parsed by GitHub.
-        lines.push(`- \`${file}\`${locSuffix} — ${title}`);
+        // W7-4: escape backticks in the filename so they cannot close the code
+        // span early.
+        const safeFile = String(file).replace(/`/g, '\\`');
+        lines.push(`- \`${safeFile}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
         }

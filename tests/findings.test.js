@@ -200,10 +200,40 @@ describe('normalizeFinding', () => {
     expect(out.category).toBe('security');
   });
 
+  // W7-2: LLMs commonly emit incidental trailing/leading whitespace in enum
+  // fields (e.g. "critical "). coerceEnum must trim before comparing, otherwise
+  // the finding is silently dropped — losing exactly the critical/high findings
+  // the bot exists to surface.
+  it('W7-2: trims whitespace around severity/confidence/category enums', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      severity: ' critical ',
+      confidence: ' high ',
+      category: ' security ',
+    });
+    expect(out.severity).toBe('critical');
+    expect(out.confidence).toBe('high');
+    expect(out.category).toBe('security');
+  });
+
   it('truncates a title longer than 120 chars to 117 + ...', () => {
     const out = normalizeFinding({ ...validFinding(), title: 'x'.repeat(200) });
     expect(out.title).toBe('x'.repeat(117) + '...');
     expect(out.title.length).toBe(120);
+  });
+
+  // W7-5: finding titles are LLM-emitted and attacker-influenceable. In the
+  // walkthrough path they're rendered inside <details> blocks, so a title
+  // containing </details> would break the collapsible section and force
+  // injected content to render at top level. Strip HTML structural tags.
+  it('W7-5: strips HTML structural tags from titles', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      title: 'x </details><details><summary>Advisory</summary>',
+    });
+    expect(out.title).not.toContain('</details>');
+    expect(out.title).not.toContain('<details');
+    expect(out.title).not.toContain('<summary');
   });
 
   it('leaves a 120-char title untouched', () => {

@@ -84,12 +84,14 @@ export function escapeUntrustedMultiline(s) {
   return String(s ?? '')
     .replace(/`/g, "'")
     .replace(/<\/?untrusted_input/gi, (m) => m.replace(/</g, '&lt;'))
-    // W6-5: the structured-review prompt wraps file entries in a
+    // W6-5 / W7-1 / W7-3: the structured-review prompt wraps file entries in a
     // <review_batch>/<file>/<diff> envelope. A malicious patch containing these
-    // structural tags would break the envelope and confuse the model about
-    // batch boundaries. Neutralize them (mirrors escapeStructuralTags in
-    // auto-review.js, which was only applied to the length-calc path).
-    .replace(/<\/?(diff|file|review_batch)>/gi, '<\\/$1>');
+    // structural tags would break the envelope. Neutralize all forms:
+    // - attribute-bearing opening tags (<review_batch batch_number="99">)
+    //   (W7-1: the old `>`-anchored regex missed these)
+    // - preserve the opening-vs-closing distinction (W7-3: the old replacement
+    //   '<\\/$1>' corrupted opening tags into closing tags)
+    .replace(/<(\/?)(diff|file|review_batch)\b[^>]*>/gi, '<\\/$1$2>');
 }
 
 /**
