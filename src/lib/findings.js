@@ -244,7 +244,7 @@ export function normalizeFinding(finding) {
   // path they render inside <details> blocks, so HTML structural tags
   // (</details>, <details>, <summary>, etc.) would break the collapsible
   // section. Strip them.
-  title = title.replace(/<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)\b[^>]*>/gi, '');
+  title = title.replace(/<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)(?:\s[^>]*)?>/gi, '');
   if (title.length > TITLE_MAX) {
     title = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length) + TITLE_TRUNC_SUFFIX;
   }

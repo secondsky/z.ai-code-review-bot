@@ -236,6 +236,21 @@ describe('normalizeFinding', () => {
     expect(out.title).not.toContain('<summary');
   });
 
+  // W9-1: the W7-5 title-stripper used \b[^>]* which over-matched hyphenated
+  // HTML-like tags (<svg-icon>, <a-link>, <details-panel>), garbling legitimate
+  // review titles about custom elements. Fix: use (?:\s[^>]*)? to only match
+  // exact tag names with optional space-attributes.
+  it('W9-1: does not strip hyphenated HTML-like element names from titles', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      title: 'Replace <svg-icon> with accessible <img> tag',
+    });
+    // The hyphenated custom element must survive; the real <img> tag is stripped.
+    expect(out.title).toContain('<svg-icon>');
+    expect(out.title).not.toContain('<img>');
+    expect(out.title).toContain('Replace');
+  });
+
   it('leaves a 120-char title untouched', () => {
     const exact = 'y'.repeat(120);
     const out = normalizeFinding({ ...validFinding(), title: exact });
