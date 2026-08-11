@@ -138,6 +138,17 @@ describe('buildCommentBody', () => {
     expect(out).toContain('body');
     expect(out.endsWith(marker)).toBe(true);
   });
+
+  // W13-1: when content is a single line (no newline) equal to the heading,
+  // the firstLine extraction used indexOf('\n')=-1 → Math.max(0,-1)=0 → ''.
+  // The heading check failed, producing a duplicate H2.
+  test('W13-1: does not duplicate heading when content is a single-line heading', () => {
+    const marker = '<!-- m -->';
+    const out = buildCommentBody({ title: 'T', content: '## T', marker });
+    const headingCount = (out.match(/^## /gm) || []).length;
+    expect(headingCount).toBe(1);
+    expect(out.endsWith(marker)).toBe(true);
+  });
 });
 
 describe('upsertReviewComment', () => {

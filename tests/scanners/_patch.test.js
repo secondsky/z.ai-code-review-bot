@@ -70,11 +70,20 @@ describe('parseAddedLines', () => {
     ]);
   });
 
-  it('skips the +++ file header', () => {
-    // Hunk starts new-file line at 1; `+++` header is not an addition and does
-    // NOT advance the counter; `+real addition` therefore lands at line 1.
+  it('treats a +++ line INSIDE a hunk as an added line (W13-1: over-scan, not under-scan)', () => {
+    // W13-1: real `+++ b/path` file headers appear BEFORE the first `@@` hunk
+    // (skipped by !inHunk). Inside a hunk, a `+++` line is always an added line
+    // whose content starts with `++`. Treating it as content is the SAFE
+    // direction — it over-scans (harmless false positive) rather than
+    // under-scanning (which would bypass secret detection). The added line
+    // `+++ b/foo.js` has content `++ b/foo.js` which won't match any secret
+    // pattern, so it's effectively a no-op for the scanner.
     const patch = ['@@ -1,1 +1,1 @@', '+++ b/foo.js', '+real addition'].join('\n');
-    expect(parseAddedLines(patch)).toEqual([{ line: 1, text: 'real addition' }]);
+    // Both lines are treated as additions.
+    expect(parseAddedLines(patch)).toEqual([
+      { line: 1, text: '++ b/foo.js' },
+      { line: 2, text: 'real addition' },
+    ]);
   });
 
   // W5-5: an ADDED line whose content starts with `++` (e.g. `++secret = ...`)
@@ -185,5 +194,17 @@ describe('parseAddedLines', () => {
     const lines = parseAddedLines(patch);
     expect(lines).toHaveLength(1);
     expect(lines[0].text).toBe('++');
+  });
+
+  // W13-1: the W12-4 fix (tightening the guard to /^\+\+\+\s+\S/) introduced a
+  // Critical regression — it runs INSIDE the hunk where real +++ b/path headers
+  // never appear (they're before the first @@). So it skips legitimate added
+  // lines whose content starts with "++ " (e.g. "++ AKIAIOSFODNN7EXAMPLE"),
+  // bypassing secret scanning on the regex-fallback path.
+  it('W13-1: does NOT skip an added line whose content starts with "++ " (secret bypass)', () => {
+    const patch = '@@ -1,1 +1,2 @@\n context\n+++ AKIAIOSFODNN7EXAMPLE';
+    const lines = parseAddedLines(patch);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].text).toBe('++ AKIAIOSFODNN7EXAMPLE');
   });
 });

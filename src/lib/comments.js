@@ -66,7 +66,12 @@ export function buildCommentBody({ title, content, marker }) {
   // duplicate H2 heading. Compare on the first line with trailing whitespace
   // stripped.
   const trimmed = safeContent.trimEnd();
-  const firstLine = trimmed.slice(0, Math.max(0, trimmed.indexOf('\n')));
+  // W13-1: when content has no newline, indexOf('\n') returns -1 and
+  // Math.max(0,-1)=0, making firstLine='' — which always fails the heading
+  // check and produces a duplicate H2. Handle the no-newline case: the whole
+  // trimmed string IS the first line.
+  const nlIdx = trimmed.indexOf('\n');
+  const firstLine = nlIdx === -1 ? trimmed : trimmed.slice(0, nlIdx);
   const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {

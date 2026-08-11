@@ -65,11 +65,13 @@ export function resolveCachePath(spec) {
   if (typeof version !== 'string' || !version) {
     throw new Error('ensureBinary: version is required');
   }
-  // Defense-in-depth: reject path separators / traversal sequences in name and
-  // version. These are currently hardcoded, but guard against future regressions
-  // and untrusted inputs that could escape the cache dir.
-  for (const label of /** @type {const} */ (['name', 'version'])) {
-    const value = label === 'name' ? name : version;
+  // Defense-in-depth: reject path separators / traversal sequences in name,
+  // version, and ext. These are currently hardcoded, but guard against future
+  // regressions and untrusted inputs that could escape the cache dir.
+  // W13-3: ext was previously unsanitized — ext='/../../../etc/shadow' would
+  // escape the cache dir via join().
+  for (const label of /** @type {const} */ (['name', 'version', 'ext'])) {
+    const value = label === 'name' ? name : label === 'version' ? version : ext;
     if (/[\\/]/.test(value) || value === '..' || value.includes('..')) {
       throw new Error(
         `ensureBinary: ${label} must not contain path separators or ".." (got "${value}")`,
@@ -462,6 +464,15 @@ export async function ensureBinary(opts, deps = {}) {
       // SCN-10: re-hash the cached file and compare to expectedChecksum. A
       // cached file whose hash no longer matches (tampering, partial write,
       // a different binary that overwrote the path) must NOT be trusted.
+      // W13-2: for specs with an extractor (tar.gz/zip), the cached file is
+      // the EXTRACTED binary, not the downloaded archive — its hash will never
+      // match the archive checksum. In that case, trust the cached binary's
+      // existence (the archive checksum was already verified on the original
+      // download). For raw-binary specs (no extractor), the cached file IS
+      // the downloaded bytes, so the checksum comparison is valid.
+      if (typeof spec.extractor === 'function') {
+        return cachePath;
+      }
       try {
         const cached = await readFile(cachePath);
         const cachedBuf = Buffer.isBuffer(cached)

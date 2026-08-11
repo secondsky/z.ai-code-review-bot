@@ -78,23 +78,25 @@ export function parseAddedLines(patch) {
       continue;
     }
     if (!inHunk) {
-      // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
+      // Lines before the first hunk (e.g. diff metadata, `+++ b/path`,
+      // `--- a/path` file headers) are skipped entirely.
       continue;
     }
-    if (/^\+\+\+\s+\S/.test(raw)) {
-      // File header — `+++ b/path` (whitespace + non-whitespace path after).
-      // W12-4: the previous guard /^\+\+\+(?:\s|$)/ also matched a bare `+++`
-      // at EOL or `+++ ` with only trailing whitespace, dropping a legitimate
-      // added line whose content is `++`. A real file header always has a
-      // path (non-whitespace) after `+++ `, so require it.
-      continue;
-    }
+    // W13-1: do NOT guard against `+++` or `---` inside a hunk. Real file
+    // headers (`+++ b/path`, `--- a/path`) only appear BEFORE the first `@@`
+    // hunk, where `!inHunk` already skips them (line 80-83 above). Inside a
+    // hunk, a line starting with `+++` is always an added line whose content
+    // starts with `++` (e.g. `++ AKIAIOSFODNN7EXAMPLE`). The previous guard
+    // (W5-5 / W12-4) skipped these, bypassing secret scanning on the regex-
+    // fallback path. Removing the guard is both correct and necessary: it
+    // restores scanning of added lines whose content starts with `++` or `--`.
     if (raw.startsWith('+')) {
       out.push({ line: newLine, text: raw.slice(1) });
       newLine++;
       continue;
     }
-    if (/^---(?:\s|$)/.test(raw)) {
+    if (raw.startsWith('-')) {
+      // Removal — counter unchanged.
       continue;
     }
     if (raw.startsWith('-')) {
