@@ -39593,7 +39593,12 @@ const ALERT_RE = new RegExp(
 // the second `@lead` lost its leading boundary char and survived neutralization
 // — a real notification-spam bypass. GitHub team names cannot contain
 // whitespace, so \s has been removed from both alternatives.
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
+// W12-1a: "/" was in the negated boundary class to protect URLs like
+// `https://user@host`. But that also blocked neutralization of `path/@user`
+// and `@lead/@junior` — GitHub DOES render @mentions after a "/". URLs like
+// `https://user@host` already don't match because the char before "@" is a
+// word char (\w), so the boundary fails WITHOUT needing "/" in the exclusion.
+const MENTION_RE = /(^|[^\w`\\])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -39610,7 +39615,9 @@ function neutralizeMentionsOutsideCode(text) {
     // ``` (optionally with a language tag or indentation). We count opening vs
     // closing delimiters naively: if a line has ``` and we're not in a fence,
     // enter; if we are in a fence and the line is a closing ```, exit.
-    if (/^\s*```/.test(line)) {
+    // W12-2a: also detect fences inside blockquotes ("> ```", ">> ```", etc.)
+    // so @mentions inside blockquoted code blocks are preserved.
+    if (/^(?:\s*>)*\s*```/.test(line)) {
       if (inFence) {
         inFence = false;
         unclosedStart = -1; // this fence closed cleanly
@@ -39652,10 +39659,13 @@ function neutralizeMentionsOutsideCode(text) {
 function neutralizeMentionsInLine(line) {
   // Split into [code, non-code, code, non-code, ...] segments. Odd indices
   // (after a backtick pair) are inline code; even indices are prose.
-  const segments = line.split(/(`[^`]*`)/g);
+  // W12-3a: match double-backtick (``...``) BEFORE single-backtick so GitHub's
+  // ``@user`` syntax is treated as code, not prose. The alternation tries the
+  // longer ``...`` first, then falls back to `...`.
+  const segments = line.split(/(``[^`]*``|`[^`]*`)/g);
   return segments
     .map((seg, i) => {
-      // Inline code segments start and end with a backtick.
+      // Inline code segments start and end with a backtick (or double backtick).
       if (i % 2 === 1) return seg;
       return seg.replace(MENTION_RE, (full, pre, name, bt, btName) => {
         // Two alternatives in MENTION_RE:
@@ -39891,6 +39901,11 @@ function buildCommentBody({ title, content, marker }) {
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
     return trimmed;
+  }
+  // W12-3b: content already has the heading but NOT the marker — append the
+  // marker without re-wrapping (re-wrapping would duplicate the heading).
+  if (hasHeading) {
+    return `${trimmed}\n\n${marker}`;
   }
   if (title) {
     return `## ${title}\n\n${safeContent}\n\n${marker}`;
@@ -40156,7 +40171,11 @@ function filterPatchableFiles(files) {
  */
 function filterExcludedFiles(files, excludePatterns) {
   if (!Array.isArray(files)) return [];
-  return files.filter((f) => !matchesAnyPattern(f.filename, excludePatterns));
+  // W12-1b: guard against null/undefined elements (from malformed API
+  // responses or test mocks) — f.filename would throw otherwise.
+  return files.filter(
+    (f) => f && typeof f === 'object' && !matchesAnyPattern(f.filename, excludePatterns),
+  );
 }
 
 ;// CONCATENATED MODULE: ./src/lib/prompt.js
@@ -42697,7 +42716,16 @@ function parseHunks(patch) {
   let oldLine = 1;
   let newLine = 1;
 
-  for (const raw of patch.split('\n')) {
+  // W12-2b: split('\n') on a patch ending with '\n' (which GitHub's patch
+  // field always does) produces a trailing '' that is NOT a real line — it's
+  // the artifact of the terminal newline. Without filtering, it hits the
+  // context-line branch and creates a phantom valid comment line one past the
+  // last real diff line, which GitHub rejects (HTTP 422) if targeted. A real
+  // blank context line in a unified diff is ' ' (a single space), never ''.
+  const rows = patch.split('\n');
+  if (rows.length > 0 && rows[rows.length - 1] === '') rows.pop();
+
+  for (const raw of rows) {
     if (raw.startsWith('@@')) {
       const header = parseFullHunkHeader(raw);
       if (header) {
@@ -42958,43 +42986,30 @@ const DESCRIBE_MARKER_END = '<!-- /zai-description -->';
  * @returns {Promise<object|null>}  The created comment data, or `null` if the
  *   context was missing the fields needed to post (defensive no-op).
  */
-async function postComment({ octokit, context, body }) {
+async function postComment({ octokit, context, body, trailers = [] }) {
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const issueNumber = context?.payload?.issue?.number;
   if (!owner || !repo || typeof issueNumber !== 'number') {
     return null;
   }
-  // W11-11: sanitizeModelOutput strips ALL zai-* HTML comments (the forgeries
-  // we defend against come from MODEL output). But the fallback-review path
-  // embeds TRUSTED trailers assembled by our own code — the idempotency marker
-  // (<!-- zai-code-review -->), the incremental-review hash block
-  // (<!-- zai-hashes: ... -->), and the schedule-dedup SHA block
-  // (<!-- zai-sha: ... -->). Stripping those breaks idempotent upsert on the
-  // next run and defeats SHA-level dedup.
+  // W11-11 / W12-1: sanitizeModelOutput strips ALL zai-* HTML comments from
+  // the body — this is the SCN-15 defense against model-forged markers. But
+  // the fallback-review path needs to preserve TRUSTED trailers (the marker,
+  // hash block, SHA block) that our own code assembled via appendTrailers.
   //
-  // The trusted trailers are always appended by `appendTrailers` AFTER the
-  // body prose, so they form a contiguous tail of zai-* comments. A model
-  // forgery can appear ANYWHERE in the prose. So we split the body into a
-  // prose region (sanitized, forgeries stripped) and a trailing-trailer
-  // region (trusted, preserved), and reassemble. This never preserves a
-  // forgery embedded in the prose — only the contiguous tail of zai-* comments
-  // that our own code appended.
-  let prose = typeof body === 'string' ? body : '';
-  let trailers = '';
-  if (prose) {
-    // Capture the trailing run of `<!-- zai-* -->` comments (each optionally
-    // preceded by a newline), working backwards from the end.
-    const tailRe = /(\s*<!--\s*zai-[^\n>]*-->)+\s*$/;
-    const tailMatch = prose.match(tailRe);
-    if (tailMatch) {
-      trailers = tailMatch[0];
-      prose = prose.slice(0, tailMatch.index);
-    }
-  }
-  let safeBody = sanitizeModelOutput(prose);
-  if (trailers) {
-    safeBody = `${safeBody.replace(/\n+$/, '')}${trailers}`;
+  // The W11-11 fix tried to extract trailers from the body tail via regex,
+  // but W12-1 found that a model-forged zai-* comment at the tail survived
+  // (the regex cannot distinguish a forgery from a real trailer). The correct
+  // fix: sanitize the body UNCONDITIONALLY (all zai-* stripped), then
+  // re-append ONLY the trusted trailers passed explicitly by the caller. The
+  // caller knows which trailers it appended; the sanitizer doesn't need to
+  // guess. This can never preserve a model forgery.
+  let safeBody = sanitizeModelOutput(body);
+  const trustedTrailers = (Array.isArray(trailers) ? trailers : [])
+    .filter((t) => typeof t === 'string' && t.length > 0);
+  if (trustedTrailers.length > 0) {
+    safeBody = `${safeBody.replace(/\n+$/, '')}\n${trustedTrailers.join('\n')}`;
   }
   const { data } = await octokit.rest.issues.createComment({
     owner,
@@ -43554,8 +43569,8 @@ async function upsertReview({ octokit, context, marker = MARKER, sha, body, comm
  * @param {{octokit:object, context:object, body:string}} args
  * @returns {Promise<object|null>}  The created comment data, or null.
  */
-async function postFallbackComment({ octokit, context, body }) {
-  return postComment({ octokit, context, body });
+async function postFallbackComment({ octokit, context, body, trailers = [] }) {
+  return postComment({ octokit, context, body, trailers });
 }
 
 ;// CONCATENATED MODULE: ./src/lib/commands.js
@@ -45079,7 +45094,21 @@ async function reviewOnePr({
           );
         }
         const fallbackBody = `${body}\n\n${comments.map((c) => c.body).join('\n\n')}`;
-        await postFallbackComment({ octokit, context: ctx, body: fallbackBody });
+        // W12-1: pass the trusted trailers EXPLICITLY so postComment sanitizes
+        // the body and re-appends only the known trusted trailers (marker +
+        // SHA block). Without this, the trailers embedded in `body` would be
+        // stripped by sanitizeModelOutput (W11-11), breaking idempotent upsert
+        // and SHA-level dedup on the next run.
+        const fallbackTrailers = [];
+        const markerMatch = body.match(/<!--\s*zai-code-review\s*-->/);
+        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        if (shaBlock) fallbackTrailers.push(shaBlock);
+        await postFallbackComment({
+          octokit,
+          context: ctx,
+          body: fallbackBody,
+          trailers: fallbackTrailers,
+        });
       }
       return { ok: true, action: 'reviewed' };
     }
@@ -45342,10 +45371,12 @@ function parseAddedLines(patch) {
       // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
       continue;
     }
-    if (/^\+\+\+(?:\s|$)/.test(raw)) {
-      // File header — `+++ b/path` (space-delimited), or bare `+++` at EOL.
-      // NOT an added line whose content starts with `++` (e.g. `++secret`
-      // → `+++secret` has no space after the third `+`). W5-5.
+    if (/^\+\+\+\s+\S/.test(raw)) {
+      // File header — `+++ b/path` (whitespace + non-whitespace path after).
+      // W12-4: the previous guard /^\+\+\+(?:\s|$)/ also matched a bare `+++`
+      // at EOL or `+++ ` with only trailing whitespace, dropping a legitimate
+      // added line whose content is `++`. A real file header always has a
+      // path (non-whitespace) after `+++ `, so require it.
       continue;
     }
     if (raw.startsWith('+')) {
@@ -46113,6 +46144,11 @@ function buildFinding({ file, line, value, pattern }) {
 function maskSecret(value) {
   if (typeof value !== 'string') return '';
   if (value.length <= 12) return value.length > 0 ? `${value[0]}…` : '';
+  // W12-5: for mid-length secrets (13-20 chars), first4+last2 exposed 6 chars
+  // (up to 46% of a 13-char secret). Use first2+last1 for mid-length so
+  // exposure stays at ~3 chars regardless of length; switch to first4+last2
+  // only for secrets longer than 20 chars (where 6 of 21+ is < 29%).
+  if (value.length <= 20) return `${value.slice(0, 2)}…${value.slice(-1)}`;
   return `${value.slice(0, 4)}…${value.slice(-2)}`;
 }
 
@@ -47641,12 +47677,19 @@ function stripComment(line) {
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === "'" && !inDouble) {
-      // Only treat `'` as a quote toggle when NOT embedded in a word. A `'`
-      // glued to a letter/digit — like the apostrophe in `it's` — is not a
-      // delimiter; treating it as one would flip `inSingle` permanently.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (!/[A-Za-z0-9]/.test(prev)) {
-        inSingle = !inSingle;
+      // W12-4b: the contraction guard (don't treat `'` as a delimiter when
+      // preceded by alphanumeric, to handle `it's`) must NOT apply when we are
+      // ALREADY inside a single-quoted string — a `'` inside a single-quoted
+      // value is always the closing delimiter regardless of the preceding char.
+      // Without this, `'see ref5'   # note` keeps inSingle=true after the
+      // closing quote, so quotes aren't stripped and the comment leaks.
+      if (inSingle) {
+        inSingle = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inSingle = !inSingle;
+        }
       }
     } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
@@ -48786,9 +48829,15 @@ function learnings_stripComment(line) {
       // is not a delimiter; treating it as one flips inSingle permanently and
       // disables comment stripping for the rest of the line. Mirrors the guard
       // in repo-config.js stripComment.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (!/[A-Za-z0-9]/.test(prev)) {
-        inSingle = !inSingle;
+      // W12-4b: the guard must NOT apply when already inside a single-quoted
+      // string — a `'` inside is always the closing delimiter.
+      if (inSingle) {
+        inSingle = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inSingle = !inSingle;
+        }
       }
     } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
@@ -50148,10 +50197,22 @@ async function run(context, deps = {}) {
           keptFindings,
           config.reviewerName,
         );
+        // W12-1: pass the trusted trailers EXPLICITLY so postComment sanitizes
+        // the body (stripping any model-forged zai-* comments) and then
+        // re-appends only the known trusted trailers. Extract them from the
+        // reviewBody (they were appended by appendTrailers from trusted literals).
+        const fallbackTrailers = [];
+        const markerMatch = reviewBody.match(/<!--\s*zai-code-review\s*-->/);
+        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        const hashMatch = reviewBody.match(/<!--\s*zai-hashes:[^>]*-->/);
+        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
+        const shaMatch = reviewBody.match(/<!--\s*zai-sha:[^>]*-->/);
+        if (shaMatch) fallbackTrailers.push(shaMatch[0]);
         await postFallbackCommentFn({
           octokit,
           context: reviewContext,
           body: fallbackBody,
+          trailers: fallbackTrailers,
         });
         await maybeAssignReviewers();
         return;
