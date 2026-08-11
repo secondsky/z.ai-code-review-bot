@@ -61,8 +61,13 @@ export function buildCommentBody({ title, content, marker }) {
   // the marker. Re-wrapping would produce a duplicate H2 heading and a
   // duplicate trailing marker on the rendered PR comment. When the sanitized
   // content already carries both, return it verbatim instead of re-wrapping.
+  // W11-8: tolerate trailing horizontal whitespace after the heading text
+  // (`## Title \n`), which used to fail the exact-string check and produced a
+  // duplicate H2 heading. Compare on the first line with trailing whitespace
+  // stripped.
   const trimmed = safeContent.trimEnd();
-  const hasHeading = !!title && trimmed.startsWith(`## ${title}\n`);
+  const firstLine = trimmed.slice(0, Math.max(0, trimmed.indexOf('\n')));
+  const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
     return trimmed;

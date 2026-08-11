@@ -689,4 +689,33 @@ describe('postFallbackComment', () => {
     // The fake createComment returns { id: 1 }.
     expect(result).toMatchObject({ id: 1 });
   });
+
+  // W11-11: the fallback path used to strip the idempotency marker
+  // (<!-- zai-code-review -->), the incremental-review hash block, and the
+  // schedule-dedup SHA block, because postComment always runs
+  // sanitizeModelOutput which strips ALL zai-* HTML comments. The next run
+  // then couldn't find the marker (creating duplicate summary comments) and
+  // couldn't find the SHA block (re-reviewing every schedule tick). The
+  // trailers are trusted literals assembled by our own code, not model output,
+  // so they must be preserved through the fallback path.
+  it('W11-11: preserves the marker + hash + SHA trailers through sanitization', async () => {
+    const { octokit, calls } = makeReviewOctokit({});
+    const body =
+      '## Z.ai Code Review\n\nsummary\n\n<!-- zai-code-review -->\n' +
+      '<!-- zai-hashes: a,b -->\n<!-- zai-sha: sha1 -->';
+    await postFallbackComment({
+      octokit,
+      context: ctx(),
+      body,
+    });
+    const posted = calls.createComment[0].body;
+    // The idempotency marker survives.
+    expect(posted).toContain('<!-- zai-code-review -->');
+    // The incremental-review hash block survives.
+    expect(posted).toContain('<!-- zai-hashes: a,b -->');
+    // The schedule-dedup SHA block survives.
+    expect(posted).toContain('<!-- zai-sha: sha1 -->');
+    // And the human-readable summary survives.
+    expect(posted).toContain('summary');
+  });
 });

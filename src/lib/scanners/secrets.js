@@ -76,8 +76,16 @@ export const SECRET_PATTERNS = [
     suggestion: 'Remove the token and revoke it at github.com/settings/tokens.',
   },
   {
+    // W11-3: the regex used to require the literal suffix `PRIVATE KEY-----`
+    // immediately after an optional type prefix, which missed two common PEM
+    // headers: `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PKCS#8 encrypted keys,
+    // where "ENCRYPTED " was absent from the type alternation) and
+    // `-----BEGIN PGP PRIVATE KEY BLOCK-----` (GnuPG keys, where the trailing
+    // ` BLOCK` broke the `PRIVATE KEY-----` suffix). The pattern now accepts
+    // any optional uppercase prefix before `PRIVATE KEY` and an optional
+    // ` BLOCK` suffix, covering every PEM private-key header in the wild.
     name: 'private-key-block',
-    regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----/,
+    regex: /-----BEGIN (?:[A-Z ]*)PRIVATE KEY(?: BLOCK)?-----/,
     title: 'Private key block detected',
     description: 'A PEM-encoded private key block was found in the diff.',
     suggestion: 'Remove the key and rotate any credentials it protected.',

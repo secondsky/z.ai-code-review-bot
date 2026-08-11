@@ -149,6 +149,26 @@ describe('scanSecretsRegex — pattern coverage', () => {
     expect(findings[0].rule).toBe('regex:private-key-block');
   });
 
+  it('detects ENCRYPTED private key blocks (W11-3: PKCS#8 encrypted keys)', () => {
+    // The regex used to miss `-----BEGIN ENCRYPTED PRIVATE KEY-----` because
+    // "ENCRYPTED " was not in the type alternation.
+    const findings = scanSecretsRegex(
+      file(buildPatch(['-----BEGIN ENCRYPTED PRIVATE KEY-----'])),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].rule).toBe('regex:private-key-block');
+  });
+
+  it('detects PGP PRIVATE KEY BLOCK headers (W11-3: GnuPG keys)', () => {
+    // The regex used to miss `-----BEGIN PGP PRIVATE KEY BLOCK-----` because
+    // the literal suffix `PRIVATE KEY-----` didn't account for ` BLOCK`.
+    const findings = scanSecretsRegex(
+      file(buildPatch(['-----BEGIN PGP PRIVATE KEY BLOCK-----'])),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].rule).toBe('regex:private-key-block');
+  });
+
   it('detects Slack tokens', () => {
     const findings = scanSecretsRegex(
       file(buildPatch(['const slack = "xoxb-' + '1'.repeat(20) + '"'])),

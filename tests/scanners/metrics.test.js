@@ -282,6 +282,17 @@ describe('computeMetrics', () => {
     expect(m.largeFiles).toEqual(['big.js']);
   });
 
+  it('flags large files when changes < additions+deletions (W11-5)', () => {
+    // GitHub defines changes = additions + deletions, but a malformed/stale
+    // payload can report a `changes` value smaller than the true diff size. The
+    // large-file check must reflect the true size, not the (possibly stale)
+    // reported `changes` value.
+    const m = computeMetrics([
+      { filename: 'big.js', additions: 500, deletions: 0, changes: 1 },
+    ]);
+    expect(m.largeFiles).toEqual(['big.js']);
+  });
+
   it('flags generated files', () => {
     const m = computeMetrics([
       { filename: 'package-lock.json' },
@@ -312,6 +323,19 @@ describe('computeMetrics', () => {
   it('defaults missing status to modified', () => {
     const m = computeMetrics([{ filename: 'a.js' }]);
     expect(m.byStatus).toEqual({ modified: 1 });
+  });
+
+  it('byStatus is robust to __proto__ / constructor status (W11-6)', () => {
+    // A status string of "__proto__" or "constructor" used to corrupt the
+    // counter via prototype pollution. Neither is a real GitHub file status,
+    // but the counter must handle them defensively.
+    const m = computeMetrics([
+      { filename: 'a.js', status: 'constructor' },
+      { filename: 'b.js', status: 'constructor' },
+      { filename: 'c.js', status: '__proto__' },
+    ]);
+    expect(m.byStatus.constructor).toBe(2);
+    expect(m.byStatus.__proto__).toBe(1);
   });
 
   it('skips entries with no filename', () => {

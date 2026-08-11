@@ -42,10 +42,14 @@ const TRUNCATION_MARKER = '\n\n> …(output truncated by Z.ai safety filter)';
  * case-insensitive (GitHub accepts any casing).
  */
 const ALERT_TYPES = ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'];
+// W11-2: GitHub renders alert banners at any blockquote nesting depth
+// (`> [!WARNING]`, `>> [!WARNING]`, `> > [!NOTE]`, …). The regex used to match
+// exactly one `>`; it now matches one-or-more (`>+`) so nested banners are
+// neutralized too.
 const ALERT_RE = new RegExp(
-  // An optional blockquote prefix, then the [!TYPE] marker at line start.
+  // An optional blockquote prefix (one or more `>`), then the [!TYPE] marker.
   // We anchor on start-of-line so a quoted `[!NOTE]` mid-paragraph is unaffected.
-  String.raw`(^|\n)(\s*>\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  String.raw`(^|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
   'gi',
 );
 
@@ -72,7 +76,13 @@ const ALERT_RE = new RegExp(
 // mention). The replacement re-emits the backtick followed by the neutralized
 // mention. This keeps the original text visually identical while inserting the
 // ZWSP that breaks GitHub's mention parser.
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_\s-]+)?)/g;
+// W11-1: the org/team alternative used to include \s in its char class
+// (`(?:\/[A-Za-z0-9_\s-]+)?`). The greedy match swallowed the space between a
+// slash-team mention and a following plain mention (e.g. `@org/x @lead`), so
+// the second `@lead` lost its leading boundary char and survived neutralization
+// — a real notification-spam bypass. GitHub team names cannot contain
+// whitespace, so \s has been removed from both alternatives.
+const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -105,7 +115,10 @@ function neutralizeMentionsOutsideCode(text) {
       out.push(line); // inside fence: never touch
       continue;
     }
-    out.push(neutralizeMentionsInLine(line));
+    // W11-2: apply alert-banner neutralization on the same non-fence lines as
+    // mentions, so alert syntax inside a fenced code block is preserved (it is
+    // not rendered as a banner by GitHub inside code).
+    out.push(neutralizeAlertsLine(neutralizeMentionsInLine(line)));
   }
   // C02: a fence was opened but never closed. The lines after the opening fence
   // line were treated as "inside fence" and pushed verbatim — but a properly
@@ -114,7 +127,7 @@ function neutralizeMentionsOutsideCode(text) {
   // opening fence line itself is left as-is.
   if (unclosedStart >= 0) {
     for (let i = unclosedStart + 1; i < out.length; i++) {
-      out[i] = neutralizeMentionsInLine(out[i]);
+      out[i] = neutralizeAlertsLine(neutralizeMentionsInLine(out[i]));
     }
   }
   return out.join('\n');
@@ -145,10 +158,37 @@ function neutralizeMentionsInLine(line) {
     .join('');
 }
 
+// Line-scoped alert-banner regex: matches `>`-prefix banner markers at the
+// start of a single line (no `\n` boundary). Used by neutralizeAlertsLine so
+// we can apply alert neutralization per-line inside the fence-aware loop.
+const ALERT_LINE_RE = new RegExp(
+  String.raw`^(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  'i',
+);
+
+/**
+ * Neutralize GitHub alert-banner syntax on a single line. Returns the line
+ * with the leading `[` of a `> [!TYPE]` marker dropped (at any blockquote
+ * nesting depth), so GitHub renders it as plain quoted text instead of an
+ * official callout banner.
+ */
+function neutralizeAlertsLine(line) {
+  return line.replace(ALERT_LINE_RE, (full, quotePrefix, type) => {
+    return `${quotePrefix}!${type.toUpperCase()}`;
+  });
+}
+
 /**
  * Neutralize GitHub alert-banner syntax. Rewrites `> [!WARNING]` (case-
- * insensitive, optional blockquote) so the leading `[` is dropped; GitHub then
- * renders it as plain quoted text instead of the official callout banner.
+ * insensitive, optional blockquote, any nesting depth) so the leading `[` is
+ * dropped; GitHub then renders it as plain quoted text instead of the official
+ * callout banner.
+ *
+ * NOTE: this full-text variant is NOT fence-aware. Callers that need to skip
+ * fenced code blocks (the default sanitize path) go through
+ * `neutralizeMentionsOutsideCode`, which calls `neutralizeAlertsLine` per
+ * non-fence line. This function is kept for the exported surface and for tests
+ * that exercise the alert regex in isolation.
  */
 function neutralizeAlerts(text) {
   return text.replace(ALERT_RE, (full, boundary, quotePrefix, type) => {
@@ -212,9 +252,11 @@ export function sanitizeModelOutput(text, options = {}) {
   if (text === '') return '';
 
   // 1. Neutralize mentions + alerts BEFORE truncating, so a long payload of
-  //    spam can't escape the sanitizer via truncation timing.
+  //    spam can't escape the sanitizer via truncation timing. Both passes are
+  //    applied inside neutralizeMentionsOutsideCode's fence-aware loop, so
+  //    neither touches text inside ``` blocks (W11-2: alert syntax inside a
+  //    fenced code block is not rendered as a banner and must be preserved).
   let out = neutralizeMentionsOutsideCode(text);
-  out = neutralizeAlerts(out);
   // SCN-15 / W2-2: strip any forged zai-* HTML comment markers that an attacker
   // might coax the model into emitting via prompt injection (hashes, description,
   // sha, etc.). Applied globally so mid-line forgeries are also caught.

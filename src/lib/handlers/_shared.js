@@ -54,7 +54,37 @@ export async function postComment({ octokit, context, body }) {
   if (!owner || !repo || typeof issueNumber !== 'number') {
     return null;
   }
-  const safeBody = sanitizeModelOutput(body);
+  // W11-11: sanitizeModelOutput strips ALL zai-* HTML comments (the forgeries
+  // we defend against come from MODEL output). But the fallback-review path
+  // embeds TRUSTED trailers assembled by our own code — the idempotency marker
+  // (<!-- zai-code-review -->), the incremental-review hash block
+  // (<!-- zai-hashes: ... -->), and the schedule-dedup SHA block
+  // (<!-- zai-sha: ... -->). Stripping those breaks idempotent upsert on the
+  // next run and defeats SHA-level dedup.
+  //
+  // The trusted trailers are always appended by `appendTrailers` AFTER the
+  // body prose, so they form a contiguous tail of zai-* comments. A model
+  // forgery can appear ANYWHERE in the prose. So we split the body into a
+  // prose region (sanitized, forgeries stripped) and a trailing-trailer
+  // region (trusted, preserved), and reassemble. This never preserves a
+  // forgery embedded in the prose — only the contiguous tail of zai-* comments
+  // that our own code appended.
+  let prose = typeof body === 'string' ? body : '';
+  let trailers = '';
+  if (prose) {
+    // Capture the trailing run of `<!-- zai-* -->` comments (each optionally
+    // preceded by a newline), working backwards from the end.
+    const tailRe = /(\s*<!--\s*zai-[^\n>]*-->)+\s*$/;
+    const tailMatch = prose.match(tailRe);
+    if (tailMatch) {
+      trailers = tailMatch[0];
+      prose = prose.slice(0, tailMatch.index);
+    }
+  }
+  let safeBody = sanitizeModelOutput(prose);
+  if (trailers) {
+    safeBody = `${safeBody.replace(/\n+$/, '')}${trailers}`;
+  }
   const { data } = await octokit.rest.issues.createComment({
     owner,
     repo,
@@ -162,8 +192,23 @@ export async function upsertPrDescription(
       // CMD-7: orphan start marker (start without a matching end). Treat as
       // "no block found" and append, instead of slicing everything after the
       // orphan marker (which would destroy human-written body text).
-      newBody = currentBody ? `${currentBody}\n\n${block}` : block;
+      // W11-7: STRIP the orphan marker(s) before appending. Without this, the
+      // body carries a dangling START; the NEXT run finds it via indexOf(START)
+      // and pairs it with the appended block's END, so the in-place replace
+      // spans the whole gap and deletes the human-written text between them.
+      const stripped = currentBody
+        .replace(/<!--\s*\/?zai-description\s*-->\n?/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trimEnd();
+      newBody = stripped ? `${stripped}\n\n${block}` : block;
     }
+  } else if (currentBody.includes(DESCRIBE_MARKER_END)) {
+    // Orphan END marker (end without a matching start). Strip it and append.
+    const stripped = currentBody
+      .replace(/<!--\s*\/?zai-description\s*-->\n?/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trimEnd();
+    newBody = stripped ? `${stripped}\n\n${block}` : block;
   } else {
     // No existing block: append.
     newBody = currentBody ? `${currentBody}\n\n${block}` : block;

@@ -265,6 +265,24 @@ describe('splitTextByLines', () => {
   test('maxChars=0 with empty string returns [""]', () => {
     expect(splitTextByLines('', 0)).toEqual(['']);
   });
+
+  // W11-9: slicing a long line on a UTF-16 code-unit boundary used to split a
+  // surrogate pair (emoji/CJK extensions), leaving lone surrogates that turn
+  // into U+FFFD when serialized to UTF-8 — silent corruption of the diff
+  // content sent to the LLM.
+  test('W11-9: does not split a surrogate pair at a chunk boundary', () => {
+    // '🎉' is U+1F389 = surrogate pair \uD83C\uDF89 (2 code units). Place it
+    // so the naive maxChars=20 boundary would fall BETWEEN the two surrogates.
+    const line = 'a'.repeat(19) + '🎉' + 'b'.repeat(19);
+    const chunks = splitTextByLines(line, 20);
+    // No chunk may contain a lone (unpaired) surrogate.
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const c of chunks) {
+      expect(c).not.toMatch(loneSurrogate);
+    }
+    // Reconstruction preserves the original string (no data loss).
+    expect(chunks.join('')).toBe(line);
+  });
 });
 
 /* ------------------------------------------------------------------ *

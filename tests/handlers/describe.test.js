@@ -315,7 +315,7 @@ describe('upsertPrDescription — CMD-7: orphan start marker', () => {
   // code sliced everything after the start marker, destroying human-written
   // body text. The fix treats an orphan start marker as "no block found" and
   // appends instead.
-  it('CMD-7: preserves body content after an orphan start marker (appends the block)', async () => {
+  it('CMD-7: preserves body content after an orphan start marker (strips orphan, appends the block)', async () => {
     const calls = { get: [], update: [] };
     const octokit = {
       rest: {
@@ -346,12 +346,64 @@ describe('upsertPrDescription — CMD-7: orphan start marker', () => {
     expect(newBody).toContain('after');
     // The new block was appended (not inserted at the orphan marker).
     expect(newBody).toContain('NEW');
-    // The orphan start marker is still present (we did not delete surrounding
-    // text), and exactly one new START/END marker pair was added.
+    // W11-7: the orphan start marker is STRIPPED before appending, so a
+    // subsequent run cannot span-replace from the orphan to the new END and
+    // destroy the human text in between. Exactly one START/END pair remains.
     const startCount = (newBody.match(/<!-- zai-description -->/g) || []).length;
     const endCount = (newBody.match(/<!-- \/zai-description -->/g) || []).length;
-    expect(startCount).toBe(2); // original orphan + new block's start
+    expect(startCount).toBe(1); // only the new block's start — orphan stripped
     expect(endCount).toBe(1); // new block's end
+  });
+
+  // W11-7: the original CMD-7 fix preserved text on the FIRST run but left the
+  // orphan start marker in place. On the SECOND run, indexOf(START) found the
+  // orphan and indexOf(END, startIdx) found the appended block's END, so the
+  // in-place replace spanned from the orphan to the appended END, irreversibly
+  // deleting every line between them (including human-written body text). The
+  // fix strips orphan markers before appending, so the body never carries a
+  // dangling START that a later run can pair with an END.
+  it('W11-7: two consecutive runs preserve human text after an orphan start marker', async () => {
+    let body = '## Summary\nFix auth.\n\n## Test plan\n<!-- zai-description -->\nMANUAL TEST NOTES: run npm test\n';
+    const calls = [];
+    const octokit = {
+      rest: {
+        pulls: {
+          async get() {
+            return { data: { body } };
+          },
+          async update(params) {
+            calls.push(params.body);
+            body = params.body; // the next get() returns the updated body
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'Generated desc 1',
+    });
+    await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'Generated desc 2',
+    });
+
+    expect(calls).toHaveLength(2);
+    const finalBody = calls[1];
+    // Human-written notes after the orphan marker MUST survive the second run.
+    expect(finalBody).toContain('MANUAL TEST NOTES: run npm test');
+    // Exactly one START/END pair after the second run.
+    const startCount = (finalBody.match(/<!-- zai-description -->/g) || []).length;
+    const endCount = (finalBody.match(/<!-- \/zai-description -->/g) || []).length;
+    expect(startCount).toBe(1);
+    expect(endCount).toBe(1);
   });
 });
 

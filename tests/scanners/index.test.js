@@ -64,6 +64,22 @@ describe('formatScannerContext', () => {
     expect(out).toContain('`src/auth.js`');
   });
 
+  // W11-4: a filename containing a backtick used to close the wrapping code
+  // span early, splitting it into multiple spans (sibling of the W8-1 fix
+  // applied to review.js / walkthrough.js / index.js / findings.js). The
+  // backtick is now escaped to an apostrophe before wrapping, consistent with
+  // the other renderers.
+  it('escapes a backtick in the filename so the code span stays intact (W11-4)', () => {
+    const findings = [
+      { file: 'src/evil`code`.js', line: 42, rule: 'x', title: 't' },
+    ];
+    const out = formatScannerContext(findings, null);
+    // No bare backtick in the middle of the filename — it's replaced with '.
+    expect(out).not.toContain('`src/evil`');
+    // The whole filename lives inside a single backtick pair.
+    expect(out).toContain("`src/evil'code'.js`");
+  });
+
   it('omits :line when line is null', () => {
     const findings = [
       { file: 'package-lock.json', line: null, rule: 'metrics:generated-file', title: 'Generated/lock file modified' },

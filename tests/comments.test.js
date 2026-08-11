@@ -115,6 +115,18 @@ describe('buildCommentBody', () => {
     const out = buildCommentBody({ title: 'Summary', content: 'body text', marker });
     expect(out).toBe(`## Summary\n\nbody text\n\n${marker}`);
   });
+
+  // W11-8: the heading-detection used `startsWith('## Title\n')` exactly. A
+  // heading with incidental trailing whitespace before the newline
+  // (`## Title \n`) failed the check, so the content was re-wrapped and the
+  // rendered comment showed a DUPLICATE H2 heading.
+  test('W11-8: does not duplicate heading when content heading has trailing whitespace', () => {
+    const marker = '<!-- zai-code-review -->';
+    const content = `## Z.ai Code Review \n\nFindings.\n\n${marker}`;
+    const out = buildCommentBody({ title: 'Z.ai Code Review', content, marker });
+    const headingCount = (out.match(/^## /gm) || []).length;
+    expect(headingCount).toBe(1);
+  });
 });
 
 describe('upsertReviewComment', () => {

@@ -73,7 +73,11 @@ export function formatScannerContext(findings, metrics) {
       const title = typeof f.title === 'string' ? f.title : '';
       // SCN-18: wrap the filename in backticks so an attacker-controlled
       // filename can't run on into the prompt text (delimits it from prose).
-      lines.push(`- \`${file}\`${line} ${rule} ${title}`.trim());
+      // W11-4: replace backticks in the filename with ' before wrapping, so a
+      // filename like `evil`code`.js` can't close the code span early (sibling
+      // of the W8-1 fix applied to the other code-span renderers).
+      const safeFile = file.replace(/`/g, "'");
+      lines.push(`- \`${safeFile}\`${line} ${rule} ${title}`.trim());
     }
   }
   if (metrics && typeof metrics === 'object') {

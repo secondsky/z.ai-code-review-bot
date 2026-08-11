@@ -170,7 +170,9 @@ export function computeMetrics(files) {
     largeFiles: [],
     generatedFiles: [],
     todoCount: 0,
-    byStatus: {},
+    // W11-6: use a null-prototype object so status strings like "__proto__" or
+    // "constructor" cannot corrupt the counter via the inherited prototype.
+    byStatus: Object.create(null),
   };
   if (!Array.isArray(files)) return out;
 
@@ -182,7 +184,12 @@ export function computeMetrics(files) {
 
     const additions = Number.isFinite(f.additions) ? Math.max(0, Math.floor(f.additions)) : 0;
     const deletions = Number.isFinite(f.deletions) ? Math.max(0, Math.floor(f.deletions)) : 0;
-    const changes = Number.isFinite(f.changes) ? Math.max(0, Math.floor(f.changes)) : additions + deletions;
+    // W11-5: `changes` from GitHub is additions+deletions, but a malformed or
+    // stale payload can report a value smaller than the true diff size. Use the
+    // reported value only when it is at least as large as additions+deletions,
+    // so the large-file check reflects the real diff footprint either way.
+    const reported = Number.isFinite(f.changes) ? Math.max(0, Math.floor(f.changes)) : 0;
+    const changes = Math.max(reported, additions + deletions);
 
     out.additions += additions;
     out.deletions += deletions;
@@ -196,7 +203,11 @@ export function computeMetrics(files) {
     out.todoCount += countTodosInPatch(typeof f.patch === 'string' ? f.patch : '');
 
     const status = typeof f.status === 'string' && f.status.length > 0 ? f.status : 'modified';
-    out.byStatus[status] = (out.byStatus[status] || 0) + 1;
+    // W11-6: a status of "__proto__" or "constructor" would corrupt the counter
+    // via prototype pollution on a plain `{}`. Use Object.hasOwn to read the
+    // own-property count, never the inherited value.
+    const prev = Object.hasOwn(out.byStatus, status) ? out.byStatus[status] : 0;
+    out.byStatus[status] = prev + 1;
   }
 
   out.testToSourceRatio = out.sourceFiles > 0 ? out.testFiles / out.sourceFiles : 0;

@@ -84,9 +84,15 @@ export async function listOpenPrs({
   // scheduled review. We skip drafts entirely during accumulation — they are
   // filtered again in runScheduledReview, but excluding them here means the
   // cap reflects only reviewable PRs.
+  // W11-12: CORE-4 added MAX_PAGES caps to changed-files.js, comments.js, and
+  // review.js to prevent a pathological endpoint from trapping pagination in an
+  // unbounded loop. schedule.js was missed. A repo with many open DRAFT PRs
+  // (all skipped) and the cap unfilled would paginate without a ceiling. The
+  // same cap is applied to hasReviewForSha below.
+  const MAX_LIST_PAGES = 100;
   const out = [];
   let page = 1;
-  for (;;) {
+  for (; page <= MAX_LIST_PAGES; page++) {
     // W2-1: capture the ACTUAL per_page sent to the API and compare data.length
     // against THAT value (not the original `perPage` parameter). The previous
     // code compared `data.length < perPage` (the parameter), which broke when
@@ -116,7 +122,6 @@ export async function listOpenPrs({
       if (out.length >= maxPrs) return out;
     }
     if (data.length < requestedPerPage) break;
-    page += 1;
   }
   return out;
 }
@@ -172,10 +177,12 @@ export async function hasReviewForSha({
   // cron tick re-reviewed PRs whose findings mapped to diff lines — defeating
   // the SHA dedup. Search both, paginating each fully.
   const perPage = 100;
+  // W11-12: cap pagination so a PR with a very large comment/review history
+  // cannot stall a scheduled run (consistent with CORE-4 caps elsewhere).
+  const MAX_COMMENT_PAGES = 100;
 
   // 1. Issue comments (issues.listComments).
-  let page = 1;
-  for (;;) {
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
     const { data: comments } = await octokit.rest.issues.listComments({
       owner,
       repo,
@@ -185,14 +192,12 @@ export async function hasReviewForSha({
     });
     if (comments.some(matches)) return true;
     if (comments.length < perPage) break;
-    page += 1;
   }
 
   // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
   // Guard for environments where the endpoint is absent (older mocks).
   if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
-    page = 1;
-    for (;;) {
+    for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
       const { data: reviews } = await octokit.rest.pulls.listReviews({
         owner,
         repo,
@@ -202,7 +207,6 @@ export async function hasReviewForSha({
       });
       if (reviews.some(matches)) return true;
       if (reviews.length < perPage) break;
-      page += 1;
     }
   }
 
@@ -263,6 +267,18 @@ export async function reviewOnePr({
     const patchable = filterPatchableFiles(files);
     if (patchable.length === 0) {
       return { ok: true, action: 'skipped-no-patchable' };
+    }
+
+    // W11-10: `largePrFileThreshold` used to be parsed in config, exported as
+    // `isLargePr`, and wired through dependencies, but never called — a pure
+    // config-wiring no-op (same class as W6-1/W6-2). Now we call it and log
+    // when a PR exceeds the threshold, so the knob has an observable effect.
+    // Batched review runs either way (batching handles both small and large
+    // PRs), but the log line helps operators tune the threshold.
+    if (typeof isLargePr === 'function' && isLargePr(patchable, { largePrFileThreshold: config.largePrFileThreshold })) {
+      if (core?.info) {
+        core.info(`Scheduled review: PR #${pr.number} is large (${patchable.length} patchable files > threshold ${config.largePrFileThreshold}); using batched review.`);
+      }
     }
 
     const result = await runStructuredReview(patchable, config, { callApi, core });

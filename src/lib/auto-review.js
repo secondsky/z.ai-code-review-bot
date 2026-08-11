@@ -121,8 +121,24 @@ export function splitTextByLines(text, maxChars) {
     if (line.length > maxChars) {
       // A single oversized line: flush pending, then slice this line.
       flush();
-      for (let i = 0; i < line.length; i += maxChars) {
-        chunks.push(line.slice(i, i + maxChars));
+      let i = 0;
+      while (i < line.length) {
+        let end = Math.min(i + maxChars, line.length);
+        // W11-9: don't split a UTF-16 surrogate pair. If the char at end-1 is
+        // a high surrogate and `end` is still inside the string (followed by a
+        // low surrogate), back up by one so the pair stays in the same chunk.
+        // Without this, the two halves land in separate chunks and serialize
+        // as U+FFFD when sent to the LLM — silent corruption of diff content.
+        if (end < line.length) {
+          const code = line.charCodeAt(end - 1);
+          if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+        }
+        // Safety: if maxChars is 1 and the char at i is a high surrogate, end
+        // would equal i and we'd loop forever. Force at least one char of
+        // progress so the lone surrogate moves into a chunk on its own.
+        if (end === i) end = i + 1;
+        chunks.push(line.slice(i, end));
+        i = end;
       }
       continue;
     }

@@ -334,15 +334,15 @@ describe('neutralizeMentionsInLine — regex boundary cases', () => {
     expect(out).toBe('`@\u200bevilspammer');
   });
 
-  it('pins org/team with embedded whitespace (surprising but intentional)', () => {
-    // The MENTION_RE second group allows \s, so '@org/team name' is matched as
-    // a single mention where the team name is 'team name' (space included). This
-    // mirrors GitHub's own team-name handling. Only the @ gets the ZWSP — the
-    // whole 'org/team name' is captured as the name group. We pin this so a
-    // future regex tightening doesn't silently change behavior.
+  it('org/team mention stops at the first space (W11-1: no \\s in char class)', () => {
+    // GitHub team names cannot contain whitespace. The regex used to include \s
+    // in the team-name char class, which let a greedy match swallow the space
+    // before a following mention and bypass its neutralization. The name now
+    // stops at the first non-team char (space), so '@org/team name' neutralizes
+    // only the @org/team mention and leaves 'name' as prose.
     const out = neutralizeMentionsInLine('cc @org/team name here');
-    expect(out).toContain('@\u200b');
-    // The captured name extends through the space: 'org/team name'.
+    expect(out).toContain('@\u200borg/team');
+    // The space after the team name is preserved.
     expect(out).toBe('cc @\u200borg/team name here');
   });
 });
@@ -476,5 +476,55 @@ describe('sanitizeCommentBody — marker / header positioning', () => {
     expect(out).toContain('@\u200bspammer');
     // No header was synthesized.
     expect(out.startsWith('## ')).toBe(false);
+  });
+});
+
+// ============================================================================
+// W11-1 / W11-2: adversarial audit fixes.
+// ============================================================================
+
+describe('W11-1: mention neutralization — slash-team greedy-space bypass', () => {
+  // The org/team alternative used to include \s, which let the greedy match
+  // swallow the space between two mentions. The second @mention then had no
+  // boundary char in front of it and survived — a real notification-spam path.
+  it('neutralizes a second @mention following a slash-team mention', () => {
+    const out = sanitizeModelOutput('cc @org/whatever @maintainer');
+    const zwspCount = (out.match(/@\u200b/g) || []).length;
+    expect(zwspCount).toBe(2);
+    expect(out).toContain('@\u200bmaintainer');
+  });
+
+  it('neutralizes every mention in a chain of slash-team + plain mentions', () => {
+    const out = sanitizeModelOutput('@org/team @alice @bob');
+    const zwspCount = (out.match(/@\u200b/g) || []).length;
+    expect(zwspCount).toBe(3);
+  });
+
+  it('still neutralizes a plain @org/team mention (no regression)', () => {
+    const out = sanitizeModelOutput('cc @org/everyone');
+    expect(out).toBe('cc @\u200borg/everyone');
+  });
+});
+
+describe('W11-2: alert-banner neutralizer — nested blockquotes & code fences', () => {
+  it('neutralizes a nested >> [!WARNING] banner (two-level blockquote)', () => {
+    const out = neutralizeAlerts('>> [!WARNING] hi');
+    expect(out).not.toContain('[!WARNING]');
+    expect(out).toContain('!WARNING');
+  });
+
+  it('neutralizes a deeply-nested >>> [!NOTE] banner', () => {
+    const out = neutralizeAlerts('>>> [!NOTE] deep');
+    expect(out).not.toContain('[!NOTE]');
+    expect(out).toContain('!NOTE');
+  });
+
+  it('does NOT mangle alert-syntax text inside a fenced code block', () => {
+    const input = '```markdown\n> [!WARNING] demo\n```';
+    const out = sanitizeModelOutput(input);
+    // The fenced content is preserved verbatim (the banner marker survives
+    // because it's inside code, not rendered by GitHub as a banner).
+    expect(out).toContain('> [!WARNING] demo');
+    expect(out).not.toContain('> !WARNING');
   });
 });

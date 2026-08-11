@@ -216,6 +216,36 @@ describe('listOpenPrs', () => {
     expect(pullsListCalls.length).toBeGreaterThanOrEqual(2);
     expect(pullsListCalls[1].page).toBe(2);
   });
+
+  // W11-12: listOpenPrs used a bare `for(;;)` with no page ceiling. A repo with
+  // many open DRAFT PRs (all skipped) and few non-draft PRs, with the cap
+  // unfilled, would paginate through every open PR without a ceiling. CORE-4
+  // added MAX_PAGES caps to changed-files.js, comments.js, and review.js but
+  // schedule.js was missed. The loop must enforce a MAX_PAGES ceiling.
+  it('terminates after MAX_PAGES even when the API always returns a full page of drafts (W11-12)', async () => {
+    let calls = 0;
+    const fullPage = Array.from({ length: 50 }, (_, i) => ({
+      number: 1000 + calls * 50 + i,
+      head: { sha: 'd' },
+      draft: true, // all drafts → all skipped → cap never filled
+      title: 'd',
+    }));
+    const octokit = {
+      rest: {
+        pulls: {
+          async list() {
+            calls += 1;
+            return { data: [...fullPage].map((p) => ({ ...p, number: 1000 + calls * 50 })) };
+          },
+        },
+      },
+    };
+    await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 100, perPage: 50 });
+    // Without a cap this would loop indefinitely (drafts never fill the cap).
+    // With the cap it terminates at MAX_PAGES (100).
+    expect(calls).toBeLessThanOrEqual(101); // MAX_PAGES + small slack
+    expect(calls).toBeGreaterThan(0);
+  });
 });
 
 /* ---------- hasReviewForSha ---------- */
@@ -536,6 +566,24 @@ describe('runScheduledReview', () => {
     // both small and large PRs); isLargePr is still passed through for future use.
     expect(bigStubs.runStructuredReview).toHaveBeenCalledTimes(1);
     expect(bigStubs.formatFindingsAsSummary).toHaveBeenCalledTimes(1);
+  });
+
+  // W11-10: `largePrFileThreshold` used to be a pure no-op — parsed in config,
+  // exported as `isLargePr`, wired through dependencies, but NEVER called. Now
+  // reviewSinglePr calls it and logs when a PR exceeds the threshold, so the
+  // config knob has an observable effect.
+  it('W11-10: logs a large-PR notice when isLargePr returns true', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(1, 'sha1')], commentsByPr: {} });
+    const callApi = vi.fn(async () => 'review');
+    const infoCalls = [];
+    const bigStubs = makeStubs({ isLargePr: vi.fn(() => true) });
+    await runScheduledReview({
+      octokit, owner: 'o', repo: 'r', config: makeConfig(), core: { info: (m) => infoCalls.push(m), warning() {} }, callApi, ...bigStubs,
+    });
+    // isLargePr was actually CALLED (not just passed through).
+    expect(bigStubs.isLargePr).toHaveBeenCalled();
+    // An observable log line mentions the large-PR threshold.
+    expect(infoCalls.some((m) => /large.*pr|threshold/i.test(m))).toBe(true);
   });
 
   it('respects scheduleMaxPrs from config', async () => {
