@@ -362,8 +362,8 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
       const line = typeof f?.line === 'number' && f.line > 0 ? `:L${f.line}` : '';
       const title = typeof f?.title === 'string' ? f.title : '';
       // W6-4: filenames are attacker-controlled — render as inline code.
-      // W7-4: escape backticks so they cannot close the code span early.
-      parts.push(`- \`${String(file).replace(/`/g, '\\`')}${line}\` — ${title}`);
+      // W8-1: replace backticks (escapes don't work in code spans).
+      parts.push(`- \`${String(file).replace(/`/g, "'")}${line}\` — ${title}`);
     }
   }
   return parts.join('\n');

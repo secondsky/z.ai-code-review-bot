@@ -700,17 +700,18 @@ describe('formatFindingsAsSummary', () => {
   it('escapes backticks in evidence so the inline-code span is not corrupted (F05)', () => {
     // Evidence is rendered inside backtick code spans. A backtick in the
     // evidence would close the span early and corrupt the markdown.
+    // W8-1: backslash escapes do NOT work in CommonMark code spans, so the
+    // backtick is replaced with "'" instead.
     const out = formatFindingsAsSummary([
       {
         ...validFinding(),
         evidence: 'foo`bar',
       },
     ]);
-    // The literal unescaped "foo`bar" must NOT appear (the backtick must be
-    // escaped so the inline code span is preserved).
+    // The literal unescaped "foo`bar" must NOT appear.
     expect(out).not.toContain('foo`bar');
-    // The escaped form should be present.
-    expect(out).toContain('foo\\`bar');
+    // The backtick is replaced with a single quote (code-span-safe).
+    expect(out).toContain("foo'bar");
   });
 
   it('W2-SEC-6: neutralizes markdown injection from a filename with ** (bold)', () => {

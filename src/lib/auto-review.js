@@ -193,7 +193,7 @@ function escapeStructuralTags(s) {
   // regex missed attribute-bearing tags and the '<\\/$1>' replacement corrupted
   // opening tags into closing tags.
   return String(s ?? '').replace(
-    /<(\/?)(diff|file|review_batch|untrusted_input)\b[^>]*>/gi,
+    /<(\/?)(diff|file|review_batch|untrusted_input)(?:\s[^>]*)?>/gi,
     '<\\/$1$2>',
   );
 }

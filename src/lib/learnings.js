@@ -61,8 +61,17 @@ function stripComment(line) {
   let inDouble = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === "'" && !inDouble) inSingle = !inSingle;
-    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    if (ch === "'" && !inDouble) {
+      // W8-4: only treat `'` as a quote toggle when NOT embedded in a word.
+      // An apostrophe glued to a letter/digit (like in `don't` or `it's`)
+      // is not a delimiter; treating it as one flips inSingle permanently and
+      // disables comment stripping for the rest of the line. Mirrors the guard
+      // in repo-config.js stripComment.
+      const prev = i > 0 ? line[i - 1] : '';
+      if (!/[A-Za-z0-9]/.test(prev)) {
+        inSingle = !inSingle;
+      }
+    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {

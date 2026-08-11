@@ -91,7 +91,7 @@ export function escapeUntrustedMultiline(s) {
     //   (W7-1: the old `>`-anchored regex missed these)
     // - preserve the opening-vs-closing distinction (W7-3: the old replacement
     //   '<\\/$1>' corrupted opening tags into closing tags)
-    .replace(/<(\/?)(diff|file|review_batch)\b[^>]*>/gi, '<\\/$1$2>');
+    .replace(/<(\/?)(diff|file|review_batch)(?:\s[^>]*)?>/gi, '<\\/$1$2>');
 }
 
 /**

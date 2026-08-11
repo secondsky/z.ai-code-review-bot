@@ -67,6 +67,20 @@ describe('buildReviewBody', () => {
     expect(body).not.toMatch(/\*\*\*\*\[click\]/);
   });
 
+  // W8-1: a filename containing a backtick must not close the code span early.
+  // Per CommonMark, backslash escapes do NOT work inside code spans, so the
+  // W7-4 fix (\` escaping) was illusory. Replace backticks with a safe char
+  // (consistent with escapeDiffFence in prompt.js) before wrapping.
+  it('W8-1: backtick in filename does not close the code span', () => {
+    const summaryOnly = [{ file: "evil`name.js", title: 'Bug', severity: 'high' }];
+    const body = buildReviewBody('Summary.', summaryOnly, {});
+    // The rendered line must contain exactly ONE pair of backticks (the code
+    // span delimiters), not three (which would indicate early close).
+    const line = body.split('\n').find((l) => l.includes('evil'));
+    const backtickCount = (line.match(/`/g) || []).length;
+    expect(backtickCount).toBe(2);
+  });
+
   it('includes the marker byte-exact at the end (idempotency detection)', () => {
     const body = buildReviewBody('s', [], {});
     expect(body.endsWith(MARKER)).toBe(true);
@@ -169,6 +183,8 @@ describe('buildReviewComments', () => {
   it('escapes backticks in evidence so the inline-code span is preserved (F05)', () => {
     // renderCommentBody wraps evidence in backtick code spans. A backtick in
     // the evidence would close the span early and corrupt the markdown.
+    // W8-1: backslash escapes do NOT work in CommonMark code spans, so the
+    // backtick is replaced with "'" instead.
     const inline = [
       {
         finding: {
@@ -184,8 +200,8 @@ describe('buildReviewComments', () => {
     const body = buildReviewComments(inline)[0].body;
     // The literal unescaped backtick-in-evidence must NOT appear.
     expect(body).not.toContain('evil`injection');
-    // The escaped form should be present.
-    expect(body).toContain('evil\\`injection');
+    // The backtick is replaced with a single quote (code-span-safe).
+    expect(body).toContain("evil'injection");
   });
 
   it('collapses newlines in evidence so the code span is preserved and links render as literal text (CORE-2)', () => {

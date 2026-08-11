@@ -210,15 +210,22 @@ export async function hasReviewForSha({
 }
 
 /**
- * Review a single PR using the structured-review pipeline. Mirrors the
- * `pull_request` branch of `run()` in src/index.js: fetch changed files, filter
- * excludes + patchable, short-circuit on zero patchable, run the structured
- * review, then post via the v2 inline-review pipeline (partition findings →
- * buildReviewBody/buildReviewComments → upsertReview) when at least one finding
- * maps to a diff line. Falls back to the legacy single summary comment when no
- * finding is line-mappable (all file-level or unmappable), and again to
- * postFallbackComment if the review submission itself fails — the review is
- * never silently lost.
+ * Review a single PR using the structured-review pipeline. Partially mirrors
+ * the `pull_request` branch of `run()` in src/index.js: fetch changed files,
+ * filter excludes + patchable, short-circuit on zero patchable, run the
+ * structured review, then post via the v2 inline-review pipeline (partition
+ * findings → buildReviewBody/buildReviewComments → upsertReview) when at least
+ * one finding maps to a diff line. Falls back to the legacy single summary
+ * comment when no finding is line-mappable (all file-level or unmappable), and
+ * again to postFallbackComment if the review submission itself fails — the
+ * review is never silently lost.
+ *
+ * KNOWN LIMITATION (W8-3): unlike the `pull_request` path, the scheduled path
+ * does not currently load `.zai.yml` repo config or run deterministic scanners
+ * (gitleaks/ast-grep). This means `path_filters`, `path_instructions`,
+ * `tone_instructions`, the `chill` profile, and deterministic secret/pattern
+ * findings are absent on scheduled reviews. Schedule is opt-in; this gap is
+ * tracked for a future enhancement.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.

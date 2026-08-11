@@ -487,8 +487,8 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
 
         const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
         // W6-4: filenames are attacker-controlled — render as inline code.
-        // W7-4: escape backticks so they cannot close the code span early.
-        const safeFile = String(file).replace(/`/g, '\\`');
+        // W8-1: replace backticks (escapes don't work in code spans).
+        const safeFile = String(file).replace(/`/g, "'");
         lines.push(`- \`${safeFile}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);

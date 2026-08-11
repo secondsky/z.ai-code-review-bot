@@ -146,6 +146,18 @@ learnings:
     expect(parseLearnings(text)).toEqual([]);
   });
 
+  // W8-4: an unquoted value containing an apostrophe (e.g. "don't") previously
+  // toggled inSingle permanently, so a trailing `# comment` was NOT stripped
+  // and became part of the parsed value. Port the apostrophe-in-word guard
+  // from repo-config.js.
+  it('W8-4: apostrophe in unquoted value does not disable comment stripping', () => {
+    const text = `learnings:\n  - file: a.js\n    pattern: don't flag # trailing\n`;
+    const out = parseLearnings(text);
+    expect(out).toHaveLength(1);
+    // The trailing "# trailing" comment must be stripped; the value is "don't flag".
+    expect(out[0].pattern).toBe("don't flag");
+  });
+
   it('keeps a reason only when it is a non-empty string', () => {
     const text = `
 learnings:

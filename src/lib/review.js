@@ -135,9 +135,9 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
         const title = typeof f?.title === 'string' ? f.title : '';
         // W6-4: filenames are attacker-controlled — render as inline code so
         // markdown metacharacters in a filename cannot inject formatting/links.
-        // W7-4: escape backticks in the filename so they cannot close the code
-        // span early.
-        const safeFile = file.replace(/`/g, '\\`');
+        // W8-1: replace backticks with "'" (backslash escapes do NOT work
+        // inside CommonMark code spans, so the W7-4 \` escape was illusory).
+        const safeFile = file.replace(/`/g, "'");
         lines.push(`- \`${safeFile}\` — ${title}`);
       }
       lines.push('');
@@ -193,7 +193,7 @@ function renderCommentBody(finding) {
     // CORE-2: escape backticks AND collapse newlines in evidence so the inline
     // code span is preserved. A newline would close the span early and let the
     // remaining content render as markdown (e.g. a clickable malicious link).
-    const safeEvidence = evidence.replace(/`/g, '\\`').replace(/\r?\n/g, ' ');
+    const safeEvidence = evidence.replace(/`/g, "'").replace(/\r?\n/g, ' ');
     parts.push(`> \`${safeEvidence}\``);
   }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);

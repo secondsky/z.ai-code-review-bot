@@ -811,9 +811,8 @@ export function formatFindingsAsSummary(findings, options = {}) {
         // Render the filename as inline code (backticks) which neutralizes
         // all markdown special characters. The line suffix is appended OUTSIDE
         // the code span so the :L42 anchor link is still parsed by GitHub.
-        // W7-4: escape backticks in the filename so they cannot close the code
-        // span early.
-        const safeFile = String(file).replace(/`/g, '\\`');
+        // W8-1: replace backticks in the filename (escapes don't work in code spans).
+        const safeFile = String(file).replace(/`/g, "'");
         lines.push(`- \`${safeFile}\`${locSuffix} — ${title}`);
         if (description.length > 0) {
           lines.push(`  ${description}`);
@@ -822,7 +821,7 @@ export function formatFindingsAsSummary(findings, options = {}) {
           lines.push(`  💡 ${suggestion}`);
         }
         if (evidence.length > 0) {
-          lines.push(`  > \`${String(evidence).replace(/`/g, '\\`')}\``);
+          lines.push(`  > \`${String(evidence).replace(/`/g, "'")}\``);
         }
       }
       lines.push('');
