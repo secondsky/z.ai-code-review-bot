@@ -72,6 +72,11 @@ export function buildCommentBody({ title, content, marker }) {
   if (hasHeading && hasMarker) {
     return trimmed;
   }
+  // W12-3b: content already has the heading but NOT the marker — append the
+  // marker without re-wrapping (re-wrapping would duplicate the heading).
+  if (hasHeading) {
+    return `${trimmed}\n\n${marker}`;
+  }
   if (title) {
     return `## ${title}\n\n${safeContent}\n\n${marker}`;
   }

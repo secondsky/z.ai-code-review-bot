@@ -82,7 +82,12 @@ const ALERT_RE = new RegExp(
 // the second `@lead` lost its leading boundary char and survived neutralization
 // — a real notification-spam bypass. GitHub team names cannot contain
 // whitespace, so \s has been removed from both alternatives.
-const MENTION_RE = /(^|[^\w`\\/])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
+// W12-1a: "/" was in the negated boundary class to protect URLs like
+// `https://user@host`. But that also blocked neutralization of `path/@user`
+// and `@lead/@junior` — GitHub DOES render @mentions after a "/". URLs like
+// `https://user@host` already don't match because the char before "@" is a
+// word char (\w), so the boundary fails WITHOUT needing "/" in the exclusion.
+const MENTION_RE = /(^|[^\w`\\])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
   const lines = text.split('\n');
@@ -99,7 +104,9 @@ function neutralizeMentionsOutsideCode(text) {
     // ``` (optionally with a language tag or indentation). We count opening vs
     // closing delimiters naively: if a line has ``` and we're not in a fence,
     // enter; if we are in a fence and the line is a closing ```, exit.
-    if (/^\s*```/.test(line)) {
+    // W12-2a: also detect fences inside blockquotes ("> ```", ">> ```", etc.)
+    // so @mentions inside blockquoted code blocks are preserved.
+    if (/^(?:\s*>)*\s*```/.test(line)) {
       if (inFence) {
         inFence = false;
         unclosedStart = -1; // this fence closed cleanly
@@ -141,10 +148,13 @@ function neutralizeMentionsOutsideCode(text) {
 function neutralizeMentionsInLine(line) {
   // Split into [code, non-code, code, non-code, ...] segments. Odd indices
   // (after a backtick pair) are inline code; even indices are prose.
-  const segments = line.split(/(`[^`]*`)/g);
+  // W12-3a: match double-backtick (``...``) BEFORE single-backtick so GitHub's
+  // ``@user`` syntax is treated as code, not prose. The alternation tries the
+  // longer ``...`` first, then falls back to `...`.
+  const segments = line.split(/(``[^`]*``|`[^`]*`)/g);
   return segments
     .map((seg, i) => {
-      // Inline code segments start and end with a backtick.
+      // Inline code segments start and end with a backtick (or double backtick).
       if (i % 2 === 1) return seg;
       return seg.replace(MENTION_RE, (full, pre, name, bt, btName) => {
         // Two alternatives in MENTION_RE:

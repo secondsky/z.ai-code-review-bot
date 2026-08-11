@@ -336,7 +336,21 @@ export async function reviewOnePr({
           );
         }
         const fallbackBody = `${body}\n\n${comments.map((c) => c.body).join('\n\n')}`;
-        await postFallbackComment({ octokit, context: ctx, body: fallbackBody });
+        // W12-1: pass the trusted trailers EXPLICITLY so postComment sanitizes
+        // the body and re-appends only the known trusted trailers (marker +
+        // SHA block). Without this, the trailers embedded in `body` would be
+        // stripped by sanitizeModelOutput (W11-11), breaking idempotent upsert
+        // and SHA-level dedup on the next run.
+        const fallbackTrailers = [];
+        const markerMatch = body.match(/<!--\s*zai-code-review\s*-->/);
+        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        if (shaBlock) fallbackTrailers.push(shaBlock);
+        await postFallbackComment({
+          octokit,
+          context: ctx,
+          body: fallbackBody,
+          trailers: fallbackTrailers,
+        });
       }
       return { ok: true, action: 'reviewed' };
     }

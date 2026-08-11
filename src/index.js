@@ -948,10 +948,22 @@ export async function run(context, deps = {}) {
           keptFindings,
           config.reviewerName,
         );
+        // W12-1: pass the trusted trailers EXPLICITLY so postComment sanitizes
+        // the body (stripping any model-forged zai-* comments) and then
+        // re-appends only the known trusted trailers. Extract them from the
+        // reviewBody (they were appended by appendTrailers from trusted literals).
+        const fallbackTrailers = [];
+        const markerMatch = reviewBody.match(/<!--\s*zai-code-review\s*-->/);
+        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        const hashMatch = reviewBody.match(/<!--\s*zai-hashes:[^>]*-->/);
+        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
+        const shaMatch = reviewBody.match(/<!--\s*zai-sha:[^>]*-->/);
+        if (shaMatch) fallbackTrailers.push(shaMatch[0]);
         await postFallbackCommentFn({
           octokit,
           context: reviewContext,
           body: fallbackBody,
+          trailers: fallbackTrailers,
         });
         await maybeAssignReviewers();
         return;

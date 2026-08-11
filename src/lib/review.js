@@ -422,6 +422,6 @@ export async function upsertReview({ octokit, context, marker = MARKER, sha, bod
  * @param {{octokit:object, context:object, body:string}} args
  * @returns {Promise<object|null>}  The created comment data, or null.
  */
-export async function postFallbackComment({ octokit, context, body }) {
-  return postComment({ octokit, context, body });
+export async function postFallbackComment({ octokit, context, body, trailers = [] }) {
+  return postComment({ octokit, context, body, trailers });
 }

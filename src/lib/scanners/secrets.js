@@ -179,6 +179,11 @@ function buildFinding({ file, line, value, pattern }) {
 export function maskSecret(value) {
   if (typeof value !== 'string') return '';
   if (value.length <= 12) return value.length > 0 ? `${value[0]}…` : '';
+  // W12-5: for mid-length secrets (13-20 chars), first4+last2 exposed 6 chars
+  // (up to 46% of a 13-char secret). Use first2+last1 for mid-length so
+  // exposure stays at ~3 chars regardless of length; switch to first4+last2
+  // only for secrets longer than 20 chars (where 6 of 21+ is < 29%).
+  if (value.length <= 20) return `${value.slice(0, 2)}…${value.slice(-1)}`;
   return `${value.slice(0, 4)}…${value.slice(-2)}`;
 }
 

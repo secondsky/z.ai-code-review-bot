@@ -47,43 +47,30 @@ export const DESCRIBE_MARKER_END = '<!-- /zai-description -->';
  * @returns {Promise<object|null>}  The created comment data, or `null` if the
  *   context was missing the fields needed to post (defensive no-op).
  */
-export async function postComment({ octokit, context, body }) {
+export async function postComment({ octokit, context, body, trailers = [] }) {
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const issueNumber = context?.payload?.issue?.number;
   if (!owner || !repo || typeof issueNumber !== 'number') {
     return null;
   }
-  // W11-11: sanitizeModelOutput strips ALL zai-* HTML comments (the forgeries
-  // we defend against come from MODEL output). But the fallback-review path
-  // embeds TRUSTED trailers assembled by our own code — the idempotency marker
-  // (<!-- zai-code-review -->), the incremental-review hash block
-  // (<!-- zai-hashes: ... -->), and the schedule-dedup SHA block
-  // (<!-- zai-sha: ... -->). Stripping those breaks idempotent upsert on the
-  // next run and defeats SHA-level dedup.
+  // W11-11 / W12-1: sanitizeModelOutput strips ALL zai-* HTML comments from
+  // the body — this is the SCN-15 defense against model-forged markers. But
+  // the fallback-review path needs to preserve TRUSTED trailers (the marker,
+  // hash block, SHA block) that our own code assembled via appendTrailers.
   //
-  // The trusted trailers are always appended by `appendTrailers` AFTER the
-  // body prose, so they form a contiguous tail of zai-* comments. A model
-  // forgery can appear ANYWHERE in the prose. So we split the body into a
-  // prose region (sanitized, forgeries stripped) and a trailing-trailer
-  // region (trusted, preserved), and reassemble. This never preserves a
-  // forgery embedded in the prose — only the contiguous tail of zai-* comments
-  // that our own code appended.
-  let prose = typeof body === 'string' ? body : '';
-  let trailers = '';
-  if (prose) {
-    // Capture the trailing run of `<!-- zai-* -->` comments (each optionally
-    // preceded by a newline), working backwards from the end.
-    const tailRe = /(\s*<!--\s*zai-[^\n>]*-->)+\s*$/;
-    const tailMatch = prose.match(tailRe);
-    if (tailMatch) {
-      trailers = tailMatch[0];
-      prose = prose.slice(0, tailMatch.index);
-    }
-  }
-  let safeBody = sanitizeModelOutput(prose);
-  if (trailers) {
-    safeBody = `${safeBody.replace(/\n+$/, '')}${trailers}`;
+  // The W11-11 fix tried to extract trailers from the body tail via regex,
+  // but W12-1 found that a model-forged zai-* comment at the tail survived
+  // (the regex cannot distinguish a forgery from a real trailer). The correct
+  // fix: sanitize the body UNCONDITIONALLY (all zai-* stripped), then
+  // re-append ONLY the trusted trailers passed explicitly by the caller. The
+  // caller knows which trailers it appended; the sanitizer doesn't need to
+  // guess. This can never preserve a model forgery.
+  let safeBody = sanitizeModelOutput(body);
+  const trustedTrailers = (Array.isArray(trailers) ? trailers : [])
+    .filter((t) => typeof t === 'string' && t.length > 0);
+  if (trustedTrailers.length > 0) {
+    safeBody = `${safeBody.replace(/\n+$/, '')}\n${trustedTrailers.join('\n')}`;
   }
   const { data } = await octokit.rest.issues.createComment({
     owner,

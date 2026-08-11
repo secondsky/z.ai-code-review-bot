@@ -81,10 +81,12 @@ export function parseAddedLines(patch) {
       // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
       continue;
     }
-    if (/^\+\+\+(?:\s|$)/.test(raw)) {
-      // File header — `+++ b/path` (space-delimited), or bare `+++` at EOL.
-      // NOT an added line whose content starts with `++` (e.g. `++secret`
-      // → `+++secret` has no space after the third `+`). W5-5.
+    if (/^\+\+\+\s+\S/.test(raw)) {
+      // File header — `+++ b/path` (whitespace + non-whitespace path after).
+      // W12-4: the previous guard /^\+\+\+(?:\s|$)/ also matched a bare `+++`
+      // at EOL or `+++ ` with only trailing whitespace, dropping a legitimate
+      // added line whose content is `++`. A real file header always has a
+      // path (non-whitespace) after `+++ `, so require it.
       continue;
     }
     if (raw.startsWith('+')) {

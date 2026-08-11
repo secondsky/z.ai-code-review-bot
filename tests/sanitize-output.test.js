@@ -528,3 +528,46 @@ describe('W11-2: alert-banner neutralizer — nested blockquotes & code fences',
     expect(out).not.toContain('> !WARNING');
   });
 });
+
+// ============================================================================
+// W12: adversarial audit Wave 12 fixes.
+// ============================================================================
+
+describe('W12: mention neutralization — slash-boundary, blockquote fence, double-backtick', () => {
+  // W12-1a: a "/" before "@" used to block neutralization (the boundary class
+  // excluded "/"). But GitHub DOES render `path/@user` and `@lead/@junior` —
+  // "/" is not a username char and acts as a valid separator. Dropping "/" from
+  // the exclusion class is safe because URLs like `https://user@host` already
+  // don't match (the "r" before "@" is \w, so the boundary fails without
+  // needing "/" in the exclusion).
+  it('W12-1a: neutralizes @mention after a slash (path/@user)', () => {
+    const out = sanitizeModelOutput('see @lead/@evilspammer');
+    expect(out).toContain('@\u200bevilspammer');
+  });
+
+  it('W12-1a: still does NOT neutralize user@host in a URL', () => {
+    const out = sanitizeModelOutput('visit https://user@host.com');
+    expect(out).not.toContain('\u200b');
+  });
+
+  // W12-2a: a code fence inside a blockquote ("> ```") used to not be detected
+  // as a fence, so @mentions inside blockquoted code were neutralized.
+  it('W12-2a: preserves @mentions inside blockquoted fenced code', () => {
+    const input = '> ```\n> @token\n> ```';
+    const out = sanitizeModelOutput(input);
+    expect(out).not.toContain('\u200b');
+  });
+
+  // W12-3a: double-backtick code spans (``@user``) were parsed as two empty
+  // single-backtick spans, so the @mention between them was treated as prose.
+  it('W12-3a: preserves @mentions inside double-backtick code spans', () => {
+    const out = neutralizeMentionsInLine('see ``@user`` now');
+    expect(out).not.toContain('\u200b');
+  });
+
+  it('W12-3a: still neutralizes @mentions in single-backtick-adjacent prose', () => {
+    // Regression guard: single-backtick spans still work.
+    const out = neutralizeMentionsInLine('see `code` @user after');
+    expect(out).toContain('@\u200buser');
+  });
+});

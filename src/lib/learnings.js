@@ -67,9 +67,15 @@ function stripComment(line) {
       // is not a delimiter; treating it as one flips inSingle permanently and
       // disables comment stripping for the rest of the line. Mirrors the guard
       // in repo-config.js stripComment.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (!/[A-Za-z0-9]/.test(prev)) {
-        inSingle = !inSingle;
+      // W12-4b: the guard must NOT apply when already inside a single-quoted
+      // string — a `'` inside is always the closing delimiter.
+      if (inSingle) {
+        inSingle = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inSingle = !inSingle;
+        }
       }
     } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {

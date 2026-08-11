@@ -65,12 +65,19 @@ function stripComment(line) {
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === "'" && !inDouble) {
-      // Only treat `'` as a quote toggle when NOT embedded in a word. A `'`
-      // glued to a letter/digit — like the apostrophe in `it's` — is not a
-      // delimiter; treating it as one would flip `inSingle` permanently.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (!/[A-Za-z0-9]/.test(prev)) {
-        inSingle = !inSingle;
+      // W12-4b: the contraction guard (don't treat `'` as a delimiter when
+      // preceded by alphanumeric, to handle `it's`) must NOT apply when we are
+      // ALREADY inside a single-quoted string — a `'` inside a single-quoted
+      // value is always the closing delimiter regardless of the preceding char.
+      // Without this, `'see ref5'   # note` keeps inSingle=true after the
+      // closing quote, so quotes aren't stripped and the comment leaks.
+      if (inSingle) {
+        inSingle = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inSingle = !inSingle;
+        }
       }
     } else if (ch === '"' && !inSingle) inDouble = !inDouble;
     else if (ch === '#' && !inSingle && !inDouble) {

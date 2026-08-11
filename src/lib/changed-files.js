@@ -83,5 +83,9 @@ export function filterPatchableFiles(files) {
  */
 export function filterExcludedFiles(files, excludePatterns) {
   if (!Array.isArray(files)) return [];
-  return files.filter((f) => !matchesAnyPattern(f.filename, excludePatterns));
+  // W12-1b: guard against null/undefined elements (from malformed API
+  // responses or test mocks) — f.filename would throw otherwise.
+  return files.filter(
+    (f) => f && typeof f === 'object' && !matchesAnyPattern(f.filename, excludePatterns),
+  );
 }

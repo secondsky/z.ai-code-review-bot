@@ -773,6 +773,14 @@ describe('parseZaiYml — comment stripping edge cases', () => {
     const text = 'reviews:\n  tone_instructions: it\'s important # be strict\n';
     expect(parseZaiYml(text).reviews.tone_instructions).toBe('it\'s important');
   });
+
+  // W12-4b: the closing quote of a single-quoted value was not recognized when
+  // preceded by an alphanumeric char (the contraction guard blocked it). This
+  // left inSingle=true, so quotes weren't stripped and a trailing comment leaked.
+  it('W12-4b: recognizes closing single-quote after an alphanumeric char', () => {
+    const text = "reviews:\n  tone_instructions: 'see ref5'   # note\n";
+    expect(parseZaiYml(text).reviews.tone_instructions).toBe('see ref5');
+  });
 });
 
 /* ------------------------------------------------------------------ *

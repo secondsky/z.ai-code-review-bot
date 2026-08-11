@@ -225,4 +225,12 @@ describe('filterExcludedFiles', () => {
   test('returns empty array for empty input', () => {
     expect(filterExcludedFiles([], ['*.lock'])).toEqual([]);
   });
+
+  // W12-1b: a null/undefined element in the files array crashed with
+  // TypeError. Every other function guards against null elements.
+  test('W12-1b: does not crash on null/undefined array elements', () => {
+    const files = [null, undefined, { filename: 'a.js' }];
+    const out = filterExcludedFiles(files, []);
+    expect(out).toEqual([{ filename: 'a.js' }]);
+  });
 });

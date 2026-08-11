@@ -176,4 +176,14 @@ describe('parseAddedLines', () => {
     expect(out[0].text).toBe('added line');
     expect(out[0].text).not.toContain('\r');
   });
+
+  // W12-4: the header guard /^\+\+\+(?:\s|$)/ matched a diff line "+++" as a
+  // false file header, dropping the added line whose content is "++". A real
+  // file header always has whitespace + a path after "+++".
+  it('W12-4: does not drop an added line whose content is "++" (diff line +++)', () => {
+    const patch = '@@ -1,1 +1,1 @@\n-old\n+++';
+    const lines = parseAddedLines(patch);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].text).toBe('++');
+  });
 });

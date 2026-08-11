@@ -85,7 +85,16 @@ export function parseHunks(patch) {
   let oldLine = 1;
   let newLine = 1;
 
-  for (const raw of patch.split('\n')) {
+  // W12-2b: split('\n') on a patch ending with '\n' (which GitHub's patch
+  // field always does) produces a trailing '' that is NOT a real line — it's
+  // the artifact of the terminal newline. Without filtering, it hits the
+  // context-line branch and creates a phantom valid comment line one past the
+  // last real diff line, which GitHub rejects (HTTP 422) if targeted. A real
+  // blank context line in a unified diff is ' ' (a single space), never ''.
+  const rows = patch.split('\n');
+  if (rows.length > 0 && rows[rows.length - 1] === '') rows.pop();
+
+  for (const raw of rows) {
     if (raw.startsWith('@@')) {
       const header = parseFullHunkHeader(raw);
       if (header) {

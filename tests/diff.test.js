@@ -190,11 +190,16 @@ describe('parseHunks', () => {
   it('treats an empty line (truly empty) as a context line', () => {
     // Unified diff context lines are " text" but a truly empty line is also
     // treated as context by git. We should emit it with the stripped text ''.
-    const patch = ['@@ -1,2 +1,2 @@', '+added', ''].join('\n');
+    // W12-2b: a trailing '' produced by split('\n') on a patch ending with '\n'
+    // is now treated as the terminal-newline artifact (not a context line).
+    // To test a REAL empty context line, place it BETWEEN content lines so it
+    // is not the split artifact.
+    const patch = ['@@ -1,3 +1,3 @@', '+added', '', '+second'].join('\n');
     const hunks = parseHunks(patch);
     expect(hunks[0].lines).toEqual([
       { type: 'add', newLine: 1, oldLine: null, text: 'added' },
       { type: 'ctx', newLine: 2, oldLine: 1, text: '' },
+      { type: 'add', newLine: 3, oldLine: null, text: 'second' },
     ]);
   });
 
@@ -325,6 +330,16 @@ describe('isValidCommentLine', () => {
     expect(isValidCommentLine(patch, 2)).toBe(true);
     expect(isValidCommentLine(patch, 3)).toBe(true);
     expect(isValidCommentLine(patch, 4)).toBe(false);
+  });
+
+  // W12-2b: a trailing newline in the patch produced a phantom empty element
+  // after split('\n'), which was treated as a context line. This made
+  // isValidCommentLine return true for a line number one past the last real
+  // diff line, which GitHub rejects (HTTP 422) if a comment targets it.
+  it('W12-2b: does NOT create a phantom valid line from a trailing newline', () => {
+    const patch = '@@ -1,1 +1,1 @@\n+a\n'; // trailing \n (GitHub always sends this)
+    expect(isValidCommentLine(patch, 1)).toBe(true); // the real line
+    expect(isValidCommentLine(patch, 2)).toBe(false); // phantom line — must NOT be valid
   });
 });
 

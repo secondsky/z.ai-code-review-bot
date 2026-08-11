@@ -70,13 +70,17 @@ describe('maskSecret', () => {
     expect(maskSecret('ABCDEFGHIJKL')).toBe('A…'); // exactly 12 chars
   });
 
-  it('masks values longer than 12 chars to <first4>…<last2>', () => {
-    // SCN-6: 13+ char secrets use the first4+last2 shape.
-    expect(maskSecret('ABCDEFGHIJKLM')).toBe('ABCD…LM'); // 13 chars
+  it('masks values 13-20 chars to <first2>…<last1> (W12-5: less exposure)', () => {
+    // W12-5: the previous first4+last2 shape exposed 6 of 13-20 chars (up to
+    // 46% for a 13-char secret). Mid-length secrets now use first2+last1.
+    expect(maskSecret('ABCDEFGHIJKLM')).toBe('AB…M'); // 13 chars
+    expect(maskSecret('ABCDEFGHIJKLMNOP')).toBe('AB…P'); // 16 chars
   });
 
-  it('masks long values to <first4>…<last2>', () => {
-    expect(maskSecret('AKIAIOSFODNN7EXAMPLE')).toBe('AKIA…LE');
+  it('masks long values (>20 chars) to <first4>…<last2>', () => {
+    // W12-5: only secrets longer than 20 chars use the first4+last2 shape
+    // (exposure drops below 30% at that length).
+    expect(maskSecret('AKIAIOSFODNN7EXAMPLEX')).toBe('AKIA…EX'); // 21 chars
     expect(maskSecret('ghp_abcdefghijklmnopqrstuvwxyz0123456789')).toBe('ghp_…89');
   });
 });
@@ -113,8 +117,8 @@ describe('scanSecretsRegex — pattern coverage', () => {
       category: 'security',
       rule: 'regex:aws-access-key-id',
     });
-    // evidence is masked
-    expect(findings[0].evidence).toBe('AKIA…LE');
+    // evidence is masked (W12-5: 20-char secret uses first2+last1)
+    expect(findings[0].evidence).toBe('AK…E');
   });
 
   it('detects GitHub PATs (ghp_/gho_/ghs_/ghu_/ghr_)', () => {
@@ -363,8 +367,8 @@ describe('mapGitleaksFinding', () => {
       description: 'AWS Access Token',
       rule: 'gitleaks:aws-access-token',
     });
-    // evidence is masked
-    expect(f.evidence).toBe('AKIA…LE');
+    // evidence is masked (W12-5: 20-char secret uses first2+last1)
+    expect(f.evidence).toBe('AK…E');
   });
 
   it('returns null when File is missing', () => {

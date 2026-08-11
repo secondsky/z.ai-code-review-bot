@@ -127,6 +127,17 @@ describe('buildCommentBody', () => {
     const headingCount = (out.match(/^## /gm) || []).length;
     expect(headingCount).toBe(1);
   });
+
+  // W12-3b: when content starts with the heading but does NOT end with the
+  // marker, the code fell through to re-wrapping, producing a duplicate H2.
+  test('W12-3b: does not duplicate heading when content has heading but no trailing marker', () => {
+    const marker = '<!-- m -->';
+    const out = buildCommentBody({ title: 'X', content: '## X\nbody', marker });
+    const headingCount = (out.match(/^## /gm) || []).length;
+    expect(headingCount).toBe(1);
+    expect(out).toContain('body');
+    expect(out.endsWith(marker)).toBe(true);
+  });
 });
 
 describe('upsertReviewComment', () => {
