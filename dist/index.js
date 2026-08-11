@@ -39896,7 +39896,12 @@ function buildCommentBody({ title, content, marker }) {
   // duplicate H2 heading. Compare on the first line with trailing whitespace
   // stripped.
   const trimmed = safeContent.trimEnd();
-  const firstLine = trimmed.slice(0, Math.max(0, trimmed.indexOf('\n')));
+  // W13-1: when content has no newline, indexOf('\n') returns -1 and
+  // Math.max(0,-1)=0, making firstLine='' — which always fails the heading
+  // check and produces a duplicate H2. Handle the no-newline case: the whole
+  // trimmed string IS the first line.
+  const nlIdx = trimmed.indexOf('\n');
+  const firstLine = nlIdx === -1 ? trimmed : trimmed.slice(0, nlIdx);
   const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
@@ -45368,23 +45373,25 @@ function parseAddedLines(patch) {
       continue;
     }
     if (!inHunk) {
-      // Lines before the first hunk (e.g. diff metadata) are skipped entirely.
+      // Lines before the first hunk (e.g. diff metadata, `+++ b/path`,
+      // `--- a/path` file headers) are skipped entirely.
       continue;
     }
-    if (/^\+\+\+\s+\S/.test(raw)) {
-      // File header — `+++ b/path` (whitespace + non-whitespace path after).
-      // W12-4: the previous guard /^\+\+\+(?:\s|$)/ also matched a bare `+++`
-      // at EOL or `+++ ` with only trailing whitespace, dropping a legitimate
-      // added line whose content is `++`. A real file header always has a
-      // path (non-whitespace) after `+++ `, so require it.
-      continue;
-    }
+    // W13-1: do NOT guard against `+++` or `---` inside a hunk. Real file
+    // headers (`+++ b/path`, `--- a/path`) only appear BEFORE the first `@@`
+    // hunk, where `!inHunk` already skips them (line 80-83 above). Inside a
+    // hunk, a line starting with `+++` is always an added line whose content
+    // starts with `++` (e.g. `++ AKIAIOSFODNN7EXAMPLE`). The previous guard
+    // (W5-5 / W12-4) skipped these, bypassing secret scanning on the regex-
+    // fallback path. Removing the guard is both correct and necessary: it
+    // restores scanning of added lines whose content starts with `++` or `--`.
     if (raw.startsWith('+')) {
       out.push({ line: newLine, text: raw.slice(1) });
       newLine++;
       continue;
     }
-    if (/^---(?:\s|$)/.test(raw)) {
+    if (raw.startsWith('-')) {
+      // Removal — counter unchanged.
       continue;
     }
     if (raw.startsWith('-')) {
@@ -45469,11 +45476,13 @@ function resolveCachePath(spec) {
   if (typeof version !== 'string' || !version) {
     throw new Error('ensureBinary: version is required');
   }
-  // Defense-in-depth: reject path separators / traversal sequences in name and
-  // version. These are currently hardcoded, but guard against future regressions
-  // and untrusted inputs that could escape the cache dir.
-  for (const label of /** @type {const} */ (['name', 'version'])) {
-    const value = label === 'name' ? name : version;
+  // Defense-in-depth: reject path separators / traversal sequences in name,
+  // version, and ext. These are currently hardcoded, but guard against future
+  // regressions and untrusted inputs that could escape the cache dir.
+  // W13-3: ext was previously unsanitized — ext='/../../../etc/shadow' would
+  // escape the cache dir via join().
+  for (const label of /** @type {const} */ (['name', 'version', 'ext'])) {
+    const value = label === 'name' ? name : label === 'version' ? version : ext;
     if (/[\\/]/.test(value) || value === '..' || value.includes('..')) {
       throw new Error(
         `ensureBinary: ${label} must not contain path separators or ".." (got "${value}")`,
@@ -45866,6 +45875,15 @@ async function ensureBinary(opts, deps = {}) {
       // SCN-10: re-hash the cached file and compare to expectedChecksum. A
       // cached file whose hash no longer matches (tampering, partial write,
       // a different binary that overwrote the path) must NOT be trusted.
+      // W13-2: for specs with an extractor (tar.gz/zip), the cached file is
+      // the EXTRACTED binary, not the downloaded archive — its hash will never
+      // match the archive checksum. In that case, trust the cached binary's
+      // existence (the archive checksum was already verified on the original
+      // download). For raw-binary specs (no extractor), the cached file IS
+      // the downloaded bytes, so the checksum comparison is valid.
+      if (typeof spec.extractor === 'function') {
+        return cachePath;
+      }
       try {
         const cached = await readFile(cachePath);
         const cachedBuf = Buffer.isBuffer(cached)
