@@ -337,6 +337,26 @@ describe('validateRepoConfig — scanners', () => {
     const out = validateRepoConfig({ scanners: { gitleaks: true, mystery: true } });
     expect(out.scanners).toEqual({ gitleaks: true });
   });
+  // W15-A1-2: action.yml documents that a repo-level .zai.yml can DISABLE
+  // individual scanners (secrets, patterns, METRICS), but `metrics` was not in
+  // SCANNER_KEYS — the validator silently dropped it, making the documented
+  // metrics toggle impossible (scanners/index.js already honors
+  // repoScanners.metrics === false).
+  it('W15-A1-2: parseZaiYml + validateRepoConfig keep scanners.metrics: false', () => {
+    const parsed = parseZaiYml('scanners:\n  metrics: false\n');
+    const out = validateRepoConfig(parsed);
+    expect(out).toEqual({ scanners: { metrics: false } });
+  });
+  it('W15-A1-2: drops non-boolean scanners.metrics values', () => {
+    const out = validateRepoConfig({ scanners: { metrics: 'false' } });
+    expect(out).not.toHaveProperty('scanners');
+  });
+  it('W15-A1-2: accepts boolean metrics alongside gitleaks/ast_grep', () => {
+    const out = validateRepoConfig({
+      scanners: { gitleaks: false, ast_grep: false, metrics: false },
+    });
+    expect(out.scanners).toEqual({ gitleaks: false, ast_grep: false, metrics: false });
+  });
 });
 
 describe('validateRepoConfig — unknown keys + edge cases', () => {
@@ -528,6 +548,32 @@ describe('mergeRepoConfig — scanners (can only DISABLE)', () => {
       {},
     );
     expect(merged.scanners.gitleaks).not.toBe(false);
+  });
+  // W15-A1-2: metrics must flow through the merge seam exactly like
+  // gitleaks/ast_grep (repo can DISABLE only) — src/index.js reads
+  // `repoConfig.scanners.metrics === false` to build scannerRepoConfig, and
+  // the merge previously dropped the key entirely so the wiring was dead.
+  it('W15-A1-2: repo can disable the metrics scanner', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: true },
+      { scanners: { metrics: false } },
+    );
+    expect(merged.scanners.metrics).toBe(false);
+  });
+  it('W15-A1-2: metrics stays on when the repo does not disable it', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: true },
+      {},
+    );
+    expect(merged.scanners.metrics).not.toBe(false);
+  });
+  it('W15-A1-2: master switch OFF forces metrics false even if the repo enables it', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: false },
+      { scanners: { metrics: true } },
+    );
+    expect(merged.scannersEnabled).toBe(false);
+    expect(merged.scanners.metrics).toBe(false);
   });
 });
 

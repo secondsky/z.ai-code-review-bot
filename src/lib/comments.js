@@ -113,13 +113,69 @@ export function appendTrailers(body, trailers = []) {
 }
 
 /**
+ * Find the bot-authored marker comment on an issue/PR.
+ *
+ * Extracted from the lookup loop inside {@link upsertReviewComment} (W15-A8-3)
+ * so other call sites can reuse the exact same pagination + bot-authority
+ * gating — notably the incremental-review hash-block read in src/index.js,
+ * which must never trust a human comment carrying a forged marker/hash block.
+ *
+ * Pagination mirrors {@link upsertReviewComment}: per_page=100, loop until a
+ * short page, the marker comment is found, or {@link MAX_COMMENT_PAGES} is
+ * reached (CORE-4 loop guard). Bot authorship is REQUIRED (comment hijack
+ * defense): only `user.type === 'Bot'` OR `user.login` ending in `[bot]` is
+ * eligible.
+ *
+ * `listComments` rejections propagate (not swallowed) — callers wrap in their
+ * own fail-soft boundary.
+ *
+ * @param {object} args
+ * @param {object} args.octokit      Octokit instance (rest.issues.listComments used).
+ * @param {string} args.owner        Repository owner.
+ * @param {string} args.repo         Repository name.
+ * @param {number} args.issueNumber  PR / issue number.
+ * @param {string} [args.marker]     Marker used to locate the comment (default {@link MARKER}).
+ * @param {number} [args.perPage=100] Page size for listComments pagination.
+ * @returns {Promise<{id:number, body?:string}|null>} the found comment, or null.
+ */
+export async function findBotMarkerComment({
+  octokit,
+  owner,
+  repo,
+  issueNumber,
+  marker = MARKER,
+  perPage = 100,
+}) {
+  // Paginate fully: the marker comment can be anywhere in the history, and a
+  // single page would miss it on high-traffic PRs. CORE-4: cap at
+  // MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us in an
+  // unbounded loop when the marker is absent.
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
+    const { data: comments } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: perPage,
+      page,
+    });
+    const existing =
+      comments.find(
+        (c) => isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
+      ) ?? null;
+    if (existing) return existing; // found it — no need to fetch more pages
+    if (comments.length < perPage) return null; // last page reached
+  }
+  return null;
+}
+
+/**
  * Upsert the single summary review comment on a PR.
  *
  * 1. List issue comments, PAGINATING fully (page=1, per_page=100, loop until a
  *    short page) so the marker lookup inspects EVERY comment — not just the
  *    first 100. Without full pagination a PR with >100 comments would lose the
  *    marker comment from the visible window and create a duplicate summary on
- *    every run.
+ *    every run. (Delegated to {@link findBotMarkerComment}.)
  * 2. Find the first BOT-AUTHORED comment whose body contains `marker` (default
  *    {@link MARKER}). The author check (`user.type === 'Bot'` OR `user.login`
  *    ends with `[bot]`) is mandatory: without it, a non-bot user could post a
@@ -150,26 +206,14 @@ export async function upsertReviewComment({
   perPage = 100,
   core,
 }) {
-  // Paginate fully: the marker comment can be anywhere in the history, and a
-  // single page would miss it on high-traffic PRs (creating a duplicate).
-  // CORE-4: cap at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us
-  // in an unbounded loop when the marker is absent.
-  let existing = null;
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: perPage,
-      page,
-    });
-    existing =
-      comments.find(
-        (c) => isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
-      ) ?? null;
-    if (existing) break; // found it — no need to fetch more pages
-    if (comments.length < perPage) break; // last page reached
-  }
+  const existing = await findBotMarkerComment({
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    marker,
+    perPage,
+  });
 
   if (existing) {
     await octokit.rest.issues.updateComment({

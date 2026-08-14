@@ -48,7 +48,13 @@ import {
 import { loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
 import { authorize } from './lib/auth.js';
-import { upsertReviewComment, buildCommentBody, appendTrailers, MARKER } from './lib/comments.js';
+import {
+  upsertReviewComment,
+  buildCommentBody,
+  appendTrailers,
+  findBotMarkerComment,
+  MARKER,
+} from './lib/comments.js';
 import {
   getChangedFiles,
   filterExcludedFiles,
@@ -472,6 +478,7 @@ export async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
+    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
     createApiClient: createApiClientFn = createApiClient,
@@ -605,6 +612,24 @@ export async function run(context, deps = {}) {
       patchable = filterExcludedFilesFn(patchable, repoConfig.excludePatterns);
       if (patchable.length === 0) {
         coreDep.info('All patchable files excluded by .zai.yml path_filters; skipping.');
+        // W15-A7-3: the `pending` status was already posted above; returning
+        // here without a TERMINAL status left the check spinning pending
+        // forever (blocking merges when the status is required). There is
+        // genuinely nothing to review, so post a terminal `success` — same
+        // fail-soft helper, same commitStatus gate.
+        if (config.commitStatus) {
+          await setReviewStatusFn(
+            {
+              octokit,
+              context,
+              sha,
+              state: 'success',
+              description:
+                'No reviewable files (.zai.yml path_filters excluded all changes)',
+            },
+            { core: coreDep },
+          );
+        }
         return;
       }
     }
@@ -642,6 +667,11 @@ export async function run(context, deps = {}) {
       scanners: {
         secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
         patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+        // W15-A1-2: `.zai.yml` `scanners.metrics: false` must reach the
+        // orchestrator's per-scanner toggle (runScanners honors
+        // repoScanners.metrics === false) — previously no metrics key was
+        // mapped, so the documented repo-level toggle was impossible.
+        metrics: repoConfig.scanners?.metrics === false ? false : undefined,
       },
     };
     const scannerResult = await runScannersFn(
@@ -691,32 +721,6 @@ export async function run(context, deps = {}) {
       },
     );
 
-    // Phase 5: flip the commit status to "success" with a findings summary now
-    // that the review itself completed. The downstream review/comment posting
-    // is UI delivery; the review result is what determines success. Fail-soft.
-    if (config.commitStatus) {
-      const criticalCount = result.findings.filter(
-        (f) => f?.severity === 'critical',
-      ).length;
-      const highCount = result.findings.filter(
-        (f) => f?.severity === 'high',
-      ).length;
-      await setReviewStatusFn(
-        {
-          octokit,
-          context,
-          sha,
-          state: 'success',
-          description: buildStatusDescriptionFn({
-            findingCount: result.findings.length,
-            criticalCount,
-            highCount,
-          }),
-        },
-        { core: coreDep },
-      );
-    }
-
     // Phase 2: partition findings into inline-mappable (anchored to diff lines
     // via pulls.createReview) and summary-only. When at least one finding maps
     // to a diff line, post a GitHub REVIEW with inline comments — the
@@ -759,6 +763,25 @@ export async function run(context, deps = {}) {
         if (withHashBlock) {
           priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
         }
+        // W15-A8-3: when findings don't map to diff lines (file-level), run 1
+        // posts the hash block into the bot's marker ISSUE COMMENT (the
+        // summary path) instead of a review — so reading reviews alone left
+        // priorHashes empty and every finding was re-reported on re-push.
+        // Read the hash block from the bot's marker comment too and MERGE the
+        // two sets. findBotMarkerComment enforces the same bot-authority gate
+        // as upsertReviewComment, so a human comment quoting the marker (and a
+        // forged hash block) can never feed suppression.
+        const priorComment = await findBotMarkerCommentFn({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          marker: MARKER,
+        });
+        if (priorComment && typeof priorComment.body === 'string') {
+          const commentHashes = parseFindingsHashBlockFn(priorComment.body);
+          for (const h of commentHashes) priorHashes.add(h);
+        }
       } catch (priorErr) {
         if (coreDep?.warning) {
           coreDep.warning(
@@ -785,6 +808,38 @@ export async function run(context, deps = {}) {
     if (learningsSuppressed > 0 && coreDep?.info) {
       coreDep.info(
         `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    // W15-A6-2: the status is computed from the FINAL kept-findings set —
+    // AFTER incremental suppression and learnings suppression. It was
+    // previously computed from `result.findings` before those stages ran, so
+    // a re-push where every finding was already reported posted
+    // "N findings (...)" to the checks tab while the PR comment said
+    // "No issues found ✅" — contradictory signals on the same run.
+    if (config.commitStatus) {
+      const criticalCount = keptFindings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = keptFindings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: keptFindings.length,
+            criticalCount,
+            highCount,
+          }),
+        },
+        { core: coreDep },
       );
     }
 

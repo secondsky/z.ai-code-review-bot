@@ -144,7 +144,7 @@ const REVIEW_KEYS = new Set([
 /** Known sub-fields of a `path_instructions` entry object. */
 const PATH_INSTRUCTION_FIELDS = new Set(['path', 'instructions']);
 /** Known keys under `scanners:`. */
-const SCANNER_KEYS = new Set(['gitleaks', 'ast_grep']);
+const SCANNER_KEYS = new Set(['gitleaks', 'ast_grep', 'metrics']);
 
 /**
  * Parse a minimal YAML subset into a plain object.
@@ -402,6 +402,9 @@ export function validateRepoConfig(parsed) {
     const sv = {};
     if (typeof s.gitleaks === 'boolean') sv.gitleaks = s.gitleaks;
     if (typeof s.ast_grep === 'boolean') sv.ast_grep = s.ast_grep;
+    // W15-A1-2: metrics was missing from the boolean set, so the documented
+    // `.zai.yml` `scanners.metrics: false` toggle was silently dropped.
+    if (typeof s.metrics === 'boolean') sv.metrics = s.metrics;
     if (Object.keys(sv).length > 0) out.scanners = sv;
   }
 
@@ -542,8 +545,12 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
         // `false` in repo disables; otherwise the action default (enabled) applies.
         gitleaks: scanners.gitleaks !== false,
         ast_grep: scanners.ast_grep !== false,
+        // W15-A1-2: metrics rides the same disable-only seam so src/index.js
+        // can forward it to the scanner orchestrator (which already honors
+        // repoScanners.metrics === false).
+        metrics: scanners.metrics !== false,
       }
-    : { gitleaks: false, ast_grep: false };
+    : { gitleaks: false, ast_grep: false, metrics: false };
 
   return {
     ...a,
