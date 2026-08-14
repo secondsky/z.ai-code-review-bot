@@ -236,10 +236,17 @@ function neutralizeAlerts(text) {
 function stripForgedHashBlocks(text) {
   // Drop any HTML comment containing a `zai-` prefix. Apply globally (not line-
   // anchored) so a mid-line forgery like `text <!-- zai-sha:x --> more` is also
-  // stripped (W2-SEC-2A). `[^>]*` is sufficient here: HTML comment bodies do not
-  // contain `>` in practice, and we are sanitizing untrusted model output, not
-  // parsing arbitrary HTML.
-  return text.replace(/<!--\s*zai-[^>]*-->/g, '');
+  // stripped (W2-SEC-2A).
+  // W15-A3-3: the payload class used to be `[^>]*`, which stops at ANY `>` —
+  // so a forged marker like `<!-- zai-hashes:HEX,> -->` survived sanitization
+  // and was later parsed as a TRUSTED prior-hash block (suppressing findings).
+  // The parsers on the reading side (parseFindingsHashBlock, hasReviewForSha)
+  // match non-greedily up to the nearest `-->`, tolerating `>` and newlines in
+  // the payload; the stripper must be at least as tolerant. `[\s\S]*?` matches
+  // any char (including newlines) non-greedily up to the CLOSEST `-->`, and
+  // still leaves non-`zai-` HTML comments (which must start with `zai-` right
+  // after `<!--\s*`) untouched.
+  return text.replace(/<!--\s*zai-[\s\S]*?-->/g, '');
 }
 
 /**
@@ -274,7 +281,14 @@ export function sanitizeModelOutput(text, options = {}) {
 
   // 2. Length cap. Compare on the post-sanitization length.
   if (out.length > maxChars) {
-    out = out.slice(0, maxChars) + TRUNCATION_MARKER;
+    // W15-A3-9: slice() cuts on UTF-16 code units. If unit maxChars-1 is the
+    // HIGH half of a surrogate pair, the kept prefix would end with a lone
+    // surrogate (rendered as U+FFFD garbage in the posted comment). Back off
+    // one code unit so the boundary never splits a pair.
+    let end = maxChars;
+    const lastUnit = out.charCodeAt(maxChars - 1);
+    if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end = maxChars - 1;
+    out = out.slice(0, end) + TRUNCATION_MARKER;
   }
 
   return out;
