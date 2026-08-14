@@ -63,8 +63,11 @@ function parseFullHunkHeader(line) {
  *   - `{type:'ctx', newLine, oldLine, text}`       — a ` text` context line
  *
  * Tracking rules (both counters advance through the body):
- *   - `+++`/`---` file headers inside the body are skipped (not real additions
- *     or removals — they only appear at patch scope, but we defend anyway).
+ *   - `+++`/`---` FILE HEADERS appear only OUTSIDE hunks (before the first
+ *     `@@` header) and are skipped by the `!cur` branch. INSIDE a hunk body a
+ *     `+++`/`---` row is an added/removed line whose content starts with
+ *     `++`/`--` (e.g. a bare `+++` row is an addition of `++`, `--- x` is a
+ *     removal of `-- x`) and must advance the counters (W15-A3-8).
  *   - `\ No newline at end of file` is metadata — skipped, counters unchanged.
  *   - A truly empty line is treated as a context line (git emits context as a
  *     leading space, but a bare empty line is also context).
@@ -111,13 +114,6 @@ export function parseHunks(patch) {
     }
     if (!cur) {
       // Lines before the first hunk (diff metadata) are skipped entirely.
-      continue;
-    }
-    if (/^(?:\+\+\+|---)(?:\s|$)/.test(raw)) {
-      // File headers — `+++ b/path` or `--- a/path` (space-delimited), or a
-      // bare `+++`/`---` at end-of-line. NOT an added/removed line whose
-      // content happens to start with `++`/`--` (e.g. `++i;` → `+++i;` has
-      // no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {

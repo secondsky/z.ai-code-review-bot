@@ -115,9 +115,13 @@ describe('parseHunks', () => {
     ]);
   });
 
-  it('skips the +++ and --- file headers inside a hunk body', () => {
-    // Real GitHub patches don't interleave these, but defensively they should
-    // NOT be treated as additions/removals.
+  it('W15-A3-8: ---/+++ rows inside a hunk body are content lines, not headers', () => {
+    // Real GitHub patches emit `--- a/path` / `+++ b/path` ONLY before the
+    // first `@@` (patch scope). Inside a hunk body such a row is a removed/
+    // added line whose CONTENT starts with `--`/`++`. The old guard skipped
+    // them without advancing the counters, shifting every later line number
+    // by one. (This test supersedes the earlier "defensively skip them"
+    // behavior, which the audit showed to be wrong for real in-hunk content.)
     const patch = [
       '@@ -1,3 +1,3 @@',
       '--- a/foo.js',
@@ -126,7 +130,9 @@ describe('parseHunks', () => {
     ].join('\n');
     const hunks = parseHunks(patch);
     expect(hunks[0].lines).toEqual([
-      { type: 'ctx', newLine: 1, oldLine: 1, text: 'context' },
+      { type: 'del', newLine: null, oldLine: 1, text: '-- a/foo.js' },
+      { type: 'add', newLine: 1, oldLine: null, text: '++ b/foo.js' },
+      { type: 'ctx', newLine: 2, oldLine: 2, text: 'context' },
     ]);
   });
 
@@ -173,9 +179,11 @@ describe('parseHunks', () => {
     ]);
   });
 
-  it('W5-5: a real +++ b/file header inside the hunk body is still skipped', () => {
-    // Regression guard: the genuine git header form (space after +++) must
-    // still be treated as a header and NOT as an addition.
+  it('W5-5/W15-A3-8: an in-hunk "+++ b/file" row is an added line (headers live outside hunks)', () => {
+    // A genuine `+++ b/file` header only appears BEFORE the first `@@`, where
+    // the `!cur` branch skips it. Inside a hunk body the row is an addition
+    // whose text starts with `++`. Treating it as a header here (the old
+    // behavior) silently dropped the line and shifted subsequent numbering.
     const patch = [
       '@@ -1,2 +1,2 @@',
       '+++ b/foo.js',
@@ -183,7 +191,39 @@ describe('parseHunks', () => {
     ].join('\n');
     const hunks = parseHunks(patch);
     expect(hunks[0].lines).toEqual([
-      { type: 'ctx', newLine: 1, oldLine: 1, text: 'context' },
+      { type: 'add', newLine: 1, oldLine: null, text: '++ b/foo.js' },
+      { type: 'ctx', newLine: 2, oldLine: 1, text: 'context' },
+    ]);
+  });
+
+  // ------------------------------------------------------------------
+  // W15-A3-8: a bare `+++` row inside a hunk is an added line whose content
+  // is `++` (e.g. a markdown "+++ divider" or a `++` increment added). The
+  // `^(?:\+\+\+|---)(?:\s|$)` guard skipped it as a "file header" without
+  // advancing newLine, so every subsequent line number shifted by one.
+  // ------------------------------------------------------------------
+  it('W15-A3-8: a bare +++ row inside a hunk is an added line (not a header)', () => {
+    const patch = ['@@ -1,3 +1,4 @@', ' line1', '+++', ' line3', '+added4'].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks[0].lines).toEqual([
+      { type: 'ctx', newLine: 1, oldLine: 1, text: 'line1' },
+      { type: 'add', newLine: 2, oldLine: null, text: '++' },
+      { type: 'ctx', newLine: 3, oldLine: 2, text: 'line3' },
+      { type: 'add', newLine: 4, oldLine: null, text: 'added4' },
+    ]);
+    // The shifted numbering previously put added4 at new line 3.
+    expect(isValidCommentLine(patch, 4)).toBe(true);
+  });
+
+  it('W15-A3-8: a "--- x" row inside a hunk is a removed line and advances oldLine', () => {
+    // A removed line whose content is `-- x` is emitted as the row `--- x`.
+    // It must be recorded as a deletion (content `-- x`) and advance the
+    // old-side counter, not be skipped as a header.
+    const patch = ['@@ -1,2 +1,1 @@', '--- x', '+added'].join('\n');
+    const hunks = parseHunks(patch);
+    expect(hunks[0].lines).toEqual([
+      { type: 'del', newLine: null, oldLine: 1, text: '-- x' },
+      { type: 'add', newLine: 1, oldLine: null, text: 'added' },
     ]);
   });
 

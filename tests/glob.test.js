@@ -1,4 +1,8 @@
 import { matchesAnyPattern } from '../src/lib/glob.js';
+// Imported for end-to-end exclude-list tests that exercise the REAL
+// matchesAnyPattern against whole file lists (same style as
+// changed-files.test.js, which documents that contract).
+import { filterExcludedFiles } from '../src/lib/changed-files.js';
 
 describe('matchesAnyPattern', () => {
   test('returns false for an empty pattern array', () => {
@@ -139,5 +143,117 @@ describe('matchesAnyPattern', () => {
     // Defense in depth: even patterns picomatch rejects at compile time
     // (e.g. unmatched `[`) must not crash the review pipeline.
     expect(() => matchesAnyPattern('foo.js', ['[unclosed'])).not.toThrow();
+  });
+
+  // ------------------------------------------------------------------
+  // W15-A2-1: picomatch isMatch must be called with { dot: true }. With the
+  // default dot:false, neither `*` nor `**` matches path segments that BEGIN
+  // with a dot, so maintainer excludes like `dist/**` silently missed
+  // dotfiles and dot-directories (dist/.gitkeep, dist/.vite/manifest.json,
+  // .cache/...). The sibling codeowners.js already compiles with
+  // { dot: true }; matchesAnyPattern is aligned here. Pinned below are the
+  // ACTUAL picomatch dot:true semantics (verified against picomatch 4.0.5):
+  // enabling dot lets stars span leading dots, so `dist/**` crosses the
+  // `.vite` segment AND `*.js` also matches `.hidden.js` (a leading-dot
+  // file whose extension the pattern names). Explicit dotfile patterns
+  // (e.g. `.*`) keep working.
+  // ------------------------------------------------------------------
+
+  test('W15-A2-1: dist/** matches dotfiles and dot-directories under dist/', () => {
+    expect(matchesAnyPattern('dist/.vite/manifest.json', ['dist/**'])).toBe(true);
+    expect(matchesAnyPattern('dist/.gitkeep', ['dist/**'])).toBe(true);
+    expect(matchesAnyPattern('dist/.cache/a.js', ['dist/**'])).toBe(true);
+  });
+
+  test('W15-A2-1: filterExcludedFiles drops dist/ and node_modules/ dotfiles (end-to-end)', () => {
+    const files = [
+      { filename: 'src/app.js' },
+      { filename: 'dist/.gitkeep' },
+      { filename: 'dist/.vite/manifest.json' },
+      { filename: 'node_modules/.package-lock.json' },
+    ];
+    const out = filterExcludedFiles(files, ['dist/**', 'node_modules/**']);
+    expect(out.map((f) => f.filename)).toEqual(['src/app.js']);
+  });
+
+  test('W15-A2-1: picomatch dot:true semantics — *.js spans leading dots for dotfiles', () => {
+    // Verified against picomatch 4.0.5: with { dot: true } a star MAY match a
+    // leading dot. `*.js` therefore now ALSO matches `.hidden.js` (via the
+    // basename AND the full path). This is the same trade codeowners.js
+    // already makes; pinning it guards against accidental option loss.
+    expect(matchesAnyPattern('a.js', ['*.js'])).toBe(true); // unchanged
+    expect(matchesAnyPattern('.hidden.js', ['*.js'])).toBe(true); // dot:true semantics
+  });
+
+  test('W15-A2-1: explicit dotfile patterns keep working (learnings globs)', () => {
+    // A pattern that itself starts with a literal `.` already matched dotfiles
+    // before the fix (the dot was explicit, not star-crossed). Still true.
+    expect(matchesAnyPattern('.gitignore', ['.*'])).toBe(true);
+    expect(matchesAnyPattern('.zai.yml', ['.*.yml'])).toBe(true);
+    // ...and a non-dot file is still NOT matched by an explicit-dot pattern.
+    expect(matchesAnyPattern('zai.yml', ['.*.yml'])).toBe(false);
+  });
+
+  // ------------------------------------------------------------------
+  // W15-A2-2: ALL leading `!`s must be stripped. Stripping only one left
+  // `!!dist/**` as `!dist/**`, which picomatch reads as the negation "not
+  // under dist/" — combined with the basename-OR fallback it matched EVERY
+  // file, so filterExcludedFiles returned [] (entire PR silently
+  // unreviewed). Stripping all `!`s makes `!!dist/**` behave as the plain
+  // pattern `dist/**`.
+  // ------------------------------------------------------------------
+
+  test('W15-A2-2: !!dist/** behaves as dist/** (all leading !s stripped)', () => {
+    expect(matchesAnyPattern('dist/b.js', ['!!dist/**'])).toBe(true);
+    expect(matchesAnyPattern('src/a.js', ['!!dist/**'])).toBe(false);
+    // Three leading !s collapse to the plain pattern too.
+    expect(matchesAnyPattern('dist/b.js', ['!!!dist/**'])).toBe(true);
+    expect(matchesAnyPattern('src/a.js', ['!!!dist/**'])).toBe(false);
+  });
+
+  test('W15-A2-2: filterExcludedFiles with !!dist/** keeps src/ and drops dist/ (end-to-end)', () => {
+    // Before the fix this dropped BOTH files (the half-stripped `!dist/**`
+    // matched everything), leaving the whole PR unreviewed.
+    const files = [
+      { filename: 'src/a.js' },
+      { filename: 'dist/b.js' },
+    ];
+    const out = filterExcludedFiles(files, ['!!dist/**']);
+    expect(out.map((f) => f.filename)).toEqual(['src/a.js']);
+  });
+
+  // ------------------------------------------------------------------
+  // W15-A2-3: POSIX bracket negation `[!d]` must behave like `[^d]`.
+  // picomatch v4 only special-cases `[^` inside a class; an unnormalized
+  // `[!a]` compiles as the POSITIVE class {'!','a'} — exactly backwards vs
+  // bash/minimatch. We normalize an UNESCAPED `[!` to `[^` before matching;
+  // `[^...]` (already correct) and escaped `\[!...\]` (literal bracket) are
+  // untouched.
+  // ------------------------------------------------------------------
+
+  test('W15-A2-3: [!a]*.js is a negated class (matches b.js, NOT a.js)', () => {
+    expect(matchesAnyPattern('b.js', ['[!a]*.js'])).toBe(true);
+    expect(matchesAnyPattern('a.js', ['[!a]*.js'])).toBe(false);
+    // The `[^...]` spelling was always correct and stays correct.
+    expect(matchesAnyPattern('b.js', ['[^a]*.js'])).toBe(true);
+    expect(matchesAnyPattern('a.js', ['[^a]*.js'])).toBe(false);
+  });
+
+  test('W15-A2-3: filterExcludedFiles with [!d]*.js keeps only d-prefixed files (end-to-end)', () => {
+    const files = [
+      { filename: 'a.js' },
+      { filename: 'b.js' },
+      { filename: 'd1.js' },
+    ];
+    const out = filterExcludedFiles(files, ['[!d]*.js']);
+    expect(out.map((f) => f.filename)).toEqual(['d1.js']);
+  });
+
+  test('W15-A2-3: an escaped \\[!a\\] pattern still matches the literal "[!a]" (no over-normalization)', () => {
+    // The `[` is backslash-escaped, so it is a LITERAL bracket — the `!`
+    // right after it must NOT be rewritten to `^`. (Verified picomatch
+    // behavior: '\[!a\]' matches the filename '[!a]'.)
+    expect(matchesAnyPattern('[!a]', ['\\[!a\\]'])).toBe(true);
+    expect(matchesAnyPattern('a', ['\\[!a\\]'])).toBe(false);
   });
 });
