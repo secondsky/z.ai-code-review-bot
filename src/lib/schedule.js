@@ -23,9 +23,49 @@
  */
 
 import { MARKER, appendTrailers } from './comments.js';
+import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
+import { buildStatusDescription as buildStatusDescriptionDefault } from './status.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
 export const DEFAULT_MAX_PRS = 10;
+
+/* ------------------------------------------------------------------ *
+ * W15-A8-4 feature-parity default deps.
+ *
+ * The new collaborators (repo config, scanners, learnings, commit statuses)
+ * are OPTIONAL and default to INERT no-ops so schedule.js stays hermetic when
+ * called without the full dep kit (existing tests, embedding). src/index.js's
+ * schedule branch wires the REAL functions for production runs. Pure helpers
+ * (renderers, description builders) default to their real implementations —
+ * they never touch the network.
+ * ------------------------------------------------------------------ */
+
+/** Inert `.zai.yml` loader: never fetches; behaves like a repo without one. */
+const defaultLoadRepoConfig = async () => ({});
+
+/** Inert merge: pass the action config through unchanged (no repo narrowing). */
+const defaultMergeRepoConfig = (actionConfig = {}) => ({ ...actionConfig });
+
+/** Inert scanner orchestrator: no findings, no metrics, no scanners run. */
+const defaultRunScanners = async () => ({ findings: [], metrics: {}, scannerNames: [] });
+
+/** Inert scanner-context formatter: contributes nothing to the prompt. */
+const defaultFormatScannerContext = () => '';
+
+/** Inert learnings loader: behaves like a repo without `.zai/learnings.yml`. */
+const defaultLoadLearnings = async () => [];
+
+/** Inert learnings prompt formatter: no prompt context. */
+const defaultFormatLearningsForPrompt = () => '';
+
+/** Inert learnings suppression: keep everything, suppress nothing. */
+const defaultFilterFindingsByLearnings = (findings) => ({
+  kept: Array.isArray(findings) ? findings : [],
+  suppressed: 0,
+});
+
+/** Inert status poster: never touches the API (status feedback is opt-in). */
+const defaultSetReviewStatus = async () => false;
 
 /**
  * Build the hidden HTML comment that embeds the PR head SHA in a posted
@@ -101,7 +141,15 @@ export async function listOpenPrs({
     // true so the loop terminated after page 1 even though page 2 had reviewable
     // PRs. Comparing against the requested size (10 < 10 → false) makes
     // pagination continue until the API truly returns a short page.
-    const requestedPerPage = Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage);
+    //
+    // W15-A6-1: the per_page must also be CONSTANT across pages. GitHub
+    // paginates by offset ((page-1)*per_page); recomputing a SMALLER per_page
+    // for page 2 (the old `min(perPage, maxPrs - out.length)` clamp) moved the
+    // offset window BACKWARD over items already seen when drafts were skipped
+    // on page 1 — returning DUPLICATE PRs (verified: [2,3,4,5,6,8,9,10,3,4])
+    // and starving tail PRs of review. The clamp is dropped entirely: the
+    // ingest loop below already stops at maxPrs, so the cap is still honored.
+    const requestedPerPage = perPage;
     const { data } = await octokit.rest.pulls.list({
       owner,
       repo,
@@ -224,12 +272,15 @@ export async function hasReviewForSha({
  * again to postFallbackComment if the review submission itself fails — the
  * review is never silently lost.
  *
- * KNOWN LIMITATION (W8-3): unlike the `pull_request` path, the scheduled path
- * does not currently load `.zai.yml` repo config or run deterministic scanners
- * (gitleaks/ast-grep). This means `path_filters`, `path_instructions`,
- * `tone_instructions`, the `chill` profile, and deterministic secret/pattern
- * findings are absent on scheduled reviews. Schedule is opt-in; this gap is
- * tracked for a future enhancement.
+ * KNOWN LIMITATION → RESOLVED (W8-3 / W15-A8-4): the scheduled path now loads
+ * and merges `.zai.yml` repo config (path_filters, path/tone instructions,
+ * chill profile narrowing), runs the deterministic scanners (gitleaks /
+ * ast-grep / metrics, with the repo's disable-only toggles), loads
+ * `.zai/learnings.yml` (prompt context + post-review suppression), posts
+ * pending/success commit statuses, and renders walkthrough summaries — the
+ * same feature set as the `pull_request` path. Every collaborator is
+ * deps-injectable with inert defaults so tests stay hermetic; src/index.js's
+ * schedule branch wires the real functions.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -260,13 +311,182 @@ export async function reviewOnePr({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
+  // W15-A6-4: walkthrough parity — index.js renders the summary-only branch
+  // via formatWalkthroughSummary when config.walkthrough is on; the scheduled
+  // path must mirror that so cron and push runs render the same PR the same
+  // way. Optional dep (default: the real renderer from walkthrough.js).
+  formatWalkthroughSummary = formatWalkthroughSummaryDefault,
+  // W15-A8-4 feature-parity deps (all OPTIONAL with inert defaults so existing
+  // tests/hermetic callers stay green; src/index.js's schedule branch wires the
+  // real functions — see run()'s schedule wiring).
+  // (a) .zai.yml repo config: load (fail-soft, returns {} on any error by
+  //     contract) + merge (action inputs always win; repo can only narrow).
+  loadRepoConfig = defaultLoadRepoConfig,
+  mergeRepoConfig = defaultMergeRepoConfig,
+  // (b) deterministic scanners: run over the patchable files; findings flow
+  //     into runStructuredReview as `deterministicFindings` and their formatted
+  //     context rides the LLM prompt as `scannerContext`.
+  runScanners = defaultRunScanners,
+  formatScannerContext = defaultFormatScannerContext,
+  // (c) learnings: load `.zai/learnings.yml` (fail-soft → []), format the
+  //     accepted patterns as prompt context, and suppress matching findings
+  //     after the review (same three seams as index.js).
+  loadLearnings = defaultLoadLearnings,
+  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  // (d) commit statuses: `pending` at the start of the review work and
+  //     `success` computed from the FINAL kept findings (post-suppression).
+  //     setReviewStatus is fail-soft by contract; buildStatusDescription is a
+  //     pure helper (defaults to the real one from status.js).
+  setReviewStatus = defaultSetReviewStatus,
+  buildStatusDescription = buildStatusDescriptionDefault,
 }) {
   try {
     let files = await getChangedFiles({ octokit, owner, repo, pullNumber: pr.number });
     files = filterExcludedFiles(files, config.excludePatterns);
-    const patchable = filterPatchableFiles(files);
+    let patchable = filterPatchableFiles(files);
     if (patchable.length === 0) {
       return { ok: true, action: 'skipped-no-patchable' };
+    }
+
+    // Synthetic @actions/github-like context. upsertReview reads
+    // context.payload.pull_request.number; postFallbackComment delegates to the
+    // shared postComment helper, which reads context.payload.issue.number — so
+    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
+    const ctx = {
+      repo: { owner, repo },
+      payload: {
+        pull_request: { number: pr.number, head: { sha: pr.headSha } },
+        issue: { number: pr.number },
+      },
+    };
+
+    // W15-A8-4d: `pending` commit status parity — the push path posts it right
+    // after the zero-patchable short-circuit (so an empty PR never gets a
+    // dangling status) and before the heavier review work, so developers see
+    // immediate feedback on a cron tick too. Fail-soft; gated by config so an
+    // operator without `statuses: write` can turn it off.
+    if (config.commitStatus) {
+      await setReviewStatus(
+        {
+          octokit,
+          context: ctx,
+          sha: pr.headSha,
+          state: 'pending',
+          description: 'Z.ai review in progress…',
+        },
+        { core },
+      );
+    }
+
+    // W15-A8-4a: `.zai.yml` parity. The push path (src/index.js) loads the
+    // in-repo config at the head SHA, merges it under the action config, and
+    // RE-FILTERS the patchable set with the merged path_filters (W6-1: the
+    // initial filter ran before the merge, so repo-defined excludes were
+    // silently ignored). The scheduled path previously skipped all of this
+    // (the old "KNOWN LIMITATION (W8-3)" gap). loadRepoConfig is fail-soft by
+    // contract (any failure → {} + warning); a throwing injectable is guarded
+    // here too so one broken config fetch can never fail the whole PR review.
+    let rawRepoConfig = {};
+    if (config.repoConfigEnabled) {
+      try {
+        rawRepoConfig = await loadRepoConfig(
+          { octokit, context: ctx, headSha: pr.headSha },
+          { core },
+        );
+      } catch (repoConfigError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: .zai.yml load failed for PR #${pr.number} (${repoConfigError?.message ?? String(repoConfigError)}); continuing without repo config.`,
+          );
+        }
+        rawRepoConfig = {};
+      }
+    }
+    const repoConfig = mergeRepoConfig(config, rawRepoConfig);
+    if (Array.isArray(repoConfig.excludePatterns) && repoConfig.excludePatterns.length > 0) {
+      patchable = filterExcludedFiles(patchable, repoConfig.excludePatterns);
+      if (patchable.length === 0) {
+        if (core?.info) {
+          core.info(`Scheduled review: PR #${pr.number} — all patchable files excluded by .zai.yml path_filters; skipping.`);
+        }
+        // W15-A7-3 parity: the `pending` status was already posted above;
+        // returning without a TERMINAL status would leave the check spinning
+        // pending forever on a required-status repo. Post terminal `success`
+        // (there is genuinely nothing to review) — same fail-soft helper, same
+        // commitStatus gate as index.js.
+        if (config.commitStatus) {
+          await setReviewStatus(
+            {
+              octokit,
+              context: ctx,
+              sha: pr.headSha,
+              state: 'success',
+              description: 'No reviewable files (.zai.yml path_filters excluded all changes)',
+            },
+            { core },
+          );
+        }
+        return { ok: true, action: 'skipped-no-patchable' };
+      }
+    }
+
+    // W15-A8-4c: learnings / memory (`.zai/learnings.yml`) parity — mirrors
+    // the push path. The file records "previously-reviewed / won't-fix"
+    // patterns so the bot doesn't re-raise the same finding on every cron
+    // tick. OPT-IN via config.learningsEnabled (the file is
+    // attacker-controllable in fork PRs). loadLearnings is fail-soft by
+    // contract (any error → [] + warning); a throwing injectable is guarded
+    // here too. The accepted patterns ride the prompt (learningsContext) and
+    // are applied as post-review suppression below.
+    let learnings = [];
+    if (config.learningsEnabled) {
+      try {
+        learnings = await loadLearnings(
+          { octokit, context: ctx, headSha: pr.headSha },
+          { core },
+        );
+      } catch (learningsError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: learnings load failed for PR #${pr.number} (${learningsError?.message ?? String(learningsError)}); continuing without learnings.`,
+          );
+        }
+        learnings = [];
+      }
+    }
+    const learningsContext = formatLearningsForPrompt(learnings);
+
+    // W15-A8-4b: deterministic scanners run BEFORE the LLM (mirrors the push
+    // path). Their findings become high-confidence findings (merged over LLM
+    // findings at the same file:line+title inside runStructuredReview via
+    // `deterministicFindings`) and are injected into the prompt as
+    // "already detected, don't re-report" context via `scannerContext`. The
+    // `.zai.yml` scanners map onto the orchestrator's per-scanner toggles
+    // (gitleaks → secrets, ast_grep → patterns, metrics → metrics; the repo
+    // can only DISABLE a scanner the action enabled — enforced by
+    // mergeRepoConfig). runScanners is fail-soft by contract.
+    const scannerRepoConfig = {
+      scanners: {
+        secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
+        patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+        // W15-A1-2: `.zai.yml` `scanners.metrics: false` must reach the
+        // orchestrator's per-scanner toggle — same mapping as index.js.
+        metrics: repoConfig.scanners?.metrics === false ? false : undefined,
+      },
+    };
+    const scannerResult = await runScanners({
+      files: patchable,
+      repoPath: process.cwd(),
+      cacheDir: config.scannersCacheDir,
+      config: { scannersEnabled: repoConfig.scannersEnabled },
+      repoConfig: scannerRepoConfig,
+    });
+    const scannerContext = formatScannerContext(scannerResult.findings, scannerResult.metrics);
+    if (scannerResult.scannerNames.length > 0 && core?.info) {
+      core.info(
+        `Scheduled review: PR #${pr.number} scanners: ${scannerResult.findings.length} finding(s) from ${scannerResult.scannerNames.join(', ')}.`,
+      );
     }
 
     // W11-10: `largePrFileThreshold` used to be parsed in config, exported as
@@ -281,21 +501,56 @@ export async function reviewOnePr({
       }
     }
 
-    const result = await runStructuredReview(patchable, config, { callApi, core });
-
-    // Synthetic @actions/github-like context. upsertReview reads
-    // context.payload.pull_request.number; postFallbackComment delegates to the
-    // shared postComment helper, which reads context.payload.issue.number — so
-    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
-    const ctx = {
-      repo: { owner, repo },
-      payload: {
-        pull_request: { number: pr.number, head: { sha: pr.headSha } },
-        issue: { number: pr.number },
+    const result = await runStructuredReview(
+      patchable,
+      {
+        ...config,
+        maxFindings: repoConfig.maxFindings,
+        minSeverity: repoConfig.minSeverity ?? config.minSeverity,
+        pathInstructions: repoConfig.pathInstructions,
+        toneInstructions: repoConfig.toneInstructions,
+        deterministicFindings: scannerResult.findings,
+        scannerContext,
+        learningsContext,
       },
-    };
+      { callApi, core },
+    );
 
-    const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
+    // W15-A8-4c: drop findings that match a previously-reviewed / won't-fix
+    // learning (mirrors the push path; applied to the final findings set so the
+    // posted review, the commit status, and the SHA-dedup hash all describe the
+    // SAME kept set). When learningsEnabled is off (or nothing matched) this is
+    // a no-op passthrough.
+    const { kept: keptFindings } = filterFindingsByLearnings(result.findings, learnings);
+
+    // W15-A8-4d: flip the commit status to `success` with a findings summary
+    // now that the review completed. Mirrors index.js (W15-A6-2): computed from
+    // the FINAL kept-findings set — AFTER learnings suppression — so the checks
+    // tab never contradicts the posted review. Fail-soft.
+    if (config.commitStatus) {
+      const criticalCount = keptFindings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = keptFindings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatus(
+        {
+          octokit,
+          context: ctx,
+          sha: pr.headSha,
+          state: 'success',
+          description: buildStatusDescription({
+            findingCount: keptFindings.length,
+            criticalCount,
+            highCount,
+          }),
+        },
+        { core },
+      );
+    }
+
+    const { inline, summaryOnly } = partitionFindings(keptFindings, patchable);
 
     if (inline.length > 0) {
       const baseBody = buildReviewBody(result.summary, summaryOnly, {
@@ -315,7 +570,7 @@ export async function reviewOnePr({
       const shaBlock = buildShaBlock(pr.headSha);
       const body = appendTrailers(baseBody, [shaBlock]);
       const comments = buildReviewComments(inline);
-      const event = resolveReviewEvent(result.findings, config);
+      const event = resolveReviewEvent(keptFindings, config);
       try {
         await upsertReview({
           octokit,
@@ -356,17 +611,31 @@ export async function reviewOnePr({
     }
 
     // No inline-mappable findings: post the whole summary as an issue comment
-    // via the existing marker-upsert path (legacy summary comment).
-    const content = formatFindingsAsSummary(result.findings, {
-      reviewerName: config.reviewerName,
-      metadata: {
-        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: Math.max(
-          0,
-          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
-        ),
-      },
-    });
+    // via the existing marker-upsert path (legacy summary comment). W15-A6-4:
+    // mirror index.js — when walkthrough is on AND there are findings, render
+    // the dependency-ordered walkthrough instead of the flat summary (previously
+    // the scheduled path ALWAYS rendered flat, so cron and push runs disagreed
+    // on the same PR). The metadata shape (summary prose carried to both
+    // renderers) matches index.js's summary-only branch.
+    const useWalkthrough =
+      config.walkthrough && Array.isArray(keptFindings) && keptFindings.length > 0;
+    const summaryMetadata = {
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: Math.max(
+        0,
+        (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+      ),
+      summary: typeof result.summary === 'string' ? result.summary : '',
+    };
+    const content = useWalkthrough
+      ? formatWalkthroughSummary(keptFindings, patchable, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        })
+      : formatFindingsAsSummary(keptFindings, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        });
 
     const commentBody = buildCommentBody({
       title: config.reviewerName,
@@ -419,6 +688,16 @@ export async function reviewOnePr({
  * @param {Function} args.upsertReview
  * @param {Function} args.postFallbackComment
  * @param {Function} args.resolveReviewEvent
+ * @param {Function} [args.formatWalkthroughSummary]  Walkthrough renderer (W15-A6-4).
+ * @param {Function} [args.loadRepoConfig]  .zai.yml loader (W15-A8-4a).
+ * @param {Function} [args.mergeRepoConfig]  .zai.yml merge (W15-A8-4a).
+ * @param {Function} [args.runScanners]  Scanner orchestrator (W15-A8-4b).
+ * @param {Function} [args.formatScannerContext]  Scanner prompt context (W15-A8-4b).
+ * @param {Function} [args.loadLearnings]  .zai/learnings.yml loader (W15-A8-4c).
+ * @param {Function} [args.formatLearningsForPrompt]  Learnings prompt context (W15-A8-4c).
+ * @param {Function} [args.filterFindingsByLearnings]  Learnings suppression (W15-A8-4c).
+ * @param {Function} [args.setReviewStatus]  Commit-status poster (W15-A8-4d).
+ * @param {Function} [args.buildStatusDescription]  Status description builder (W15-A8-4d).
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 export async function runScheduledReview({
@@ -448,6 +727,18 @@ export async function runScheduledReview({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
+  // W15-A6-4 walkthrough parity dep (optional; default: real renderer).
+  formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummaryDefault,
+  // W15-A8-4 feature-parity deps (optional; inert defaults — see reviewOnePr).
+  loadRepoConfig = defaultLoadRepoConfig,
+  mergeRepoConfig = defaultMergeRepoConfig,
+  runScanners = defaultRunScanners,
+  formatScannerContext = defaultFormatScannerContext,
+  loadLearnings = defaultLoadLearnings,
+  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  setReviewStatus = defaultSetReviewStatus,
+  buildStatusDescription = buildStatusDescriptionDefault,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -508,10 +799,29 @@ export async function runScheduledReview({
       upsertReview,
       postFallbackComment,
       resolveReviewEvent,
+      formatWalkthroughSummary: formatWalkthroughSummaryFn,
+      loadRepoConfig,
+      mergeRepoConfig,
+      runScanners,
+      formatScannerContext,
+      loadLearnings,
+      formatLearningsForPrompt,
+      filterFindingsByLearnings,
+      setReviewStatus,
+      buildStatusDescription,
     });
 
     if (result.ok) {
-      reviewed += 1;
+      // W15-A6-3: an ok result is not necessarily a REVIEW. reviewOnePr returns
+      // {ok:true, action:'skipped-no-patchable'} for PRs with nothing to
+      // review; counting those as reviewed made the log say "skipped-no-
+      // patchable" while the summary said {reviewed:1}. Only real reviews count
+      // as reviewed; skip-actions count as skipped.
+      if (result.action === 'skipped-no-patchable') {
+        skipped += 1;
+      } else {
+        reviewed += 1;
+      }
       if (core?.info) core.info(`Scheduled review: PR #${pr.number} ${result.action}.`);
     } else {
       failed += 1;

@@ -15,6 +15,12 @@ import {
 } from '../src/lib/schedule.js';
 import { MARKER } from '../src/lib/comments.js';
 import { partitionFindings } from '../src/lib/diff.js';
+import { formatWalkthroughSummary } from '../src/lib/walkthrough.js';
+import { filterExcludedFiles } from '../src/lib/changed-files.js';
+import { mergeRepoConfig } from '../src/lib/repo-config.js';
+import { filterFindingsByLearnings } from '../src/lib/learnings.js';
+import { formatFindingsAsSummary } from '../src/lib/findings.js';
+import { buildStatusDescription } from '../src/lib/status.js';
 import {
   buildReviewBody,
   buildReviewComments,
@@ -166,19 +172,17 @@ describe('listOpenPrs', () => {
   });
 
   // ----- W2-1: pagination termination must compare against the ACTUAL page size
-  // sent to the API, not the original `perPage` parameter. When maxPrs=10 and
-  // page 1 returns 10 drafts (all skipped), the dynamic per_page is
-  // min(50, 10-0)=10. After skipping, data.length=10 must be compared against
-  // the REQUESTED 10 (not 50) so we keep paginating to find reviewable PRs.
-  // The buggy version compared data.length (10) against the original perPage
-  // (50), concluded "10 < 50 → last page", and broke after page 1, returning 0
-  // PRs even though page 2 had reviewable PRs.
+  // sent to the API. When page 1 returns a FULL page of 10 drafts (all skipped),
+  // the loop must keep paginating to find reviewable PRs.
+  // W15-A6-1 update: per_page is now CONSTANT across pages (no dynamic clamp),
+  // so this fake models true GitHub semantics — a full page returns exactly
+  // `per_page` items. Previously the fake returned 10 items against a requested
+  // 10 (the old clamped size); with the constant 50 the equivalent scenario is
+  // a FULL 50-item page of drafts, followed by the reviewable PRs.
   it('continues paginating when page 1 is all drafts (W2-1 regression)', async () => {
-    // Page 1: 10 drafts (all skipped). Page 2: 5 non-draft PRs + a short page
-    // to terminate (3 items). maxPrs=10 so the requested per_page for page 1 is
-    // min(50, 10) = 10; for page 2 it is min(50, 10-0) = 10 (out.length is still
-    // 0 after page 1's drafts were all skipped).
-    const page1 = Array.from({ length: 10 }, (_, i) => ({
+    // Page 1: a FULL page of 50 drafts (perPage default = 50; all skipped).
+    // Page 2: 5 non-draft PRs + a short page to terminate. maxPrs=10.
+    const page1 = Array.from({ length: 50 }, (_, i) => ({
       number: 100 + i,
       head: { sha: `d${i}` },
       draft: true,
@@ -206,13 +210,13 @@ describe('listOpenPrs', () => {
         },
       },
     };
-    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10 });
+    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10, perPage: 50 });
     // Must return the 5 non-draft PRs from page 2 — NOT an empty array.
     expect(out).toHaveLength(5);
     expect(out.every((pr) => pr.draft === false)).toBe(true);
     expect(out.map((pr) => pr.number).sort()).toEqual([200, 201, 202, 203, 204]);
     // And it must have actually requested page 2 (proving it did not terminate
-    // after page 1).
+    // after page 1: a full 50-of-50 page is NOT a short page).
     expect(pullsListCalls.length).toBeGreaterThanOrEqual(2);
     expect(pullsListCalls[1].page).toBe(2);
   });
@@ -222,6 +226,46 @@ describe('listOpenPrs', () => {
   // unfilled, would paginate through every open PR without a ceiling. CORE-4
   // added MAX_PAGES caps to changed-files.js, comments.js, and review.js but
   // schedule.js was missed. The loop must enforce a MAX_PAGES ceiling.
+  // W15-A6-1: GitHub paginates by OFFSET ((page-1)*per_page). The dynamic
+  // per_page clamp (min(perPage, maxPrs - out.length)) SHRINKS the page size
+  // between requests, so page 2 with a smaller per_page re-covers items already
+  // seen on page 1 (offset moves by less than the first window) → DUPLICATE PRs
+  // in the batch and tail PRs starved. The fix: request a CONSTANT per_page
+  // every page; the loop already stops ingesting at maxPrs.
+  it('W15-A6-1: requests a constant per_page (offset-window fake → no duplicates, tail PRs included)', async () => {
+    // 12 PRs; #1 and #7 (positions 1 and 7) are drafts. maxPrs=10, perPage=50.
+    // The fake slices by the true GitHub offset semantics ((page-1)*per_page),
+    // so the buggy dynamic clamp produced [2,3,4,5,6,8,9,10,3,4] (10 items,
+    // #3/#4 duplicated, #11/#12 starved). The fixed version must return exactly
+    // the 10 distinct non-draft PRs including the tail #11/#12.
+    const prs = Array.from({ length: 12 }, (_, i) => ({
+      number: i + 1,
+      head: { sha: `s${i + 1}` },
+      draft: i + 1 === 1 || i + 1 === 7,
+      title: `PR ${i + 1}`,
+    }));
+    const octokit = makeOctokit({ prs });
+    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10, perPage: 50 });
+    expect(out).toHaveLength(10);
+    const numbers = out.map((p) => p.number);
+    expect(new Set(numbers).size).toBe(10); // no duplicates
+    expect(numbers).toEqual([2, 3, 4, 5, 6, 8, 9, 10, 11, 12]); // tail PRs included
+  });
+
+  it('W15-A6-1: terminates on a short page with the constant per_page', async () => {
+    // 3 PRs returned while perPage=50 → a single short page must terminate
+    // pagination after exactly ONE request (no page 2 fetch).
+    const prs = [
+      { number: 1, head: { sha: 'a' }, draft: false, title: 'A' },
+      { number: 2, head: { sha: 'b' }, draft: false, title: 'B' },
+      { number: 3, head: { sha: 'c' }, draft: false, title: 'C' },
+    ];
+    const octokit = makeOctokit({ prs });
+    const out = await listOpenPrs({ octokit, owner: 'o', repo: 'r', maxPrs: 10, perPage: 50 });
+    expect(out.map((p) => p.number)).toEqual([1, 2, 3]);
+    expect(octokit.__calls.pullsList).toHaveLength(1);
+  });
+
   it('terminates after MAX_PAGES even when the API always returns a full page of drafts (W11-12)', async () => {
     let calls = 0;
     const fullPage = Array.from({ length: 50 }, (_, i) => ({
@@ -600,6 +644,21 @@ describe('runScheduledReview', () => {
     });
     expect(result.reviewed).toBe(2);
   });
+
+  // W15-A6-3: reviewOnePr returns {ok:true, action:'skipped-no-patchable'} when
+  // a PR has no patchable files, but runScheduledReview counted EVERY ok as
+  // reviewed — so the log said "skipped-no-patchable" while the summary said
+  // {reviewed:1}. The skipped-no-patchable action must count as SKIPPED.
+  it('W15-A6-3: counts skipped-no-patchable PRs as skipped, not reviewed', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(1, 'sha1')], commentsByPr: {} });
+    const s = makeStubs({ filterPatchableFiles: vi.fn(() => []) });
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r', config: makeConfig(),
+      core: { info() {}, warning() {} }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(s.runStructuredReview).not.toHaveBeenCalled();
+  });
 });
 
 /* ---------- reviewOnePr (v2 inline pipeline) ---------- */
@@ -678,6 +737,94 @@ describe('reviewOnePr', () => {
     expect(s.upsertReview).not.toHaveBeenCalled();
   });
 
+  // W15-A6-4: the summary-only branch (file-level findings) always used
+  // formatFindingsAsSummary, ignoring config.walkthrough — while src/index.js
+  // renders formatWalkthroughSummary on the SAME PR when walkthrough is on, so
+  // cron runs rendered flat while push runs rendered the walkthrough. Mirror
+  // index.js: walkthrough && findings.length > 0 → walkthrough renderer.
+  it('W15-A6-4: renders the walkthrough summary when config.walkthrough is true (file-level findings)', async () => {
+    const octokit = makeOctokit();
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const fileLevelFinding = { file: 'a.js', line: null, severity: 'low', title: 'X', description: 'd' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [fileLevelFinding],
+        summary: 'summary only',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      // Real renderer so the posted body reflects what production renders.
+      formatWalkthroughSummary: vi.fn(formatWalkthroughSummary),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(8, 'sha8'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ walkthrough: true }), core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.formatWalkthroughSummary).toHaveBeenCalledTimes(1);
+    // Same call shape as index.js: (keptFindings, patchable, {reviewerName, metadata}).
+    const wArgs = s.formatWalkthroughSummary.mock.calls[0];
+    expect(wArgs[0]).toEqual([fileLevelFinding]);
+    expect(wArgs[2].reviewerName).toBe('Z.ai Code Review');
+    expect(wArgs[2].metadata.summary).toBe('summary only');
+    // The posted comment body carries the walkthrough structure (collapsible
+    // cohort sections + overview), not the flat list.
+    const posted = s.upsertReviewComment.mock.calls[0][0];
+    expect(posted.body).toContain('<details>');
+    expect(posted.body).toContain('📊 Overview');
+    // And the flat renderer was NOT used.
+    expect(s.formatFindingsAsSummary).not.toHaveBeenCalled();
+  });
+
+  it('W15-A6-4: renders the flat summary when walkthrough is false/absent (file-level findings)', async () => {
+    const octokit = makeOctokit();
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const fileLevelFinding = { file: 'a.js', line: null, severity: 'low', title: 'X', description: 'd' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [fileLevelFinding],
+        summary: 'summary only',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      formatWalkthroughSummary: vi.fn(formatWalkthroughSummary),
+    });
+
+    await reviewOnePr({
+      pr: mkPr(8, 'sha8'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ walkthrough: false }), core, callApi: vi.fn(), ...s,
+    });
+
+    expect(s.formatFindingsAsSummary).toHaveBeenCalledTimes(1);
+    expect(s.formatWalkthroughSummary).not.toHaveBeenCalled();
+    // Flat renderer keeps its (findings, {reviewerName, metadata}) shape.
+    const fArgs = s.formatFindingsAsSummary.mock.calls[0];
+    expect(fArgs[0]).toEqual([fileLevelFinding]);
+    expect(fArgs[1].reviewerName).toBe('Z.ai Code Review');
+  });
+
+  it('W15-A6-4: walkthrough renderer is NOT used when there are no findings', async () => {
+    // index.js: useWalkthrough = config.walkthrough && keptFindings.length > 0 —
+    // a clean review (0 findings) still renders the flat "No issues found"
+    // summary, never an empty walkthrough.
+    const octokit = makeOctokit();
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs({
+      formatWalkthroughSummary: vi.fn(formatWalkthroughSummary),
+    });
+    await reviewOnePr({
+      pr: mkPr(8, 'sha8'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ walkthrough: true }), core, callApi: vi.fn(), ...s,
+    });
+    expect(s.formatFindingsAsSummary).toHaveBeenCalledTimes(1);
+    expect(s.formatWalkthroughSummary).not.toHaveBeenCalled();
+  });
+
   it('posts a fallback comment when upsertReview throws', async () => {
     const octokit = makeOctokit();
     const callApi = vi.fn(async () => 'review');
@@ -733,5 +880,413 @@ describe('reviewOnePr', () => {
     expect(result).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
     expect(s.upsertReview).toHaveBeenCalledTimes(1);
     expect(s.upsertReviewComment).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------- reviewOnePr — W15-A8-4 scheduled/push feature parity ---------- */
+
+// The docs promise scanners, .zai.yml repo config, learnings, commit statuses,
+// and walkthrough UNCONDITIONALLY — but the scheduled path historically wired
+// none of them (the "KNOWN LIMITATION (W8-3)" comment). These tests pin the
+// parity wiring. All new collaborators are injected (DI-first) so the tests
+// stay hermetic; src/index.js's schedule branch wires the real functions.
+describe('reviewOnePr — W15-A8-4 feature parity', () => {
+  it('W15-A8-4a: loads .zai.yml at the head SHA, merges it, and re-filters patchable files by merged path_filters', async () => {
+    const generated = { filename: 'generated/x.js', status: 'added', patch: '@@ -1,0 +1,1 @@\n+a\n' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE, generated]),
+      filterExcludedFiles: vi.fn(filterExcludedFiles), // real glob filtering
+      loadRepoConfig: vi.fn(async () => ({ reviews: { path_filters: ['generated/**'] } })),
+      mergeRepoConfig, // real merge: path_filters → excludePatterns union
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(21, 'sha21'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // Fetched at the PR head SHA via the synthetic context.
+    expect(s.loadRepoConfig).toHaveBeenCalledTimes(1);
+    const loadArgs = s.loadRepoConfig.mock.calls[0][0];
+    expect(loadArgs.headSha).toBe('sha21');
+    expect(loadArgs.octokit).toBeDefined();
+    expect(loadArgs.context.repo).toEqual({ owner: 'o', repo: 'r' });
+    // The merged path_filters re-filtered the patchable set: generated/** was
+    // dropped before the structured review ran.
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(1);
+    expect(s.runStructuredReview.mock.calls[0][0]).toEqual([INLINE_FILE]);
+  });
+
+  it('W15-A8-4a: a throwing loadRepoConfig is fail-soft — the review proceeds with no repo config', async () => {
+    const s = makeStubs({
+      loadRepoConfig: vi.fn(async () => { throw new Error('boom'); }),
+      mergeRepoConfig,
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(22, 'sha22'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(1);
+  });
+
+  it('W15-A8-4a: does NOT load .zai.yml when repoConfigEnabled is off (flag honored)', async () => {
+    const s = makeStubs({
+      loadRepoConfig: vi.fn(async () => { throw new Error('must not be called'); }),
+      mergeRepoConfig,
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(23, 'sha23'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.loadRepoConfig).not.toHaveBeenCalled();
+  });
+
+  it('W15-A8-4a: returns skipped (no review) when .zai.yml path_filters exclude EVERY patchable file', async () => {
+    const s = makeStubs({
+      filterExcludedFiles: vi.fn(filterExcludedFiles),
+      loadRepoConfig: vi.fn(async () => ({ reviews: { path_filters: ['**/*.js'] } })),
+      mergeRepoConfig,
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(24, 'sha24'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'skipped-no-patchable' });
+    expect(s.runStructuredReview).not.toHaveBeenCalled();
+  });
+
+  // A deterministic scanner finding: line-anchored to the INLINE patch so it
+  // flows through the inline-review branch (buildReviewComments renders it).
+  const SCANNER_FINDING = {
+    file: 'a.js',
+    line: 2,
+    severity: 'critical',
+    title: 'Hardcoded AWS key',
+    description: 'secret detected',
+    rule: 'gitleaks:aws-access-key',
+  };
+  // Stub that echoes the deterministic findings as the review output, so the
+  // test observes the schedule-side WIRING (scanner findings handed to
+  // runStructuredReview and rendered into the posted review).
+  const echoDeterministic = vi.fn(async (files, cfg) => ({
+    findings: Array.isArray(cfg.deterministicFindings) ? cfg.deterministicFindings : [],
+    summary: 'scanners',
+    metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 1, batchMetadata: [] },
+  }));
+
+  it('W15-A8-4b: runs scanners on the changed files and merges scanner findings into the posted review', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: echoDeterministic,
+      runScanners: vi.fn(async () => ({
+        findings: [SCANNER_FINDING],
+        metrics: { totalFiles: 1 },
+        scannerNames: ['secrets:fake'],
+      })),
+      formatScannerContext: vi.fn(() => 'SCANNER-CTX'),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(25, 'sha25'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // Scanners ran on the PATCHABLE (changed) files.
+    expect(s.runScanners).toHaveBeenCalledTimes(1);
+    expect(s.runScanners.mock.calls[0][0].files).toEqual([INLINE_FILE]);
+    // The scanner findings + context were handed to the structured review
+    // exactly the way src/index.js's push path does.
+    expect(s.formatScannerContext).toHaveBeenCalledWith([SCANNER_FINDING], { totalFiles: 1 });
+    const reviewCfg = s.runStructuredReview.mock.calls[0][1];
+    expect(reviewCfg.deterministicFindings).toEqual([SCANNER_FINDING]);
+    expect(reviewCfg.scannerContext).toBe('SCANNER-CTX');
+    // And the scanner finding reached the posted inline review.
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    const comments = s.upsertReview.mock.calls[0][0].comments;
+    expect(comments.some((c) => c.body.includes('Hardcoded AWS key'))).toBe(true);
+  });
+
+  it('W15-A8-4b: maps .zai.yml scanner toggles onto the orchestrator repoConfig (incl. the metrics key)', async () => {
+    const s = makeStubs({
+      loadRepoConfig: vi.fn(async () => ({ scanners: { gitleaks: false, metrics: false } })),
+      mergeRepoConfig,
+      runScanners: vi.fn(async () => ({ findings: [], metrics: {}, scannerNames: [] })),
+      formatScannerContext: vi.fn(() => ''),
+    });
+    await reviewOnePr({
+      pr: mkPr(26, 'sha26'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    // gitleaks→secrets and metrics are disabled by the repo; ast_grep→patterns
+    // is left to the action default (undefined = not disabled).
+    expect(s.runScanners).toHaveBeenCalledTimes(1);
+    expect(s.runScanners.mock.calls[0][0].repoConfig.scanners).toEqual({
+      secrets: false,
+      patterns: undefined,
+      metrics: false,
+    });
+  });
+
+  it('W15-A8-4b: forwards scannersEnabled:false to the orchestrator (flag honored)', async () => {
+    const s = makeStubs({
+      runScanners: vi.fn(async () => ({ findings: [], metrics: {}, scannerNames: [] })),
+      formatScannerContext: vi.fn(() => ''),
+    });
+    await reviewOnePr({
+      pr: mkPr(27, 'sha27'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ scannersEnabled: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    // Mirrors index.js: runScanners is always invoked; the master switch rides
+    // opts.config.scannersEnabled and the orchestrator no-ops when it is false.
+    expect(s.runScanners.mock.calls[0][0].config.scannersEnabled).toBe(false);
+  });
+
+  it('W15-A8-4c: loads learnings, passes learningsContext into the prompt, and suppresses matching findings', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'learnings review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      loadLearnings: vi.fn(async () => [{ file: 'a.js', pattern: 'Bad' }]),
+      formatLearningsForPrompt: vi.fn(() => 'LRN-CTX'),
+      filterFindingsByLearnings, // real suppression semantics
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary), // real renderer
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(28, 'sha28'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ learningsEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // Fetched at the PR head SHA via the synthetic context.
+    expect(s.loadLearnings).toHaveBeenCalledTimes(1);
+    expect(s.loadLearnings.mock.calls[0][0].headSha).toBe('sha28');
+    // The accepted patterns rode the LLM prompt config exactly like index.js.
+    expect(s.runStructuredReview.mock.calls[0][1].learningsContext).toBe('LRN-CTX');
+    expect(s.formatLearningsForPrompt).toHaveBeenCalledWith([{ file: 'a.js', pattern: 'Bad' }]);
+    // The matching finding was suppressed: nothing inline, and the posted
+    // summary carries no trace of it.
+    expect(s.upsertReview).not.toHaveBeenCalled();
+    expect(s.formatFindingsAsSummary).toHaveBeenCalledWith([], expect.anything());
+    const posted = s.upsertReviewComment.mock.calls[0][0];
+    expect(posted.body).not.toContain('Bad');
+  });
+
+  it('W15-A8-4c: a NON-matching learning keeps the finding (no over-suppression)', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'learnings review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      loadLearnings: vi.fn(async () => [{ file: 'a.js', pattern: 'totally unrelated' }]),
+      formatLearningsForPrompt: vi.fn(() => 'LRN-CTX'),
+      filterFindingsByLearnings,
+    });
+
+    await reviewOnePr({
+      pr: mkPr(29, 'sha29'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ learningsEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    // Kept → inline review still posted with the finding.
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    const comments = s.upsertReview.mock.calls[0][0].comments;
+    expect(comments.some((c) => c.body.includes('Bad'))).toBe(true);
+  });
+
+  it('W15-A8-4c: does NOT load learnings when learningsEnabled is off (flag honored)', async () => {
+    const s = makeStubs({
+      loadLearnings: vi.fn(async () => { throw new Error('must not be called'); }),
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(30, 'sha30'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ learningsEnabled: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.loadLearnings).not.toHaveBeenCalled();
+  });
+
+  it('W15-A8-4d: posts a pending status at the start and a success status computed from the final kept findings', async () => {
+    const criticalFinding = { ...INLINE_FINDING, severity: 'critical' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [criticalFinding],
+        summary: 'status review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      setReviewStatus: vi.fn(async () => true),
+      buildStatusDescription, // real description builder
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(31, 'sha31'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.setReviewStatus).toHaveBeenCalledTimes(2);
+    const [pendingArgs] = s.setReviewStatus.mock.calls[0];
+    expect(pendingArgs.sha).toBe('sha31');
+    expect(pendingArgs.state).toBe('pending');
+    expect(pendingArgs.context.repo).toEqual({ owner: 'o', repo: 'r' });
+    const [successArgs] = s.setReviewStatus.mock.calls[1];
+    expect(successArgs.sha).toBe('sha31');
+    expect(successArgs.state).toBe('success');
+    // Success description is derived from the FINAL kept findings (1 critical).
+    expect(successArgs.description).toBe(
+      buildStatusDescription({ findingCount: 1, criticalCount: 1, highCount: 0 }),
+    );
+  });
+
+  it('W15-A8-4d: the success status reflects learnings suppression (kept set, not raw set)', async () => {
+    const criticalFinding = { ...INLINE_FINDING, severity: 'critical', title: 'Bad' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [criticalFinding],
+        summary: 'status review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      loadLearnings: vi.fn(async () => [{ file: 'a.js', pattern: 'Bad' }]),
+      formatLearningsForPrompt: vi.fn(() => 'LRN'),
+      filterFindingsByLearnings,
+      setReviewStatus: vi.fn(async () => true),
+      buildStatusDescription,
+    });
+
+    await reviewOnePr({
+      pr: mkPr(32, 'sha32'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true, learningsEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(s.setReviewStatus).toHaveBeenCalledTimes(2);
+    const [successArgs] = s.setReviewStatus.mock.calls[1];
+    // The finding was learning-suppressed → the status must say "no issues",
+    // not "1 findings" (W15-A6-2 parity: status matches the posted review).
+    expect(successArgs.state).toBe('success');
+    expect(successArgs.description).toBe('Review complete: no issues found ✅');
+  });
+
+  it('W15-A8-4d: posts a TERMINAL success status when .zai.yml path_filters exclude everything (W15-A7-3 parity)', async () => {
+    const s = makeStubs({
+      filterExcludedFiles: vi.fn(filterExcludedFiles),
+      loadRepoConfig: vi.fn(async () => ({ reviews: { path_filters: ['**/*.js'] } })),
+      mergeRepoConfig,
+      setReviewStatus: vi.fn(async () => true),
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(33, 'sha33'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true, commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'skipped-no-patchable' });
+    // pending was posted, then the terminal success — never left spinning.
+    const states = s.setReviewStatus.mock.calls.map((c) => c[0].state);
+    expect(states).toEqual(['pending', 'success']);
+  });
+
+  it('W15-A8-4d: posts NO status for a zero-patchable PR (pending fires only after the patchable check)', async () => {
+    const s = makeStubs({
+      filterPatchableFiles: vi.fn(() => []),
+      setReviewStatus: vi.fn(async () => true),
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(34, 'sha34'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'skipped-no-patchable' });
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  it('W15-A8-4d: posts NO statuses when commitStatus is off (flag honored)', async () => {
+    const s = makeStubs({
+      setReviewStatus: vi.fn(async () => true),
+    });
+    const result = await reviewOnePr({
+      pr: mkPr(35, 'sha35'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  // End-to-end: the batch entry must thread EVERY parity dep into reviewOnePr
+  // so a production scheduled run gets scanners + repo config + learnings +
+  // statuses + scanner findings in the posted review.
+  it('W15-A8-4: runScheduledReview threads the parity deps (scanners, repo config, learnings, statuses) end-to-end', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(40, 'sha40')], commentsByPr: {} });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: echoDeterministic,
+      loadRepoConfig: vi.fn(async () => ({ reviews: {} })),
+      mergeRepoConfig,
+      loadLearnings: vi.fn(async () => []),
+      formatLearningsForPrompt: vi.fn(() => ''),
+      filterFindingsByLearnings,
+      runScanners: vi.fn(async () => ({
+        findings: [SCANNER_FINDING],
+        metrics: {},
+        scannerNames: ['secrets:fake'],
+      })),
+      formatScannerContext: vi.fn(() => 'SCANNER-CTX'),
+      setReviewStatus: vi.fn(async () => true),
+      buildStatusDescription,
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ repoConfigEnabled: true, learningsEnabled: true, commitStatus: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
+    // Every parity collaborator was reached from the batch entry.
+    expect(s.loadRepoConfig).toHaveBeenCalledTimes(1);
+    expect(s.loadLearnings).toHaveBeenCalledTimes(1);
+    expect(s.runScanners).toHaveBeenCalledTimes(1);
+    expect(s.runScanners.mock.calls[0][0].files).toEqual([INLINE_FILE]);
+    expect(s.setReviewStatus.mock.calls.map((c) => c[0].state)).toEqual(['pending', 'success']);
+    // Scanner findings made it into the posted review.
+    const comments = s.upsertReview.mock.calls[0][0].comments;
+    expect(comments.some((c) => c.body.includes('Hardcoded AWS key'))).toBe(true);
   });
 });

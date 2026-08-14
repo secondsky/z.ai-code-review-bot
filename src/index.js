@@ -1207,6 +1207,29 @@ export async function run(context, deps = {}) {
       upsertReview: upsertReviewFn,
       postFallbackComment: postFallbackCommentFn,
       resolveReviewEvent: resolveReviewEventFn,
+      // W15-A6-4 walkthrough parity.
+      formatWalkthroughSummary: formatWalkthroughSummaryFn,
+      // W15-A8-4 feature parity with the push path: wire the REAL repo-config,
+      // scanner, learnings, and commit-status collaborators (schedule.js's
+      // defaults are inert no-ops so hermetic callers are unaffected). The
+      // scanner wrapper closes over the production scanner-deps kit + expanded
+      // cache dir, exactly like the pull_request branch's runScanners call.
+      loadRepoConfig: loadRepoConfigFn,
+      mergeRepoConfig: mergeRepoConfigFn,
+      runScanners: (opts) =>
+        runScannersFn(
+          { ...opts, cacheDir: expandHome(config.scannersCacheDir) },
+          createScannerDeps({
+            core: coreDep,
+            cacheDir: expandHome(config.scannersCacheDir),
+          }),
+        ),
+      formatScannerContext: formatScannerContextFn,
+      loadLearnings: loadLearningsFn,
+      formatLearningsForPrompt: formatLearningsForPromptFn,
+      filterFindingsByLearnings: filterFindingsByLearningsFn,
+      setReviewStatus: setReviewStatusFn,
+      buildStatusDescription: buildStatusDescriptionFn,
     });
     return;
   }
