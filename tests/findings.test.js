@@ -251,6 +251,108 @@ describe('normalizeFinding', () => {
     expect(out.title).toContain('Replace');
   });
 
+  // W15-A3-1: the W7-5 tag-strip only ran on the title. description/evidence/
+  // suggestion are equally LLM-emitted and attacker-influenceable, and they
+  // render inside walkthrough <details> sections too — a `</details><details>`
+  // sequence in the description injects forged collapsible sections.
+  it('W15-A3-1: strips structural HTML tags from description', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      description: 'x</details><details><summary>Forged</summary>y',
+    });
+    expect(out.description).not.toContain('</details>');
+    expect(out.description).not.toContain('<details');
+    expect(out.description).not.toContain('<summary');
+    expect(out.description).toContain('Forged');
+  });
+
+  it('W15-A3-1: strips structural HTML tags from evidence and suggestion', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      evidence: 'a<img src=x>b',
+      suggestion: 'c</details><script>d</script>e',
+    });
+    expect(out.evidence).not.toContain('<img');
+    expect(out.evidence).toBe('ab');
+    expect(out.suggestion).not.toContain('</details>');
+    expect(out.suggestion).not.toContain('<script');
+    // Tags are stripped; inner text between them survives.
+    expect(out.suggestion).toBe('cde');
+  });
+
+  // W15-A3-2: newlines in model-controlled fields were rendered raw by
+  // formatFindingsAsSummary / formatWalkthroughSummary (renderCommentBody in
+  // review.js already collapses them — CORE-2). A title like
+  // "First half\n\n#### INJECTED" would inject a markdown heading. Collapse
+  // \r?\n to a single space at the chokepoint: normalizeFinding.
+  it('W15-A3-2: collapses newlines to a single space in title/description/evidence/suggestion', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      title: 'First half\n\n#### INJECTED',
+      description: 'line one\r\nline two\nline three',
+      evidence: 'a\n> forged quote',
+      suggestion: 'b\r\n```js\nblock\n```',
+    });
+    expect(out.title).toBe('First half  #### INJECTED');
+    expect(out.title).not.toMatch(/\r|\n/);
+    expect(out.description).not.toMatch(/\r|\n/);
+    expect(out.description).toContain('line one line two line three');
+    expect(out.evidence).not.toMatch(/\r|\n/);
+    expect(out.suggestion).not.toMatch(/\r|\n/);
+  });
+
+  // W15-A3-5: the anti-hallucination filter matched the file EXACTLY, so an
+  // LLM emitting incidental whitespace or a './' prefix (' a.js', 'a.js ',
+  // './a.js') had its findings silently dropped. normalizeFinding now trims
+  // and strips a leading './' so the exact-set filter still applies to the
+  // CANONICAL filename.
+  it('W15-A3-5: normalizes file — trims whitespace and strips a leading ./', () => {
+    const a = normalizeFinding({ ...validFinding(), file: ' src/index.js ' });
+    const b = normalizeFinding({ ...validFinding(), file: './src/index.js' });
+    const c = normalizeFinding({ ...validFinding(), file: ' ./src/index.js' });
+    expect(a.file).toBe('src/index.js');
+    expect(b.file).toBe('src/index.js');
+    expect(c.file).toBe('src/index.js');
+  });
+
+  it('W15-A3-5: leaves a path like src/./index.js inner segments untouched (only the leading ./ is stripped)', () => {
+    const out = normalizeFinding({ ...validFinding(), file: 'src/./index.js' });
+    // Only the LEADING './' is stripped — inner segments are a different
+    // (valid) path and must not be rewritten by the normalizer.
+    expect(out.file).toBe('src/./index.js');
+  });
+
+  // W15-A3-7: validateFinding rejects line:0 and line:'42', and normalizeFinding
+  // validated BEFORE coercing the line — so the whole finding was dropped and
+  // the post-validation coercion branch was dead code. LLMs emit string lines
+  // ('42') all the time. Coerce BEFORE validating: '42' → 42; 0 / negative /
+  // garbage / floats → null (file-level finding, still kept).
+  it('W15-A3-7: coerces a string line "42" to the number 42', () => {
+    const out = normalizeFinding({ ...validFinding(), line: '42' });
+    expect(out).not.toBeNull();
+    expect(out.line).toBe(42);
+  });
+
+  it('W15-A3-7: coerces line 0 to null (file-level finding) instead of dropping it', () => {
+    const out = normalizeFinding({ ...validFinding(), line: 0 });
+    expect(out).not.toBeNull();
+    expect(out.line).toBeNull();
+  });
+
+  it('W15-A3-7: coerces negative / float / garbage lines to null (file-level)', () => {
+    for (const line of [-3, 1.5, 'garbage', '']) {
+      const out = normalizeFinding({ ...validFinding(), line });
+      expect(out).not.toBeNull();
+      expect(out.line).toBeNull();
+    }
+  });
+
+  it('W15-A3-7: keeps an explicit null line as null (file-level path intact)', () => {
+    const out = normalizeFinding({ ...validFinding(), line: null });
+    expect(out).not.toBeNull();
+    expect(out.line).toBeNull();
+  });
+
   it('leaves a 120-char title untouched', () => {
     const exact = 'y'.repeat(120);
     const out = normalizeFinding({ ...validFinding(), title: exact });
@@ -379,6 +481,21 @@ describe('parseFindings', () => {
       changedFiles: ['src/a.js', { filename: 'src/b.js' }],
     });
     expect(out.map((f) => f.file).sort()).toEqual(['src/a.js', 'src/b.js']);
+  });
+
+  // W15-A3-5: the exact-set anti-hallucination filter must compare against
+  // the CANONICAL filename — whitespace or a './' prefix from the LLM must
+  // not silently drop an otherwise-legitimate finding.
+  it('W15-A3-5: keeps findings whose file has a ./ prefix or incidental whitespace', () => {
+    const raw = JSON.stringify([
+      { ...validFinding(), file: './src/index.js' },
+      { ...validFinding(), file: ' src/index.js', title: 'Whitespace-prefixed' },
+      { ...validFinding(), file: 'src/index.js ', title: 'Whitespace-suffixed' },
+      { ...validFinding(), file: 'not-in-diff.js', title: 'Still hallucinated' },
+    ]);
+    const out = parseFindings(raw, { changedFiles: ['src/index.js'] });
+    expect(out).toHaveLength(3);
+    expect(out.every((f) => f.file === 'src/index.js')).toBe(true);
   });
 
   it('dedups by file:line:title (first occurrence wins)', () => {
@@ -780,6 +897,55 @@ describe('formatFindingsAsSummary', () => {
     // The pre-fix bold-wrapped form must be gone.
     expect(out).not.toMatch(/- \*\*weird\*\*name\.js\*\*/);
   });
+
+  // W15-A3-2: a normalized finding whose title tried to inject a markdown
+  // heading via a newline must render with no line starting "#### INJECTED".
+  // (Production findings always flow through normalizeFinding before render.)
+  it('W15-A3-2: renders a normalized injected-heading title without any injected heading line', () => {
+    const normalized = normalizeFinding({
+      ...validFinding(),
+      title: 'First half\n\n#### INJECTED',
+    });
+    const out = formatFindingsAsSummary([normalized]);
+    expect(out).not.toMatch(/^#### INJECTED/m);
+    expect(out).toContain('First half');
+  });
+
+  // W15-A8-2: the flat summary silently discarded metadata.summary — where
+  // the incremental-suppression note and the model's summary prose live. With
+  // ZAI_WALKTHROUGH:false (or when ALL findings were suppressed on re-push),
+  // the bot posted exactly "No issues found ... ✅" with zero indication that
+  // findings were elided. Mirror formatWalkthroughSummary: render the prose
+  // right after the header.
+  it('W15-A8-2: renders metadata.summary prose alongside findings', () => {
+    const out = formatFindingsAsSummary([validFinding()], {
+      metadata: { summary: 'This PR adds a users table.' },
+    });
+    expect(out).toContain('This PR adds a users table.');
+    // Both the prose and the finding render.
+    expect(out).toContain('- `src/index.js`:L42 — Possible null dereference');
+  });
+
+  it('W15-A8-2: keeps the summary visible when all findings were suppressed (empty kept list)', () => {
+    const out = formatFindingsAsSummary([], {
+      metadata: {
+        summary: '3 previously-reported finding(s) suppressed (incremental review).',
+      },
+    });
+    // The suppression note must be visible — not swallowed by the no-issues
+    // message.
+    expect(out).toContain('suppressed');
+    expect(out).toContain('3 previously-reported finding(s) suppressed');
+    // The no-issues line still renders for the (kept) empty finding list.
+    expect(out).toContain('No issues found. The changes look good. ✅');
+  });
+
+  it('W15-A8-2: omits the summary block when metadata.summary is empty or absent', () => {
+    expect(formatFindingsAsSummary([])).not.toContain('### Review notes');
+    expect(
+      formatFindingsAsSummary([], { metadata: { summary: '' } }),
+    ).not.toContain('### Review notes');
+  });
 });
 
 describe('parseStructuredReview', () => {
@@ -1168,6 +1334,22 @@ describe('parseFindingsHashBlock', () => {
     expect(set.size).toBeGreaterThanOrEqual(1);
     expect(set.has('aaa')).toBe(true);
   });
+
+  // W15-A3-3 (defense-in-depth): the hash-block regex is lax, so a payload
+  // containing anything other than hex digits / commas / whitespace must be
+  // rejected outright — an injected payload like `HEX,>` can never be honored.
+  it('W15-A3-3: rejects hash-block payloads with characters outside [0-9a-fA-F, \\t]', () => {
+    expect(parseFindingsHashBlock('<!-- zai-hashes:abc123,> -->').size).toBe(0);
+    expect(parseFindingsHashBlock('<!-- zai-hashes:zzz -->').size).toBe(0);
+    expect(parseFindingsHashBlock('<!-- zai-hashes:ab c-d -->').size).toBe(0);
+  });
+
+  it('W15-A3-3: valid hex payloads (mixed case, commas, spaces) still parse', () => {
+    const set = parseFindingsHashBlock('<!-- zai-hashes:AbC123, DEF456 -->');
+    expect(set.size).toBe(2);
+    expect(set.has('AbC123')).toBe(true);
+    expect(set.has('DEF456')).toBe(true);
+  });
 });
 
 describe('filterIncrementalFindings', () => {
@@ -1353,6 +1535,64 @@ describe('JSON extraction — nested structures', () => {
     // array itself must still parse without throwing.
     expect(() => parseFindings(raw, { changedFiles: [] })).not.toThrow();
     expect(parseFindings(raw, { changedFiles: [] })).toEqual([]);
+  });
+});
+
+describe('JSON extraction — W15-A3-4 trailing-comma repair', () => {
+  // A single trailing comma before ]/} is the classic LLM JSON failure, and it
+  // defeated every extraction strategy — parseFindings returned [] and the bot
+  // posted a false "No issues found ✅". Both extractors now retry JSON.parse
+  // on a repaired slice (trailing commas removed; bare NaN/Infinity/-Infinity
+  // literals mapped to null) as a last resort.
+  it('repairs a trailing comma inside the findings array of the envelope', () => {
+    const raw =
+      '{"summary":"s","findings":[' +
+      JSON.stringify({ ...validFinding(), file: 'a.js' }) +
+      ',]}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['a.js'],
+    });
+    expect(summary).toBe('s');
+    expect(findings).toHaveLength(1);
+    expect(findings[0].file).toBe('a.js');
+  });
+
+  it('repairs a trailing comma in a bare findings array (parseFindings)', () => {
+    const raw = '[' + JSON.stringify(validFinding()) + ',]';
+    const out = parseFindings(raw, { changedFiles: ['src/index.js'] });
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe('Possible null dereference');
+  });
+
+  it('repairs a trailing comma in the envelope object itself', () => {
+    const raw = '{"summary":"s","findings":[],}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['src/index.js'],
+    });
+    expect(summary).toBe('s');
+    expect(findings).toEqual([]);
+  });
+
+  it('repairs bare NaN / Infinity / -Infinity literals to null', () => {
+    // Hand-built invalid JSON: a NaN line and Infinity/-Infinity values
+    // (JSON.parse rejects these literals; the repair maps them to null).
+    const raw =
+      '{"summary":"s","findings":[{"file":"a.js","line":NaN,' +
+      '"severity":"high","confidence":"medium","category":"bug",' +
+      '"title":"T","description":"d","evidence":"","suggestion":null,' +
+      '"rule":"llm","pos":Infinity,"neg":-Infinity}],}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['a.js'],
+    });
+    expect(summary).toBe('s');
+    expect(findings).toHaveLength(1);
+    // NaN line coerces to null → the finding survives as file-level.
+    expect(findings[0].line).toBeNull();
+  });
+
+  it('still returns [] for unrepairable JSON (repair is last-resort only)', () => {
+    expect(parseFindings('Review: [ { "file": "a", ', { changedFiles: ['a'] })).toEqual([]);
+    expect(parseStructuredReview('totally not json', { changedFiles: ['a'] }).summary).toBe('');
   });
 });
 
