@@ -5,7 +5,11 @@
  * their absolute (new-file) line numbers.
  */
 import { describe, it, expect } from 'vitest';
-import { parseHunkHeader, parseAddedLines } from '../../src/lib/scanners/_patch.js';
+import {
+  parseHunkHeader,
+  parseAddedLines,
+  changedFileNames,
+} from '../../src/lib/scanners/_patch.js';
 
 describe('parseHunkHeader', () => {
   it('returns the +c start line from `@@ -a,b +c,d @@`', () => {
@@ -206,5 +210,24 @@ describe('parseAddedLines', () => {
     const lines = parseAddedLines(patch);
     expect(lines).toHaveLength(1);
     expect(lines[0].text).toBe('++ AKIAIOSFODNN7EXAMPLE');
+  });
+});
+
+describe('changedFileNames [W15-A5-1]', () => {
+  it('builds a Set of filenames from GitHub PR file objects', () => {
+    const set = changedFileNames([
+      { filename: 'src/a.js', patch: '@@ hunk' },
+      { filename: 'src/b.ts' },
+    ]);
+    expect(set).toBeInstanceOf(Set);
+    expect(set.has('src/a.js')).toBe(true);
+    expect(set.has('src/b.ts')).toBe(true);
+    expect(set.has('legacy/old.js')).toBe(false);
+  });
+
+  it('skips entries without a usable filename and non-array input', () => {
+    expect(changedFileNames([{ patch: 'x' }, null, { filename: '' }])).toEqual(new Set());
+    expect(changedFileNames(null)).toEqual(new Set());
+    expect(changedFileNames(undefined)).toEqual(new Set());
   });
 });

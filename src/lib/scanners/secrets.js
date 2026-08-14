@@ -17,7 +17,7 @@
  */
 
 import os from 'node:os';
-import { parseAddedLines } from './_patch.js';
+import { parseAddedLines, changedFileNames } from './_patch.js';
 import { selectPlatformAsset, pickExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
@@ -117,7 +117,10 @@ export const SECRET_PATTERNS = [
     // by an assignment and a quoted value of length >= 8. Capture group 1 is
     // the value, on which we run an entropy check (≥ 3.5 Shannon) to suppress
     // false positives like `password = "password"`.
-    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-.]{8,})['"]/i,
+    // W15-A5-6: the value charset now also includes `/` and `,;:=~|` — real
+    // secrets routinely contain them (JWT fragments, base64 with `/`, scoped
+    // tokens), and their omission made those values unmatchable.
+    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-/.,;:=~|]{8,})['"]/i,
     captureGroup: 1,
     minEntropy: 3.5,
     title: 'Hardcoded credential assigned to a key',
@@ -133,6 +136,18 @@ export const SECRET_PATTERNS = [
     regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
     captureGroup: 1,
     minEntropy: 4.5,
+    // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
+    // Before accepting a candidate, the preceding context on the same line is
+    // tested against each regex — data URIs and subresource-integrity hashes
+    // are high-entropy BY DESIGN and flooded reviews with critical FPs.
+    skipIfPrecededBy: [
+      // `data:image/png;base64,<candidate>` (data URIs)
+      /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,\s*$/,
+      // `"integrity": "sha512-<candidate>"`, `integrity="sha384-..."`,
+      // `sha256:<candidate>`, etc. (SRI hashes / digest prefixes). The first
+      // `["']?` allows the JSON key's closing quote (`integrity": "sha512-`).
+      /(?:integrity|sha256|sha384|sha512)["']?[=:]?\s*["']?(?:sha\d+-)?$/i,
+    ],
     title: 'High-entropy string (possible secret)',
     description:
       'A long, high-entropy string was found in the diff. This often indicates an ' +
@@ -212,6 +227,14 @@ export function scanSecretsRegex(files) {
         pattern.regex.lastIndex = 0; // defense in depth for stateful regexes
         const match = pattern.regex.exec(text);
         if (!match) continue;
+
+        // W15-A5-5: suppress candidates that sit in a known-benign base64
+        // context (data URIs, SRI integrity hashes). Look at up to 40 chars
+        // immediately before the match on the same line.
+        if (Array.isArray(pattern.skipIfPrecededBy) && typeof match.index === 'number') {
+          const before = text.slice(Math.max(0, match.index - 40), match.index);
+          if (pattern.skipIfPrecededBy.some((re) => re.test(before))) continue;
+        }
 
         // Resolve the value used for evidence + entropy check.
         const groupIdx = typeof pattern.captureGroup === 'number' ? pattern.captureGroup : 0;
@@ -423,7 +446,14 @@ export async function scanSecrets(opts, deps = {}) {
       maxBuffer: 10 * 1024 * 1024,
     });
     const stdout = typeof result === 'string' ? result : String(result?.stdout ?? '');
-    const findings = parseGitleaksJson(stdout);
+    // W15-A5-1: gitleaks scans the repo's HISTORY (`detect --source`), so its
+    // report includes leaks in files this PR never touched (with line numbers
+    // from the historical file, not the diff). Scope findings to the PR's
+    // changed files before returning.
+    const changedFiles = changedFileNames(files);
+    const findings = parseGitleaksJson(stdout).filter((f) =>
+      changedFiles.has(typeof f.file === 'string' ? f.file : ''),
+    );
     if (core?.info) {
       core.info(`gitleaks: ${findings.length} secret finding(s).`);
     }

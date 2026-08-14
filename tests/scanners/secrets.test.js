@@ -263,6 +263,45 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     expect(he).withContext('URL-safe base64 string should match').toBeTruthy();
   });
 
+  it('does NOT flag data-URI base64 payloads [W15-A5-5]', () => {
+    // data:image/png;base64,<payload> is legitimate inline-image content, not
+    // a secret. The 60-char payload is genuinely high-entropy (guarded below)
+    // so this exercises the context suppression, not the entropy threshold.
+    const payload = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA1b';
+    expect(shannonEntropy(payload)).toBeGreaterThanOrEqual(4.5); // guard
+    const findings = scanSecretsRegex(
+      file(buildPatch([`const img = "data:image/png;base64,${payload}";`])),
+    );
+    const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
+    expect(he).withContext('data URI payload must not be flagged').toBeUndefined();
+  });
+
+  it('does NOT flag subresource-integrity (SRI) hashes [W15-A5-5]', () => {
+    // `"integrity": "sha512-<86 b64 chars>"` is an SRI hash in package-lock /
+    // HTML script tags — legitimate content. Both the JSON key form and the
+    // HTML attribute form must be suppressed.
+    const hash86 = (
+      'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA' +
+      'bC3dE5fGhJ5kL7mN9pQ1sT3uV5wXyZaB1cD'
+    ).slice(0, 86);
+    expect(shannonEntropy(hash86)).toBeGreaterThanOrEqual(4.5); // guard
+    const findings = scanSecretsRegex(
+      file(buildPatch([
+        `"integrity": "sha512-${hash86}",`,
+        `<script src="app.js" integrity="sha384-${hash86}"></script>`,
+      ])),
+    );
+    const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
+    expect(he).withContext('SRI hash must not be flagged').toBeUndefined();
+  });
+
+  it('still flags a high-entropy api_key value outside benign base64 contexts [W15-A5-5]', () => {
+    const value = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3p'; // 40 chars
+    const findings = scanSecretsRegex(file(buildPatch([`api_key = "${value}"`])));
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.some((f) => f.rule === 'regex:high-entropy-string')).toBe(true);
+  });
+
   it('detects api-key variants (api-key, apikey, apiKey, secret, token, auth_token, access_token, client_secret)', () => {
     const value = 'Xy9P3kMNBq2VtRZ7'; // high-entropy
     const variants = [
@@ -274,6 +313,34 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
       `auth_token = "${value}"`,
       `access_token = "${value}"`,
       `client_secret = "${value}"`,
+    ];
+    for (const v of variants) {
+      const findings = scanSecretsRegex(file(buildPatch([v])));
+      const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+      expect(api).withContext(`variant "${v}" should match`).toBeTruthy();
+    }
+  });
+
+  it('detects quoted secret values containing a slash [W15-A5-6]', () => {
+    // The value charset used to omit `/` (and `,;:=~|`), so a quoted secret
+    // with a slash could never match the generic-assignment pattern.
+    const findings = scanSecretsRegex(
+      file(buildPatch(['api_key = "AbCdEfGh/IjKlMnOpQrSt"'])),
+    );
+    const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+    expect(api).withContext('slash-containing secret should match').toBeTruthy();
+  });
+
+  it('detects quoted secret values containing , ; : = ~ | [W15-A5-6]', () => {
+    // Each punctuation char newly added to the value charset, embedded in a
+    // high-entropy quoted value.
+    const variants = [
+      'api_key = "aB1,cD2,eF3,gH4,iJ5,kL6"', // ,
+      'api_key = "aB1;cD2;eF3;gH4;iJ5;kL6"', // ;
+      'api_key = "aB1:cD2:eF3:gH4:iJ5:kL6"', // :
+      'api_key = "aB1=cD2=eF3=gH4=iJ5=kL6"', // =
+      'api_key = "aB1~cD2~eF3~gH4~iJ5~kL6"', // ~
+      'api_key = "aB1|cD2|eF3|gH4|iJ5|kL6"', // |
     ];
     for (const v of variants) {
       const findings = scanSecretsRegex(file(buildPatch([v])));
@@ -447,7 +514,11 @@ describe('scanSecrets — gitleaks path (fake runBinary)', () => {
     const fakeRunBinary = vi.fn().mockResolvedValue(gitleaksJson);
     const fakeEnsureBinary = vi.fn().mockResolvedValue('/cache/gitleaks/gitleaks');
     const result = await scanSecrets(
-      { files: [], repoPath: '/repo', cacheDir: '/cache' },
+      {
+        files: [{ filename: 'src/auth.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+        cacheDir: '/cache',
+      },
       {
         ensureBinary: fakeEnsureBinary,
         runBinary: fakeRunBinary,
@@ -467,6 +538,67 @@ describe('scanSecrets — gitleaks path (fake runBinary)', () => {
     expect(args).toContain('json');
     expect(args).toContain('--no-banner');
     expect(args).toContain('--redact');
+  });
+
+  it('drops gitleaks findings for files NOT in the PR changed set [W15-A5-1]', async () => {
+    // gitleaks scans repo HISTORY — a leak in a file this PR never touched
+    // must not surface as a finding on it.
+    const gitleaksJson = JSON.stringify([
+      {
+        RuleID: 'generic-api-key',
+        Description: 'Generic API Key',
+        Match: 'zzz',
+        Secret: 'zzz',
+        File: 'legacy/old.js',
+        StartLine: 12,
+      },
+    ]);
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: vi.fn().mockResolvedValue(gitleaksJson),
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('keeps gitleaks findings for files that ARE in the PR changed set [W15-A5-1]', async () => {
+    const gitleaksJson = JSON.stringify([
+      {
+        RuleID: 'aws-access-token',
+        Description: 'AWS',
+        Match: 'AKIAIOSFODNN7EXAMPLE',
+        Secret: 'AKIAIOSFODNN7EXAMPLE',
+        File: 'src/new.js',
+        StartLine: 5,
+      },
+    ]);
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: vi.fn().mockResolvedValue(gitleaksJson),
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/new.js',
+      line: 5,
+      rule: 'gitleaks:aws-access-token',
+    });
   });
 
   it('returns regex fallback when gitleaks reports no findings (empty array)', async () => {

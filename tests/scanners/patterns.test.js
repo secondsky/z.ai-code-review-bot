@@ -18,6 +18,7 @@ import {
   scanPatternsRegex,
   astGrepPatternToRegex,
   fileMatchesLanguages,
+  filenameToLanguage,
   DEFAULT_PATTERN_RULES,
   parseAstGrepJson,
   mapAstGrepFinding,
@@ -109,6 +110,21 @@ describe('astGrepPatternToRegex', () => {
     expect(re.test('// TODO: fix this')).toBe(true);
   });
 
+  it('adds a TRAILING word boundary to bare-identifier patterns [W15-A5-7]', () => {
+    // A bare-identifier pattern (letters/digits/underscore only) must be
+    // wrapped in \b...\b so `TODO` doesn't prefix-match `TODOS`.
+    const re = astGrepPatternToRegex('TODO');
+    expect(re.source).toBe('\\bTODO\\b');
+    expect(re.test('const TODOS = [1, 2, 3];')).toBe(false);
+    expect(re.test('const TODO = 1;')).toBe(true);
+    expect(re.test('// TODO fix')).toBe(true);
+    // Non-identifier patterns (with punctuation/wildcards) keep the leading
+    // \b only — no trailing boundary is added.
+    const evalRe = astGrepPatternToRegex('eval($$$ARGS)');
+    expect(evalRe.source.startsWith('\\b')).toBe(true);
+    expect(evalRe.source.endsWith('\\b')).toBe(false);
+  });
+
   it('does NOT emit a regex beginning with .*? (ReDoS guard)', () => {
     // A leading unanchored `.*?` causes catastrophic backtracking on long
     // near-miss lines. The sql-concat rule (`$CONN.query("$$$" + $VAR)`)
@@ -183,6 +199,24 @@ describe('fileMatchesLanguages', () => {
   it('rejects dotfiles and unknown extensions', () => {
     expect(fileMatchesLanguages('.eslintrc', ['js'])).toBe(false);
     expect(fileMatchesLanguages('foo', ['js'])).toBe(false);
+  });
+});
+
+describe('filenameToLanguage [W15-A5-2]', () => {
+  it('maps extensions to ast-grep language names (same map as the fallback)', () => {
+    expect(filenameToLanguage('a.js')).toBe('js');
+    expect(filenameToLanguage('a.mjs')).toBe('js');
+    expect(filenameToLanguage('a.cjs')).toBe('js');
+    expect(filenameToLanguage('src/a.ts')).toBe('ts');
+    expect(filenameToLanguage('src/C.jsx')).toBe('jsx');
+    expect(filenameToLanguage('src/C.tsx')).toBe('tsx');
+  });
+
+  it('returns null for unknown extensions, dotfiles, and bad input', () => {
+    expect(filenameToLanguage('README.md')).toBeNull();
+    expect(filenameToLanguage('.eslintrc')).toBeNull();
+    expect(filenameToLanguage('foo')).toBeNull();
+    expect(filenameToLanguage(null)).toBeNull();
   });
 });
 
@@ -267,6 +301,23 @@ describe('scanPatternsRegex — rule coverage', () => {
     const rules = findings.map((f) => f.rule).sort();
     expect(rules).toContain('astgrep:todo-in-code');
     expect(rules).toContain('astgrep:fixme-in-code');
+  });
+
+  it('does NOT flag TODOS/FIXMES identifiers as TODO/FIXME markers [W15-A5-7]', () => {
+    // Without a trailing \b on bare-identifier patterns, `const TODOS = [...]`
+    // matched the `TODO` prefix and produced a false todo-in-code finding.
+    const findings = scanPatternsRegex([
+      { filename: 'src/list.js', patch: buildPatch(['const TODOS = [1, 2, 3];']) },
+      { filename: 'src/list2.js', patch: buildPatch(['let FIXMES_COUNT = 0;']) },
+    ]);
+    expect(findings.find((f) => f.rule === 'astgrep:todo-in-code')).toBeUndefined();
+    expect(findings.find((f) => f.rule === 'astgrep:fixme-in-code')).toBeUndefined();
+
+    // Real markers still fire.
+    const findings2 = scanPatternsRegex([
+      { filename: 'src/x.js', patch: buildPatch(['// TODO fix']) },
+    ]);
+    expect(findings2.find((f) => f.rule === 'astgrep:todo-in-code')).toBeTruthy();
   });
 
   it('detects dangerouslySetInnerHTML only in jsx/tsx', () => {
@@ -440,7 +491,9 @@ describe('parseAstGrepJson', () => {
 describe('scanPatterns — ast-grep path (fake runBinary)', () => {
   it('uses ast-grep when deps.runBinary + ensureBinary are provided', async () => {
     // The fake returns [] for every rule except `eval`, where it returns one
-    // finding. The orchestrator calls runBinary once per non-`*` rule.
+    // finding. The orchestrator calls runBinary once per (rule, language)
+    // pair where the language is declared by the rule AND present in the
+    // changed files.
     const fakeRunBinary = vi.fn().mockImplementation((path, args) => {
       const patternIdx = args.indexOf('--pattern');
       const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
@@ -463,7 +516,11 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
     });
     const fakeEnsureBinary = vi.fn().mockResolvedValue('/cache/ast-grep/ast-grep');
     const result = await scanPatterns(
-      { files: [], repoPath: '/repo', cacheDir: '/cache' },
+      {
+        files: [{ filename: 'src/foo.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+        cacheDir: '/cache',
+      },
       {
         ensureBinary: fakeEnsureBinary,
         runBinary: fakeRunBinary,
@@ -476,14 +533,200 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
     expect(result.findings[0].rule).toBe('astgrep:eval');
     expect(result.findings[0].file).toBe('src/foo.js');
     expect(result.findings[0].line).toBe(42);
-    // runBinary invoked once per non-`*` rule
-    const nonStarRules = DEFAULT_PATTERN_RULES.filter(
-      (r) => !r.languages.includes('*'),
+    // runBinary invoked once per (non-`*` rule, needed language) pair — the
+    // only changed file is src/foo.js → only `js` is needed.
+    const needed = new Set(['js']);
+    const expectedInvocations = DEFAULT_PATTERN_RULES.reduce(
+      (n, r) =>
+        Array.isArray(r.languages) && !r.languages.includes('*')
+          ? n + r.languages.filter((l) => needed.has(l)).length
+          : n,
+      0,
     );
-    expect(fakeRunBinary).toHaveBeenCalledTimes(nonStarRules.length);
+    expect(expectedInvocations).toBeGreaterThan(0);
+    expect(fakeRunBinary).toHaveBeenCalledTimes(expectedInvocations);
     const args = fakeRunBinary.mock.calls[0][1];
     expect(args).toContain('run');
     expect(args).toContain('--json');
+  });
+
+  it('drops ast-grep findings for files NOT in the PR changed set [W15-A5-1]', async () => {
+    // ast-grep runs over the whole repo tree — a pre-existing issue in an
+    // untouched file must not surface as a finding on this PR (wrong lines,
+    // and it can crowd out real same-titled findings downstream).
+    const fakeRunBinary = vi.fn().mockImplementation((path, args) => {
+      const patternIdx = args.indexOf('--pattern');
+      const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
+      if (pattern.startsWith('eval')) {
+        return Promise.resolve(
+          JSON.stringify([
+            { text: 'eval("boom")', file: 'legacy/old.js', lines: { start: 3 } },
+          ]),
+        );
+      }
+      return Promise.resolve('[]');
+    });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('keeps ast-grep findings for files that ARE in the PR changed set [W15-A5-1]', async () => {
+    const fakeRunBinary = vi.fn().mockImplementation((path, args) => {
+      const patternIdx = args.indexOf('--pattern');
+      const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
+      if (pattern.startsWith('eval')) {
+        return Promise.resolve(
+          JSON.stringify([
+            { text: 'eval("boom")', file: 'src/new.js', lines: { start: 3 } },
+          ]),
+        );
+      }
+      return Promise.resolve('[]');
+    });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/new.js',
+      line: 3,
+      rule: 'astgrep:eval',
+    });
+  });
+
+  it('runs a multi-language rule once per language present in the changed files [W15-A5-2]', async () => {
+    // `const lang = rule.languages[0]` only ever ran `js`, so .ts files were
+    // never scanned by the binary path. Now the rule runs for each language
+    // it declares that a changed file actually needs.
+    const rules = [
+      {
+        id: 'eval',
+        pattern: 'eval($$$ARGS)',
+        severity: 'high',
+        category: 'security',
+        languages: ['js', 'ts'],
+        title: 'Use of eval()',
+      },
+    ];
+    const fakeRunBinary = vi.fn().mockResolvedValue(
+      JSON.stringify([{ text: 'eval(x)', file: 'src/a.ts', lines: { start: 7 } }]),
+    );
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/a.ts', patch: buildPatch(['const y = 2;']) }],
+        repoPath: '/r',
+        rules,
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(fakeRunBinary).toHaveBeenCalledTimes(1);
+    const args = fakeRunBinary.mock.calls[0][1];
+    expect(args[args.indexOf('--lang') + 1]).toBe('ts');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/a.ts',
+      line: 7,
+      rule: 'astgrep:eval',
+    });
+  });
+
+  it('runs ONLY the languages present in the changed files (js-only diff) [W15-A5-2]', async () => {
+    const rules = [
+      {
+        id: 'eval',
+        pattern: 'eval($$$ARGS)',
+        severity: 'high',
+        category: 'security',
+        languages: ['js', 'ts', 'jsx', 'tsx'],
+        title: 'Use of eval()',
+      },
+    ];
+    const fakeRunBinary = vi.fn().mockResolvedValue('[]');
+    await scanPatterns(
+      {
+        files: [{ filename: 'src/a.js', patch: buildPatch(['const y = 2;']) }],
+        repoPath: '/r',
+        rules,
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(fakeRunBinary).toHaveBeenCalledTimes(1);
+    const args = fakeRunBinary.mock.calls[0][1];
+    expect(args[args.indexOf('--lang') + 1]).toBe('js');
+  });
+
+  it('keeps *-language rule findings on the binary success path [W15-A5-3]', async () => {
+    // TODO/FIXME rules are skipped in the ast-grep loop (ast-grep `run`
+    // requires a concrete --lang). Previously their findings vanished entirely
+    // whenever the binary worked — the success path returned ONLY binary
+    // findings. Their diff-scoped regex findings must be appended.
+    const fakeRunBinary = vi.fn().mockResolvedValue('[]');
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/x.js', patch: buildPatch(['// TODO fix later']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    const todo = result.findings.find((f) => f.rule === 'astgrep:todo-in-code');
+    expect(todo).withContext('*-rule findings must survive the binary path').toBeTruthy();
+  });
+
+  it('does not fabricate *-rule findings when the diff has no TODO [W15-A5-3]', async () => {
+    const fakeRunBinary = vi.fn().mockResolvedValue('[]');
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/x.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings.find((f) => f.rule === 'astgrep:todo-in-code')).toBeUndefined();
   });
 });
 
@@ -523,11 +766,18 @@ describe('scanPatterns — fallback paths', () => {
   });
 
   it('returns ast-grep result with [] when output is unparseable (no error thrown)', async () => {
+    // W15-A5-1: a changed file is required for any rule to run (the binary
+    // path is scoped to the diff); benign patch so only the parse path fires.
     const result = await scanPatterns(
-      { files: [], repoPath: '/r' },
+      {
+        files: [{ filename: 'a.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/r',
+      },
       {
         ensureBinary: vi.fn().mockResolvedValue('/p'),
         runBinary: vi.fn().mockResolvedValue('not json'),
+        platform: 'linux',
+        arch: 'x64',
       },
     );
     expect(result.scanner).toBe('ast-grep');
