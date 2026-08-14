@@ -25,6 +25,14 @@ const MAX_CONTEXT_CHARS = 8000;
  */
 const MAX_QUESTION_CHARS = 4000;
 
+/**
+ * W15-A4-5: hard cap on the PR body length. The PR description is
+ * attacker-controllable (fork PRs) and was previously interpolated
+ * UNTRUNCATED — a 60k body made a 60k prompt even though the question is
+ * capped at 4000 and the diffs at 8000.
+ */
+const MAX_BODY_CHARS = 4000;
+
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
@@ -46,13 +54,28 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
+  let skippedOversized = false;
   for (const f of patchable) {
     const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (used + entry.length > maxChars) break;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
     lines.push(entry);
     used += entry.length + 2; // +2 for the '\n\n' joiner
   }
-  if (lines.length === 0) return '(no textual diffs available)';
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
   return lines.join('\n\n');
 }
 
@@ -68,7 +91,12 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
  */
 export function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
-  const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
+  // W15-A4-5: cap the (attacker-controllable) PR body before interpolation.
+  // The whole prContext (title + body + diffs) is wrapped via wrapUntrusted
+  // below, so the truncation does not weaken the untrusted-content wrapping.
+  const body = pr?.body
+    ? `**Description:**\n${pr.body.slice(0, MAX_BODY_CHARS)}\n`
+    : '';
   const prContext = `${title}${body}${buildDiffContext(files)}`;
   // W2-SEC-1: the user's question is the most direct prompt-injection vector
   // and must be wrapped in <untrusted_input> tags before being interpolated

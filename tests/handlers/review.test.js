@@ -116,6 +116,94 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A8-8: whole-PR branch honors EXCLUDE_PATTERNS
+ *
+ * The whole-PR `/zai review` branch applied only filterPatchableFiles and
+ * ignored config.excludePatterns — a lockfile-only PR got reviewed despite
+ * the default excludes, while the auto-review path drops those files. The
+ * handler must filter excluded files BEFORE filtering patchable ones
+ * (mirroring index.js). NOTE: .zai.yml path_filters are merged into the
+ * repoConfig locally inside index.js run() and are not reachable from the
+ * comment-handler dispatch; action-level excludePatterns are applied here.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W15-A8-8: excludes applied on whole-PR path', () => {
+  it('lockfile-only PR with default excludes → "No textual changes" note, no callApi', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+    });
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      // The default EXCLUDE_PATTERNS from config.js.
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createComment[0].body).toContain('No textual changes');
+  });
+
+  it('a non-excluded .js file is still reviewed when excludes are set', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+        { filename: 'src/a.js', status: 'modified', patch: '+a' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        maxDiffChars: 0,
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/a.js');
+    expect(prompt).not.toContain('package-lock.json');
+    expect(octokit.__calls.createComment[0].body).toContain('REVIEW');
+  });
+
+  it('no excludePatterns configured → behavior unchanged (all patchable reviewed)', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+    });
+    const callApi = vi.fn(async () => 'REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('package-lock.json');
+  });
+});
+
 describe('handleReviewCommand — specific file', () => {
   it('valid file → reviews only that file', async () => {
     const octokit = makeOctokit();

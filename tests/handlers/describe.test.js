@@ -281,6 +281,46 @@ describe('handleDescribeCommand — H1/M3 sanitization of model output', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A4-2: fail-soft opt-in mutation
+ *
+ * The body upsert used to share the outer catch with callApi, so a
+ * pulls.update failure posted a FALSE "> ⚠️ Z.ai request failed." comment
+ * AFTER the description had already been posted (two comments, the second
+ * misleading). Per SECURITY.md's fail-soft write-surfaces contract, a
+ * mutation failure must only core.warning — the description comment remains
+ * the only comment.
+ * ------------------------------------------------------------------ */
+
+describe('handleDescribeCommand — W15-A4-2: body-upsert failure is fail-soft', () => {
+  it('pulls.update rejects → exactly ONE comment (the description), no false "request failed"', async () => {
+    const octokit = makeOctokit({ pr: { body: '' } });
+    octokit.rest.pulls.update = async () => {
+      throw new Error('422 Validation Failed');
+    };
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => '## Overview\ndescription body');
+
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', describeWriteBody: true },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+
+    // The description comment is the ONLY comment — no false error follow-up.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('description body');
+    expect(body).not.toContain('request failed');
+    // The mutation failure was logged as a warning (fail-soft write surface).
+    expect(core.warning).toHaveBeenCalled();
+  });
+});
+
 describe('handleDescribeCommand — error path', () => {
   it('callApi rejects → short error comment, no throw', async () => {
     const octokit = makeOctokit();

@@ -78,24 +78,27 @@ export function parseSeverity(text) {
   );
   const cleaned = raw.replace(NEGATED_RE, 'neutral');
   const firstLine = cleaned.split('\n')[0];
-  // Check emoji + word forms in priority order (critical first).
-  for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
-    const mapped = SEVERITY_KEYS[key];
-    if (!mapped) continue;
-    if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
-      // Emoji keys have no word boundaries; use includes. W5-7: restrict to
-      // the FIRST line (where the prompt puts the level), consistent with the
-      // word-form match below. Previously `raw.includes(key)` scanned the whole
-      // body, so a 🔴 appearing in the rationale overrode the declared level.
-      if (firstLine.includes(key)) return mapped;
-    } else {
-      // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
-      // so "highlighted" → no match, "noncritical" → no match, and
-      // "high-availability" → no match (hyphen is NOT a word boundary here).
-      // Only match on the FIRST line (where the prompt puts the level).
-      const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
-      if (re.test(firstLine)) return mapped;
-    }
+  // W15-A4-3: the EMOJI forms are the canonical format the prompt requests
+  // (`🔴 critical`, `🟠 high`, …), so check ALL FOUR emoji first (in severity
+  // order). Only when no emoji is on the first line fall back to word-form
+  // matching. The previous interleaved loop (🔴, critical, 🟠, high, …) let a
+  // stray higher-severity WORD override the declared emoji: '🟡 medium — not
+  // in the critical path' matched the word 'critical' first → wrong
+  // zai:critical label.
+  for (const key of ['🔴', '🟠', '🟡', '🟢']) {
+    // Emoji keys have no word boundaries; use includes. W5-7: restrict to
+    // the FIRST line (where the prompt puts the level), consistent with the
+    // word-form match below. Previously `raw.includes(key)` scanned the whole
+    // body, so a 🔴 appearing in the rationale overrode the declared level.
+    if (firstLine.includes(key)) return SEVERITY_KEYS[key];
+  }
+  for (const key of ['critical', 'high', 'medium', 'low']) {
+    // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
+    // so "highlighted" → no match, "noncritical" → no match, and
+    // "high-availability" → no match (hyphen is NOT a word boundary here).
+    // Only match on the FIRST line (where the prompt puts the level).
+    const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
+    if (re.test(firstLine)) return SEVERITY_KEYS[key];
   }
   return null;
 }
@@ -113,13 +116,28 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
+  let skippedOversized = false;
   for (const f of patchable) {
     const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (used + entry.length > maxChars) break;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
     lines.push(entry);
     used += entry.length + 2;
   }
-  if (lines.length === 0) return '(no textual diffs available)';
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
   return lines.join('\n\n');
 }
 
@@ -225,16 +243,30 @@ export async function handleImpactCommand(
     await post(assessment);
     // OPT-IN mutation: when ZAI_IMPACT_LABELS is true, apply a scoped zai:
     // severity label (removing prior zai: labels for idempotency).
+    // W15-A4-2: the label application gets its OWN fail-soft try/catch. It
+    // previously shared the outer catch with callApi, so an addLabels
+    // failure posted a FALSE "> ⚠️ Z.ai request failed." comment AFTER the
+    // assessment was already posted. Per SECURITY.md's fail-soft
+    // write-surfaces contract, a mutation failure only core.warning's — the
+    // assessment comment stays the only comment.
     if (config.impactLabels && typeof pullNumber === 'number') {
-      const severity = parseSeverity(assessment);
-      await applyLabel({
-        octokit,
-        owner,
-        repo,
-        issueNumber: pullNumber,
-        severity,
-        labelMap: config.impactLabelMap,
-      });
+      try {
+        const severity = parseSeverity(assessment);
+        await applyLabel({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          severity,
+          labelMap: config.impactLabelMap,
+        });
+      } catch (mutationError) {
+        if (core?.warning) {
+          core.warning(
+            `impact label application failed: ${mutationError?.message ?? mutationError}`,
+          );
+        }
+      }
     }
   } catch (error) {
     if (core?.warning) {

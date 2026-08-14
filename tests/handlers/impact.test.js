@@ -6,7 +6,11 @@
  * default read-only path and the opt-in label-application feature.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleImpactCommand, parseSeverity } from '../../src/lib/handlers/impact.js';
+import {
+  handleImpactCommand,
+  parseSeverity,
+  buildDiffContext,
+} from '../../src/lib/handlers/impact.js';
 
 function makeOctokit({
   files = [
@@ -318,6 +322,50 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A4-2: fail-soft opt-in mutation
+ *
+ * The label application used to share the outer catch with callApi, so an
+ * issues.addLabels failure posted a FALSE "> ⚠️ Z.ai request failed." comment
+ * AFTER the assessment had already been posted (two comments, the second
+ * misleading). Per SECURITY.md's fail-soft write-surfaces contract, a
+ * mutation failure must only core.warning — the assessment comment remains
+ * the only comment.
+ * ------------------------------------------------------------------ */
+
+describe('handleImpactCommand — W15-A4-2: label-application failure is fail-soft', () => {
+  const labelMap = {
+    critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low',
+  };
+
+  it('addLabels rejects → exactly ONE comment (the assessment), no false "request failed"', async () => {
+    const octokit = makeOctokit();
+    octokit.rest.issues.addLabels = async () => {
+      throw new Error('403 Resource not accessible');
+    };
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => '🟡 medium\nassessment body');
+
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+
+    // The assessment comment is the ONLY comment — no false error follow-up.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('assessment body');
+    expect(body).not.toContain('request failed');
+    // The mutation failure was logged as a warning (fail-soft write surface).
+    expect(core.warning).toHaveBeenCalled();
+  });
+});
+
 describe('handleImpactCommand — error path', () => {
   it('callApi rejects → short error comment, no throw', async () => {
     const octokit = makeOctokit();
@@ -394,6 +442,35 @@ describe('parseSeverity — precedence (edge cases)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A4-3: the declared EMOJI is canonical
+ *
+ * The interleaved priority loop (🔴, critical, 🟠, high, …) let a stray
+ * higher-severity WORD override the declared emoji: '🟡 medium — not in the
+ * critical path' matched the word 'critical' first and produced the wrong
+ * zai:critical label. The prompt requests the emoji form, so all four emoji
+ * must be checked FIRST; word-forms are only a fallback when no emoji is on
+ * the first line.
+ * ------------------------------------------------------------------ */
+
+describe('parseSeverity — W15-A4-3: emoji takes precedence over stray words', () => {
+  it('declared emoji wins over a stray higher-severity word on the same line', () => {
+    expect(parseSeverity('🟡 medium — not in the critical path')).toBe('medium');
+    expect(parseSeverity('🟠 high — fixes a critical auth bug')).toBe('high');
+    expect(parseSeverity('🟢 low — avoid a critical-sounding false alarm')).toBe('low');
+  });
+
+  it('word-form still maps when NO emoji is on the first line', () => {
+    expect(parseSeverity('Critical issue in the auth flow')).toBe('critical');
+    expect(parseSeverity('low risk overall')).toBe('low');
+  });
+
+  it('negated words still do not match when no emoji is present', () => {
+    expect(parseSeverity('not critical')).toBeNull();
+    expect(parseSeverity('no high risks')).toBeNull();
+  });
+});
+
 describe('parseSeverity — case-insensitive matching (edge cases)', () => {
   it('"CRITICAL" (all caps) → "critical"', () => {
     expect(parseSeverity('CRITICAL')).toBe('critical');
@@ -405,5 +482,33 @@ describe('parseSeverity — case-insensitive matching (edge cases)', () => {
 
   it('"HiGh" (mixed case) → "high"', () => {
     expect(parseSeverity('HiGh')).toBe('high');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-4 (impact copy): oversized entries are SKIPPED, not fatal.
+ * See tests/handlers/ask.test.js for the full rationale — impact.js carries
+ * an identical buildDiffContext.
+ * ------------------------------------------------------------------ */
+
+describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', () => {
+  it('big-first: later small entries still make it into the context', () => {
+    const files = [
+      { filename: 'big.js', patch: 'x'.repeat(9000) },
+      { filename: 'small.js', patch: '+tiny change' },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('small.js');
+    expect(context).toContain('+tiny change');
+  });
+
+  it('all entries oversized → budget-exceeded placeholder, not a false no-diffs claim', () => {
+    const files = [
+      { filename: 'big1.js', patch: 'x'.repeat(9000) },
+      { filename: 'big2.js', patch: 'y'.repeat(9000) },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('budget');
+    expect(context).not.toContain('no textual diffs');
   });
 });

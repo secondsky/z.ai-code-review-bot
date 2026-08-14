@@ -7,7 +7,11 @@
  * throw.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleAskCommand, buildAskPrompt } from '../../src/lib/handlers/ask.js';
+import {
+  handleAskCommand,
+  buildAskPrompt,
+  buildDiffContext,
+} from '../../src/lib/handlers/ask.js';
 
 function makeOctokit({
   pr = { title: 'T', body: 'B', head: { ref: 'f' }, base: { ref: 'm' } },
@@ -273,5 +277,97 @@ describe('handleAskCommand — CMD-9: question length cap', () => {
     });
     const prompt = callApi.mock.calls[0][2];
     expect(prompt).toContain('short question');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-4: oversized entries are SKIPPED, not fatal
+ *
+ * buildDiffContext used 'break' on the first over-budget entry, so a huge
+ * diff FIRST in the list caused '(no textual diffs available)' even though
+ * later, smaller entries fit the budget. Over-sized entries must be skipped
+ * (continue) and, when EVERY entry was oversized, the placeholder must say
+ * the budget was exceeded rather than claiming no diffs exist.
+ * ------------------------------------------------------------------ */
+
+describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', () => {
+  it('big-first: later small entries still make it into the context', () => {
+    const files = [
+      { filename: 'big.js', patch: 'x'.repeat(9000) },
+      { filename: 'small.js', patch: '+tiny change' },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('small.js');
+    expect(context).toContain('+tiny change');
+  });
+
+  it('all entries oversized → budget-exceeded placeholder, not a false no-diffs claim', () => {
+    const files = [
+      { filename: 'big1.js', patch: 'x'.repeat(9000) },
+      { filename: 'big2.js', patch: 'y'.repeat(9000) },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('budget');
+    expect(context).not.toContain('no textual diffs');
+  });
+
+  it('small-only input behaves normally', () => {
+    const files = [{ filename: 'a.js', patch: '+a' }];
+    const context = buildDiffContext(files);
+    expect(context).toContain('a.js');
+    expect(context).toContain('+a');
+  });
+
+  it('no patchable files at all → the original no-diffs placeholder', () => {
+    expect(buildDiffContext([{ filename: 'bin', status: 'modified' }])).toBe(
+      '(no textual diffs available)',
+    );
+    expect(buildDiffContext([])).toBe('(no textual diffs available)');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-5: PR body is capped
+ *
+ * The user question is capped at 4000 chars (CMD-9) and the diff context at
+ * 8000, but `pr.body` was interpolated UNTRUNCATED — a 60k PR body made a
+ * 60k prompt (cost/quota exposure). The body is now capped at 4000 chars,
+ * still inside the pr-context untrusted wrapper.
+ * ------------------------------------------------------------------ */
+
+describe('buildAskPrompt — W15-A4-5: PR body length cap', () => {
+  it('a 60000-char PR body produces a prompt well under 12000 chars', () => {
+    const prompt = buildAskPrompt({
+      question: 'what changed?',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body: 'B'.repeat(60000) },
+      files: [{ filename: 'a.js', patch: '+a' }],
+    });
+    expect(prompt.length).toBeLessThan(12000);
+  });
+
+  it('a short PR body is included unchanged', () => {
+    const prompt = buildAskPrompt({
+      question: 'q',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body: 'Fixes the login redirect bug.' },
+      files: [],
+    });
+    expect(prompt).toContain('Fixes the login redirect bug.');
+  });
+
+  it('the capped body stays inside the untrusted pr-context wrapper', () => {
+    const marker = 'BODYMARKER';
+    const body = marker + 'B'.repeat(60000);
+    const prompt = buildAskPrompt({
+      question: 'q',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body },
+      files: [],
+    });
+    const ctxStart = prompt.indexOf('<untrusted_input source="pr-context">');
+    const ctxEnd = prompt.indexOf('</untrusted_input>', ctxStart);
+    expect(ctxStart).toBeGreaterThan(-1);
+    expect(prompt.slice(ctxStart, ctxEnd)).toContain(marker);
   });
 });

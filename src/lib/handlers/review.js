@@ -14,6 +14,7 @@
 import { postComment } from './_shared.js';
 import {
   getChangedFiles,
+  filterExcludedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
 import { buildStructuredReviewPrompt, wrapUntrusted } from '../prompt.js';
@@ -125,7 +126,14 @@ export async function handleReviewCommand(
     }
 
     // ---- whole-PR path ----
-    const patchable = filterPatchableFiles(files || []);
+    // W15-A8-8: apply the action-level EXCLUDE_PATTERNS before the patchable
+    // filter, mirroring the auto-review path in index.js — previously only
+    // filterPatchableFiles ran here, so lockfiles got reviewed despite the
+    // default excludes. (.zai.yml path_filters are merged into a repoConfig
+    // that is local to index.js run() and is not passed to comment handlers;
+    // action-level excludePatterns are the reachable, correct scope here.)
+    const notExcluded = filterExcludedFiles(files || [], config.excludePatterns);
+    const patchable = filterPatchableFiles(notExcluded);
     if (patchable.length === 0) {
       await post('> No textual changes to review in this PR.');
       return;

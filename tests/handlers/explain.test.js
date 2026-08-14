@@ -371,6 +371,121 @@ describe('handleExplainCommand — CMD-12: empty content guidance', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * W15-A4-1: empty line-window guard (range entirely past EOF)
+ *
+ * CMD-12 only guarded whole-file emptiness. A NON-empty file with a range
+ * entirely past its end (e.g. 5000-5001 on a 5-line file) produced an EMPTY
+ * extractLineWindow, which was sent to the API — the model then hallucinated
+ * line content. The handler must post guidance instead of calling callApi.
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — W15-A4-1: empty line window guidance', () => {
+  it('range entirely past EOF → posts range/length guidance, does NOT call callApi', async () => {
+    const octokit = makeOctokit({
+      content: { content: b64('line1\nline2\nline3\nline4\nline5') },
+    });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '5000-5001 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The guidance mentions the requested range and the file's real length.
+    expect(body).toContain('5000-5001');
+    expect(body).toContain('src/a.js');
+    expect(body).toContain('5');
+    expect(body).toMatch(/line/i);
+  });
+
+  it('a valid range on the same file still calls callApi (regression guard)', async () => {
+    const octokit = makeOctokit({
+      content: { content: b64('line1\nline2\nline3\nline4\nline5') },
+    });
+    const callApi = vi.fn(async () => 'EXPLANATION');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '2-3 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('line2');
+    expect(octokit.__calls.createComment[0].body).toContain('EXPLANATION');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-6: binary file under the 1MB API limit
+ *
+ * A small binary file (e.g. a PNG) comes back from the contents API with
+ * base64 content that decodes to non-empty mojibake (U+FFFD replacement
+ * chars / C0 control bytes), so the CMD-12 emptiness guard does not fire and
+ * the garbage is sent to the API as an "explain lines 1-2" prompt. A single
+ * replacement char or C0 control char (excluding \t\n\r) must be treated as
+ * binary → same guidance as CMD-12, no callApi.
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — W15-A4-6: binary content guard', () => {
+  it('PNG magic bytes (decodes to mojibake) → CMD-12 guidance, does NOT call callApi', async () => {
+    // Raw PNG header bytes (NOT a UTF-8-encodable JS string): base64 them the
+    // way the contents API would. Decoding as UTF-8 yields \uFFFD + control
+    // chars (\x1a), both binary markers.
+    const pngBase64 = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52,
+    ]).toString('base64');
+    const octokit = makeOctokit({ content: { content: pngBase64 } });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available');
+    expect(body).toContain('src/a.js');
+  });
+
+  it('plain text with non-ASCII (but valid UTF-8) characters still works', async () => {
+    const octokit = makeOctokit({
+      content: { content: b64('héllo wörld\nsecond line') },
+    });
+    const callApi = vi.fn(async () => 'EXPLANATION');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('héllo wörld');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * parseRange — edge cases (Task 11)
  *
  * These pin behavior for the three supported separators, the single-line

@@ -32,6 +32,16 @@ const MAX_WINDOW_CHARS = 16000;
 const RANGE_SEPARATORS = ['-', ':', '..'];
 
 /**
+ * W15-A4-6: binary-content marker. A binary file under the 1MB contents-API
+ * limit returns base64 that decodes to non-empty mojibake — U+FFFD
+ * replacement chars (invalid UTF-8 byte sequences) and/or C0 control bytes.
+ * Deliberately conservative: a SINGLE replacement char or a single C0
+ * control char (excluding the whitespace controls \t \n \r) marks the file
+ * as binary. Valid-UTF-8 text with accented/CJK characters never matches.
+ */
+const BINARY_CONTENT_RE = /\uFFFD|[\x00-\x08\x0E-\x1F]/;
+
+/**
  * Parse a range token into `{ start, end }`.
  *
  * Accepts `N-M`, `N:M`, `N..M`; a single `N` → `{ start: N, end: N }`.
@@ -243,7 +253,9 @@ export async function handleExplainCommand(
     // CMD-12: when the file has no textual content (binary file, directory
     // entry, or a file too large for the API to return), post a guidance
     // comment instead of calling the API with an empty code window.
-    if (!content || content.trim() === '') {
+    // W15-A4-6: a binary file UNDER the 1MB API limit decodes to non-empty
+    // mojibake (replacement chars / C0 controls) — same guidance, no callApi.
+    if (!content || content.trim() === '' || BINARY_CONTENT_RE.test(content)) {
       await post(`> No textual content available for \`${target}\`.`);
       return;
     }
@@ -252,6 +264,19 @@ export async function handleExplainCommand(
     // visible range reported to the model reflects the clamp.
     const clampedEnd = Math.min(range.end, range.start + MAX_WINDOW_LINES - 1);
     let window = extractLineWindow(content, range.start, clampedEnd);
+    // W15-A4-1: CMD-12 only guarded whole-file emptiness. A range entirely
+    // past EOF on a non-empty file (e.g. 5000-5001 on a 5-line file) yields an
+    // EMPTY window here — sending that to the API invites the model to
+    // hallucinate the requested lines. Post guidance instead.
+    if (window.trim() === '') {
+      const lines = content.split('\n');
+      const lineCount =
+        lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+      await post(
+        `> No lines in range ${range.start}-${range.end} — \`${target}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
+      );
+      return;
+    }
     if (window.length > MAX_WINDOW_CHARS) {
       window = window.slice(0, MAX_WINDOW_CHARS);
     }
