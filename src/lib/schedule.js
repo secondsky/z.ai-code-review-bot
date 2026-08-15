@@ -25,6 +25,10 @@
 import { MARKER, appendTrailers } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
 import { buildStatusDescription as buildStatusDescriptionDefault } from './status.js';
+import {
+  parseFindingsHashBlock as parseFindingsHashBlockDefault,
+  buildFindingsHashBlock as buildFindingsHashBlockDefault,
+} from './findings.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
 export const DEFAULT_MAX_PRS = 10;
@@ -66,6 +70,14 @@ const defaultFilterFindingsByLearnings = (findings) => ({
 
 /** Inert status poster: never touches the API (status feedback is opt-in). */
 const defaultSetReviewStatus = async () => false;
+
+/**
+ * Inert marker-comment finder: never fetches; behaves like a PR with no prior
+ * bot marker comments (W16-B2-2). src/index.js's schedule branch wires the REAL
+ * findBotMarkerComments so production scheduled summaries preserve the
+ * incremental-review hash block.
+ */
+const defaultFindBotMarkerComments = async () => [];
 
 /**
  * Build the hidden HTML comment that embeds the PR head SHA in a posted
@@ -340,7 +352,26 @@ export async function reviewOnePr({
   //     pure helper (defaults to the real one from status.js).
   setReviewStatus = defaultSetReviewStatus,
   buildStatusDescription = buildStatusDescriptionDefault,
+  // W16-B2-2: incremental-review hash-block preservation on the summary path.
+  // (a) findBotMarkerComments enumerates the bot's existing marker comments so
+  //     their `<!-- zai-hashes:... -->` blocks survive the wholesale upsert
+  //     replace (inert default; src/index.js wires the real finder).
+  // (b/c) parseFindingsHashBlock/buildFindingsHashBlock are PURE helpers
+  //     (default: the real ones from findings.js) used to read prior hashes
+  //     and compute this run's canonical set.
+  findBotMarkerComments = defaultFindBotMarkerComments,
+  parseFindingsHashBlock = parseFindingsHashBlockDefault,
+  buildFindingsHashBlock = buildFindingsHashBlockDefault,
 }) {
+  // W16-B2-1: whether THIS invocation successfully posted the `pending`
+  // commit status. The outer catch must flip that status to a TERMINAL
+  // `failure` (a spinning `pending` blocks merging on required-check repos),
+  // but only for statuses it started — PRs that failed BEFORE pending (e.g. a
+  // getChangedFiles error) must post nothing, mirroring the push path's
+  // main() catch. `statusCtx` is the synthetic context hoisted out of the try
+  // so the catch can still address the PR's status endpoint.
+  let pendingPosted = false;
+  let statusCtx = null;
   try {
     let files = await getChangedFiles({ octokit, owner, repo, pullNumber: pr.number });
     files = filterExcludedFiles(files, config.excludePatterns);
@@ -360,6 +391,7 @@ export async function reviewOnePr({
         issue: { number: pr.number },
       },
     };
+    statusCtx = ctx;
 
     // W15-A8-4d: `pending` commit status parity — the push path posts it right
     // after the zero-patchable short-circuit (so an empty PR never gets a
@@ -378,6 +410,9 @@ export async function reviewOnePr({
         },
         { core },
       );
+      // W16-B2-1: set only AFTER the post resolves — a `pending` that never
+      // landed must not obligate the catch to post a terminal status.
+      pendingPosted = true;
     }
 
     // W15-A8-4a: `.zai.yml` parity. The push path (src/index.js) loads the
@@ -645,10 +680,56 @@ export async function reviewOnePr({
       content,
       marker: MARKER,
     });
-    // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
-    // cron tick (see the inline branch above for rationale).
+    // W16-B2-2: upsertReviewComment replaces the marker comment WHOLESALE, so
+    // a body built with marker + shaBlock only would DESTROY the
+    // `<!-- zai-hashes:... -->` block a prior push run deposited — the next
+    // push would then re-report every unchanged finding (regressing the
+    // W15-A8-3 fix). Before building the replacement body, read the existing
+    // marker comments' hash blocks (same fail-soft read pattern as index.js)
+    // and re-emit them, UNIONED with the hashes this scheduled run itself
+    // produces when incremental review is enabled — so nothing is lost.
+    let priorHashes = new Set();
+    try {
+      const priorMarkerComments = await findBotMarkerComments({
+        octokit,
+        owner,
+        repo,
+        issueNumber: pr.number,
+        marker: MARKER,
+      });
+      for (const priorComment of priorMarkerComments) {
+        if (typeof priorComment?.body === 'string') {
+          const hashes = parseFindingsHashBlock(priorComment.body);
+          for (const h of hashes) priorHashes.add(h);
+        }
+      }
+    } catch (priorError) {
+      // Fail-soft: a broken comments read degrades to "no prior hashes" —
+      // the scheduled review still posts (with its own hashes).
+      if (core?.warning) {
+        core.warning(
+          `Scheduled review: could not read prior review hashes for PR #${pr.number} (${priorError?.message ?? String(priorError)}); posting without prior hashes.`,
+        );
+      }
+    }
+    const mergedHashes = new Set(priorHashes);
+    // Same canonical rule as index.js: the hash set is built from the FULL
+    // findings set (not just kept) so the next run sees the complete set.
+    if (
+      config.incrementalReview === true &&
+      Array.isArray(result.findings) &&
+      result.findings.length > 0
+    ) {
+      const newHashes = parseFindingsHashBlock(buildFindingsHashBlock(result.findings));
+      for (const h of newHashes) mergedHashes.add(h);
+    }
+    const hashBlock =
+      mergedHashes.size > 0 ? `<!-- zai-hashes:${[...mergedHashes].join(',')} -->` : '';
+    // Append the hash + SHA blocks so hasReviewForSha can dedup-by-SHA on the
+    // next cron tick and the incremental hashes survive the upsert (see the
+    // inline branch above for the SHA-block rationale).
     const shaBlock = buildShaBlock(pr.headSha);
-    const body = appendTrailers(commentBody, [shaBlock]);
+    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
     await upsertReviewComment({
       octokit,
       owner,
@@ -660,6 +741,35 @@ export async function reviewOnePr({
     });
     return { ok: true, action: 'reviewed' };
   } catch (error) {
+    // W16-B2-1: if THIS invocation posted `pending`, the outer failure would
+    // leave the check spinning pending forever on a required-status repo (the
+    // per-PR catch previously returned {ok:false} with no terminal status).
+    // Post a terminal `failure` before returning — same fail-soft helper, same
+    // commitStatus gate, same reviewerName threading the success path uses,
+    // mirroring the push path's main() catch but scoped to this PR. The status
+    // post itself is best-effort: it must never mask the original {ok:false}
+    // result or break the batch's per-PR isolation.
+    if (pendingPosted && statusCtx && config.commitStatus) {
+      try {
+        await setReviewStatus(
+          {
+            octokit,
+            context: statusCtx,
+            sha: pr.headSha,
+            state: 'failure',
+            description: 'Z.ai review failed',
+            reviewerName: config.reviewerName,
+          },
+          { core },
+        );
+      } catch (statusError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: failed to post terminal failure status for PR #${pr.number} (${statusError?.message ?? String(statusError)}).`,
+          );
+        }
+      }
+    }
     return { ok: false, error: error?.message ?? String(error) };
   }
 }
@@ -701,6 +811,9 @@ export async function reviewOnePr({
  * @param {Function} [args.filterFindingsByLearnings]  Learnings suppression (W15-A8-4c).
  * @param {Function} [args.setReviewStatus]  Commit-status poster (W15-A8-4d).
  * @param {Function} [args.buildStatusDescription]  Status description builder (W15-A8-4d).
+ * @param {Function} [args.findBotMarkerComments]  Bot marker-comment finder (W16-B2-2).
+ * @param {Function} [args.parseFindingsHashBlock]  Hash-block parser (W16-B2-2).
+ * @param {Function} [args.buildFindingsHashBlock]  Hash-block builder (W16-B2-2).
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 export async function runScheduledReview({
@@ -742,6 +855,11 @@ export async function runScheduledReview({
   filterFindingsByLearnings = defaultFilterFindingsByLearnings,
   setReviewStatus = defaultSetReviewStatus,
   buildStatusDescription = buildStatusDescriptionDefault,
+  // W16-B2-2 hash-block preservation deps (optional; inert/pure defaults —
+  // see reviewOnePr).
+  findBotMarkerComments = defaultFindBotMarkerComments,
+  parseFindingsHashBlock = parseFindingsHashBlockDefault,
+  buildFindingsHashBlock = buildFindingsHashBlockDefault,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -812,6 +930,9 @@ export async function runScheduledReview({
       filterFindingsByLearnings,
       setReviewStatus,
       buildStatusDescription,
+      findBotMarkerComments,
+      parseFindingsHashBlock,
+      buildFindingsHashBlock,
     });
 
     if (result.ok) {

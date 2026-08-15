@@ -1845,6 +1845,66 @@ describe('run — pull_request incremental review (Phase 6.3)', () => {
     expect(octokit.__calls.createReview[0].comments).toHaveLength(1);
     expect(octokit.__calls.createReview[0].body).not.toMatch(/previously-reported/);
   });
+
+  // ------------------------------------------------------------------
+  // W16-B2-3: the marker-comment hash read used findBotMarkerComment (FIRST
+  // bot marker comment only). When a fallback comment exists — created after
+  // an inline-review failure, and the fallback path always CREATES a new
+  // comment — its hash block (the newest full set) was never read, so hashes
+  // only present there were orphaned and their findings re-reported on
+  // re-push. The read must UNION parseFindingsHashBlock across ALL bot
+  // marker comments (same bot-authority gating + pagination).
+  // ------------------------------------------------------------------
+  it('W16-B2-3: unions hash blocks across ALL bot marker comments (C1[h1], C2[h1,h2] → both suppressed)', async () => {
+    const core = makeCore();
+    const finding1 = {
+      file: 'src/a.js', line: 1, severity: 'high', confidence: 'medium',
+      category: 'bug', title: 'Dup one', description: 'same',
+      evidence: '', suggestion: null, rule: 'llm',
+    };
+    const finding2 = {
+      file: 'src/a.js', line: 2, severity: 'high', confidence: 'medium',
+      category: 'bug', title: 'Dup two', description: 'same',
+      evidence: '', suggestion: null, rule: 'llm',
+    };
+    const h1 = hashFinding(finding1);
+    const h2 = hashFinding(finding2);
+    // C1: the original marker comment (only h1 was known when it was posted).
+    // C2: the fallback comment created after an inline-review failure — it
+    // carries the newest FULL set. listReviews is EMPTY (nothing inline).
+    const c1 = {
+      id: 101,
+      body: `## Z.ai Code Review\n\nfirst summary\n\n<!-- zai-code-review -->\n<!-- zai-hashes:${h1} -->`,
+      user: { login: 'zai-code-review[bot]', type: 'Bot' },
+    };
+    const c2 = {
+      id: 102,
+      body: `fallback summary\n\n<!-- zai-code-review -->\n<!-- zai-hashes:${h1},${h2} -->`,
+      user: { login: 'zai-code-review[bot]', type: 'Bot' },
+    };
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,2 +1,2 @@\n+const a = null;\n+const b = null;' }],
+      existingReviews: [],
+      list: [c1, c2],
+    });
+    // The model re-emits BOTH previously-reported findings.
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [finding1, finding2] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ incrementalReview: true }),
+      core, octokit, callApi, apiClient: { call: vi.fn() },
+    });
+
+    // h2 lived ONLY in C2 — with the first-match read it was orphaned and
+    // finding2 re-reported. The union read suppresses BOTH.
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringMatching(/Incremental review: suppressed 2 previously-reported finding/),
+    );
+    // No inline findings survived → no review with comments was posted.
+    expect(octokit.__calls.createReview).toHaveLength(0);
+  });
 });
 
 /* ------------------------------------------------------------------ *

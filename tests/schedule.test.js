@@ -13,13 +13,17 @@ import {
   reviewOnePr,
   DEFAULT_MAX_PRS,
 } from '../src/lib/schedule.js';
-import { MARKER } from '../src/lib/comments.js';
+import { MARKER, findBotMarkerComments } from '../src/lib/comments.js';
 import { partitionFindings } from '../src/lib/diff.js';
 import { formatWalkthroughSummary } from '../src/lib/walkthrough.js';
 import { filterExcludedFiles } from '../src/lib/changed-files.js';
 import { mergeRepoConfig } from '../src/lib/repo-config.js';
 import { filterFindingsByLearnings } from '../src/lib/learnings.js';
-import { formatFindingsAsSummary } from '../src/lib/findings.js';
+import {
+  formatFindingsAsSummary,
+  hashFinding,
+  parseFindingsHashBlock,
+} from '../src/lib/findings.js';
 import { buildStatusDescription } from '../src/lib/status.js';
 import {
   buildReviewBody,
@@ -1288,5 +1292,224 @@ describe('reviewOnePr — W15-A8-4 feature parity', () => {
     // Scanner findings made it into the posted review.
     const comments = s.upsertReview.mock.calls[0][0].comments;
     expect(comments.some((c) => c.body.includes('Hardcoded AWS key'))).toBe(true);
+  });
+});
+
+/* ---------- reviewOnePr — W16-B2-1 terminal failure status ---------- */
+
+// reviewOnePr posts `pending` before the heavy review work. If
+// runStructuredReview (or anything after pending) throws, the outer catch
+// returned {ok:false} with NO terminal status — the check spun `pending`
+// forever and a required-check repo was unmergeable until a later lucky tick.
+// The catch must post a TERMINAL `failure` status (mirroring what the push
+// path's main() does, scoped per-PR) — but ONLY when THIS invocation actually
+// posted `pending` (failures before pending — e.g. getChangedFiles — post
+// nothing) and only when commitStatus is enabled.
+describe('reviewOnePr — W16-B2-1 terminal failure status after pending', () => {
+  it('W16-B2-1: posts pending then a TERMINAL failure status when runStructuredReview throws', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => {
+        throw new Error('LLM exploded');
+      }),
+      setReviewStatus: vi.fn(async () => true),
+      buildStatusDescription,
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(41, 'sha41'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    // The PR failure is still reported as {ok:false} (batch isolation).
+    expect(result.ok).toBe(false);
+    // pending was posted by THIS invocation → a terminal status MUST follow.
+    const states = s.setReviewStatus.mock.calls.map((c) => c[0].state);
+    expect(states).toEqual(['pending', 'failure']);
+    const [failureArgs] = s.setReviewStatus.mock.calls[1];
+    expect(failureArgs.sha).toBe('sha41');
+    expect(failureArgs.state).toBe('failure');
+    expect(failureArgs.description).toMatch(/Z\.ai review failed/i);
+    // reviewerName threading + synthetic context, same as the success path.
+    expect(failureArgs.reviewerName).toBe('Z.ai Code Review');
+    expect(failureArgs.context.repo).toEqual({ owner: 'o', repo: 'r' });
+    expect(failureArgs.context.payload.pull_request.number).toBe(41);
+  });
+
+  it('W16-B2-1: posts NO statuses when the failure happens BEFORE pending (getChangedFiles throws)', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => {
+        throw new Error('files API down');
+      }),
+      setReviewStatus: vi.fn(async () => true),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(42, 'sha42'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result.ok).toBe(false);
+    // pending was never posted by this invocation → no failure status either
+    // (mirrors the push path's main(), which only flips statuses it started).
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  it('W16-B2-1: posts NO statuses when commitStatus is off (flag honored)', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => {
+        throw new Error('LLM exploded');
+      }),
+      setReviewStatus: vi.fn(async () => true),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(43, 'sha43'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------- reviewOnePr — W16-B2-2 scheduled summary preserves the hash block ---------- */
+
+// The scheduled summary path built its comment body with marker + shaBlock
+// ONLY; upsertReviewComment replaces the marker comment WHOLESALE, destroying
+// the `<!-- zai-hashes:... -->` block a prior push run deposited (regressing
+// W15-A8-3: the next push re-reported every unchanged finding). The scheduled
+// path must read the existing marker comment's hash block (fail-soft) and
+// re-append it, unioned with any hashes this run itself produces.
+describe('reviewOnePr — W16-B2-2 preserve hash block across scheduled summaries', () => {
+  // parseFindingsHashBlock only honors hex payloads (forged-block defense), so
+  // seeded prior hashes must be valid 64-char hex.
+  const HEX1 = 'a1b2c3d4'.repeat(8);
+  const HEX2 = 'e5f6a7b8'.repeat(8);
+  const fileLevelFinding = { file: 'a.js', line: null, severity: 'low', title: 'X', description: 'd' };
+  const reviewResult = (findings) => ({
+    findings,
+    summary: 'summary only',
+    metadata: { totalBatches: 1, totalFindingsBeforeCap: findings.length, deterministicFindingsCount: 0, batchMetadata: [] },
+  });
+
+  it('W16-B2-2: unions prior marker-comment hashes with this run\'s findings hashes (summary path)', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: {
+        50: [{
+          id: 1,
+          body:
+            '## Z.ai Code Review\n\nprior push summary\n\n' +
+            `${MARKER}\n<!-- zai-hashes:${HEX1},${HEX2} -->`,
+          user: { login: 'github-actions[bot]', type: 'Bot' },
+        }],
+      },
+    });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([fileLevelFinding])),
+      // Real finder over the fake octokit — the same function src/index.js wires.
+      findBotMarkerComments: vi.fn(findBotMarkerComments),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(50, 'sha50'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    const hashes = parseFindingsHashBlock(body);
+    // NOTHING is lost: both prior hashes survive the wholesale replace...
+    expect(hashes.has(HEX1)).toBe(true);
+    expect(hashes.has(HEX2)).toBe(true);
+    // ...and the scheduled run's own finding hash is computed and unioned in
+    // (same canonical full-findings-set rule as the push path in index.js).
+    expect(hashes.has(hashFinding(fileLevelFinding))).toBe(true);
+  });
+
+  it('W16-B2-2: no existing comment → body carries only this run\'s hashes', async () => {
+    const octokit = makeOctokit({ commentsByPr: {} });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([fileLevelFinding])),
+      findBotMarkerComments: vi.fn(findBotMarkerComments),
+    });
+
+    await reviewOnePr({
+      pr: mkPr(51, 'sha51'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    const hashes = parseFindingsHashBlock(body);
+    expect(hashes.size).toBe(1);
+    expect(hashes.has(hashFinding(fileLevelFinding))).toBe(true);
+  });
+
+  it('W16-B2-2: preserves prior hashes even when incrementalReview is off (destruction-free replace)', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: {
+        52: [{
+          id: 2,
+          body: `prior\n\n${MARKER}\n<!-- zai-hashes:${HEX1} -->`,
+          user: { login: 'github-actions[bot]', type: 'Bot' },
+        }],
+      },
+    });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([fileLevelFinding])),
+      findBotMarkerComments: vi.fn(findBotMarkerComments),
+    });
+
+    await reviewOnePr({
+      pr: mkPr(52, 'sha52'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    const hashes = parseFindingsHashBlock(body);
+    // The prior block is still re-appended (nothing lost); the scheduled run
+    // computes no NEW hashes of its own while incremental review is off.
+    expect(hashes.has(HEX1)).toBe(true);
+    expect(hashes.has(hashFinding(fileLevelFinding))).toBe(false);
+  });
+
+  it('W16-B2-2: a prior-hash read failure is fail-soft — the review still posts', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([fileLevelFinding])),
+      findBotMarkerComments: vi.fn(async () => {
+        throw new Error('comments API down');
+      }),
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    const result = await reviewOnePr({
+      pr: mkPr(53, 'sha53'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('hash'));
+    // The body still carries this run's own hashes (degraded, not broken).
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    expect(parseFindingsHashBlock(body).has(hashFinding(fileLevelFinding))).toBe(true);
   });
 });

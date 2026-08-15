@@ -8,6 +8,7 @@ import {
   upsertReviewComment,
   buildCommentBody,
   findBotMarkerComment,
+  findBotMarkerComments,
   MARKER,
 } from '../src/lib/comments.js';
 
@@ -442,5 +443,99 @@ describe('findBotMarkerComment', () => {
     const { octokit } = makeOctokit({ list: [existing] });
     const found = await findBotMarkerComment({ ...base, octokit });
     expect(found?.id).toBe(5);
+  });
+});
+
+describe('findBotMarkerComments', () => {
+  // W16-B2-3: findBotMarkerComment returns only the FIRST bot marker comment
+  // in API order. When a fallback comment exists (created after an
+  // inline-review failure — the fallback path always CREATES a new comment),
+  // its hash block (the newest full set) was never read — orphaned
+  // suppression data. Consumers need the FULL list (same pagination +
+  // bot-authority gating) so they can union hash blocks across ALL marker
+  // comments.
+  const base = { owner: 'o', repo: 'r', issueNumber: 42 };
+
+  test('returns ALL bot marker comments in API order', async () => {
+    const first = makeComment(11, `one\n\n${MARKER}\n<!-- zai-hashes:aaa -->`, BOT_USER);
+    const second = makeComment(22, `two\n\n${MARKER}\n<!-- zai-hashes:bbb -->`, BOT_USER);
+    const { octokit } = makeOctokit({
+      list: [makeComment(1, 'noise'), first, second],
+    });
+
+    const all = await findBotMarkerComments({ ...base, octokit });
+
+    expect(all.map((c) => c.id)).toEqual([11, 22]);
+    expect(all.every((c) => typeof c.body === 'string')).toBe(true);
+  });
+
+  test('excludes human (User) marker comments — bot-authority gate', async () => {
+    const spoofed = makeComment(9, `attacker\n\n${MARKER}\n<!-- zai-hashes:FORGED -->`, HUMAN_USER);
+    const real = makeComment(10, `real\n\n${MARKER}`, BOT_USER);
+    const { octokit } = makeOctokit({ list: [spoofed, real] });
+
+    const all = await findBotMarkerComments({ ...base, octokit });
+
+    expect(all.map((c) => c.id)).toEqual([10]);
+  });
+
+  test('matches bot comments via the [bot] login suffix (type absent)', async () => {
+    const existing = makeComment(12, `review\n\n${MARKER}`, { login: 'z-ai-reviewer[bot]' });
+    const { octokit } = makeOctokit({ list: [existing] });
+    const all = await findBotMarkerComments({ ...base, octokit });
+    expect(all.map((c) => c.id)).toEqual([12]);
+  });
+
+  test('paginates beyond 100 comments and returns markers from EVERY page', async () => {
+    // Page 1 is full (100 comments) with a bot marker at position 51; page 2
+    // carries another bot marker. Both must be returned.
+    const page1 = Array.from({ length: 100 }, (_, i) =>
+      i === 50
+        ? makeComment(51, `p1 marker\n\n${MARKER}`, BOT_USER)
+        : makeComment(i + 1, 'x'),
+    );
+    const page2 = [makeComment(101, `p2 marker\n\n${MARKER}`, BOT_USER)];
+    const { octokit, calls } = makeOctokit({
+      paginated: { perPage: 100, pages: [page1, page2] },
+    });
+
+    const all = await findBotMarkerComments({ ...base, octokit });
+
+    expect(all.map((c) => c.id)).toEqual([51, 101]);
+    expect(calls.listComments).toHaveLength(2);
+    expect(calls.listComments[0].page).toBe(1);
+    expect(calls.listComments[1].page).toBe(2);
+  });
+
+  test('returns [] when no comments exist / none carry the marker', async () => {
+    const { octokit: empty } = makeOctokit({ list: [] });
+    expect(await findBotMarkerComments({ ...base, octokit: empty })).toEqual([]);
+    const { octokit: noMarker } = makeOctokit({
+      list: [makeComment(1, 'plain'), makeComment(2, 'still no marker', BOT_USER)],
+    });
+    expect(await findBotMarkerComments({ ...base, octokit: noMarker })).toEqual([]);
+  });
+
+  test('defaults marker to the MARKER constant', async () => {
+    const existing = makeComment(5, `review\n\n${MARKER}`, BOT_USER);
+    const { octokit } = makeOctokit({ list: [existing] });
+    const all = await findBotMarkerComments({ ...base, octokit });
+    expect(all.map((c) => c.id)).toEqual([5]);
+  });
+
+  test('listComments rejection propagates (not swallowed)', async () => {
+    const boom = new Error('api down');
+    const { octokit } = makeOctokit({ throwOnList: boom });
+    await expect(findBotMarkerComments({ ...base, octokit })).rejects.toBe(boom);
+  });
+
+  test('findBotMarkerComment stays a first-match wrapper over the plural finder', async () => {
+    const first = makeComment(11, `one\n\n${MARKER}`, BOT_USER);
+    const second = makeComment(22, `two\n\n${MARKER}`, BOT_USER);
+    const { octokit } = makeOctokit({ list: [first, second] });
+
+    const found = await findBotMarkerComment({ ...base, octokit });
+
+    expect(found?.id).toBe(11); // FIRST in API order, not the newest
   });
 });

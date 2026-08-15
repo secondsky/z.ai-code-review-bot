@@ -53,6 +53,7 @@ import {
   buildCommentBody,
   appendTrailers,
   findBotMarkerComment,
+  findBotMarkerComments,
   MARKER,
 } from './lib/comments.js';
 import {
@@ -479,6 +480,7 @@ export async function run(context, deps = {}) {
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
     findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
+    findBotMarkerComments: findBotMarkerCommentsFn = findBotMarkerComments,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
     createApiClient: createApiClientFn = createApiClient,
@@ -770,19 +772,27 @@ export async function run(context, deps = {}) {
         // summary path) instead of a review — so reading reviews alone left
         // priorHashes empty and every finding was re-reported on re-push.
         // Read the hash block from the bot's marker comment too and MERGE the
-        // two sets. findBotMarkerComment enforces the same bot-authority gate
-        // as upsertReviewComment, so a human comment quoting the marker (and a
+        // two sets. The finder enforces the same bot-authority gate as
+        // upsertReviewComment, so a human comment quoting the marker (and a
         // forged hash block) can never feed suppression.
-        const priorComment = await findBotMarkerCommentFn({
+        // W16-B2-3: read ALL bot marker comments, not just the first. A
+        // fallback comment (created after an inline-review failure — the
+        // fallback path always CREATES a new comment) carries the newest FULL
+        // hash set; a first-match read orphaned it, so hashes present only
+        // there never suppressed. UNION the parsed hash blocks across every
+        // bot marker comment.
+        const priorMarkerComments = await findBotMarkerCommentsFn({
           octokit,
           owner,
           repo,
           issueNumber: pullNumber,
           marker: MARKER,
         });
-        if (priorComment && typeof priorComment.body === 'string') {
-          const commentHashes = parseFindingsHashBlockFn(priorComment.body);
-          for (const h of commentHashes) priorHashes.add(h);
+        for (const priorComment of priorMarkerComments) {
+          if (typeof priorComment?.body === 'string') {
+            const commentHashes = parseFindingsHashBlockFn(priorComment.body);
+            for (const h of commentHashes) priorHashes.add(h);
+          }
         }
       } catch (priorErr) {
         if (coreDep?.warning) {
@@ -1233,6 +1243,11 @@ export async function run(context, deps = {}) {
       filterFindingsByLearnings: filterFindingsByLearningsFn,
       setReviewStatus: setReviewStatusFn,
       buildStatusDescription: buildStatusDescriptionFn,
+      // W16-B2-2: real marker-comment finder so scheduled summaries preserve
+      // the incremental-review hash block across the wholesale upsert replace
+      // (parseFindingsHashBlock/buildFindingsHashBlock default to the real
+      // pure helpers inside schedule.js).
+      findBotMarkerComments: findBotMarkerCommentsFn,
     });
     return;
   }
