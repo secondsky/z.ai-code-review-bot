@@ -8,12 +8,16 @@
  * findings are rendered under their cohort as collapsible sections so the
  * summary reads like a narrative instead of a flat severity-sorted list.
  *
- * This module is PURE (no I/O, no imports of other project modules). The
- * renderer's trailing marker is duplicated here as a literal so the module
- * stays self-contained; it MUST stay byte-exact with comments.js's MARKER.
+ * This module is PURE (no I/O). It imports the shared free-text sanitizer
+ * from findings.js (W16-B1-4) so the summary prose gets exactly the same
+ * treatment in both summary renderers; the renderer's trailing marker is
+ * duplicated here as a literal so the module stays self-contained; it MUST
+ * stay byte-exact with comments.js's MARKER.
  *
  * @module src/lib/walkthrough.js
  */
+
+import { sanitizeTextField } from './findings.js';
 
 // ---------------------------------------------------------------------------
 // Cohort metadata
@@ -423,7 +427,12 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
   lines.push('');
 
   if (summaryProse.length > 0) {
-    lines.push(summaryProse);
+    // W16-B1-4: the summary is model-controlled prose rendered into the
+    // bot's trusted comment — sanitize it exactly like finding text fields
+    // (newline collapse + angle-bracket escaping) so 'ok\n#### INJECTED'
+    // cannot become a real heading and raw `<tag>` HTML stays inert.
+    // Mirrors formatFindingsAsSummary.
+    lines.push(sanitizeTextField(summaryProse));
     lines.push('');
   }
 

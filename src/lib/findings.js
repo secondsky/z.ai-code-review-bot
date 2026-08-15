@@ -138,6 +138,38 @@ function isPositiveInteger(value) {
 }
 
 /**
+ * W16-B1-2 / W16-B1-4: shared sanitizer for model-controlled free text that
+ * is rendered into the bot's trusted markdown comments (finding
+ * title/description/evidence/suggestion AND the review `metadata.summary`
+ * prose rendered by formatFindingsAsSummary / formatWalkthroughSummary).
+ *
+ * Treatment:
+ *   - HTML-ESCAPE angle brackets (`<` → `&lt;`, `>` → `&gt;`). This makes
+ *     HTML structural tags (`</details>`, `<img …>`, `<script>`) inert in
+ *     every render path while keeping the text VISIBLE — the W7-5/W15-A3-1
+ *     tag-STRIP deleted content outright, so a security finding quoting
+ *     `payload <img src=x onerror=alert(1)>` lost the very payload it quoted.
+ *     GitHub renders `&lt;` as a literal `<` (in code spans and prose), so
+ *     escaped tags still read correctly.
+ *   - Collapse `\r?\n` to a single space (W15-A3-2): a raw
+ *     "\n\n#### heading" in a model field would otherwise break markdown
+ *     structure in the rendered comment.
+ *
+ * Non-strings are returned as-is (callers rely on the pass-through so the
+ * downstream type validation rejects them).
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+export function sanitizeTextField(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\r?\n/g, ' ');
+}
+
+/**
  * Validate a single finding object against the schema.
  *
  * Rules:
@@ -252,27 +284,25 @@ export function normalizeFinding(finding) {
   // W7-5: free-text fields are LLM-emitted and attacker-influenceable. In the
   // walkthrough path they render inside <details> blocks, so HTML structural
   // tags (</details>, <details>, <summary>, etc.) would break the collapsible
-  // section. W15-A3-1: this strip now applies to description, evidence, and
-  // suggestion too — a `</details><details><summary>` sequence in the
-  // description could inject forged collapsible sections into walkthrough
-  // summaries just like it could via the title.
-  // W15-A3-2: newlines are also collapsed to a single space (same rationale as
-  // CORE-2 in review.js): a raw "\n\n#### heading" in a model field would
-  // otherwise break markdown structure when rendered by
-  // formatFindingsAsSummary / formatWalkthroughSummary.
-  const sanitizeTextField = (value) =>
-    typeof value === 'string'
-      ? value
-          .replace(
-            /<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)(?:\s[^>]*)?>/gi,
-            '',
-          )
-          .replace(/\r?\n/g, ' ')
-      : value;
-
+  // section. W15-A3-1 extended the treatment to description, evidence, and
+  // suggestion. W16-B1-2 replaces the STRIP with HTML ESCAPING (see
+  // sanitizeTextField) so tags are inert everywhere while the quoted
+  // payload/prose stays visible. W15-A3-2: newlines are collapsed to a single
+  // space (same rationale as CORE-2 in review.js) so raw markdown structure
+  // can never be injected via a model field.
   let title = sanitizeTextField(typeof f.title === 'string' ? f.title : '');
   if (title.length > TITLE_MAX) {
-    title = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length) + TITLE_TRUNC_SUFFIX;
+    // W16-B1-5: slice() cuts on UTF-16 code units. If the LAST unit of the
+    // kept prefix is the HIGH half of a surrogate pair, the truncated title
+    // would end with a lone surrogate (rendered as U+FFFD garbage) right
+    // before the '...' suffix. Back off one code unit so the boundary never
+    // splits a pair.
+    let sliced = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length);
+    const lastUnit = sliced.charCodeAt(sliced.length - 1);
+    if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+      sliced = sliced.slice(0, -1);
+    }
+    title = sliced + TITLE_TRUNC_SUFFIX;
   }
 
   // Apply defaults to optional fields before validating so a finding that
@@ -288,7 +318,7 @@ export function normalizeFinding(finding) {
       : null;
   const rule = typeof f.rule === 'string' ? f.rule : 'llm';
   // W15-A3-1: description is required (never defaulted) but still
-  // model-controlled — strip structural tags while preserving the
+  // model-controlled — sanitize structural tags while preserving the
   // "non-string description fails validation" contract.
   const description = sanitizeTextField(f.description);
 
@@ -297,10 +327,17 @@ export function normalizeFinding(finding) {
   // validating the raw value dropped the WHOLE finding and made the
   // post-validation coercion below dead code. Coerce per the schema contract:
   // numeric strings → number; 0/negative/float/garbage → null (file-level).
-  const line =
-    Number.isFinite(+f.line) && Number.isInteger(+f.line) && +f.line >= 1
-      ? +f.line
-      : null;
+  // W16-B1-3: the old `+f.line` also accepted booleans (true → 1, misanchoring
+  // an inline comment on line 1), arrays (['3'] → 3) and exotic numeric
+  // strings ('0x10' → 16, '1e2' → 100). Strict coercion: numbers keep the
+  // integer/≥1 check; strings must be plain decimal digits (optionally
+  // whitespace-padded); everything else → null (file-level, finding kept).
+  let line = null;
+  if (typeof f.line === 'number') {
+    line = Number.isInteger(f.line) && f.line >= 1 ? f.line : null;
+  } else if (typeof f.line === 'string' && /^\s*\d+\s*$/.test(f.line)) {
+    line = parseInt(f.line, 10);
+  }
 
   // Pre-coerce + pre-truncate + pre-defaulted copy for validation: validate
   // the coerced enum values, the truncated title, and the defaulted optionals
@@ -351,13 +388,88 @@ export function normalizeFinding(finding) {
  * found ✅"). Returns the repaired text; callers only JSON.parse it when the
  * direct parse already failed.
  *
+ * W16-B1-1: the repair used to run blind regex replaces over the raw JSON
+ * text, so `,]`/`,}`/NaN sequences INSIDE string values were silently
+ * rewritten whenever the repair fired (a finding titled "use arr[0,] here"
+ * came back as "use arr[0] here"). The repair is now a single string-aware
+ * pass: trailing-comma deletion and NaN/Infinity→null only apply at
+ * positions OUTSIDE string literals (double-quoted, backslash escapes
+ * respected).
+ *
  * @param {string} text
  * @returns {string}
  */
 function repairJson(text) {
-  return text
-    .replace(/,\s*([}\]])/g, '$1')
-    .replace(/([:\[,]\s*)(?:NaN|-?Infinity)(?=\s*[,\}\]]|$)/g, '$1null');
+  const n = text.length;
+  let out = '';
+  let i = 0;
+  let inString = false;
+  // Last non-whitespace character emitted OUTSIDE a string literal. Used to
+  // decide whether a bare NaN/Infinity sits in a VALUE position (preceded by
+  // ':', '[', or ','), mirroring the pre-W16 `[:\[,]` prefix class.
+  let lastSignificant = '';
+  while (i < n) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (ch === '\\' && i + 1 < n) {
+        // Escaped character (e.g. \" or \\): copy verbatim; it never toggles
+        // the string state.
+        out += text[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+        lastSignificant = '"';
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      lastSignificant = '"';
+      i += 1;
+      continue;
+    }
+    if (ch === ',') {
+      // Trailing-comma repair: drop the comma (and any whitespace after it)
+      // when the next significant char is '}' or ']' — outside strings only.
+      let j = i + 1;
+      while (j < n && /\s/.test(text[j])) j += 1;
+      if (j < n && (text[j] === '}' || text[j] === ']')) {
+        i = j;
+        continue;
+      }
+      out += ch;
+      lastSignificant = ',';
+      i += 1;
+      continue;
+    }
+    if (ch === 'N' || ch === 'I' || ch === '-') {
+      // Bare NaN / Infinity / -Infinity literal in a value position → null.
+      // The lookahead (followed by , } ] or end) mirrors the pre-W16 regex.
+      const m = text
+        .slice(i)
+        .match(/^(?:NaN|-?Infinity)(?=\s*[,\}\]]|$)/);
+      if (
+        m &&
+        (lastSignificant === ':' ||
+          lastSignificant === '[' ||
+          lastSignificant === ',')
+      ) {
+        out += 'null';
+        i += m[0].length;
+        lastSignificant = 'n';
+        continue;
+      }
+    }
+    out += ch;
+    if (!/\s/.test(ch)) lastSignificant = ch;
+    i += 1;
+  }
+  return out;
 }
 
 /**
@@ -824,10 +936,14 @@ export function formatFindingsAsSummary(findings, options = {}) {
   // suppressed (incremental review)."); without this, a run where ALL
   // findings were suppressed posted exactly "No issues found ... ✅" with
   // zero indication findings were elided.
+  // W16-B1-4: the summary is model-controlled prose rendered into the bot's
+  // trusted comment. It used to render RAW, so 'ok\n\n#### INJECTED' injected
+  // a real heading (and raw `<tag>` HTML rendered as HTML). Pass it through
+  // the same sanitizeTextField treatment as finding text fields.
   const summaryProse =
     typeof metadata.summary === 'string' ? metadata.summary : '';
   if (summaryProse.length > 0) {
-    lines.push(summaryProse);
+    lines.push(sanitizeTextField(summaryProse));
     lines.push('');
   }
 

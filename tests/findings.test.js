@@ -225,8 +225,10 @@ describe('normalizeFinding', () => {
   // W7-5: finding titles are LLM-emitted and attacker-influenceable. In the
   // walkthrough path they're rendered inside <details> blocks, so a title
   // containing </details> would break the collapsible section and force
-  // injected content to render at top level. Strip HTML structural tags.
-  it('W7-5: strips HTML structural tags from titles', () => {
+  // injected content to render at top level. W16-B1-2 supersedes the original
+  // tag-STRIP with HTML ESCAPING: the angle brackets become &lt;/&gt; so the
+  // tags are inert everywhere while the text stays visible.
+  it('W7-5/W16-B1-2: escapes HTML structural tags in titles instead of stripping them', () => {
     const out = normalizeFinding({
       ...validFinding(),
       title: 'x </details><details><summary>Advisory</summary>',
@@ -234,28 +236,34 @@ describe('normalizeFinding', () => {
     expect(out.title).not.toContain('</details>');
     expect(out.title).not.toContain('<details');
     expect(out.title).not.toContain('<summary');
+    // Escaped (inert) forms are present, preserving the original text.
+    expect(out.title).toContain('&lt;/details&gt;');
+    expect(out.title).toContain('&lt;summary&gt;');
   });
 
   // W9-1: the W7-5 title-stripper used \b[^>]* which over-matched hyphenated
   // HTML-like tags (<svg-icon>, <a-link>, <details-panel>), garbling legitimate
-  // review titles about custom elements. Fix: use (?:\s[^>]*)? to only match
-  // exact tag names with optional space-attributes.
-  it('W9-1: does not strip hyphenated HTML-like element names from titles', () => {
+  // review titles about custom elements. W16-B1-2 replaces the strip entirely
+  // with escaping, which is tag-name-agnostic: custom element names survive
+  // (in escaped form) alongside real tags.
+  it('W9-1/W16-B1-2: keeps hyphenated HTML-like element names in titles (escaped)', () => {
     const out = normalizeFinding({
       ...validFinding(),
       title: 'Replace <svg-icon> with accessible <img> tag',
     });
-    // The hyphenated custom element must survive; the real <img> tag is stripped.
-    expect(out.title).toContain('<svg-icon>');
+    // The hyphenated custom element survives — escaped, not deleted.
+    expect(out.title).toContain('&lt;svg-icon&gt;');
+    // The real <img> tag is inert too (escaped, not stripped).
     expect(out.title).not.toContain('<img>');
+    expect(out.title).toContain('&lt;img&gt;');
     expect(out.title).toContain('Replace');
   });
 
-  // W15-A3-1: the W7-5 tag-strip only ran on the title. description/evidence/
-  // suggestion are equally LLM-emitted and attacker-influenceable, and they
-  // render inside walkthrough <details> sections too — a `</details><details>`
-  // sequence in the description injects forged collapsible sections.
-  it('W15-A3-1: strips structural HTML tags from description', () => {
+  // W15-A3-1: the tag treatment applies to description/evidence/suggestion too
+  // — a `</details><details><summary>` sequence in any field could inject
+  // forged collapsible sections into walkthrough summaries. W16-B1-2 changes
+  // the treatment from strip to ESCAPE so the payload stays visible.
+  it('W15-A3-1/W16-B1-2: escapes structural HTML tags in description (no structural injection)', () => {
     const out = normalizeFinding({
       ...validFinding(),
       description: 'x</details><details><summary>Forged</summary>y',
@@ -263,21 +271,51 @@ describe('normalizeFinding', () => {
     expect(out.description).not.toContain('</details>');
     expect(out.description).not.toContain('<details');
     expect(out.description).not.toContain('<summary');
+    // The escaped forms render as literal text — no structural injection, and
+    // the injected label is still visible (not silently deleted).
+    expect(out.description).toContain('&lt;/details&gt;&lt;details&gt;&lt;summary&gt;');
     expect(out.description).toContain('Forged');
   });
 
-  it('W15-A3-1: strips structural HTML tags from evidence and suggestion', () => {
+  it('W15-A3-1/W16-B1-2: escapes structural HTML tags in evidence and suggestion', () => {
     const out = normalizeFinding({
       ...validFinding(),
       evidence: 'a<img src=x>b',
       suggestion: 'c</details><script>d</script>e',
     });
+    // No raw tag survives into the rendered fields...
     expect(out.evidence).not.toContain('<img');
-    expect(out.evidence).toBe('ab');
     expect(out.suggestion).not.toContain('</details>');
     expect(out.suggestion).not.toContain('<script');
-    // Tags are stripped; inner text between them survives.
-    expect(out.suggestion).toBe('cde');
+    // ...but the payload is preserved via escaping, not deleted.
+    expect(out.evidence).toBe('a&lt;img src=x&gt;b');
+    expect(out.suggestion).toBe('c&lt;/details&gt;&lt;script&gt;d&lt;/script&gt;e');
+  });
+
+  // W16-B1-2: the W15 strip DELETED content outright — a security finding
+  // quoting 'payload <img src=x onerror=alert(1)>' lost the very payload it
+  // was quoting ('payload '), and prose like "The <a href=x>link</a> element"
+  // lost the tag names. Escaping keeps the payload/prose visible while making
+  // the tags inert in every render path.
+  it('W16-B1-2: keeps a quoted XSS payload visible (escaped) in evidence', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      evidence: 'payload <img src=x onerror=alert(1)>',
+    });
+    expect(out.evidence).toContain('onerror=alert(1)');
+    expect(out.evidence).toContain('&lt;img');
+    expect(out.evidence).not.toContain('<img');
+    expect(out.evidence).toBe('payload &lt;img src=x onerror=alert(1)&gt;');
+  });
+
+  it('W16-B1-2: keeps inline-HTML prose readable in description', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      description: 'The <a href=x>link</a> element is unsafe: includes <img src=x>',
+    });
+    expect(out.description).toBe(
+      'The &lt;a href=x&gt;link&lt;/a&gt; element is unsafe: includes &lt;img src=x&gt;',
+    );
   });
 
   // W15-A3-2: newlines in model-controlled fields were rendered raw by
@@ -351,6 +389,55 @@ describe('normalizeFinding', () => {
     const out = normalizeFinding({ ...validFinding(), line: null });
     expect(out).not.toBeNull();
     expect(out.line).toBeNull();
+  });
+
+  // W16-B1-3: the W15-A3-7 coercion used `+f.line`, which happily accepted
+  // booleans (true → 1 — misanchoring the inline comment on line 1), arrays
+  // (['3'] → 3), and exotic numeric strings ('0x10' → 16, '1e2' → 100).
+  // Coercion is now strict: numbers keep the integer/≥1 check; strings must
+  // be plain decimal digits (whitespace-padded ok); everything else → null
+  // (file-level finding, still kept).
+  it('W16-B1-3: coerces a boolean line to null (file-level), not to 1', () => {
+    const out = normalizeFinding({ ...validFinding(), line: true });
+    expect(out).not.toBeNull();
+    expect(out.line).toBeNull();
+  });
+
+  it('W16-B1-3: coerces an array line to null', () => {
+    const out = normalizeFinding({ ...validFinding(), line: ['3'] });
+    expect(out).not.toBeNull();
+    expect(out.line).toBeNull();
+  });
+
+  it("W16-B1-3: coerces '0x10' and '1e2' to null (strict decimal strings only)", () => {
+    expect(normalizeFinding({ ...validFinding(), line: '0x10' }).line).toBeNull();
+    expect(normalizeFinding({ ...validFinding(), line: '1e2' }).line).toBeNull();
+  });
+
+  it("W16-B1-3: coerces ' 42 ' to 42 (whitespace-padded decimal string)", () => {
+    expect(normalizeFinding({ ...validFinding(), line: ' 42 ' }).line).toBe(42);
+  });
+
+  it('W16-B1-3: keeps a plain integer number line unchanged', () => {
+    expect(normalizeFinding({ ...validFinding(), line: 42 }).line).toBe(42);
+  });
+
+  // W16-B1-5: title.slice(0, 117) cuts on UTF-16 code units. When unit 116 is
+  // the HIGH half of a surrogate pair, the truncated title ended with a lone
+  // surrogate (rendered as U+FFFD garbage) right before the '...' suffix.
+  // Back off one code unit so the boundary never splits a pair.
+  it('W16-B1-5: does not split a surrogate pair at the title truncation boundary', () => {
+    // 116 BMP chars + astral emoji (2 units) + padding = 128 units > 120.
+    // slice(0, 117) would land BETWEEN the surrogate pair.
+    const title = 'x'.repeat(116) + '\u{1F600}' + 'y'.repeat(10);
+    const out = normalizeFinding({ ...validFinding(), title });
+    expect(out).not.toBeNull();
+    // The truncated title is 116 chars + '...' — the lone high surrogate is
+    // backed off, so no code point is mangled.
+    expect(out.title).toBe('x'.repeat(116) + '...');
+    expect(out.title.length).toBe(119);
+    // No lone (unpaired) high surrogate anywhere in the truncated title.
+    expect(out.title).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
   });
 
   it('leaves a 120-char title untouched', () => {
@@ -945,6 +1032,41 @@ describe('formatFindingsAsSummary', () => {
     expect(
       formatFindingsAsSummary([], { metadata: { summary: '' } }),
     ).not.toContain('### Review notes');
+  });
+
+  // W16-B1-4: metadata.summary is model-controlled prose rendered RAW into
+  // the bot's trusted comment — 'ok\n\n#### INJECTED\n\n[a](https://x.example)'
+  // injected an H4 heading and raw link. The summary now gets the same
+  // treatment as finding text fields: newlines collapsed to spaces AND angle
+  // brackets HTML-escaped.
+  it('W16-B1-4: flattens a newline-injected heading in the summary (no heading line)', () => {
+    const out = formatFindingsAsSummary([], {
+      metadata: { summary: 'ok\n#### INJECTED' },
+    });
+    expect(out).not.toMatch(/^#### INJECTED/m);
+    // No line in the whole body starts a heading introduced by the summary...
+    expect(out).not.toMatch(/^#{1,6} INJECTED/m);
+    // ...but the text survives flattened, on the summary line.
+    expect(out).toContain('ok #### INJECTED');
+  });
+
+  it('W16-B1-4: escapes angle brackets in the summary; link syntax stays literal', () => {
+    const out = formatFindingsAsSummary([], {
+      metadata: { summary: 'see <img src=x> and [a](https://x.example)' },
+    });
+    expect(out).toContain('&lt;img src=x&gt;');
+    expect(out).not.toContain('<img');
+    // Markdown link SYNTAX is left as literal text (visible, not stripped) —
+    // only structural HTML and newlines are neutralized.
+    expect(out).toContain('[a](https://x.example)');
+  });
+
+  it('W16-B1-4: leaves a plain single-line summary unchanged', () => {
+    const out = formatFindingsAsSummary([validFinding()], {
+      metadata: { summary: 'This PR adds a users table.' },
+    });
+    expect(out).toContain('This PR adds a users table.');
+    expect(out).toContain('- `src/index.js`:L42 — Possible null dereference');
   });
 });
 
@@ -1593,6 +1715,62 @@ describe('JSON extraction — W15-A3-4 trailing-comma repair', () => {
   it('still returns [] for unrepairable JSON (repair is last-resort only)', () => {
     expect(parseFindings('Review: [ { "file": "a", ', { changedFiles: ['a'] })).toEqual([]);
     expect(parseStructuredReview('totally not json', { changedFiles: ['a'] }).summary).toBe('');
+  });
+});
+
+describe('JSON extraction — W16-B1-1 string-aware repair', () => {
+  // The W15-A3-4 repair ran regex replaces over the raw JSON text with NO
+  // string-literal awareness, so `,]` / `,}` / NaN sequences INSIDE string
+  // values were silently rewritten whenever the repair fired — a finding
+  // titled "use arr[0,] here" came back as "use arr[0] here". The repair is
+  // now a single string-aware pass: the trailing-comma deletion and the
+  // NaN/Infinity→null rewrite only apply OUTSIDE string literals.
+  it('keeps a ",]" inside a string value intact while repairing the real trailing comma', () => {
+    const raw =
+      '{"summary":"s","findings":[' +
+      JSON.stringify({ ...validFinding(), file: 'a.js', title: 'use arr[0,] here' }) +
+      ',]}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['a.js'],
+    });
+    expect(summary).toBe('s');
+    expect(findings).toHaveLength(1);
+    // The title's own ",]" must survive the repair byte-exact.
+    expect(findings[0].title).toBe('use arr[0,] here');
+  });
+
+  it('keeps "[1,NaN,3]" inside string values unchanged while a real NaN literal is repaired', () => {
+    // Hand-built invalid JSON: a real NaN line forces the repair path; the
+    // "[1,NaN,3]" substrings inside summary/evidence must NOT be rewritten.
+    const raw =
+      '{"summary":"see [1,NaN,3]","findings":[' +
+      '{"file":"a.js","line":NaN,"severity":"high","confidence":"medium",' +
+      '"category":"bug","title":"T","description":"d","evidence":"[1,NaN,3]"}' +
+      ',]}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['a.js'],
+    });
+    expect(summary).toBe('see [1,NaN,3]');
+    expect(findings).toHaveLength(1);
+    // The REAL NaN literal (outside strings) is repaired to null → file-level.
+    expect(findings[0].line).toBeNull();
+    expect(findings[0].evidence).toBe('[1,NaN,3]');
+  });
+
+  it('respects backslash escapes when tracking string state', () => {
+    // A string containing an escaped quote followed by a comma-close-bracket
+    // sequence must not confuse the string tracker into repairing inside (or
+    // failing to repair after) the string.
+    const raw =
+      '{"summary":"quote \\" then ,] noise","findings":[' +
+      JSON.stringify({ ...validFinding(), file: 'a.js' }) +
+      ',]}';
+    const { summary, findings } = parseStructuredReview(raw, {
+      changedFiles: ['a.js'],
+    });
+    expect(summary).toBe('quote " then ,] noise');
+    expect(findings).toHaveLength(1);
+    expect(findings[0].file).toBe('a.js');
   });
 });
 

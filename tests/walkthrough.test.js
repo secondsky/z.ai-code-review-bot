@@ -460,6 +460,33 @@ describe('formatWalkthroughSummary', () => {
     expect(out).toContain('This PR adds a users table.');
   });
 
+  // W16-B1-4: metadata.summary is model-controlled prose and was rendered RAW
+  // with newlines/HTML — an injected 'ok\n#### INJECTED <script>' became a
+  // real heading (and raw HTML) inside the bot's trusted comment. The
+  // walkthrough renderer now applies the same treatment as finding text
+  // fields (newline collapse + angle-bracket escaping) — mirroring
+  // formatFindingsAsSummary.
+  it('W16-B1-4: flattens and escapes an injected heading/HTML summary', () => {
+    const out = formatWalkthroughSummary([], [], {
+      metadata: { summary: 'ok\n#### INJECTED [a](https://x.example) <script>' },
+    });
+    expect(out).not.toMatch(/^#### INJECTED/m);
+    expect(out).not.toMatch(/^#{1,6} INJECTED/m);
+    // Flattened onto one line; link syntax stays literal; HTML is escaped.
+    expect(out).toContain('ok #### INJECTED [a](https://x.example)');
+    expect(out).not.toContain('<script>');
+    expect(out).toContain('&lt;script&gt;');
+    expect(out.endsWith(MARKER)).toBe(true);
+  });
+
+  it('W16-B1-4: leaves a plain single-line summary unchanged', () => {
+    const out = formatWalkthroughSummary([baseFinding()], [baseFinding().file], {
+      metadata: { summary: 'This PR adds a users table.' },
+    });
+    expect(out).toContain('This PR adds a users table.');
+    expect(out.endsWith(MARKER)).toBe(true);
+  });
+
   it('uses the correct emoji for each cohort', () => {
     const findings = [
       baseFinding({ file: 'db/a.sql', title: '1' }), // 🗄️

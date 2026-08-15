@@ -38,6 +38,18 @@ export const MAX_OUTPUT_CHARS = 16000;
 const TRUNCATION_MARKER = '\n\n> …(output truncated by Z.ai safety filter)';
 
 /**
+ * W16-B1-6: a trailing (possibly PARTIAL) truncation-marker remnant. Matches
+ * the tail end of TRUNCATION_MARKER — from its `\n> …(output truncat` lead-in
+ * through an optional unterminated tail — anchored at end-of-string. Used to
+ * strip a previous application's marker before a fresh one is appended so
+ * that re-sanitizing already-truncated output is idempotent (the production
+ * fallback path sanitizes twice). The `[^)]*\)?` payload tolerates a slice
+ * that cut the marker mid-text (e.g. after `(output truncat`), and it stops
+ * at the first `)` just like the marker itself.
+ */
+const TRUNCATION_MARKER_TAIL_RE = /\n?> ?…\(output truncat[^)]*\)?\s*$/u;
+
+/**
  * GitHub alert types that render as official callout banners. Matching is
  * case-insensitive (GitHub accepts any casing).
  */
@@ -288,7 +300,18 @@ export function sanitizeModelOutput(text, options = {}) {
     let end = maxChars;
     const lastUnit = out.charCodeAt(maxChars - 1);
     if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end = maxChars - 1;
-    out = out.slice(0, end) + TRUNCATION_MARKER;
+    // W16-B1-6: re-sanitizing an already-truncated output (the production
+    // fallback path double-sanitizes) must be idempotent. When the surrogate
+    // backoff shortened a previous pass's prefix to maxChars-1 units, this
+    // slice keeps a stray '\n' from the previous marker — and re-appending
+    // the marker then produced output DIFFERENT from the first application.
+    // Strip any pre-existing (possibly partial) marker remnant plus trailing
+    // whitespace before appending a fresh marker.
+    out =
+      out
+        .slice(0, end)
+        .replace(TRUNCATION_MARKER_TAIL_RE, '')
+        .replace(/\s+$/, '') + TRUNCATION_MARKER;
   }
 
   return out;

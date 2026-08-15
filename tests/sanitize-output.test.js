@@ -536,6 +536,42 @@ describe('sanitizeModelOutput — surrogate-safe truncation (W15-A3-9)', () => {
   });
 });
 
+describe('sanitizeModelOutput — W16-B1-6 idempotent truncation marker', () => {
+  // The production fallback path can sanitize an output that was ALREADY
+  // truncated once. When the W15-A3-9 surrogate backoff shortened the first
+  // pass's prefix to maxChars-1 units, the second pass's slice kept a stray
+  // '\n' from the first pass's truncation marker and re-appended the marker —
+  // double application produced different output than a single application.
+  it('double application on a surrogate-boundary overlong input equals single application', () => {
+    const input =
+      'a'.repeat(MAX_OUTPUT_CHARS - 1) + '\u{1F680}' + 'b'.repeat(50);
+    const once = sanitizeModelOutput(input);
+    const twice = sanitizeModelOutput(once);
+    expect(twice).toBe(once);
+    // And the single application is the expected backed-off truncation.
+    expect(once.endsWith('output truncated by Z.ai safety filter)')).toBe(true);
+    expect(once).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
+  });
+
+  it('double application on a non-boundary overlong input is identical (pin)', () => {
+    // This case already worked (the slice cuts exactly at the marker start);
+    // pin it so the idempotency fix cannot regress it.
+    const input = 'a'.repeat(MAX_OUTPUT_CHARS + 50);
+    const once = sanitizeModelOutput(input);
+    expect(once.endsWith('output truncated by Z.ai safety filter)')).toBe(true);
+    expect(sanitizeModelOutput(once)).toBe(once);
+  });
+
+  it('never accumulates a second truncation marker on re-application', () => {
+    const input = 'a'.repeat(MAX_OUTPUT_CHARS - 1) + '\u{1F680}' + 'b'.repeat(50);
+    const once = sanitizeModelOutput(input);
+    const twice = sanitizeModelOutput(once);
+    expect((twice.match(/output truncated/g) || []).length).toBe(1);
+    // No stray newline pile-up between content and marker either.
+    expect(twice).toBe(once);
+  });
+});
+
 describe('sanitizeCommentBody — marker / header positioning', () => {
   it('leaves an HTML marker mid-content untouched (regex only matches trailing)', () => {
     // The marker regex is anchored on `$`, so an HTML comment that is NOT the
