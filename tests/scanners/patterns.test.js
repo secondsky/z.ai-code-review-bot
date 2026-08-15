@@ -22,6 +22,7 @@ import {
   DEFAULT_PATTERN_RULES,
   parseAstGrepJson,
   mapAstGrepFinding,
+  normalizeFindingFilePath,
   AST_GREP_SPEC,
 } from '../../src/lib/scanners/patterns.js';
 
@@ -899,6 +900,73 @@ describe('scanPatterns — absolute ast-grep output paths [W16-B3-1]', () => {
     );
     expect(result.scanner).toBe('ast-grep');
     expect(result.findings).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W17-C1-5: normalizeFindingFilePath's outside-source guard
+// `rel.startsWith('..')` also caught legitimate IN-REPO paths that merely
+// START with '..' (e.g. '/repo/..hidden/x.js' → rel '..hidden/x.js'): the
+// function returned the unmatchable absolute path, so the finding was
+// dropped by the changed-files filter. Only a true parent traversal — '..'
+// itself or a '../' prefix — is outside the source tree.
+// ---------------------------------------------------------------------------
+describe('normalizeFindingFilePath — ".."-prefixed in-repo paths [W17-C1-5]', () => {
+  it("normalizes an in-repo path starting with '..' to itself", () => {
+    expect(normalizeFindingFilePath('/repo/..hidden/x.js', '/repo')).toBe('..hidden/x.js');
+  });
+
+  it('returns the raw path for a file outside source', () => {
+    expect(normalizeFindingFilePath('/tmp/x.js', '/repo')).toBe('/tmp/x.js');
+  });
+
+  it("returns the raw path for a '../' traversal outside source", () => {
+    expect(normalizeFindingFilePath('/repo/../../etc/x', '/repo')).toBe('/repo/../../etc/x');
+  });
+
+  it('keeps normalizing ordinary in-repo and already-relative paths', () => {
+    expect(normalizeFindingFilePath('/repo/src/foo.js', '/repo')).toBe('src/foo.js');
+    expect(normalizeFindingFilePath('src/foo.js', '/repo')).toBe('src/foo.js');
+  });
+});
+
+describe('scanPatterns — absolute in-repo path starting with ".." [W17-C1-5]', () => {
+  it('keeps the finding and normalizes the file to "..hidden/x.js"', async () => {
+    const deps = {
+      ensureBinary: vi.fn().mockResolvedValue('/p'),
+      platform: 'linux',
+      arch: 'x64',
+      runBinary: vi.fn().mockImplementation((_path, args) => {
+        const patternIdx = args.indexOf('--pattern');
+        const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
+        const matches =
+          pattern === 'eval($$$ARGS)'
+            ? [
+                {
+                  text: 'eval("boom")',
+                  file: '/repo/..hidden/x.js',
+                  lines: 'eval("boom")',
+                  range: {
+                    start: { line: 41, column: 0, index: 0 },
+                    end: { line: 41, column: 11, index: 11 },
+                  },
+                  ruleId: 'eval',
+                },
+              ]
+            : [];
+        return Promise.resolve(JSON.stringify(matches));
+      }),
+    };
+    const result = await scanPatterns(
+      {
+        files: [{ filename: '..hidden/x.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      deps,
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].file).toBe('..hidden/x.js');
   });
 });
 

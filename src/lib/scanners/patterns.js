@@ -420,7 +420,14 @@ export function normalizeFindingFilePath(file, source) {
   if (!isAbsolute) return posixFile;
   if (typeof source !== 'string' || source.length === 0) return posixFile;
   const rel = nodePath.relative(source, file);
-  if (!rel || rel.startsWith('..') || nodePath.isAbsolute(rel)) return posixFile;
+  // W17-C1-5: `rel.startsWith('..')` also rejected legitimate IN-REPO paths
+  // that merely START with '..' (e.g. '/repo/..hidden/x.js' → rel
+  // '..hidden/x.js'), returning the unmatchable absolute path so the finding
+  // was dropped by the changed-files filter. Only a true parent traversal —
+  // '..' itself or a '../' (platform-separator) prefix — is outside source.
+  if (!rel || rel === '..' || rel.startsWith('..' + nodePath.sep) || nodePath.isAbsolute(rel)) {
+    return posixFile;
+  }
   return rel.replace(/\\/g, '/');
 }
 

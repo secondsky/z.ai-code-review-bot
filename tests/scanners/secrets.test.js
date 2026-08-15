@@ -320,8 +320,23 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     const heFindings = (line) =>
       scanOne(line).filter((f) => f.rule === 'regex:high-entropy-string');
 
-    it('"integrity sha512-<hash>" (no =/: adjacency) → finding PRESENT', () => {
-      expect(heFindings(`"integrity sha512-${V}"`)).toHaveLength(1);
+    it('"integrity sha512-<hash>" (no =/: adjacency) → suppressed [superseded by W17-C1-6]', () => {
+      // W16-B3-5 expected this PRESENT only because the candidate charset
+      // ABSORBED the `sha512-` prefix, so the sha-adjacency alternative was
+      // dead code (its own comment: "the end-to-end adjacency case cannot
+      // arise for THIS pattern"). W17-C1-6 made the match land on the bare
+      // digest, so a directly adjacent sha###- digest now suppresses
+      // uniformly — the value is digest-shaped and indistinguishable from a
+      // real SRI hash, which W16-B3-5's own contract ("a directly adjacent
+      // hyphen-prefixed digest … still suppresses") always intended.
+      expect(heFindings(`"integrity sha512-${V}"`)).toHaveLength(0);
+    });
+
+    it('"integrity <hash>" (no =/: adjacency, no digest prefix) → finding PRESENT [W16-B3-5]', () => {
+      // The W16-B3-5 structural guarantee, now end-to-end: a bare integrity
+      // KEY in prose (no `=`/`:` attachment) must NOT suppress an opaque
+      // high-entropy value.
+      expect(heFindings(`"integrity ${V}"`)).toHaveLength(1);
     });
 
     it('"integrity": "sha512-<hash>" (JSON) → still suppressed', () => {
@@ -337,10 +352,11 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     });
 
     it('a directly adjacent digest prefix (before-text "sha512-") still suppresses', () => {
-      // The candidate charset swallows `sha512-` when the hash follows it
-      // directly, so the end-to-end adjacency case cannot arise for THIS
-      // pattern — pin the regex semantics on the before-text directly: a
-      // hyphen-prefixed digest immediately abutting the candidate suppresses.
+      // Since W17-C1-6 the candidate regex rejects sha-prefixed match starts,
+      // so the match lands on the bare digest and this adjacency case arises
+      // end-to-end (see the W17-C1-4/C1-6 block). Pin the before-text
+      // semantics directly as well: a hyphen-prefixed digest immediately
+      // abutting the candidate suppresses; a colon prefix must NOT.
       const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
       expect(he.skipIfPrecededBy.some((re) => re.test('sha512-'))).toBe(true);
       expect(he.skipIfPrecededBy.some((re) => re.test('sha384-'))).toBe(true);
@@ -361,6 +377,102 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
       // `sha256:` was one of the verified attacker-controllable suppressions
       // (a bare digest-colon prefix must not disable secret detection).
       expect(heFindings(`digest = "sha256:${V}"`)).toHaveLength(1);
+    });
+  });
+
+  // ==================================================================
+  // W17-C1-4: the B3-5 integrity suppression regex
+  // `/integrity["']?\s*[=:]\s*["']?\s*(?:sha\d{3}-)?$/i` matched ANY
+  // identifier ending in `integrity` followed by `=`/`:` — naming a variable
+  // `integrity` (`const integrity = "<64-char hi-entropy>"`) silently
+  // blinded the high-entropy backstop. Suppression is now restricted to the
+  // bare HTML-attribute shape: the token before `=` must BE `integrity`
+  // (preceded by start, `>` or whitespace, not part of a longer identifier
+  // like `data-integrity`) with NO whitespace around the `=`. Colon forms
+  // and spaced assignments no longer suppress an OPAQUE value — real
+  // sha-prefixed digests stay suppressed via the sha-adjacency alternative.
+  // ==================================================================
+  // W17-C1-6: the `(?:sha\d{3}-)$` skip alternative was dead code — the
+  // candidate class includes `-`, so the leftmost match ABSORBED an adjacent
+  // `sha512-` prefix and the before-text could never end with `sha###-`.
+  // Bare SRI digests (CSP `script-src 'self' 'sha512-…'`) therefore fired as
+  // critical FPs. The candidate regex now rejects sha-prefixed match starts
+  // (`(?!sha\d{3}-)`) and the orphan `-`-start between the prefix and the
+  // digest (`(?<!sha\d{3})`), so the match lands on the BARE digest and the
+  // sha-adjacency alternative actually fires.
+  // ==================================================================
+  describe('integrity-adjacency + SRI digest suppression [W17-C1-4/C1-6]', () => {
+    const HI64 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL2mN4pQ6rS8tU0vW2xY4zA6bC8dE0f';
+    const H86 = (
+      'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA' +
+      'bC3dE5fGhJ5kL7mN9pQ1sT3uV5wXyZaB1cD'
+    ).slice(0, 86);
+    const V35 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL';
+    const heFindings = (line) =>
+      scanSecretsRegex([{ filename: 'src/lock.json', patch: buildPatch([line]) }])
+        .filter((f) => f.rule === 'regex:high-entropy-string');
+
+    // --- W17-C1-4: the integrity off-switch ---------------------------
+    it('const integrity = "<64-char hi-entropy>" → finding PRESENT (variable named integrity must not blind the scanner)', () => {
+      expect(shannonEntropy(HI64)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`const integrity = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('token = "<64-char hi-entropy>" → finding PRESENT (regression)', () => {
+      expect(heFindings(`token = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('"integrity": "<opaque hi-entropy>" (JSON, no sha prefix) → finding PRESENT (opaque value scans)', () => {
+      expect(heFindings(`"integrity": "${HI64}",`)).toHaveLength(1);
+    });
+
+    it('"integrity": "sha512-<hash>" (JSON) → still suppressed', () => {
+      expect(shannonEntropy(H86)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`"integrity": "sha512-${H86}",`)).toHaveLength(0);
+    });
+
+    it('<script integrity="sha512-<hash>"> → still suppressed', () => {
+      expect(heFindings(`<script src="a.js" integrity="sha512-${H86}"></script>`)).toHaveLength(0);
+    });
+
+    it('integrity=sha384-<hash> (unquoted attr) → still suppressed', () => {
+      expect(heFindings(`<a integrity=sha384-${H86}>x</a>`)).toHaveLength(0);
+    });
+
+    it('integrity="<opaque>" (bare attribute, no spaces around =) → suppressed (attribute about to hold a digest)', () => {
+      expect(heFindings(`integrity="${HI64}"`)).toHaveLength(0);
+    });
+
+    it('data-integrity="<opaque>" → finding PRESENT (only the bare `integrity` attribute suppresses)', () => {
+      expect(heFindings(`data-integrity="${HI64}"`)).toHaveLength(1);
+    });
+
+    it('suppression-regex pins: attribute shape only — no spaced =, colon, or longer-identifier forms', () => {
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      const integrityAlt = he.skipIfPrecededBy.find((re) => /integrity/.test(re.source));
+      expect(integrityAlt.test(' integrity="')).toBe(true); // bare HTML attribute
+      expect(integrityAlt.test('integrity=')).toBe(true); // unquoted, about to hold a digest
+      expect(integrityAlt.test('const integrity = "')).toBe(false); // W17-C1-4 attack shape
+      expect(integrityAlt.test('"integrity": "')).toBe(false); // colon form must scan
+      expect(integrityAlt.test('data-integrity="')).toBe(false); // longer identifier
+      expect(integrityAlt.test('integrity ')).toBe(false); // pin kept from W16-B3-5
+    });
+
+    // --- W17-C1-6: bare SRI digests (CSP) -------------------------------
+    it("CSP `script-src 'self' 'sha512-<86-char b64>'` → no high-entropy finding", () => {
+      expect(heFindings(`+script-src 'self' 'sha512-${H86}'`)).toHaveLength(0);
+    });
+
+    it("CSP sha256 variant → no finding", () => {
+      expect(heFindings(`Content-Security-Policy: default-src 'sha256-${H86}'`)).toHaveLength(0);
+    });
+
+    it("'sha384-<hash>' bare → no finding", () => {
+      expect(heFindings(`'sha384-${H86}'`)).toHaveLength(0);
+    });
+
+    it('x = "<random 40>" without prefix → still flagged', () => {
+      expect(heFindings(`x = "${V35}"`)).toHaveLength(1);
     });
   });
 

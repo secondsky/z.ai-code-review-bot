@@ -141,7 +141,23 @@ export const SECRET_PATTERNS = [
     // conservative, only flags obvious secrets. The regex captures the candidate
     // (alphanumeric + /+=); the entropy check filters out non-secret strings.
     // SCN-2: include `-` and `_` so URL-safe base64 secrets are matched.
-    regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
+    //
+    // W17-C1-6: two zero-width assertions relocate matches off sha-prefixed
+    // SRI digests so the `sha\d{3}-` skipIfPrecededBy alternative (dead code
+    // since W15-A5-5 — the class includes `-`, so the leftmost match always
+    // ABSORBED an adjacent `sha512-` prefix and the before-text could never
+    // END with `sha###-`, leaving bare CSP digests firing as critical FPs)
+    // actually fires:
+    //   `(?!sha\d{3}-)` — a match must not START at the `sha512-` prefix
+    //     itself (rejects the absorbing leftmost match);
+    //   `(?<!sha\d{3})` — a match must not start at the orphan `-` left
+    //     between the prefix and the digest (before-text ends `sha512`).
+    // The match therefore lands on the BARE digest, whose before-text ends
+    // with `sha512-`, and the adjacency alternative suppresses it. Note: a
+    // literal `(?<!sha\d{3}-)` at the match start is a no-op here — the
+    // leftmost match starts AT `sha512`, and positions after `sha###-` are
+    // never attempted — hence the two-assertion form.
+    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
     captureGroup: 1,
     minEntropy: 4.5,
     // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
@@ -151,22 +167,27 @@ export const SECRET_PATTERNS = [
     // W16-B3-5: suppression now requires STRUCTURAL adjacency. The previous
     // `/(?:integrity|sha256|sha384|sha512)["']?[=:]?\s*["']?(?:sha\d+-)?$/i`
     // made every suffix optional, so bare prose like
-    // `"integrity sha512-<hash>"` (no `=`/`:` between the key and the hash)
+    // `"integrity <hash>"` (no `=`/`:` between the key and the hash)
     // silently suppressed the high-entropy backstop — an attacker-controlled
-    // off switch for unknown-format secrets. Only a directly adjacent
-    // hyphen-prefixed digest, a data URI, or an integrity key attached via
-    // `=`/`:` (allowing the JSON key's closing quote and an opening value
-    // quote around them) still suppresses.
+    // off switch for unknown-format secrets.
     skipIfPrecededBy: [
       // `data:image/png;base64,<candidate>` (data URIs)
       /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,\s*$/i,
       // `sha512-<candidate>` etc. — a digest prefix directly abutting the
-      // candidate (hyphen-terminated).
+      // candidate (hyphen-terminated). Reachable since W17-C1-6 relocated
+      // matches onto the bare digest; suppresses bare SRI/CSP digests.
       /(?:sha\d{3}-)$/i,
-      // `"integrity": "sha512-<cand>"` (JSON), `integrity="sha384-<cand>"`
-      // (HTML, quoted or not) — the integrity key must be structurally
-      // attached via `=` or `:` (with optional quotes) before the hash.
-      /integrity["']?\s*[=:]\s*["']?\s*(?:sha\d{3}-)?$/i,
+      // W17-C1-4: ONLY the bare HTML-attribute shape suppresses — the token
+      // before `=` must BE `integrity` (preceded by start, `>`, or
+      // whitespace; NOT part of a longer identifier like `data-integrity`)
+      // with no whitespace around the `=`, optionally inside an opening
+      // quote. The previous `integrity["']?\s*[=:]\s*["']?\s*(?:sha\d{3}-)?$/i`
+      // matched ANY identifier ending in `integrity` followed by `=`/`:`
+      // (the sha group was optional), so `const integrity = "<opaque>"`
+      // blinded the backstop. Spaced assignments (`integrity = "`), colon
+      // forms (`"integrity": "`), and opaque values now scan; real
+      // sha-prefixed digests stay suppressed via the adjacency alternative.
+      /(?:^|[>\s])integrity=["']?\s*$/i,
     ],
     title: 'High-entropy string (possible secret)',
     description:
