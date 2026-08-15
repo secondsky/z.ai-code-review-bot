@@ -416,6 +416,35 @@ function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0
 }
 
 /**
+ * Insert the W17-C1-3 skipped-files note into a rendered body.
+ *
+ * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
+ * review, but nothing surfaced that to the reviewer — a run that skipped
+ * files still posted a bare "No issues found. The changes look good. ✅".
+ * When the structured pipeline reports `skippedFiles > 0`, an italic note
+ * (mirroring the `_N findings truncated to cap._` style the summary
+ * renderers use) is inserted just before the trailing marker so it lands in
+ * the posted body of BOTH delivery paths (inline review body and summary
+ * comment). Rendering happens here — after the renderer returns — because
+ * the note must appear on every path without touching each renderer.
+ *
+ * @param {string} body   Rendered body ending in the marker (typically).
+ * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @returns {string}
+ */
+function insertSkippedFilesNote(body, skippedFiles) {
+  const n =
+    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
+      ? Math.floor(skippedFiles)
+      : 0;
+  if (n === 0 || typeof body !== 'string' || body.length === 0) return body;
+  const note = `_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`;
+  const idx = body.lastIndexOf(MARKER);
+  if (idx === -1) return `${body}\n\n${note}`;
+  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
+}
+
+/**
  * Pull every ZAI_* + GITHUB_TOKEN input into a plain object via core.getInput.
  * `core.getInput` returns '' for unset inputs, which loadConfig handles.
  *
@@ -953,10 +982,19 @@ export async function run(context, deps = {}) {
       0,
       (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
     );
+    // W17-C1-3: the cumulative-cap drop count, threaded into BOTH metadata
+    // objects below and rendered as an italic note in the posted body —
+    // previously nothing consumed it, so a run that skipped files posted a
+    // bare "No issues found" all-clear.
+    const skippedFileCount =
+      typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
+        ? result.metadata.skippedFiles
+        : 0;
     const reviewMetadata = {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      skippedFiles: skippedFileCount,
       // Phase 7: walkthrough context for the summary-only section of the
       // review body. When config.walkthrough is true, buildReviewBody renders
       // the summary-only findings as dependency-ordered cohort sections
@@ -983,8 +1021,11 @@ export async function run(context, deps = {}) {
         summaryOnly,
         reviewMetadata,
       );
+      // W17-C1-3: surface the skipped-files drop inside the review body
+      // (before the trailers so the marker/SHA ordering is untouched).
+      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount);
       const shaBlock = buildShaBlock(sha);
-      const reviewBody = appendTrailers(baseBody, [hashBlock, shaBlock]);
+      const reviewBody = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -1051,6 +1092,7 @@ export async function run(context, deps = {}) {
     const summaryMetadata = {
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      skippedFiles: skippedFileCount,
       summary: finalSummary,
       // Phase 8.1: pre-rendered "Suggested reviewers" line.
       suggestedReviewersLine,
@@ -1069,9 +1111,12 @@ export async function run(context, deps = {}) {
       content,
       marker: MARKER,
     });
+    // W17-C1-3: surface the skipped-files drop in the summary comment too
+    // (before the trailers so the marker/SHA ordering is untouched).
+    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount);
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
-    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
+    const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
     await upsertReviewCommentFn({
       octokit,
       owner,
@@ -1248,6 +1293,9 @@ export async function run(context, deps = {}) {
       // (parseFindingsHashBlock/buildFindingsHashBlock default to the real
       // pure helpers inside schedule.js).
       findBotMarkerComments: findBotMarkerCommentsFn,
+      // W17-C2-1: real incremental filter so scheduled runs suppress
+      // previously-reported findings exactly like the push path.
+      filterIncrementalFindings: filterIncrementalFindingsFn,
     });
     return;
   }

@@ -591,6 +591,58 @@ describe('createReviewBatches', () => {
     expect(metadata.skippedEntries).toBeUndefined();
   });
 
+  // ==================================================================
+  // W17-C1-3: skippedFiles must count only files with ZERO reviewed
+  // entries. A multi-chunk file whose first chunk was packed but whose
+  // later chunk hit the cumulative cap is PARTIALLY reviewed — counting
+  // it as "skipped" overstates the drop and (now that consumers render a
+  // note from this count) would tell the reviewer an untruth.
+  // ==================================================================
+  test('W17-C1-3: a partially-reviewed file (some chunks packed, some dropped) is NOT counted in skippedFiles', () => {
+    // f0.js is 'added' (+8) so it outranks a.js and sorts first; a.js splits
+    // into two 20-char chunks under maxPatchChars 25. With maxDiffChars 100:
+    // f0.js (~82 packed chars) is packed, a.js chunk 1 (~91) is rescued by
+    // the single-entry tolerance, and a.js chunk 2 (~91) hits the exhausted
+    // cumulative budget and is dropped — a.js is partially reviewed.
+    const files = [
+      makeFile({ filename: 'f0.js', status: 'added', patch: 'y'.repeat(24) }),
+      makeFile({
+        filename: 'a.js',
+        patch: 'x'.repeat(20) + '\n' + 'x'.repeat(20),
+      }),
+    ];
+    const { batches, metadata } = createReviewBatches(files, {
+      maxDiffChars: 100,
+      maxPatchChars: 25,
+    });
+    // Premise: a.js chunk 1 WAS reviewed (a.js is partially reviewed)…
+    expect(batches.some((b) => b.some((e) => e.filename === 'a.js'))).toBe(true);
+    // …and a.js chunk 2 was dropped…
+    expect(metadata.skippedEntries).toBe(1);
+    // …so NO file was skipped wholesale (the old count said 1: any file
+    // with a dropped entry was counted, even when it had packed entries).
+    expect(metadata.skippedFiles).toBe(0);
+  });
+
+  test('W17-C1-3: a fully-dropped multi-chunk file still counts exactly once', () => {
+    // Both chunks of a.js fall beyond the cap and NOTHING of a.js was
+    // reviewed → it counts as one skipped file (two dropped entries).
+    const files = [
+      makeFile({ filename: 'f0.js', status: 'added', patch: 'y'.repeat(24) }),
+      makeFile({
+        filename: 'a.js',
+        patch: 'x'.repeat(20) + '\n' + 'x'.repeat(20),
+      }),
+    ];
+    const { batches, metadata } = createReviewBatches(files, {
+      maxDiffChars: 90,
+      maxPatchChars: 25,
+    });
+    expect(batches.some((b) => b.some((e) => e.filename === 'a.js'))).toBe(false);
+    expect(metadata.skippedEntries).toBe(2);
+    expect(metadata.skippedFiles).toBe(1);
+  });
+
   test('W15-A8-1: maxDiffChars 0/unset → maxBatchChars governs (behavior unchanged)', () => {
     const files = [];
     for (let i = 0; i < 10; i++) {

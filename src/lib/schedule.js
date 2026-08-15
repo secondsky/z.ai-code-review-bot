@@ -28,10 +28,26 @@ import { buildStatusDescription as buildStatusDescriptionDefault } from './statu
 import {
   parseFindingsHashBlock as parseFindingsHashBlockDefault,
   buildFindingsHashBlock as buildFindingsHashBlockDefault,
+  filterIncrementalFindings as filterIncrementalFindingsDefault,
 } from './findings.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
 export const DEFAULT_MAX_PRS = 10;
+
+/**
+ * W17-C2-3: maximum number of findings hashes emitted in a single
+ * `<!-- zai-hashes:... -->` block on the scheduled summary path.
+ *
+ * The block unions the prior marker-comment hashes with this run's findings
+ * hashes so the wholesale upsert replace never loses suppression state — but
+ * an UNBOUNDED union grows ~65 chars per hash on every cron tick that finds
+ * something new, and past ~65k total comment chars the update 422s
+ * PERMANENTLY. 600 hashes ≈ 39k chars leaves ample room for the rendered
+ * body while retaining a long suppression history.
+ *
+ * @type {number}
+ */
+export const MAX_HASH_BLOCK_HASHES = 600;
 
 /* ------------------------------------------------------------------ *
  * W15-A8-4 feature-parity default deps.
@@ -80,7 +96,7 @@ const defaultSetReviewStatus = async () => false;
 const defaultFindBotMarkerComments = async () => [];
 
 /**
- * Build the hidden HTML comment that embeds the PR head SHA in a posted
+ * The hidden HTML comment that embeds the PR head SHA in a posted
  * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
  * body contains BOTH the marker AND the head SHA; without this block the
  * review body carries only the fixed marker literal, so the SHA match never
@@ -96,6 +112,33 @@ const defaultFindBotMarkerComments = async () => [];
 export function buildShaBlock(sha) {
   if (typeof sha !== 'string' || sha.length === 0) return '';
   return `<!-- zai-sha: ${sha} -->`;
+}
+
+/**
+ * Insert the W17-C1-3 skipped-files note into a rendered body.
+ *
+ * Mirrors the same-named helper in src/index.js (duplicated deliberately:
+ * schedule.js cannot import from index.js — the entry point imports THIS
+ * module — and the helper is four lines). When the structured pipeline
+ * reports `skippedFiles > 0`, an italic note (the `_N findings truncated to
+ * cap._` style) is inserted just before the trailing marker so the posted
+ * body never claims a bare "No issues found" all-clear while files were
+ * silently dropped by the cumulative MAX_DIFF_CHARS cap.
+ *
+ * @param {string} body   Rendered body ending in the marker (typically).
+ * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @returns {string}
+ */
+function insertSkippedFilesNote(body, skippedFiles) {
+  const n =
+    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
+      ? Math.floor(skippedFiles)
+      : 0;
+  if (n === 0 || typeof body !== 'string' || body.length === 0) return body;
+  const note = `_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`;
+  const idx = body.lastIndexOf(MARKER);
+  if (idx === -1) return `${body}\n\n${note}`;
+  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
 }
 
 /**
@@ -362,6 +405,10 @@ export async function reviewOnePr({
   findBotMarkerComments = defaultFindBotMarkerComments,
   parseFindingsHashBlock = parseFindingsHashBlockDefault,
   buildFindingsHashBlock = buildFindingsHashBlockDefault,
+  // W17-C2-1: incremental-suppression filter (pure; default: the real one
+  // from findings.js). The scheduled path previously never applied it, so
+  // cron ticks re-reported unchanged findings on BOTH branches.
+  filterIncrementalFindings = filterIncrementalFindingsDefault,
 }) {
   // W16-B2-1: whether THIS invocation successfully posted the `pending`
   // commit status. The outer catch must flip that status to a TERMINAL
@@ -399,7 +446,7 @@ export async function reviewOnePr({
     // immediate feedback on a cron tick too. Fail-soft; gated by config so an
     // operator without `statuses: write` can turn it off.
     if (config.commitStatus) {
-      await setReviewStatus(
+      const pendingLanded = await setReviewStatus(
         {
           octokit,
           context: ctx,
@@ -412,7 +459,12 @@ export async function reviewOnePr({
       );
       // W16-B2-1: set only AFTER the post resolves — a `pending` that never
       // landed must not obligate the catch to post a terminal status.
-      pendingPosted = true;
+      // W17-C2-2: setReviewStatus is fail-soft and returns FALSE on API
+      // failure (it never throws), so the boolean contract must be honored
+      // explicitly — setting pendingPosted unconditionally obligated the
+      // catch to post a doomed terminal `failure` whenever the pending 403'd
+      // (attempts ['pending','failure'] with createCommitStatus broken).
+      if (pendingLanded === true) pendingPosted = true;
     }
 
     // W15-A8-4a: `.zai.yml` parity. The push path (src/index.js) loads the
@@ -553,12 +605,60 @@ export async function reviewOnePr({
       { callApi, core },
     );
 
+    // W17-C1-3: the cumulative MAX_DIFF_CHARS drop count, threaded into the
+    // renderer metadata objects below and rendered as an italic note in the
+    // posted body — previously nothing consumed it (same fix as index.js).
+    const skippedFileCount =
+      typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
+        ? result.metadata.skippedFiles
+        : 0;
+
+    // W17-C2-1: incremental review — mirrors the push path (src/index.js)
+    // faithfully, including ORDERING: the incremental filter runs BEFORE the
+    // learnings filter so the two layers compose exactly as on a push. Read
+    // the prior marker-comment hashes (fail-soft) ONLY when incremental
+    // review is on — with it off nothing reads or writes suppression state,
+    // and skipping the read avoids a wasted comments API pagination.
+    let priorHashes = new Set();
+    if (config.incrementalReview === true) {
+      try {
+        const priorMarkerComments = await findBotMarkerComments({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pr.number,
+          marker: MARKER,
+        });
+        for (const priorComment of priorMarkerComments) {
+          if (typeof priorComment?.body === 'string') {
+            const hashes = parseFindingsHashBlock(priorComment.body);
+            for (const h of hashes) priorHashes.add(h);
+          }
+        }
+      } catch (priorError) {
+        // Fail-soft: a broken comments read degrades to "no prior hashes" —
+        // the scheduled review still posts (with its own hashes).
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: could not read prior review hashes for PR #${pr.number} (${priorError?.message ?? String(priorError)}); posting without prior hashes.`,
+          );
+        }
+      }
+    }
+    const { kept: incrementalKept, suppressed: incrementalSuppressed } =
+      filterIncrementalFindings(result.findings, priorHashes);
+    if (incrementalSuppressed > 0 && core?.info) {
+      core.info(
+        `Scheduled review: PR #${pr.number} incremental review: suppressed ${incrementalSuppressed} previously-reported finding(s).`,
+      );
+    }
+
     // W15-A8-4c: drop findings that match a previously-reviewed / won't-fix
-    // learning (mirrors the push path; applied to the final findings set so the
-    // posted review, the commit status, and the SHA-dedup hash all describe the
-    // SAME kept set). When learningsEnabled is off (or nothing matched) this is
-    // a no-op passthrough.
-    const { kept: keptFindings } = filterFindingsByLearnings(result.findings, learnings);
+    // learning (mirrors the push path; applied to the post-incremental set so
+    // the posted review, the commit status, and the SHA-dedup hash all
+    // describe the SAME kept set). When learningsEnabled is off (or nothing
+    // matched) this is a no-op passthrough.
+    const { kept: keptFindings } = filterFindingsByLearnings(incrementalKept, learnings);
 
     // W15-A8-4d: flip the commit status to `success` with a findings summary
     // now that the review completed. Mirrors index.js (W15-A6-2): computed from
@@ -600,13 +700,30 @@ export async function reviewOnePr({
           0,
           (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
         ),
+        // W17-C1-3: threaded alongside truncated/deterministic counts (same
+        // metadata contract as index.js's reviewMetadata).
+        skippedFiles: skippedFileCount,
       });
+      // W17-C1-3: surface the skipped-files drop inside the review body
+      // (before the trailers so the marker/SHA ordering is untouched).
+      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount);
+      // W17-C2-1: the hash block is built from the FULL findings set (not
+      // just kept) so the next run sees the complete canonical set —
+      // otherwise a finding suppressed this run would re-surface on the next
+      // tick. Byte-identical rule to index.js's inline path: emitted only
+      // when incremental review is on AND there is at least one finding.
+      const hashBlock =
+        config.incrementalReview === true &&
+        Array.isArray(result.findings) &&
+        result.findings.length > 0
+          ? buildFindingsHashBlock(result.findings)
+          : '';
       // Append the SHA block so hasReviewForSha can dedup-by-SHA on the next
       // cron tick (without it, the body carries only the marker and the PR is
       // re-reviewed every tick). Appended after the body so the marker scan and
       // rendered review are unaffected.
       const shaBlock = buildShaBlock(pr.headSha);
-      const body = appendTrailers(baseBody, [shaBlock]);
+      const body = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewComments(inline);
       const event = resolveReviewEvent(keptFindings, config);
       try {
@@ -637,6 +754,11 @@ export async function reviewOnePr({
         const fallbackTrailers = [];
         const markerMatch = body.match(/<!--\s*zai-code-review\s*-->/);
         if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        // W17-C2-1: carry the hash block through the fallback too (index.js
+        // parity) so suppression state survives even when the review API
+        // rejects the payload.
+        const hashMatch = body.match(/<!--\s*zai-hashes:[^>]*-->/);
+        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
         if (shaBlock) fallbackTrailers.push(shaBlock);
         await postFallbackComment({
           octokit,
@@ -663,6 +785,7 @@ export async function reviewOnePr({
         0,
         (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
       ),
+      skippedFiles: skippedFileCount,
       summary: typeof result.summary === 'string' ? result.summary : '',
     };
     const content = useWalkthrough
@@ -680,56 +803,53 @@ export async function reviewOnePr({
       content,
       marker: MARKER,
     });
-    // W16-B2-2: upsertReviewComment replaces the marker comment WHOLESALE, so
-    // a body built with marker + shaBlock only would DESTROY the
-    // `<!-- zai-hashes:... -->` block a prior push run deposited — the next
-    // push would then re-report every unchanged finding (regressing the
-    // W15-A8-3 fix). Before building the replacement body, read the existing
-    // marker comments' hash blocks (same fail-soft read pattern as index.js)
-    // and re-emit them, UNIONED with the hashes this scheduled run itself
-    // produces when incremental review is enabled — so nothing is lost.
-    let priorHashes = new Set();
-    try {
-      const priorMarkerComments = await findBotMarkerComments({
-        octokit,
-        owner,
-        repo,
-        issueNumber: pr.number,
-        marker: MARKER,
-      });
-      for (const priorComment of priorMarkerComments) {
-        if (typeof priorComment?.body === 'string') {
-          const hashes = parseFindingsHashBlock(priorComment.body);
-          for (const h of hashes) priorHashes.add(h);
+    // W17-C1-3: surface the skipped-files drop in the scheduled summary
+    // comment too (before the trailers so the marker/SHA ordering is
+    // untouched).
+    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount);
+    // W16-B2-2 → W17-C2-1/C2-3: upsertReviewComment replaces the marker
+    // comment WHOLESALE, so a body built with marker + shaBlock only would
+    // DESTROY the `<!-- zai-hashes:... -->` block a prior run deposited (the
+    // next push would re-report every unchanged finding, regressing
+    // W15-A8-3). Re-emit a hash block UNIONED with this run's own hashes.
+    // W17-C2-3 bounds the union: the emitted set is capped at
+    // MAX_HASH_BLOCK_HASHES — this run's new hashes always survive, then the
+    // NEWEST prior hashes; the OLDEST priors are dropped to fit. Without the
+    // cap every cron tick permanently added up to maxFindings×65 chars and
+    // the comment update eventually 422'd forever. The prior set is only
+    // re-emitted while incremental review is ON (priorHashes is only read
+    // then); with it OFF nothing reads hash blocks, so emitting only this
+    // run's own hashes is safe and bounded regardless of prior size.
+    const mergedHashes = [];
+    const seenHashes = new Set();
+    // Same canonical rule as index.js: this run's set is built from the FULL
+    // findings set (not just kept) so the next run sees the complete set.
+    if (Array.isArray(result.findings) && result.findings.length > 0) {
+      for (const h of parseFindingsHashBlock(buildFindingsHashBlock(result.findings))) {
+        if (!seenHashes.has(h)) {
+          seenHashes.add(h);
+          mergedHashes.push(h);
         }
       }
-    } catch (priorError) {
-      // Fail-soft: a broken comments read degrades to "no prior hashes" —
-      // the scheduled review still posts (with its own hashes).
-      if (core?.warning) {
-        core.warning(
-          `Scheduled review: could not read prior review hashes for PR #${pr.number} (${priorError?.message ?? String(priorError)}); posting without prior hashes.`,
-        );
-      }
     }
-    const mergedHashes = new Set(priorHashes);
-    // Same canonical rule as index.js: the hash set is built from the FULL
-    // findings set (not just kept) so the next run sees the complete set.
-    if (
-      config.incrementalReview === true &&
-      Array.isArray(result.findings) &&
-      result.findings.length > 0
-    ) {
-      const newHashes = parseFindingsHashBlock(buildFindingsHashBlock(result.findings));
-      for (const h of newHashes) mergedHashes.add(h);
+    // Newest-first retention of the priors: iterate the collected list from
+    // the end (later comments / later block entries are newer) until the cap
+    // is full, unshifting so the surviving priors keep their relative order
+    // ahead of this run's hashes (the emission order previous runs used).
+    const priorHashList = [...priorHashes];
+    for (let i = priorHashList.length - 1; i >= 0 && mergedHashes.length < MAX_HASH_BLOCK_HASHES; i--) {
+      const h = priorHashList[i];
+      if (seenHashes.has(h)) continue;
+      seenHashes.add(h);
+      mergedHashes.unshift(h);
     }
     const hashBlock =
-      mergedHashes.size > 0 ? `<!-- zai-hashes:${[...mergedHashes].join(',')} -->` : '';
+      mergedHashes.length > 0 ? `<!-- zai-hashes:${mergedHashes.join(',')} -->` : '';
     // Append the hash + SHA blocks so hasReviewForSha can dedup-by-SHA on the
     // next cron tick and the incremental hashes survive the upsert (see the
     // inline branch above for the SHA-block rationale).
     const shaBlock = buildShaBlock(pr.headSha);
-    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
+    const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
     await upsertReviewComment({
       octokit,
       owner,
@@ -814,6 +934,7 @@ export async function reviewOnePr({
  * @param {Function} [args.findBotMarkerComments]  Bot marker-comment finder (W16-B2-2).
  * @param {Function} [args.parseFindingsHashBlock]  Hash-block parser (W16-B2-2).
  * @param {Function} [args.buildFindingsHashBlock]  Hash-block builder (W16-B2-2).
+ * @param {Function} [args.filterIncrementalFindings]  Incremental-suppression filter (W17-C2-1).
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 export async function runScheduledReview({
@@ -860,6 +981,8 @@ export async function runScheduledReview({
   findBotMarkerComments = defaultFindBotMarkerComments,
   parseFindingsHashBlock = parseFindingsHashBlockDefault,
   buildFindingsHashBlock = buildFindingsHashBlockDefault,
+  // W17-C2-1: incremental-suppression filter (pure; default: the real one).
+  filterIncrementalFindings = filterIncrementalFindingsDefault,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -933,6 +1056,7 @@ export async function runScheduledReview({
       findBotMarkerComments,
       parseFindingsHashBlock,
       buildFindingsHashBlock,
+      filterIncrementalFindings,
     });
 
     if (result.ok) {

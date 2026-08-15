@@ -1908,6 +1908,103 @@ describe('run — pull_request incremental review (Phase 6.3)', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * W17-C1-3 — skipped-files note (cumulative MAX_DIFF_CHARS cap)
+ *
+ * W16-B3-4 recorded metadata.skippedFiles/skippedEntries but NOTHING
+ * consumed them: with a small maxDiffChars the bot silently dropped files
+ * and still posted a bare "No issues found. The changes look good. ✅".
+ * The run must surface the drop in the posted body (both the summary
+ * comment path via formatFindingsAsSummary and the inline-review path via
+ * buildReviewBody), mirroring the italic truncated-note style.
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request skipped-files note (W17-C1-3)', () => {
+  it('W17-C1-3: real pipeline, 2 files + maxDiffChars 5 → summary body carries the skip note next to the all-clear', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js'), file('src/b.js')],
+    });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: '', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig({ maxDiffChars: 5 }),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    // maxDiffChars 5 < every packed entry → 0 batches, 0 model calls, and
+    // both files recorded as skipped by the (real) structured pipeline.
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The all-clear line is still there…
+    expect(body).toContain('No issues found');
+    // …but it is NOT bare: the skip note is rendered in the same body.
+    expect(body).toContain('2 files not reviewed (MAX_DIFF_CHARS cap).');
+  });
+
+  it('W17-C1-3: inline review body carries the skip note (buildReviewBody path) and threads skippedFiles into its metadata', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [
+        { file: 'src/a.js', line: 2, severity: 'high', title: 'T', description: 'd' },
+      ],
+      summary: 's',
+      metadata: {
+        totalBatches: 1,
+        totalFindingsBeforeCap: 1,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+        skippedFiles: 1,
+        skippedEntries: 3,
+      },
+    }));
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const body = octokit.__calls.createReview[0].body;
+    expect(body).toContain('1 file not reviewed (MAX_DIFF_CHARS cap).');
+  });
+
+  it('W17-C1-3: zero skipped files → no skip note in the summary body', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const callApi = vi.fn(async () =>
+      JSON.stringify({ summary: 's', findings: [] }),
+    );
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi,
+      apiClient: { call: vi.fn() },
+    });
+
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No issues found');
+    expect(body).not.toContain('not reviewed');
+    expect(body).not.toContain('MAX_DIFF_CHARS');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * issue_comment path
  * ------------------------------------------------------------------ */
 

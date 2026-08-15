@@ -265,7 +265,9 @@ export function formatEntry(entry) {
  * that is never rescued. The total can therefore overshoot maxDiffChars by at
  * most one per-batch-budget-sized entry. Dropped entries are recorded in
  * metadata as `skippedEntries` / `skippedFiles` (present only when a drop
- * happened) so callers can surface the truncation.
+ * happened) so callers can surface the truncation. W17-C1-3: `skippedFiles`
+ * counts only files with ZERO reviewed entries — a partially-reviewed file
+ * (some chunks packed, some dropped) is not counted as skipped.
  */
 export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
@@ -286,6 +288,11 @@ export function createReviewBatches(files, options = {}) {
   let stopped = false;
   /** @type {Array<object>} */
   const skippedEntries = [];
+  // W17-C1-3: filenames with at least one entry actually packed into a
+  // batch. skippedFiles must count only files with ZERO reviewed entries —
+  // a multi-chunk file whose first chunk was packed but whose later chunk
+  // hit the cumulative cap is PARTIALLY reviewed, not skipped.
+  const packedFiles = new Set();
 
   const flush = () => {
     if (currentEntries.length > 0) {
@@ -331,6 +338,7 @@ export function createReviewBatches(files, options = {}) {
     currentChars += entryLen;
     currentFiles.add(entry.filename);
     cumulativeChars += entryLen;
+    packedFiles.add(entry.filename);
   }
   flush();
 
@@ -357,7 +365,17 @@ export function createReviewBatches(files, options = {}) {
   // field's presence is itself the truncation signal.
   if (skippedEntries.length > 0) {
     metadata.skippedEntries = skippedEntries.length;
-    metadata.skippedFiles = new Set(skippedEntries.map((e) => e.filename)).size;
+    // W17-C1-3: count only files with ZERO reviewed entries. The old count
+    // (`distinct filenames among dropped entries`) also counted partially-
+    // reviewed files — a multi-chunk file with chunk 1 packed and chunk 2
+    // dropped has dropped entries but WAS (partially) reviewed, and must not
+    // be reported as skipped.
+    const droppedFileNames = new Set(skippedEntries.map((e) => e.filename));
+    let fullySkipped = 0;
+    for (const name of droppedFileNames) {
+      if (!packedFiles.has(name)) fullySkipped += 1;
+    }
+    metadata.skippedFiles = fullySkipped;
   }
 
   return { entries, batches, metadata };
