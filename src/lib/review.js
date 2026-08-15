@@ -150,7 +150,11 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
         // W8-1: replace backticks with "'" (backslash escapes do NOT work
         // inside CommonMark code spans, so the W7-4 \` escape was illusory).
         const safeFile = file.replace(/`/g, "'");
-        lines.push(`- \`${safeFile}\` — ${title}`);
+        // W17-C1-1 carryover (defensive): primary-path findings are
+        // pre-sanitized by normalizeFinding, but a caller passing
+        // un-normalized findings would post raw titles (raw HTML / injected
+        // heading lines). Apply the same sanitizeTextField treatment here.
+        lines.push(`- \`${safeFile}\` — ${sanitizeTextField(title)}`);
       }
       lines.push('');
     }

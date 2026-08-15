@@ -799,3 +799,143 @@ describe('buildExplainPrompt — W2-SEC-4: filename backtick sanitization', () =
     expect(prompt).toContain('Explain lines 1-5');
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * W17-C3-1: backtick-safe filenames in GUIDANCE comments
+ *
+ * Every guidance comment interpolates the attacker-controllable FILENAME
+ * into a backtick code span (`> File \`${target}\` is not part of this PR.`).
+ * A fork PR filename containing a backtick (a`[Download security
+ * update](https://evil.phish/x)`b.js) closes the span early, so everything
+ * after it renders as LIVE markdown in the bot's trusted comment — the
+ * phishing link survives postComment's sanitizeModelOutput (which neutralizes
+ * mentions/alerts, NOT links). Fix: the W8-1 convention from findings.js —
+ * replace backticks with "'" before interpolating, at ALL FOUR guidance
+ * message sites.
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — W17-C3-1: backtick-safe filenames in guidance comments', () => {
+  const EVIL = 'a`[Download security update](https://evil.phish/x)`b.js';
+
+  // Exactly 2 backticks on the guidance line naming the file = the span
+  // delimiters (payload trapped inside the code span). 3+ = early close, the
+  // link payload renders as live markdown.
+  const backticksOnFileLine = (body) => {
+    const line = body
+      .split('\n')
+      .find((l) => l.includes('Download security update'));
+    return line ? (line.match(/`/g) || []).length : -1;
+  };
+
+  it('file-not-in-PR guidance: the link payload stays inside the code span', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `1-2 ${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('not part of this PR');
+    // Backticks in the filename are replaced (W8-1 convention) so the span
+    // never closes early — the link text may appear but only INSIDE the span.
+    expect(body).toContain(`\`a'[Download security update](https://evil.phish/x)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('empty-content guidance: the link payload stays inside the code span', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: EVIL, status: 'modified', patch: '+x' }],
+      content: { content: b64('') },
+    });
+    const callApi = vi.fn();
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `1-2 ${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available');
+    expect(body).toContain(`\`a'[Download security update](https://evil.phish/x)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('range-past-EOF guidance: the link payload stays inside the code span', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: EVIL, status: 'modified', patch: '+x' }],
+      content: { content: b64('line1\nline2\nline3\nline4\nline5') },
+    });
+    const callApi = vi.fn();
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `5000-5001 ${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No lines in range 5000-5001');
+    expect(body).toContain(`\`a'[Download security update](https://evil.phish/x)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('binary-window guidance: the link payload stays inside the code span', async () => {
+    const pngBase64 = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52,
+    ]).toString('base64');
+    const octokit = makeOctokit({
+      files: [{ filename: EVIL, status: 'modified', patch: '+x' }],
+      content: { content: pngBase64 },
+    });
+    const callApi = vi.fn();
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `1-2 ${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available for lines 1-2');
+    expect(body).toContain(`\`a'[Download security update](https://evil.phish/x)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('benign filenames render unchanged (no substitution)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/missing.js',
+      callApi,
+    });
+
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('File `src/missing.js` is not part of this PR.');
+  });
+});

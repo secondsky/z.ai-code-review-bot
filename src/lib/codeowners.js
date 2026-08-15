@@ -65,6 +65,20 @@ function stripComment(line) {
 }
 
 /**
+ * W17-C3-2: a VALID owner token shape — `@login` or `@org/team`, each segment
+ * being a GitHub handle (`[\w.-]+`). CODEOWNERS is untrusted fork-PR content;
+ * keeping any `@`-prefixed token verbatim let a forged token like
+ * `@r[x](https://evil.phish)` (or an image beacon) ride into the
+ * "Suggested reviewers" line rendered in the trusted review summary. Tokens
+ * that fail the grammar check are DROPPED at parse time (fail-soft: a line
+ * whose owners are all invalid just has no owners; the pattern still matches
+ * files, same shape as an intentionally unowned pattern).
+ *
+ * @type {RegExp}
+ */
+const OWNER_TOKEN_RE = /^@[\w.-]+(?:\/[\w.-]+)?$/;
+
+/**
  * Parse a CODEOWNERS document into `[{pattern, owners}]`, in file order.
  *
  * Tolerant of malformed input and NEVER throws. Returns `[]` for non-string
@@ -75,7 +89,8 @@ function stripComment(line) {
  *   - inline comments (` ... # note`) are stripped (whitespace-prefixed `#`)
  *   - blank lines (after comment-strip) are skipped
  *   - the first whitespace-separated token is the `pattern`; trailing tokens
- *     starting with `@` are the `owners`. A line with no pattern is skipped.
+ *     matching a valid `@login` / `@org/team` shape (W17-C3-2) are the
+ *     `owners`. A line with no pattern is skipped.
  *     Backslash-escaped spaces (`\ `) are preserved within a token.
  *   - a pattern with no `@`-owners yields `owners: []` (still a valid rule —
  *     CODEOWNERS permits unowned patterns; they "match" with empty owners).
@@ -101,7 +116,10 @@ export function parseCodeowners(text) {
     const pattern = tokens[0];
     if (!pattern) continue;
     // Only `@`-prefixed tokens are owners; bare emails/handles are dropped.
-    const owners = tokens.slice(1).filter((t) => t.startsWith('@'));
+    // W17-C3-2: additionally require a valid handle grammar (OWNER_TOKEN_RE)
+    // so a forged `@r[x](https://evil.phish)` token cannot ride into the
+    // trusted "Suggested reviewers" line.
+    const owners = tokens.slice(1).filter((t) => OWNER_TOKEN_RE.test(t));
     out.push({ pattern, owners });
   }
   return out;

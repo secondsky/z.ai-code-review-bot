@@ -124,12 +124,18 @@ export async function handleReviewCommand(
     // ---- specific-file path ----
     if (target !== '') {
       if (isUnsafePath(target)) {
-        await post(`> \`${target}\` is not a valid file path.`);
+        // W17-C3-1: the filename is attacker-controllable and is interpolated
+        // into a backtick code span — a backtick in the name would close the
+        // span early and let the rest render as live markdown (e.g. a phishing
+        // link) in the bot's trusted comment. Replace backticks with "'"
+        // (the W8-1 convention from findings.js).
+        await post(`> \`${target.replace(/`/g, "'")}\` is not a valid file path.`);
         return;
       }
       const match = (files || []).find((f) => f?.filename === target);
       if (!match) {
-        await post(`> File \`${target}\` is not part of this PR.`);
+        // W17-C3-1: backtick-safe filename (same convention as above).
+        await post(`> File \`${target.replace(/`/g, "'")}\` is not part of this PR.`);
         return;
       }
       const review = await callApi(

@@ -143,6 +143,26 @@ describe('buildReviewBody', () => {
     );
     expect(body).toContain('The changes look good overall; only minor nits were found.');
   });
+
+  // W17-C1-1 carryover (defensive): primary-path findings are pre-sanitized by
+  // normalizeFinding, but the "Additional findings" bullet rendered
+  // `title` RAW — a caller passing un-normalized findings would post
+  // unsanitized titles (raw HTML / injected heading lines) into the trusted
+  // review body. The bullet must apply the same sanitizeTextField treatment
+  // (angle-bracket escaping + newline collapse) itself.
+  it('W17-C1-1 carryover: defensively sanitizes an un-normalized finding title', () => {
+    const body = buildReviewBody(
+      'Summary.',
+      [{ file: 'src/a.js', title: '<img src=x>\n# H', severity: 'high' }],
+      {},
+    );
+    expect(body).toContain('&lt;img');
+    expect(body).not.toContain('<img');
+    // The newline in the title is collapsed — the trailing '# H' stays on the
+    // bullet line and never starts a heading of its own.
+    expect(body).not.toContain('\n# H');
+    expect(body).not.toMatch(/^# H$/m);
+  });
 });
 
 describe('buildReviewComments', () => {

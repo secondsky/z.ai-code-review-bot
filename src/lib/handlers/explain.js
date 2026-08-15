@@ -125,6 +125,23 @@ export function extractLineWindow(content, start, end) {
 }
 
 /**
+ * W17-C3-1: render an attacker-controllable filename for a GUIDANCE comment.
+ * The guidance messages below interpolate the filename into a backtick code
+ * span; a filename containing a backtick (e.g. a`[x](https://phish)`b.js)
+ * closes the span early, so everything after it renders as LIVE markdown in
+ * the bot's trusted comment — the link survives sanitizeModelOutput (which
+ * neutralizes mentions/alerts, NOT links). Same convention as findings.js
+ * (W8-1): replace backticks with "'" (backslash escapes do not work inside
+ * CommonMark code spans).
+ *
+ * @param {string} file
+ * @returns {string}
+ */
+function displayFile(file) {
+  return String(file).replace(/`/g, "'");
+}
+
+/**
  * Build the explain USER prompt. Pure (exported for testing).
  *
  * @param {object} p
@@ -240,7 +257,8 @@ export async function handleExplainCommand(
         return;
       }
     } else if (!filenames.includes(target)) {
-      await post(`> File \`${target}\` is not part of this PR.`);
+      // W17-C3-1: backtick-safe filename (see displayFile).
+      await post(`> File \`${displayFile(target)}\` is not part of this PR.`);
       return;
     }
 
@@ -259,7 +277,8 @@ export async function handleExplainCommand(
     // entry, or a file too large for the API to return), post a guidance
     // comment instead of calling the API with an empty code window.
     if (!content || content.trim() === '') {
-      await post(`> No textual content available for \`${target}\`.`);
+      // W17-C3-1: backtick-safe filename (see displayFile).
+      await post(`> No textual content available for \`${displayFile(target)}\`.`);
       return;
     }
     // Clamp the requested range to a sane window so a `/zai explain 1-50000`
@@ -276,7 +295,8 @@ export async function handleExplainCommand(
       const lineCount =
         lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
       await post(
-        `> No lines in range ${range.start}-${range.end} — \`${target}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
+        // W17-C3-1: backtick-safe filename (see displayFile).
+        `> No lines in range ${range.start}-${range.end} — \`${displayFile(target)}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
       );
       return;
     }
@@ -290,7 +310,8 @@ export async function handleExplainCommand(
     // UTF-16 file (decoded as UTF-8 → NUL bytes) is still caught.
     if (BINARY_CONTENT_RE.test(window)) {
       await post(
-        `> No textual content available for lines ${range.start}-${clampedEnd} of \`${target}\`.`,
+        // W17-C3-1: backtick-safe filename (see displayFile).
+        `> No textual content available for lines ${range.start}-${clampedEnd} of \`${displayFile(target)}\`.`,
       );
       return;
     }

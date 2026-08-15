@@ -469,3 +469,82 @@ describe('isUnsafePath — null byte & empty input (edge cases)', () => {
     expect(isUnsafePath(42)).toBe(true);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * W17-C3-1: backtick-safe filenames in guidance comments
+ *
+ * Both guidance messages interpolate the attacker-controllable FILENAME into
+ * a backtick code span. A fork PR filename containing a backtick
+ * (a`[x](https://phish)`b.js) closes the span early, so the link renders as
+ * LIVE markdown in the bot's trusted comment (sanitizeModelOutput does not
+ * neutralize links). Fix: the W8-1 convention from findings.js — replace
+ * backticks with "'" before interpolating, at BOTH message sites.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W17-C3-1: backtick-safe filenames in guidance comments', () => {
+  const EVIL = 'a`[x](https://phish)`b.js';
+
+  const backticksOnFileLine = (body) => {
+    const line = body.split('\n').find((l) => l.includes('https://phish'));
+    return line ? (line.match(/`/g) || []).length : -1;
+  };
+
+  it('not-part-of-PR guidance: the link payload stays inside the code span', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: EVIL,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('not part of this PR');
+    expect(body).toContain(`\`a'[x](https://phish)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('not-a-valid-file-path guidance: the link payload stays inside the code span', async () => {
+    // Traversal prefix makes isUnsafePath fire; the backtick+link tail must
+    // still not close the code span early.
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `../${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('not a valid file path');
+    expect(body).toContain(`\`../a'[x](https://phish)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('benign filenames render unchanged (no substitution)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: 'src/missing.js',
+      callApi,
+    });
+
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('File `src/missing.js` is not part of this PR.');
+  });
+});
