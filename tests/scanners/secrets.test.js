@@ -13,7 +13,9 @@
  *
  * No real binaries are executed — `deps.runBinary` is always a fake.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import nodePath from 'node:path';
 import {
   scanSecrets,
   scanSecretsRegex,
@@ -302,6 +304,66 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     expect(findings.some((f) => f.rule === 'regex:high-entropy-string')).toBe(true);
   });
 
+  // ==================================================================
+  // W16-B3-5: the SRI/data-URI context suppression was too slack — every
+  // suffix in `/(?:integrity|sha256|...)["']?[=:]?\s*["']?(?:sha\d+-)?$/i`
+  // was optional, so prose like `"integrity sha512-<hash>"` (no = or :
+  // between the key and the hash) silently suppressed the high-entropy
+  // backstop: an attacker-controlled off switch for unknown-format secrets.
+  // Suppression now requires STRUCTURAL adjacency.
+  // ==================================================================
+  describe('SRI/data-URI suppression adjacency [W16-B3-5]', () => {
+    // 35-char high-entropy value (entropy 4.90 alone; 5.01 behind sha512-).
+    const V = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL';
+    const scanOne = (line) =>
+      scanSecretsRegex([{ filename: 'src/lock.json', patch: buildPatch([line]) }]);
+    const heFindings = (line) =>
+      scanOne(line).filter((f) => f.rule === 'regex:high-entropy-string');
+
+    it('"integrity sha512-<hash>" (no =/: adjacency) → finding PRESENT', () => {
+      expect(heFindings(`"integrity sha512-${V}"`)).toHaveLength(1);
+    });
+
+    it('"integrity": "sha512-<hash>" (JSON) → still suppressed', () => {
+      expect(heFindings(`"integrity": "sha512-${V}"`)).toHaveLength(0);
+    });
+
+    it('integrity="sha512-<hash>" (quoted HTML attr) → still suppressed', () => {
+      expect(heFindings(`<script src="a.js" integrity="sha512-${V}"></script>`)).toHaveLength(0);
+    });
+
+    it('integrity=sha512-<hash> (unquoted HTML attr) → still suppressed', () => {
+      expect(heFindings(`<a integrity=sha512-${V}>x</a>`)).toHaveLength(0);
+    });
+
+    it('a directly adjacent digest prefix (before-text "sha512-") still suppresses', () => {
+      // The candidate charset swallows `sha512-` when the hash follows it
+      // directly, so the end-to-end adjacency case cannot arise for THIS
+      // pattern — pin the regex semantics on the before-text directly: a
+      // hyphen-prefixed digest immediately abutting the candidate suppresses.
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha512-'))).toBe(true);
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha384-'))).toBe(true);
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha256:'))).toBe(false);
+      expect(he.skipIfPrecededBy.some((re) => re.test('integrity '))).toBe(false);
+    });
+
+    it('data-URI payloads → still suppressed', () => {
+      const payload = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA1b';
+      expect(heFindings(`const img = "data:image/png;base64,${payload}";`)).toHaveLength(0);
+    });
+
+    it('a plain high-entropy value → still flagged', () => {
+      expect(heFindings(`const k = "${V}";`)).toHaveLength(1);
+    });
+
+    it('"sha256:<hash>" without an integrity key → now FLAGGED (slack off-switch removed)', () => {
+      // `sha256:` was one of the verified attacker-controllable suppressions
+      // (a bare digest-colon prefix must not disable secret detection).
+      expect(heFindings(`digest = "sha256:${V}"`)).toHaveLength(1);
+    });
+  });
+
   it('detects api-key variants (api-key, apikey, apiKey, secret, token, auth_token, access_token, client_secret)', () => {
     const value = 'Xy9P3kMNBq2VtRZ7'; // high-entropy
     const variants = [
@@ -329,6 +391,33 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     );
     const api = findings.find((f) => f.rule === 'regex:generic-assignment');
     expect(api).withContext('slash-containing secret should match').toBeTruthy();
+  });
+
+  // ==================================================================
+  // W16-B3-6: the broadened value charset (W15-A5-6 added `,;:=~|/`) made
+  // URL VALUES match generic-assignment — `api_key = "https://…"` (entropy
+  // 3.95 ≥ 3.5) fired as a CRITICAL finding. URL-shaped values are
+  // configuration, not secrets: skip them.
+  // ==================================================================
+  it('does NOT flag URL values assigned to credential-like keys [W16-B3-6]', () => {
+    const lines = [
+      'api_key = "https://api.github.com/repos/foo"', // entropy 3.95 → was critical FP
+      'token = "https://xK9mQ2vT5wZ8.bLnM4pR7/sJu6W3yA1"', // entropy 5.01
+      'password = "http://Qz8Xc2Vb5Nm4/Lk9Jh7Gt6"', // entropy 4.46
+    ];
+    for (const line of lines) {
+      const findings = scanSecretsRegex(file(buildPatch([line])));
+      const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+      expect(api).withContext(`URL value must not be flagged: ${line}`).toBeUndefined();
+    }
+  });
+
+  it('still flags a real base64 secret containing slashes (A5-6 regression guard) [W16-B3-6]', () => {
+    const value = 'AbCdEfGh/IjKlMnOpQrSt'; // slash-bearing, NOT a URL
+    expect(shannonEntropy(value)).toBeGreaterThanOrEqual(3.5); // guard
+    const findings = scanSecretsRegex(file(buildPatch([`api_key = "${value}"`])));
+    const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+    expect(api).withContext('non-URL slash-bearing secret must still match').toBeTruthy();
   });
 
   it('detects quoted secret values containing , ; : = ~ | [W15-A5-6]', () => {
@@ -606,6 +695,140 @@ describe('scanSecrets — gitleaks path (fake runBinary)', () => {
     const result = await scanSecrets(
       { files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }], repoPath: '/r' },
       { ensureBinary: vi.fn().mockResolvedValue('/p'), runBinary: fakeRunBinary },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toEqual([]);
+  });
+});
+
+// W16-B3-3: gitleaks 8.21.2 only writes a JSON report when `--report-path
+// <file>` is passed — WITHOUT it, stdout is empty even when leaks are present,
+// so parseGitleaksJson('') → [] and the scanner silently reported gitleaks
+// success with 0 findings (verified end-to-end with the real binary: AWS key +
+// GitHub PAT → 0 findings). The scanner must write to a temp report file, read
+// it back, and ALWAYS delete it (including on error).
+describe('scanSecrets — gitleaks --report-path temp file [W16-B3-3]', () => {
+  let tmpdir;
+  beforeAll(() => {
+    tmpdir = fs.mkdtempSync(nodePath.join(fs.realpathSync('/tmp'), 'gitleaks-test-'));
+  });
+  afterAll(() => {
+    try { fs.rmSync(tmpdir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const leakReport = (file) =>
+    JSON.stringify([
+      {
+        RuleID: 'aws-access-token',
+        Description: 'AWS',
+        Match: 'AKIAIOSFODNN7EXAMPLE',
+        Secret: 'AKIAIOSFODNN7EXAMPLE',
+        File: file,
+        StartLine: 42,
+      },
+    ]);
+
+  it('passes --report-path <tmpfile> and parses findings from the report FILE', async () => {
+    let reportPathSeen = null;
+    const fakeRunBinary = vi.fn().mockImplementation((_bin, args) => {
+      const idx = args.indexOf('--report-path');
+      reportPathSeen = idx >= 0 ? args[idx + 1] : null;
+      // REAL 8.21.2 behavior: the report goes to the FILE, stdout stays empty.
+      if (reportPathSeen) fs.writeFileSync(reportPathSeen, leakReport('src/auth.js'));
+      return Promise.resolve('');
+    });
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/auth.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir, // inject the temp dir so cleanup is assertable
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(fakeRunBinary).toHaveBeenCalledOnce();
+    const args = fakeRunBinary.mock.calls[0][1];
+    const idx = args.indexOf('--report-path');
+    expect(idx).toBeGreaterThan(-1);
+    expect(typeof args[idx + 1]).toBe('string');
+    expect(nodePath.dirname(args[idx + 1])).toBe(tmpdir);
+    // The finding was parsed from the report file (stdout was empty).
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/auth.js',
+      line: 42,
+      rule: 'gitleaks:aws-access-token',
+    });
+    // The temp report file is deleted after the run.
+    expect(fs.existsSync(reportPathSeen)).toBe(false);
+  });
+
+  it('deletes the temp report file even when runBinary throws', async () => {
+    let reportPathSeen = null;
+    const fakeRunBinary = vi.fn().mockImplementation((_bin, args) => {
+      const idx = args.indexOf('--report-path');
+      reportPathSeen = idx >= 0 ? args[idx + 1] : null;
+      if (reportPathSeen) fs.writeFileSync(reportPathSeen, 'partial');
+      return Promise.reject(new Error('gitleaks crashed'));
+    });
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
+    );
+    expect(result.scanner).toBe('regex-fallback'); // error path unchanged
+    expect(fs.existsSync(reportPathSeen)).toBe(false); // temp file cleaned up
+  });
+
+  it('falls back to stdout parsing when the report file is missing/empty', async () => {
+    // Older/other gitleaks builds (and any environment where the file cannot
+    // be written/read) may still emit JSON on stdout — keep that path working.
+    const fakeRunBinary = vi.fn().mockImplementation(() => Promise.resolve(leakReport('src/x.js')));
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/x.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].rule).toBe('gitleaks:aws-access-token');
+  });
+
+  it('report file AND stdout both empty → 0 findings, scanner still gitleaks (exit-code semantics unchanged)', async () => {
+    const fakeRunBinary = vi.fn().mockResolvedValue('');
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
     );
     expect(result.scanner).toBe('gitleaks');
     expect(result.findings).toEqual([]);

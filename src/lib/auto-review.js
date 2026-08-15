@@ -240,16 +240,32 @@ export function formatEntry(entry) {
  * the distinct-file count over `maxFilesPerBatch`, in which case the current
  * batch is flushed first. A single oversized entry still gets its own batch.
  *
- * W15-A8-1: the char budget is `min(maxBatchChars, maxDiffChars)` when
- * `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap against
- * cost abuse from oversized PRs, but the prompt-side truncation (W6-6 in
- * buildStructuredReviewPrompt) is intentionally skipped whenever a batch
+ * W15-A8-1: the per-batch char budget is `min(maxBatchChars, maxDiffChars)`
+ * when `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap
+ * against cost abuse from oversized PRs, but the prompt-side truncation (W6-6
+ * in buildStructuredReviewPrompt) is intentionally skipped whenever a batch
  * envelope is present — post-hoc truncation would silently drop entries
  * already counted in the batch metadata. Enforcing the cap HERE, at batch
  * construction, keeps the cap effective on the batched auto-review path
  * without breaking batch metadata. The oversized-single-entry guarantee is
  * preserved with the clamped budget: an entry larger than the budget still
  * forms its own batch.
+ *
+ * W16-B3-4: the per-batch clamp alone did NOT bound the TOTAL chars — a tiny
+ * maxDiffChars with many files produced one batch per file (N API calls,
+ * strictly worse than main) and the "hard cap against cost abuse" was still
+ * unenforced. When maxDiffChars > 0, the CUMULATIVE packed chars across ALL
+ * batches are capped: once the running total would exceed maxDiffChars, the
+ * entry and every entry after it are NOT reviewed (dropping trailing entries,
+ * mirroring the unbatched MAX_DIFF_CHARS semantics). One guard keeps the
+ * oversized-entry semantics bounded: when the FIRST entry of a (fresh, empty)
+ * batch exceeds only the REMAINING cumulative budget — and the budget is not
+ * yet exhausted — it is still included as a single-entry batch, but ONLY if
+ * its size fits the effective per-batch budget; an entry larger than even
+ * that is never rescued. The total can therefore overshoot maxDiffChars by at
+ * most one per-batch-budget-sized entry. Dropped entries are recorded in
+ * metadata as `skippedEntries` / `skippedFiles` (present only when a drop
+ * happened) so callers can surface the truncation.
  */
 export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
@@ -265,6 +281,11 @@ export function createReviewBatches(files, options = {}) {
   let currentEntries = [];
   let currentChars = 0;
   let currentFiles = new Set();
+  // W16-B3-4: cumulative packed chars across ALL batches + the drop record.
+  let cumulativeChars = 0;
+  let stopped = false;
+  /** @type {Array<object>} */
+  const skippedEntries = [];
 
   const flush = () => {
     if (currentEntries.length > 0) {
@@ -277,6 +298,10 @@ export function createReviewBatches(files, options = {}) {
 
   for (const entry of entries) {
     const entryLen = formatEntry(entry).length;
+    if (stopped) {
+      skippedEntries.push(entry);
+      continue;
+    }
     const nextDistinctFiles = currentFiles.has(entry.filename)
       ? currentFiles.size
       : currentFiles.size + 1;
@@ -287,9 +312,25 @@ export function createReviewBatches(files, options = {}) {
     ) {
       flush();
     }
+    // W16-B3-4 cumulative cap (only when maxDiffChars > 0).
+    if (maxDiffChars > 0 && cumulativeChars + entryLen > maxDiffChars) {
+      const firstOfFreshBatch = currentEntries.length === 0;
+      const fitsPerBatchBudget = entryLen <= charBudget;
+      const budgetNotExhausted = cumulativeChars < maxDiffChars;
+      if (!(firstOfFreshBatch && fitsPerBatchBudget && budgetNotExhausted)) {
+        // Beyond the total cap and not rescuable as a bounded single-entry
+        // batch: this entry and everything after it are NOT reviewed.
+        stopped = true;
+        skippedEntries.push(entry);
+        continue;
+      }
+      // Single-entry tolerance: include it even though the cumulative total
+      // overshoots (by at most one per-batch-budget-sized entry).
+    }
     currentEntries.push(entry);
     currentChars += entryLen;
     currentFiles.add(entry.filename);
+    cumulativeChars += entryLen;
   }
   flush();
 
@@ -312,6 +353,12 @@ export function createReviewBatches(files, options = {}) {
     splitFileCount,
     totalBatches: batches.length,
   };
+  // W16-B3-4: expose the cumulative-cap drop ONLY when it happened, so the
+  // field's presence is itself the truncation signal.
+  if (skippedEntries.length > 0) {
+    metadata.skippedEntries = skippedEntries.length;
+    metadata.skippedFiles = new Set(skippedEntries.map((e) => e.filename)).size;
+  }
 
   return { entries, batches, metadata };
 }
@@ -553,6 +600,24 @@ export async function runStructuredReview(files, config, deps = {}) {
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
 
+  // W16-B3-4: surface the cumulative maxDiffChars drop (if any) on the result
+  // metadata, the same way totalFindingsBeforeCap/deterministicFindingsCount
+  // are exposed — index.js assembles its reviewMetadata from result.metadata
+  // and can render the skip note later without touching this module.
+  const skippedMeta =
+    typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0
+      ? {
+          skippedFiles: batchMetadata.skippedFiles,
+          skippedEntries: batchMetadata.skippedEntries,
+        }
+      : {};
+  if (core?.info && skippedMeta.skippedFiles) {
+    core.info(
+      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles} file(s) ` +
+        `(${skippedMeta.skippedEntries} chunk(s) unreviewed).`,
+    );
+  }
+
   // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
   // `batchConcurrency` calls in flight at once. runWithConcurrency returns
   // results in INPUT order, so the downstream parse/merge/dedup stays
@@ -629,6 +694,7 @@ export async function runStructuredReview(files, config, deps = {}) {
       deterministicFindingsCount: deterministicFindings.length,
       batchMetadata: batchMeta,
       splitFileCount: batchMetadata.splitFileCount,
+      ...skippedMeta,
     },
   };
 }

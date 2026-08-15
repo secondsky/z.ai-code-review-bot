@@ -498,30 +498,97 @@ describe('createReviewBatches', () => {
     }
   });
 
-  test('W15-A8-1: an entry larger than maxDiffChars still gets its own batch', () => {
+  test('W15-A8-1 → W16-B3-4: a beyond-cap oversized trailing entry is dropped, not rescued', () => {
     // smalls are high-risk (.js → priority 25) and processed FIRST; huge.md
-    // (priority 7) is processed LAST, after the smalls filled a batch. With
-    // the clamped budget (500), huge.md must flush into its own batch rather
-    // than be merged — the default maxBatchChars (120000) would otherwise
-    // absorb it, making maxDiffChars a no-op.
+    // (priority 7) is processed LAST. W15's per-batch clamp put huge.md in its
+    // own batch, but that left the TOTAL unbounded: with maxDiffChars=500 the
+    // cumulative budget is exhausted by the smalls, and huge.md (~5060 packed
+    // chars) exceeds even the effective per-batch budget (min(120000,500)),
+    // so the single-entry tolerance cannot rescue it — it is NOT reviewed and
+    // the skip is recorded in metadata.
     const files = [
       makeFile({ filename: 'small1.js', patch: 'x'.repeat(100) }),
       makeFile({ filename: 'small2.js', patch: 'x'.repeat(100) }),
       makeFile({ filename: 'docs/huge.md', patch: 'x'.repeat(5000) }),
     ];
-    const { batches } = createReviewBatches(files, { maxDiffChars: 500 });
-    const hugeBatchIdx = batches.findIndex((b) =>
-      b.some((e) => e.filename === 'docs/huge.md'),
-    );
-    expect(hugeBatchIdx).toBeGreaterThan(0); // not the first batch
-    expect(batches[hugeBatchIdx][0].filename).toBe('docs/huge.md');
-    expect(batches[hugeBatchIdx]).toHaveLength(1); // alone in its batch
-    // Every non-oversized batch respects the clamped budget.
-    for (let i = 0; i < batches.length; i++) {
-      if (i === hugeBatchIdx) continue;
-      const total = batches[i].reduce((sum, e) => sum + formatEntry(e).length, 0);
-      expect(total).toBeLessThanOrEqual(500);
+    const { batches, metadata } = createReviewBatches(files, { maxDiffChars: 500 });
+    expect(batches).toHaveLength(1);
+    expect(batches[0].map((e) => e.filename).sort()).toEqual(['small1.js', 'small2.js']);
+    expect(metadata.skippedFiles).toBe(1);
+    expect(metadata.skippedEntries).toBe(1);
+    const total = batches[0].reduce((sum, e) => sum + formatEntry(e).length, 0);
+    expect(total).toBeLessThanOrEqual(500);
+  });
+
+  // ==================================================================
+  // W16-B3-4: the W15 clamp only capped EACH batch at min(maxBatchChars,
+  // maxDiffChars) — the TOTAL chars across ALL batches was unbounded, so a
+  // tiny maxDiffChars with many files produced N batches = N API calls
+  // (strictly worse than main) and the documented "hard cap defends against
+  // cost abuse" was still not enforced. The cap must bind on the CUMULATIVE
+  // packed chars: once the running total reaches maxDiffChars, trailing
+  // entries are NOT reviewed (mirroring the unbatched MAX_DIFF_CHARS
+  // semantics), and the drop is recorded in metadata (skippedFiles /
+  // skippedEntries) so callers can surface it.
+  // ==================================================================
+  test('W16-B3-4: tiny maxDiffChars with many files → few batches, not one-per-file', () => {
+    const files = [];
+    for (let i = 0; i < 60; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(800) }));
     }
+    const { batches, metadata } = createReviewBatches(files, { maxDiffChars: 50 });
+    // The effective per-batch budget is min(120000, 50) = 50; every packed
+    // entry (~860 chars) is larger than it, so the single-entry tolerance
+    // cannot rescue anything: NOTHING is reviewed (not 60 batches / 60 calls).
+    expect(batches.length).toBe(0);
+    expect(metadata.skippedFiles).toBe(60);
+    expect(metadata.skippedEntries).toBe(60);
+    const packed = batches.reduce(
+      (sum, b) => sum + b.reduce((s, e) => s + formatEntry(e).length, 0),
+      0,
+    );
+    expect(packed).toBeLessThanOrEqual(50 + 50); // budget + one-entry tolerance
+  });
+
+  test('W16-B3-4: cumulative cap drops trailing files and records the skip', () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(400) }));
+    }
+    const { batches, metadata } = createReviewBatches(files, { maxDiffChars: 1000 });
+    // Entry ≈ 462 chars: batch1 packs f0+f1 (924 ≤ 1000); f2 exceeds the
+    // remaining cumulative budget but fits the per-batch budget AND starts a
+    // fresh batch → single-entry tolerance lets it through as batch2; the
+    // cumulative total is now over the cap, so f3-f5 are NOT reviewed.
+    expect(batches.length).toBe(2);
+    expect(batches[0].map((e) => e.filename)).toEqual(['f0.md', 'f1.md']);
+    expect(batches[1].map((e) => e.filename)).toEqual(['f2.md']);
+    expect(metadata.skippedFiles).toBe(3);
+    expect(metadata.skippedEntries).toBe(3);
+    const packed = batches.reduce(
+      (sum, b) => sum + b.reduce((s, e) => s + formatEntry(e).length, 0),
+      0,
+    );
+    expect(packed).toBeLessThanOrEqual(1000 + 1000); // cap + one-entry tolerance
+  });
+
+  test('W16-B3-4: maxDiffChars 0 → exactly today’s behavior, no skip metadata', () => {
+    const files = [];
+    for (let i = 0; i < 10; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(900) }));
+    }
+    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: 0 });
+    const unset = createReviewBatches(files, { maxBatchChars: 3000 });
+    expect(capped.batches).toEqual(unset.batches);
+    expect(capped.metadata.skippedFiles).toBeUndefined();
+    expect(capped.metadata.skippedEntries).toBeUndefined();
+  });
+
+  test('W16-B3-4: skip metadata absent when nothing is truncated under the cap', () => {
+    const files = [makeFile({ filename: 'a.md', patch: 'x'.repeat(100) })];
+    const { metadata } = createReviewBatches(files, { maxDiffChars: 5000 });
+    expect(metadata.skippedFiles).toBeUndefined();
+    expect(metadata.skippedEntries).toBeUndefined();
   });
 
   test('W15-A8-1: maxDiffChars 0/unset → maxBatchChars governs (behavior unchanged)', () => {
@@ -1240,6 +1307,44 @@ describe('runStructuredReview', () => {
     await runStructuredReview(files, { apiKey: 'k', model: 'm' }, { callApi });
     // No cap → all entries fit the default 120000-char budget → one batch.
     expect(calls).toBe(1);
+  });
+
+  // W16-B3-4: when the cumulative cap drops files, runStructuredReview must
+  // surface the drop on the metadata object it returns (same shape as
+  // totalFindingsBeforeCap/deterministicFindingsCount) so callers — index.js
+  // builds reviewMetadata from result.metadata — can render it later.
+  test('W16-B3-4: skippedFiles is threaded into runStructuredReview metadata', async () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(400) }));
+    }
+    const prompts = [];
+    const callApi = async (_k, _m, prompt) => {
+      prompts.push(prompt);
+      return structuredPayload('s', []);
+    };
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxDiffChars: 1000 },
+      { callApi },
+    );
+    // Only the entries under the cumulative cap are reviewed (2 batches),
+    // and the metadata records the dropped files.
+    expect(prompts.length).toBe(2);
+    expect(out.metadata.totalBatches).toBe(2);
+    expect(out.metadata.skippedFiles).toBe(3);
+    expect(out.metadata.skippedEntries).toBe(3);
+  });
+
+  test('W16-B3-4: skippedFiles absent from runStructuredReview metadata when no truncation', async () => {
+    const files = [makeFile({ filename: 'a.md', patch: 'x'.repeat(100) })];
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxDiffChars: 5000 },
+      { callApi: async () => structuredPayload('s', []) },
+    );
+    expect(out.metadata.skippedFiles).toBeUndefined();
+    expect(out.metadata.skippedEntries).toBeUndefined();
   });
 });
 

@@ -17,6 +17,7 @@
  */
 
 import os from 'node:os';
+import nodePath from 'node:path';
 import { parseAddedLines, changedFileNames } from './_patch.js';
 import { selectPlatformAsset, zipExtractor } from './ensure-binary.js';
 
@@ -388,6 +389,42 @@ export const AST_GREP_SPEC = {
 };
 
 /**
+ * Normalize an ast-grep finding's `file` to the repo-RELATIVE, posix-separator
+ * form used by GitHub filenames (W16-B3-1).
+ *
+ * Production runs `ast-grep ... <ABSOLUTE repoPath>` (repoPath is
+ * process.cwd()), so the REAL binary emits ABSOLUTE paths in its JSON, while
+ * the PR's changed-file names are repo-relative. If the path is absolute (or
+ * sits under `source`), it is converted via path.relative(source, file) with
+ * backslashes normalized to '/'; an already-relative path is returned
+ * posix-normalized as-is.
+ *
+ * Pure (no I/O). Returns '' for bad input.
+ *
+ * @param {string} file
+ * @param {string} source - the absolute repo path ast-grep was run against
+ * @returns {string}
+ */
+export function normalizeFindingFilePath(file, source) {
+  if (typeof file !== 'string' || file.length === 0) return '';
+  const posixFile = file.replace(/\\/g, '/');
+  const isAbsolute =
+    nodePath.posix.isAbsolute(posixFile) ||
+    /^[a-zA-Z]:/.test(posixFile) ||
+    (typeof source === 'string' &&
+      source.length > 0 &&
+      (posixFile === source.replace(/\\/g, '/') ||
+        posixFile.startsWith(
+          (source.endsWith('/') ? source.slice(0, -1) : source).replace(/\\/g, '/') + '/',
+        )));
+  if (!isAbsolute) return posixFile;
+  if (typeof source !== 'string' || source.length === 0) return posixFile;
+  const rel = nodePath.relative(source, file);
+  if (!rel || rel.startsWith('..') || nodePath.isAbsolute(rel)) return posixFile;
+  return rel.replace(/\\/g, '/');
+}
+
+/**
  * Map one ast-grep JSON match to our normalized finding schema.
  *
  * ast-grep `--json` emits an array of objects with at least:
@@ -401,6 +438,12 @@ export const AST_GREP_SPEC = {
  *     "ruleId": "eval",           // present when scanning with a rule YAML
  *   }
  *
+ * W16-B3-2: the REAL ast-grep (0.34.3) emits `lines` as a STRING (the matched
+ * text) and the 0-based start line under `range.start.line`. The line is read
+ * from `range.start.line` (+1 → 1-based) first, falling back to the legacy
+ * numeric `lines.start` shape used by older fixtures, and null when neither
+ * exists.
+ *
  * @param {object} match
  * @param {Map<string, object>} [ruleIndex] - ruleId → rule object (for title/desc lookup)
  * @returns {Record<string, unknown> | null}
@@ -411,10 +454,22 @@ export function mapAstGrepFinding(match, ruleIndex) {
   const file = typeof m.file === 'string' ? m.file : '';
   if (!file) return null;
 
-  const startLine =
-    m.lines && Number.isFinite(m.lines.start) && m.lines.start >= 1
-      ? Math.floor(m.lines.start)
+  let startLine = null;
+  const rangeStartLine =
+    m.range &&
+    typeof m.range === 'object' &&
+    m.range.start &&
+    typeof m.range.start === 'object' &&
+    Number.isFinite(m.range.start.line)
+      ? m.range.start.line
       : null;
+  if (rangeStartLine !== null && rangeStartLine >= 0) {
+    // Real ast-grep: range.start.line is 0-based.
+    startLine = Math.floor(rangeStartLine) + 1;
+  } else if (m.lines && Number.isFinite(m.lines.start) && m.lines.start >= 1) {
+    // Legacy numeric shape (1-based in fixtures).
+    startLine = Math.floor(m.lines.start);
+  }
   const text = typeof m.text === 'string' ? m.text : '';
   const ruleId = typeof m.ruleId === 'string' && m.ruleId ? m.ruleId : 'match';
   const ruleObj = ruleIndex && ruleIndex.get(ruleId);
@@ -595,11 +650,20 @@ export async function scanPatterns(opts, deps = {}) {
     }
 
     // W15-A5-1/A5-2: scope to changed files + dedup by file:line:rule.
+    // W16-B3-1: the real binary emits ABSOLUTE paths (repoPath is
+    // process.cwd()); normalize each finding's file to the repo-relative
+    // posix form before matching it against the PR's GitHub filenames, and
+    // rewrite the finding to carry the normalized name so downstream
+    // inline-comment anchoring (which matches patch filenames) still works.
     const seen = new Set();
     /** @type {Record<string, unknown>[]} */
     const scoped = [];
     for (const f of allFindings) {
-      if (!changedFiles.has(typeof f.file === 'string' ? f.file : '')) continue;
+      const rawFile = typeof f.file === 'string' ? f.file : '';
+      if (!rawFile) continue;
+      const normalized = normalizeFindingFilePath(rawFile, source);
+      if (!changedFiles.has(normalized) && !changedFiles.has(rawFile)) continue;
+      f.file = normalized;
       const key = `${f.file}:${f.line}:${f.rule}`;
       if (seen.has(key)) continue;
       seen.add(key);

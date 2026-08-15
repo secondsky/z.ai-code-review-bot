@@ -413,11 +413,14 @@ describe('scanPatternsRegex — line mapping & robustness', () => {
 
 describe('mapAstGrepFinding', () => {
   it('maps a canonical ast-grep match to the schema', () => {
+    // W16-B3-2: updated to the REAL 0.34.3 output shape — `lines` is the
+    // matched text (string) and the line lives in range.start.line (0-based).
     const f = mapAstGrepFinding(
       {
         text: 'eval("alert(1)")',
         file: 'src/foo.js',
-        lines: { start: 42, end: 42 },
+        lines: 'eval("alert(1)")',
+        range: { start: { line: 41, column: 3, index: 84 }, end: { line: 41, column: 17, index: 98 } },
         ruleId: 'eval',
       },
       new Map([['eval', { title: 'Use of eval()', severity: 'high', category: 'security' }]]),
@@ -455,6 +458,41 @@ describe('mapAstGrepFinding', () => {
     const f = mapAstGrepFinding({ text: 'x', file: 'a.js' });
     expect(f.line).toBeNull();
   });
+
+  // W16-B3-2: real ast-grep 0.34.3 emits `lines` as a STRING (the matched
+  // text) and the 0-based line under `range.start.line`. The old code read
+  // `m.lines.start` → undefined → line:null for EVERY real-binary finding,
+  // and the file:line:rule dedup then collapsed distinct matches.
+  it('reads the line from range.start.line (+1, 0-based) with real-binary shape [W16-B3-2]', () => {
+    const f = mapAstGrepFinding({
+      text: 'eval(x);',
+      file: 'src/foo.js',
+      lines: 'eval(x);', // REAL ast-grep: the matched text, NOT a line range
+      range: { start: { line: 2, column: 5, index: 40 }, end: { line: 2, column: 13, index: 48 } },
+      ruleId: 'eval',
+    });
+    expect(f.line).toBe(3); // 0-based 2 → 1-based 3
+  });
+
+  it('range.start.line takes precedence over legacy numeric lines.start [W16-B3-2]', () => {
+    const f = mapAstGrepFinding({
+      text: 'eval(x);',
+      file: 'a.js',
+      lines: { start: 99 }, // legacy fake shape — must NOT win over range
+      range: { start: { line: 0 } },
+    });
+    expect(f.line).toBe(1);
+  });
+
+  it('falls back to legacy numeric lines.start when range is absent [W16-B3-2]', () => {
+    const f = mapAstGrepFinding({ text: 'x', file: 'a.js', lines: { start: 42 } });
+    expect(f.line).toBe(42);
+  });
+
+  it('line → null when neither range.start.line nor numeric lines.start exists [W16-B3-2]', () => {
+    const f = mapAstGrepFinding({ text: 'x', file: 'a.js', lines: 'the matched text' });
+    expect(f.line).toBeNull();
+  });
 });
 
 describe('parseAstGrepJson', () => {
@@ -466,6 +504,21 @@ describe('parseAstGrepJson', () => {
     const findings = parseAstGrepJson(json);
     expect(findings).toHaveLength(2);
     expect(findings[0].rule).toBe('astgrep:eval');
+  });
+
+  it('parses REAL ast-grep output shape (lines=string, range.start.line 0-based) [W16-B3-2]', () => {
+    const json = JSON.stringify([
+      {
+        text: 'eval(x);',
+        file: 'a.js',
+        lines: 'eval(x);',
+        range: { start: { line: 4, column: 0, index: 80 }, end: { line: 4, column: 8, index: 88 } },
+        ruleId: 'eval',
+      },
+    ]);
+    const findings = parseAstGrepJson(json);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].line).toBe(5);
   });
 
   it('returns [] for empty/invalid input', () => {
@@ -500,12 +553,16 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
       if (pattern.includes('$$') || pattern.includes('eval')) {
         // Match the eval rule's pattern.
         if (pattern.startsWith('eval')) {
+          // W16-B3-1/B3-2: REAL binary shape — the file path is ABSOLUTE
+          // (ast-grep echoes the absolute <source> argument) and the line is
+          // 0-based under range.start.line.
           return Promise.resolve(
             JSON.stringify([
               {
                 text: 'eval("alert(1)")',
-                file: 'src/foo.js',
-                lines: { start: 42, end: 42 },
+                file: '/repo/src/foo.js',
+                lines: 'eval("alert(1)")',
+                range: { start: { line: 41, column: 0, index: 0 }, end: { line: 41, column: 15, index: 15 } },
                 ruleId: 'eval',
               },
             ]),
@@ -558,9 +615,16 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
       const patternIdx = args.indexOf('--pattern');
       const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
       if (pattern.startsWith('eval')) {
+        // W16-B3-1: absolute path (real binary shape) under a DIFFERENT
+        // relative location than any changed file → must be dropped.
         return Promise.resolve(
           JSON.stringify([
-            { text: 'eval("boom")', file: 'legacy/old.js', lines: { start: 3 } },
+            {
+              text: 'eval("boom")',
+              file: '/repo/legacy/old.js',
+              lines: 'eval("boom")',
+              range: { start: { line: 2, column: 0, index: 0 }, end: { line: 2, column: 11, index: 11 } },
+            },
           ]),
         );
       }
@@ -587,9 +651,15 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
       const patternIdx = args.indexOf('--pattern');
       const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
       if (pattern.startsWith('eval')) {
+        // W16-B3-1: absolute path (real binary shape) under the changed file.
         return Promise.resolve(
           JSON.stringify([
-            { text: 'eval("boom")', file: 'src/new.js', lines: { start: 3 } },
+            {
+              text: 'eval("boom")',
+              file: '/repo/src/new.js',
+              lines: 'eval("boom")',
+              range: { start: { line: 2, column: 0, index: 0 }, end: { line: 2, column: 11, index: 11 } },
+            },
           ]),
         );
       }
@@ -631,7 +701,15 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
       },
     ];
     const fakeRunBinary = vi.fn().mockResolvedValue(
-      JSON.stringify([{ text: 'eval(x)', file: 'src/a.ts', lines: { start: 7 } }]),
+      // W16-B3-1/B3-2: real binary shape — absolute file, 0-based range line.
+      JSON.stringify([
+        {
+          text: 'eval(x)',
+          file: '/r/src/a.ts',
+          lines: 'eval(x)',
+          range: { start: { line: 6, column: 0, index: 0 }, end: { line: 6, column: 7, index: 7 } },
+        },
+      ]),
     );
     const result = await scanPatterns(
       {
@@ -727,6 +805,143 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
     );
     expect(result.scanner).toBe('ast-grep');
     expect(result.findings.find((f) => f.rule === 'astgrep:todo-in-code')).toBeUndefined();
+  });
+});
+
+// W16-B3-1: production passes repoPath = process.cwd() (absolute) and runs
+// `ast-grep ... <ABS_PATH>` with cwd: source. The REAL binary then emits
+// ABSOLUTE file paths in its JSON, while changedFileNames(files) holds
+// repo-relative GitHub filenames — the old changedFiles.has(f.file) filter
+// never matched, dropping EVERY binary-path finding (and because the run
+// still "succeeded", the regex fallback never fired either). Findings' file
+// paths must be normalized (path.relative + posix separators) before the
+// changed-files filter.
+describe('scanPatterns — absolute ast-grep output paths [W16-B3-1]', () => {
+  // Real-binary shape: absolute file path, lines = matched text (string),
+  // 0-based line in range.start.line.
+  const realShapeMatch = (file, line0) => ({
+    text: 'eval("boom")',
+    file,
+    lines: 'eval("boom")',
+    range: { start: { line: line0, column: 0, index: 0 }, end: { line: line0, column: 11, index: 11 } },
+    ruleId: 'eval',
+  });
+
+  const makeDeps = (matchesByPattern) => ({
+    ensureBinary: vi.fn().mockResolvedValue('/p'),
+    platform: 'linux',
+    arch: 'x64',
+    runBinary: vi.fn().mockImplementation((_path, args) => {
+      const patternIdx = args.indexOf('--pattern');
+      const pattern = patternIdx >= 0 ? args[patternIdx + 1] : '';
+      const matches = matchesByPattern[pattern] || [];
+      return Promise.resolve(JSON.stringify(matches));
+    }),
+  });
+
+  it('keeps a finding whose file is ABSOLUTE under source and normalizes it [W16-B3-1]', async () => {
+    const deps = makeDeps({ 'eval($$$ARGS)': [realShapeMatch('/repo/src/foo.js', 41)] });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/foo.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      deps,
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toHaveLength(1);
+    // The returned finding must carry the repo-RELATIVE name (downstream
+    // inline-comment anchoring matches GitHub patch filenames).
+    expect(result.findings[0].file).toBe('src/foo.js');
+    expect(result.findings[0].line).toBe(42); // 0-based 41 → 1-based 42
+    expect(result.findings[0].rule).toBe('astgrep:eval');
+  });
+
+  it('still keeps a finding whose file is ALREADY repo-relative [W16-B3-1]', async () => {
+    const deps = makeDeps({ 'eval($$$ARGS)': [realShapeMatch('src/foo.js', 41)] });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/foo.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      deps,
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].file).toBe('src/foo.js');
+  });
+
+  it('drops an ABSOLUTE finding whose relative path is NOT in the changed set [W16-B3-1]', async () => {
+    const deps = makeDeps({
+      'eval($$$ARGS)': [realShapeMatch('/repo/legacy/old.js', 2)],
+    });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      deps,
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('drops an ABSOLUTE finding outside source entirely (no relative match) [W16-B3-1]', async () => {
+    const deps = makeDeps({
+      'eval($$$ARGS)': [realShapeMatch('/elsewhere/other/x.js', 0)],
+    });
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'x.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      deps,
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toEqual([]);
+  });
+});
+
+// W16-B3-2: with the line now read from range.start.line, the file:line:rule
+// dedup must NOT collapse multiple DISTINCT matches of one rule in one file.
+describe('scanPatterns — distinct matches survive dedup (real shape) [W16-B3-2]', () => {
+  it('three distinct matches at range lines 0/2/4 → three findings', async () => {
+    const rules = [
+      {
+        id: 'eval',
+        pattern: 'eval($$$ARGS)',
+        severity: 'high',
+        category: 'security',
+        languages: ['js'],
+        title: 'Use of eval()',
+      },
+    ];
+    const matches = [0, 2, 4].map((line0) => ({
+      text: 'eval(x);',
+      file: '/r/src/a.js',
+      lines: 'eval(x);',
+      range: { start: { line: line0, column: 0, index: 0 }, end: { line: line0, column: 8, index: 8 } },
+      ruleId: 'eval',
+    }));
+    const result = await scanPatterns(
+      {
+        files: [{ filename: 'src/a.js', patch: buildPatch(['const y = 2;']) }],
+        repoPath: '/r',
+        rules,
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: vi.fn().mockResolvedValue(JSON.stringify(matches)),
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('ast-grep');
+    expect(result.findings).toHaveLength(3);
+    expect(result.findings.map((f) => f.line).sort((a, b) => a - b)).toEqual([1, 3, 5]);
+    // All three share file+rule; only the line differs — the dedup key must
+    // keep them distinct.
+    expect(new Set(result.findings.map((f) => `${f.file}:${f.line}:${f.rule}`)).size).toBe(3);
   });
 });
 
