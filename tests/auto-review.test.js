@@ -1461,12 +1461,20 @@ describe('runStructuredReview', () => {
   // batchMetadata[].rawTextCount:0, which NOTHING consumes. A whole file's
   // content could go unreviewed while the metadata carried neither
   // skippedFiles nor skippedEntries — callers posted a bare "No issues
-  // found ✅". The context-drop count must merge into the same
-  // skippedMeta.skippedEntries the portion-note machinery already renders.
-  test('W19-E1-1: single file always context-overflowing → metadata.skippedEntries === 1', async () => {
+  // found ✅".
+  // W20-F1-1: the context-drop count lives in a SEPARATE metadata key
+  // (`contextSkippedEntries`), NOT summed into `skippedEntries`. The W19-E1-1
+  // merge made both insertSkippedFilesNote copies render the hard-coded
+  // "(MAX_DIFF_CHARS cap)" cause for context drops — with MAX_DIFF_CHARS
+  // disabled that was the wrong cause and the wrong implied remedy (the real
+  // remedies are smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context
+  // model). skippedEntries reverts to counting ONLY MAX_DIFF_CHARS cap
+  // drops; the context count flows to its own "(model context limit)" note
+  // in index.js / schedule.js.
+  test('W19-E1-1/W20-F1-1: single file always context-overflowing (maxDiffChars 0) → contextSkippedEntries 1, skippedEntries ABSENT', async () => {
     const files = [makeFile({ filename: 'src/big.js', patch: 'x'.repeat(100) })];
     const core = { info: vi.fn(), warning: vi.fn() };
-    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: 0 }, {
       callApi: async () => {
         throw new Error('maximum context length is 1024 tokens');
       },
@@ -1474,40 +1482,80 @@ describe('runStructuredReview', () => {
     });
     expect(out.findings).toEqual([]);
     expect(out.metadata.totalBatches).toBe(1);
-    // The context drop reaches the metadata the portion-note machinery reads.
-    expect(out.metadata.skippedEntries).toBe(1);
+    // The context drop reaches the metadata in its OWN key…
+    expect(out.metadata.contextSkippedEntries).toBe(1);
+    // …and skippedEntries reverts to counting ONLY MAX_DIFF_CHARS cap drops
+    // (the cap is disabled here), so it stays ABSENT for a pure context drop.
+    expect(out.metadata.skippedEntries).toBeUndefined();
     // No file was dropped by the MAX_DIFF_CHARS cap — that signal stays absent.
     expect(out.metadata.skippedFiles).toBeUndefined();
     // The base case warned (the drop is never silent).
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('src/big.js'));
   });
 
-  test('W19-E1-1: multi-entry batch halving down to NOTHING counts every dropped entry', async () => {
+  test('W19-E1-1/W20-F1-1: multi-entry batch halving down to NOTHING counts every dropped entry in contextSkippedEntries', async () => {
     // Four single-chunk files in ONE batch; callApi ALWAYS context-errors, so
     // the batch halves 4 → 2+2 → 1+1+1+1 and every single-entry base case
     // drops one entry permanently (halved halves are retried, so only the
-    // single-entry drops are final). All four drops must be counted.
+    // single-entry drops are final). All four drops must be counted — in the
+    // context key, NOT skippedEntries (W20-F1-1).
     const files = [];
     for (let i = 0; i < 4; i++) {
       files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(50) }));
     }
-    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: 0 }, {
       callApi: async () => {
         throw new Error('maximum context length is 1024 tokens');
       },
       core: { info: vi.fn(), warning: vi.fn() },
     });
     expect(out.metadata.totalBatches).toBe(1);
-    expect(out.metadata.skippedEntries).toBe(4);
+    expect(out.metadata.contextSkippedEntries).toBe(4);
+    expect(out.metadata.skippedEntries).toBeUndefined();
     expect(out.metadata.batchMetadata[0].rawTextCount).toBe(0);
   });
 
+  // W20-F1-1 mixed scenario: a MAX_DIFF_CHARS cap drop AND context-limit
+  // drops in the SAME run stay DISTINCT — skippedEntries counts only the cap
+  // drop(s), contextSkippedEntries only the context drop(s); they are never
+  // summed. Same construction as the W18-D2-3 partial-drop test above
+  // (f0.js packed; a.js chunk 1 rescued; a.js chunk 2 cap-dropped), but
+  // callApi ALWAYS context-errors, so each packed single-entry batch is
+  // context-dropped at its base case too.
+  test('W20-F1-1: cap drop + context drops in one run → the two counts stay distinct (never summed)', async () => {
+    const files = [
+      makeFile({ filename: 'f0.js', status: 'added', patch: 'y'.repeat(24) }),
+      makeFile({
+        filename: 'a.js',
+        patch: 'x'.repeat(20) + '\n' + 'x'.repeat(20),
+      }),
+    ];
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxDiffChars: 100, maxPatchChars: 25 },
+      {
+        callApi: async () => {
+          throw new Error('maximum context length is 1024 tokens');
+        },
+        core: { info: vi.fn(), warning: vi.fn() },
+      },
+    );
+    // Only the a.js chunk-2 cap drop lands in skippedEntries…
+    expect(out.metadata.skippedEntries).toBe(1);
+    // …the two single-entry context drops (f0.js and a.js chunk 1) land in
+    // their OWN key — skippedEntries must stay 1, not 3.
+    expect(out.metadata.contextSkippedEntries).toBe(2);
+    // a.js was partially packed before the cap drop → not wholesale skipped.
+    expect(out.metadata.skippedFiles).toBeUndefined();
+  });
+
   // Normal path unchanged: a healthy callApi still yields NO skip fields.
-  test('W19-E1-1: normal path — no context errors → skippedEntries stays absent', async () => {
+  test('W19-E1-1: normal path — no context errors → contextSkippedEntries and skippedEntries stay absent', async () => {
     const files = [makeFile({ filename: 'a.js', patch: 'x'.repeat(100) })];
     const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
       callApi: async () => structuredPayload('s', []),
     });
+    expect(out.metadata.contextSkippedEntries).toBeUndefined();
     expect(out.metadata.skippedEntries).toBeUndefined();
     expect(out.metadata.skippedFiles).toBeUndefined();
   });

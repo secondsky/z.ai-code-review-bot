@@ -683,14 +683,17 @@ export async function runStructuredReview(files, config, deps = {}) {
     );
   });
 
-  // W19-E1-1: merge the context-drop count into skippedMeta.skippedEntries so
-  // the existing portion-note machinery (index.js / schedule.js read
-  // result.metadata.skippedEntries) renders it. Previously only
-  // batchMetadata.rawTextCount:0 recorded the drop — which nothing consumed.
+  // W19-E1-1 → W20-F1-1: surface the context-drop count in a SEPARATE
+  // metadata key (`contextSkippedEntries`) so the note renderers in
+  // index.js / schedule.js can state the CORRECT cause. The W19-E1-1
+  // version summed it into skippedMeta.skippedEntries, which made both
+  // insertSkippedFilesNote copies render the hard-coded "(MAX_DIFF_CHARS
+  // cap)" cause for context drops — with the cap disabled that was the
+  // wrong cause and the wrong implied remedy (real remedies: smaller
+  // ZAI_MAX_PATCH_CHARS chunks or a larger-context model). Batch-cap drops
+  // (skippedEntries) and context drops stay DISTINCT counts.
   if (contextSkipCounter.entries > 0) {
-    skippedMeta.skippedEntries =
-      (typeof skippedMeta.skippedEntries === 'number' ? skippedMeta.skippedEntries : 0) +
-      contextSkipCounter.entries;
+    skippedMeta.contextSkippedEntries = contextSkipCounter.entries;
   }
 
   /** @type {Record<string, unknown>[]} */

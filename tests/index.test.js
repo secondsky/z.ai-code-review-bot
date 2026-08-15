@@ -2047,6 +2047,8 @@ describe('run — pull_request partial-drop portion note (W18-D2-3)', () => {
     expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
     // No file was skipped wholesale → no file note.
     expect(body).not.toContain('files not reviewed');
+    // W20-F1-1: a pure cap-drop scenario renders NO context-limit note.
+    expect(body).not.toContain('model context limit');
   });
 
   it('W18-D2-3: both full-file and partial drops → BOTH notes render in the inline review body', async () => {
@@ -2084,6 +2086,94 @@ describe('run — pull_request partial-drop portion note (W18-D2-3)', () => {
     expect(body).toContain('1 file not reviewed (MAX_DIFF_CHARS cap).');
     // …and the partial-drop portion note rides alongside it.
     expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W20-F1-1 — context-limit portion note (contextSkippedEntries)
+ *
+ * W19-E1-1 merged the context-limit drop count INTO skippedEntries, so a
+ * context drop (with MAX_DIFF_CHARS disabled) rendered "N portion(s) not
+ * reviewed (MAX_DIFF_CHARS cap)" — wrong cause, wrong implied remedy (the
+ * real remedies are smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context
+ * model, not a bigger MAX_DIFF_CHARS). The counts now flow SEPARATELY:
+ * metadata.contextSkippedEntries renders "_N portion(s) not reviewed
+ * (model context limit)._", and when both causes fired BOTH notes render.
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request context-limit portion note (W20-F1-1)', () => {
+  it('W20-F1-1: context drops only (maxDiffChars off) → note says "model context limit", never "MAX_DIFF_CHARS"', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: '',
+      metadata: {
+        totalBatches: 1,
+        totalFindingsBeforeCap: 0,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+        skippedFiles: 0,
+        // Pure context-limit drop (the W20-F1-1 separate key).
+        contextSkippedEntries: 1,
+      },
+    }));
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+    });
+
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The all-clear is NOT bare: the context-limit note renders beside it…
+    expect(body).toContain('No issues found');
+    expect(body).toContain('1 portion not reviewed (model context limit).');
+    // …with the CORRECT cause — the MAX_DIFF_CHARS wording must not appear
+    // (the cap is disabled in this scenario).
+    expect(body).not.toContain('MAX_DIFF_CHARS');
+  });
+
+  it('W20-F1-1: cap drop + context drop → BOTH portion notes render in the inline review body', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [
+        { file: 'src/a.js', line: 2, severity: 'high', title: 'T', description: 'd' },
+      ],
+      summary: 's',
+      metadata: {
+        totalBatches: 1,
+        totalFindingsBeforeCap: 1,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+        skippedFiles: 1,
+        skippedEntries: 13,
+        contextSkippedEntries: 2,
+      },
+    }));
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const body = octokit.__calls.createReview[0].body;
+    // The cap-drop portion note keeps its cause…
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+    // …and the context-limit note rides alongside with its own cause.
+    expect(body).toContain('2 portions not reviewed (model context limit).');
   });
 });
 

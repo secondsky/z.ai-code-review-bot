@@ -2246,6 +2246,8 @@ describe('reviewOnePr — W18-D2-3 partial-drop portion note', () => {
     expect(body).toContain('No issues found');
     expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
     expect(body).not.toContain('files not reviewed');
+    // W20-F1-1: a pure cap-drop scenario renders NO context-limit note.
+    expect(body).not.toContain('model context limit');
   });
 
   it('W18-D2-3: both full-file and partial drops → BOTH notes render in the inline review body', async () => {
@@ -2282,10 +2284,13 @@ describe('reviewOnePr — W18-D2-3 partial-drop portion note', () => {
   // W19-E1-1: end-to-end rendering. When the REAL runStructuredReview drops
   // every entry to context-limit errors (its halving bottoms out at
   // single-entry base cases that skip rather than abort), the surfaced
-  // metadata.skippedEntries must reach the posted body via the existing
-  // portion-note machinery — never a bare "No issues found ✅" while the
-  // file's content went entirely unreviewed.
-  it('W19-E1-1: context-limit skip (real runStructuredReview) → summary body carries the portion note', async () => {
+  // metadata count must reach the posted body via the note machinery —
+  // never a bare "No issues found ✅" while the file's content went
+  // entirely unreviewed.
+  // W20-F1-1: the count flows through the SEPARATE contextSkippedEntries
+  // key and renders with its own cause ("model context limit") — not the
+  // hard-coded "(MAX_DIFF_CHARS cap)" wording the W19-E1-1 merge produced.
+  it('W19-E1-1/W20-F1-1: context-limit skip (real runStructuredReview) → summary body carries the "model context limit" note', async () => {
     const s = makeStubs({
       getChangedFiles: vi.fn(async () => [INLINE_FILE]),
       runStructuredReview: realRunStructuredReview,
@@ -2305,7 +2310,45 @@ describe('reviewOnePr — W18-D2-3 partial-drop portion note', () => {
     expect(result).toEqual({ ok: true, action: 'reviewed' });
     const body = s.upsertReviewComment.mock.calls[0][0].body;
     expect(body).toContain('No issues found');
-    expect(body).toContain('1 portion not reviewed');
+    // The context drop renders with the CORRECT cause…
+    expect(body).toContain('1 portion not reviewed (model context limit).');
+    // …and the MAX_DIFF_CHARS wording must NOT appear (no cap fired here).
+    expect(body).not.toContain('MAX_DIFF_CHARS');
+  });
+
+  // W20-F1-1: when BOTH causes fired (a MAX_DIFF_CHARS cap drop AND a
+  // context-limit drop), BOTH portion notes render — each with its own
+  // cause — in the inline review body (index.js parity).
+  it('W20-F1-1: cap drop + context drop → BOTH portion notes render in the inline review body', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline',
+        metadata: {
+          totalBatches: 1,
+          totalFindingsBeforeCap: 1,
+          deterministicFindingsCount: 0,
+          batchMetadata: [],
+          skippedFiles: 1,
+          skippedEntries: 13,
+          contextSkippedEntries: 2,
+        },
+      })),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(98, 'sha98'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReview.mock.calls[0][0].body;
+    // The cap-drop portion note keeps its cause…
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+    // …and the context-limit note rides alongside with its own cause.
+    expect(body).toContain('2 portions not reviewed (model context limit).');
   });
 });
 

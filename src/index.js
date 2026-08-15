@@ -400,12 +400,22 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
  * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
  * "N file(s) (M chunk(s) unreviewed)" style).
  *
+ * W20-F1-1: context-limit drops (contextSkippedEntries — single-entry
+ * batches skipped by executeStructuredBatch when even one entry overflows
+ * the model context) get their OWN note with the correct cause. Summing
+ * them into skippedEntries (the W19-E1-1 approach) rendered the hard-coded
+ * "(MAX_DIFF_CHARS cap)" cause for context drops — with the cap disabled
+ * that was the wrong cause and the wrong implied remedy (real remedies:
+ * smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context model).
+ *
  * @param {string} body   Rendered body ending in the marker (typically).
  * @param {number} skippedFiles  Count of files with zero reviewed entries.
  * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
+ * @param {number} [contextSkippedEntries]  Count of entries dropped by the
+ *   model context limit (NOT MAX_DIFF_CHARS).
  * @returns {string}
  */
-function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0) {
+function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
   const n =
     typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
       ? Math.floor(skippedFiles)
@@ -414,13 +424,24 @@ function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0) {
     typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
       ? Math.floor(skippedEntries)
       : 0;
-  if ((n === 0 && e === 0) || typeof body !== 'string' || body.length === 0) return body;
+  const c =
+    typeof contextSkippedEntries === 'number' &&
+    Number.isFinite(contextSkippedEntries) &&
+    contextSkippedEntries > 0
+      ? Math.floor(contextSkippedEntries)
+      : 0;
+  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
+    return body;
+  }
   const notes = [];
   if (n > 0) {
     notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
   }
   if (e > 0) {
     notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (c > 0) {
+    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
   }
   const note = notes.join('\n\n');
   const idx = body.lastIndexOf(MARKER);
@@ -980,6 +1001,14 @@ export async function run(context, deps = {}) {
       typeof result.metadata.skippedEntries === 'number' && result.metadata.skippedEntries > 0
         ? result.metadata.skippedEntries
         : 0;
+    // W20-F1-1: context-limit drops flow SEPARATELY from cap drops so the
+    // note can state the correct cause ("model context limit", not the
+    // MAX_DIFF_CHARS cap).
+    const contextSkippedCount =
+      typeof result.metadata.contextSkippedEntries === 'number' &&
+      result.metadata.contextSkippedEntries > 0
+        ? result.metadata.contextSkippedEntries
+        : 0;
     const reviewMetadata = {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
@@ -1014,7 +1043,13 @@ export async function run(context, deps = {}) {
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
       // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
-      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount, skippedEntryCount);
+      // W20-F1-1: context-limit note rides alongside too.
+      const baseBodyWithNote = insertSkippedFilesNote(
+        baseBody,
+        skippedFileCount,
+        skippedEntryCount,
+        contextSkippedCount,
+      );
       const shaBlock = buildShaBlock(sha);
       const reviewBody = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
@@ -1105,7 +1140,13 @@ export async function run(context, deps = {}) {
     // W17-C1-3: surface the skipped-files drop in the summary comment too
     // (before the trailers so the marker/SHA ordering is untouched).
     // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
-    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount, skippedEntryCount);
+    // W20-F1-1: context-limit note rides alongside too.
+    const commentBodyWithNote = insertSkippedFilesNote(
+      commentBody,
+      skippedFileCount,
+      skippedEntryCount,
+      contextSkippedCount,
+    );
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
     const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
