@@ -38608,7 +38608,14 @@ function loadConfig(inputs = {}, options = {}) {
   const largePrFileThreshold = clampPositive(
     read(inputs, 'ZAI_LARGE_PR_FILE_THRESHOLD'), 50,
   );
-  const maxBatchChars = clampPositive(read(inputs, 'ZAI_MAX_BATCH_CHARS'), 120000);
+  // W18-D3-4: floor at 1000 chars. A min of 1 accepted e.g.
+  // ZAI_MAX_BATCH_CHARS=1 → a degenerate one-batch-per-entry split (30 files
+  // → 30 API calls), contradicting the clamp's stated purpose of preventing
+  // degenerate batching. Below-floor values fall back to the default, the
+  // same below-min→default semantics clampPositive applies to ZAI_TIMEOUT_MS.
+  const maxBatchChars = clampPositive(
+    read(inputs, 'ZAI_MAX_BATCH_CHARS'), 120000, 1000,
+  );
   const maxFilesPerBatch = clampPositive(read(inputs, 'ZAI_MAX_FILES_PER_BATCH'), 40);
   const maxPatchChars = clampPositive(read(inputs, 'ZAI_MAX_PATCH_CHARS'), 18000);
   const timeoutMs = clampPositive(read(inputs, 'ZAI_TIMEOUT_MS'), 120000, 1000);
@@ -38896,9 +38903,12 @@ function extractStatusCode(message) {
 function categorizeError(error) {
   const message = String(error?.message ?? '').toLowerCase();
 
-  if (message.includes('timeout') || message.includes('timed out')) {
-    return { category: 'timeout', retryable: true };
-  }
+  // W18-D3-1: status-code checks run FIRST. The production error shape
+  // `Z.ai API error NNN: <provider body>` embeds the real HTTP status in the
+  // message, and provider bodies often contain the word "timeout" (e.g. a 400
+  // whose body says "request timeout exceeded", or a 503 "gateway timeout").
+  // The status the provider actually returned must win over message
+  // substrings, or a permanent 400 was misclassified as a retryable timeout.
   const statusCode = extractStatusCode(message);
   if (statusCode === 429) return { category: 'rate-limit', retryable: true };
   if (statusCode === 401 || statusCode === 403) {
@@ -38908,6 +38918,9 @@ function categorizeError(error) {
   if (statusCode >= 500 && statusCode < 600) {
     return { category: 'provider', retryable: true };
   }
+  if (message.includes('timeout') || message.includes('timed out')) {
+    return { category: 'timeout', retryable: true };
+  }
   // Lowercase once — `ECONNREFUSED` becomes `econnrefused`, so a single
   // lowercase check suffices (the fork had redundant mixed-case checks).
   // W15-A7-1: beyond connect-time ECONNREFUSED/ENETUNREACH, the most common
@@ -38916,9 +38929,16 @@ function categorizeError(error) {
   // ("socket hang up"), aborted requests, and transient DNS failures
   // (EAI_AGAIN). Treating any of these as internal/non-retryable lets one
   // reset in any batch kill the entire review with no comment posted.
+  // W18-D3-1: add ETIMEDOUT and EHOSTUNREACH. The OS connect-timeout errno is
+  // one of the most common transient errors on GitHub runners, but 'etimedout'
+  // does NOT contain the substring 'timeout', so it previously fell through to
+  // internal/non-retryable and killed the whole review after ONE attempt.
+  // EHOSTUNREACH is the missing sibling of the already-covered ENETUNREACH.
   if (
     message.includes('econnrefused') ||
     message.includes('enetunreach') ||
+    message.includes('ehostunreach') ||
+    message.includes('etimedout') ||
     message.includes('econnreset') ||
     message.includes('epipe') ||
     message.includes('socket hang up') ||
@@ -41898,6 +41918,53 @@ function findings_filterIncrementalFindings(newFindings, priorHashes) {
   return { kept, suppressed };
 }
 
+// ---------------------------------------------------------------------------
+// Incremental/learnings suppression note (W18-D1-3 shared helper)
+// ---------------------------------------------------------------------------
+
+/**
+ * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ *
+ * The note is appended (with a blank-line separator) so reviewers can see how
+ * many previously-resolved findings were elided. Returns the (possibly empty)
+ * summary with the note appended. Kept as a pure helper so it can be unit
+ * tested in isolation if needed.
+ *
+ * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
+ * only the incremental count was reported, so a run that suppressed 5 findings
+ * via learnings showed no note at all — reviewers had no signal that the bot
+ * had intentionally dropped findings. Both suppression reasons now contribute
+ * to a single note so the summary reflects the total elided count.
+ *
+ * W18-D1-3: extracted verbatim from src/index.js (the entry module cannot be
+ * imported by schedule.js — the entry imports IT) so the scheduled path can
+ * render the exact same note. Behavior is byte-identical.
+ *
+ * @param {string} summary  The model's original summary prose.
+ * @param {number} suppressedCount  How many findings were suppressed (incremental).
+ * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
+ * @returns {string}
+ */
+function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
+  const base = typeof summary === 'string' ? summary : '';
+  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
+  const total = inc + lrn;
+  if (total === 0) return base;
+  // Compose a note that reflects BOTH suppression reasons when both fired.
+  const parts = [];
+  if (inc > 0) {
+    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
+  }
+  if (lrn > 0) {
+    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
+  }
+  // English join: "a and b" or just "a".
+  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  const note = `_${what} suppressed (incremental review)._`;
+  return base.length === 0 ? note : `${base}\n\n${note}`;
+}
+
 // Exported internals for testing (none beyond the public exports today).
 
 ;// CONCATENATED MODULE: ./src/lib/auto-review.js
@@ -42521,17 +42588,26 @@ async function runStructuredReview(files, config, deps = {}) {
   // metadata, the same way totalFindingsBeforeCap/deterministicFindingsCount
   // are exposed — index.js assembles its reviewMetadata from result.metadata
   // and can render the skip note later without touching this module.
-  const skippedMeta =
-    typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0
-      ? {
-          skippedFiles: batchMetadata.skippedFiles,
-          skippedEntries: batchMetadata.skippedEntries,
-        }
-      : {};
-  if (core?.info && skippedMeta.skippedFiles) {
+  // W18-D2-3: each key is gated INDEPENDENTLY. The old single gate
+  // (`skippedFiles > 0 ? {skippedFiles, skippedEntries} : {}`) dropped the
+  // entries count whenever no file was skipped wholesale — a file with 2/15
+  // chunks reviewed surfaced NOTHING and callers posted a bare
+  // "No issues found ✅". skippedEntries>0 alone (pure partial drops) must
+  // still reach the result metadata.
+  const skippedMeta = {};
+  if (typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0) {
+    skippedMeta.skippedFiles = batchMetadata.skippedFiles;
+  }
+  if (
+    typeof batchMetadata.skippedEntries === 'number' &&
+    batchMetadata.skippedEntries > 0
+  ) {
+    skippedMeta.skippedEntries = batchMetadata.skippedEntries;
+  }
+  if (core?.info && (skippedMeta.skippedFiles || skippedMeta.skippedEntries)) {
     core.info(
-      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles} file(s) ` +
-        `(${skippedMeta.skippedEntries} chunk(s) unreviewed).`,
+      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles ?? 0} file(s) ` +
+        `(${skippedMeta.skippedEntries ?? 0} chunk(s) unreviewed).`,
     );
   }
 
@@ -43643,6 +43719,12 @@ async function upsertPrDescription(
     newBody = currentBody ? `${currentBody}\n\n${block}` : block;
   }
 
+  // W18-D3-3: re-running with an UNCHANGED description reconstructs a
+  // byte-identical body. Skip the update in that case — calling pulls.update
+  // anyway churned the PR's edit history on every re-run.
+  if (newBody === currentBody) {
+    return { updated: false };
+  }
   await updatePr({ owner, repo, pull_number: pullNumber, body: newBody });
   return { updated: true };
 }
@@ -45412,19 +45494,24 @@ function buildImpactPrompt(files, excludePatterns) {
  * This works for any label-map shape — `zai:`-prefixed maps AND flat value
  * sets like `{ critical: 'P0', high: 'P1', ... }`.
  *
+ * W18-D3-2: when `severity` is null (model output unparseable), the managed
+ * labels from a PREVIOUS run are stale — the new assessment does not confirm
+ * them. They are still removed (all of them; there is no target), and nothing
+ * is added. Previously `if (!severity) return false;` bailed before the
+ * removal loop, leaving e.g. a stale zai:high on the PR forever.
+ *
  * Injected via deps so tests never touch the GitHub API.
  *
  * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
- * @returns {Promise<boolean>} true if a label was applied, false if unmappable.
+ * @returns {Promise<boolean>} true if a label was applied, false otherwise.
  */
 async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
-  if (!severity) return false;
-  const targetLabel = labelMap?.[severity];
-  if (!targetLabel) return false;
+  const targetLabel = severity ? labelMap?.[severity] : null;
 
   // Fetch current labels and remove any existing managed labels (idempotent).
   // A label is "managed" if it appears as a value in the labelMap; this is
   // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
+  // With a null severity there is no target, so ALL managed labels are removed.
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
@@ -45441,6 +45528,9 @@ async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, 
       }
     }
   }
+  // Nothing to add when the severity is null (unparseable) or unmappable —
+  // the stale-label cleanup above is the whole job.
+  if (!targetLabel) return false;
   await octokit.rest.issues.addLabels({
     owner,
     repo,
@@ -45793,6 +45883,14 @@ const defaultSetReviewStatus = async () => false;
 const defaultFindBotMarkerComments = async () => [];
 
 /**
+ * Inert bot-review finder: never fetches; behaves like a PR with no prior bot
+ * reviews (W18-D1-2). src/index.js's schedule branch wires the REAL
+ * review.js listBotReviews so scheduled incremental reads ALSO see the hash
+ * blocks deposited in review bodies by the inline-review path.
+ */
+const defaultListBotReviews = async () => [];
+
+/**
  * The hidden HTML comment that embeds the PR head SHA in a posted
  * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
  * body contains BOTH the marker AND the head SHA; without this block the
@@ -45812,27 +45910,45 @@ function buildShaBlock(sha) {
 }
 
 /**
- * Insert the W17-C1-3 skipped-files note into a rendered body.
+ * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
+ * into a rendered body.
  *
  * Mirrors the same-named helper in src/index.js (duplicated deliberately:
  * schedule.js cannot import from index.js — the entry point imports THIS
- * module — and the helper is four lines). When the structured pipeline
- * reports `skippedFiles > 0`, an italic note (the `_N findings truncated to
- * cap._` style) is inserted just before the trailing marker so the posted
- * body never claims a bare "No issues found" all-clear while files were
- * silently dropped by the cumulative MAX_DIFF_CHARS cap.
+ * module — and the helper is small). When the structured pipeline reports
+ * `skippedFiles > 0`, an italic note (the `_N findings truncated to cap._`
+ * style) is inserted just before the trailing marker so the posted body never
+ * claims a bare "No issues found" all-clear while files were silently dropped
+ * by the cumulative MAX_DIFF_CHARS cap.
+ *
+ * W18-D2-3: PARTIAL drops of multi-chunk files (skippedEntries) were surfaced
+ * nowhere — a file with 2/15 chunks reviewed still posted the bare
+ * all-clear. When `skippedEntries > 0` a matching portions note renders too
+ * (both notes when both kinds fired), keeping the two inserters consistent.
  *
  * @param {string} body   Rendered body ending in the marker (typically).
  * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
  * @returns {string}
  */
-function insertSkippedFilesNote(body, skippedFiles) {
+function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0) {
   const n =
     typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
       ? Math.floor(skippedFiles)
       : 0;
-  if (n === 0 || typeof body !== 'string' || body.length === 0) return body;
-  const note = `_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`;
+  const e =
+    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
+      ? Math.floor(skippedEntries)
+      : 0;
+  if ((n === 0 && e === 0) || typeof body !== 'string' || body.length === 0) return body;
+  const notes = [];
+  if (n > 0) {
+    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (e > 0) {
+    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  const note = notes.join('\n\n');
   const idx = body.lastIndexOf(MARKER);
   if (idx === -1) return `${body}\n\n${note}`;
   return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
@@ -46106,6 +46222,12 @@ async function reviewOnePr({
   // from findings.js). The scheduled path previously never applied it, so
   // cron ticks re-reported unchanged findings on BOTH branches.
   filterIncrementalFindings = findings_filterIncrementalFindings,
+  // W18-D1-2: bot-review finder (inert default; src/index.js wires the real
+  // review.js listBotReviews). The scheduled INLINE path deposits its hash
+  // block exclusively in the REVIEW body, so reading marker comments alone
+  // left priorHashes empty on the common path and every tick after a re-push
+  // re-reported unchanged findings (index.js unions reviews + comments).
+  listBotReviews = defaultListBotReviews,
 }) {
   // W16-B2-1: whether THIS invocation successfully posted the `pending`
   // commit status. The outer catch must flip that status to a TERMINAL
@@ -46309,6 +46431,12 @@ async function reviewOnePr({
       typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
         ? result.metadata.skippedFiles
         : 0;
+    // W18-D2-3: partial drops (multi-chunk files with some chunks dropped)
+    // ride the same note inserter as the whole-file drops (index.js parity).
+    const skippedEntryCount =
+      typeof result.metadata.skippedEntries === 'number' && result.metadata.skippedEntries > 0
+        ? result.metadata.skippedEntries
+        : 0;
 
     // W17-C2-1: incremental review — mirrors the push path (src/index.js)
     // faithfully, including ORDERING: the incremental filter runs BEFORE the
@@ -46341,6 +46469,32 @@ async function reviewOnePr({
           );
         }
       }
+      // W18-D1-2: ALSO union the hash blocks carried by prior bot REVIEWS.
+      // The scheduled inline path deposits its hash block ONLY in the review
+      // body (upsertReview), so a comments-only read left priorHashes empty
+      // on the common path and unchanged findings were re-reported on every
+      // tick after a re-push (index.js unions both sources; mirror it).
+      // Fail-soft, and separately from the comments read so a broken reviews
+      // pagination keeps the already-collected comment hashes.
+      try {
+        const priorReviews = await listBotReviews({
+          octokit,
+          context: ctx,
+          marker: MARKER,
+        });
+        for (const priorReview of priorReviews) {
+          if (typeof priorReview?.body === 'string') {
+            const hashes = parseFindingsHashBlock(priorReview.body);
+            for (const h of hashes) priorHashes.add(h);
+          }
+        }
+      } catch (priorReviewError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: could not read prior bot reviews for PR #${pr.number} (${priorReviewError?.message ?? String(priorReviewError)}); continuing without review-side prior hashes.`,
+          );
+        }
+      }
     }
     const { kept: incrementalKept, suppressed: incrementalSuppressed } =
       filterIncrementalFindings(result.findings, priorHashes);
@@ -46355,7 +46509,23 @@ async function reviewOnePr({
     // the posted review, the commit status, and the SHA-dedup hash all
     // describe the SAME kept set). When learningsEnabled is off (or nothing
     // matched) this is a no-op passthrough.
-    const { kept: keptFindings } = filterFindingsByLearnings(incrementalKept, learnings);
+    const { kept: keptFindings, suppressed: learningsSuppressed } =
+      filterFindingsByLearnings(incrementalKept, learnings);
+    if (learningsSuppressed > 0 && core?.info) {
+      core.info(
+        `Scheduled review: PR #${pr.number} learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
+    // W18-D1-3: append the suppression note to the summary so a suppressed
+    // tick never posts a false bare "No issues found ✅" (index.js parity —
+    // same helper, same wording, covering BOTH incremental and learnings
+    // drops). The noted summary feeds BOTH render paths below.
+    const baseSummary = typeof result.summary === 'string' ? result.summary : '';
+    const finalSummary =
+      incrementalSuppressed > 0 || learningsSuppressed > 0
+        ? appendIncrementalNote(baseSummary, incrementalSuppressed, learningsSuppressed)
+        : baseSummary;
 
     // W15-A8-4d: flip the commit status to `success` with a findings summary
     // now that the review completed. Mirrors index.js (W15-A6-2): computed from
@@ -46368,7 +46538,12 @@ async function reviewOnePr({
       const highCount = keptFindings.filter(
         (f) => f?.severity === 'high',
       ).length;
-      await setReviewStatus(
+      // W18-D2-4: capture the success post's boolean — setReviewStatus is
+      // fail-soft and returns FALSE without throwing. If it never landed the
+      // check stays `pending` on this SHA; warn so operators see it (the
+      // skip-branch reconciliation in runScheduledReview repairs it on a
+      // later tick, so no retry loop is needed here).
+      const successLanded = await setReviewStatus(
         {
           octokit,
           context: ctx,
@@ -46383,12 +46558,17 @@ async function reviewOnePr({
         },
         { core },
       );
+      if (successLanded !== true && core?.warning) {
+        core.warning(
+          `Scheduled review: success commit status may not have landed for PR #${pr.number} (${pr.headSha}); it will be reconciled on a later tick if still pending.`,
+        );
+      }
     }
 
     const { inline, summaryOnly } = partitionFindings(keptFindings, patchable);
 
     if (inline.length > 0) {
-      const baseBody = buildReviewBody(result.summary, summaryOnly, {
+      const baseBody = buildReviewBody(finalSummary, summaryOnly, {
         reviewerName: config.reviewerName,
         walkthrough: config.walkthrough === true,
         files: patchable,
@@ -46403,7 +46583,8 @@ async function reviewOnePr({
       });
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
-      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount);
+      // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount, skippedEntryCount);
       // W17-C2-1: the hash block is built from the FULL findings set (not
       // just kept) so the next run sees the complete canonical set —
       // otherwise a finding suppressed this run would re-surface on the next
@@ -46483,7 +46664,9 @@ async function reviewOnePr({
         (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
       ),
       skippedFiles: skippedFileCount,
-      summary: typeof result.summary === 'string' ? result.summary : '',
+      // W18-D1-3: the noted summary (never the raw prose) so the suppression
+      // note is visible on the summary branch too.
+      summary: finalSummary,
     };
     const content = useWalkthrough
       ? formatWalkthroughSummary(keptFindings, patchable, {
@@ -46502,8 +46685,8 @@ async function reviewOnePr({
     });
     // W17-C1-3: surface the skipped-files drop in the scheduled summary
     // comment too (before the trailers so the marker/SHA ordering is
-    // untouched).
-    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount);
+    // untouched). W18-D2-3: portions note rides alongside.
+    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount, skippedEntryCount);
     // W16-B2-2 → W17-C2-1/C2-3: upsertReviewComment replaces the marker
     // comment WHOLESALE, so a body built with marker + shaBlock only would
     // DESTROY the `<!-- zai-hashes:... -->` block a prior run deposited (the
@@ -46632,6 +46815,7 @@ async function reviewOnePr({
  * @param {Function} [args.parseFindingsHashBlock]  Hash-block parser (W16-B2-2).
  * @param {Function} [args.buildFindingsHashBlock]  Hash-block builder (W16-B2-2).
  * @param {Function} [args.filterIncrementalFindings]  Incremental-suppression filter (W17-C2-1).
+ * @param {Function} [args.listBotReviews]  Bot-review finder for review-side prior-hash reads (W18-D1-2).
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 async function runScheduledReview({
@@ -46680,6 +46864,9 @@ async function runScheduledReview({
   buildFindingsHashBlock = findings_buildFindingsHashBlock,
   // W17-C2-1: incremental-suppression filter (pure; default: the real one).
   filterIncrementalFindings = findings_filterIncrementalFindings,
+  // W18-D1-2: bot-review finder for review-side prior-hash reads (inert
+  // default; src/index.js wires the real review.js listBotReviews).
+  listBotReviews = defaultListBotReviews,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -46714,6 +46901,36 @@ async function runScheduledReview({
       headSha: pr.headSha,
     });
     if (already) {
+      // W18-D2-4: commit-status reconciliation. If the tick that reviewed
+      // this SHA landed `pending` but its SUCCESS post failed transiently
+      // (403/5xx — setReviewStatus returns false), the check stays pending
+      // FOREVER on that SHA: this skip fires before any status work, so
+      // nothing ever flipped it terminal. Re-post the terminal success for
+      // the already-reviewed SHA — idempotent (GitHub overwrites same-context
+      // statuses for the same SHA) — fail-soft, and only when commitStatus is
+      // on. We cannot know the recorded findings count from here, so the
+      // plain "review complete" description is used.
+      if (config.commitStatus) {
+        try {
+          await setReviewStatus(
+            {
+              octokit,
+              context: { repo: { owner, repo } },
+              sha: pr.headSha,
+              state: 'success',
+              description: 'Review complete (reconciled)',
+              reviewerName: config.reviewerName,
+            },
+            { core },
+          );
+        } catch (statusError) {
+          if (core?.warning) {
+            core.warning(
+              `Scheduled review: failed to reconcile success status for PR #${pr.number} (${pr.headSha}) (${statusError?.message ?? String(statusError)}).`,
+            );
+          }
+        }
+      }
       skipped += 1;
       continue;
     }
@@ -46754,6 +46971,7 @@ async function runScheduledReview({
       parseFindingsHashBlock,
       buildFindingsHashBlock,
       filterIncrementalFindings,
+      listBotReviews,
     });
 
     if (result.ok) {
@@ -47671,7 +47889,16 @@ const SECRET_PATTERNS = [
     // literal `(?<!sha\d{3}-)` at the match start is a no-op here — the
     // leftmost match starts AT `sha512`, and positions after `sha###-` are
     // never attempted — hence the two-assertion form.
-    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
+    //
+    // W18-D1-1: compiled with the `i` flag. CSP3/SRI hash-algorithm names
+    // match ASCII case-insensitively, but these lookarounds were
+    // case-sensitive while the sha-adjacency skipIfPrecededBy alternative is
+    // /i — so valid digests like `script-src 'SHA512-<digest>'` absorbed the
+    // uppercase prefix and fired as critical FPs. With /i the assertions
+    // reject uppercase/mixed-case prefixes exactly as they do lowercase. The
+    // candidate class `[A-Za-z0-9+/\-_]` already covers both cases, so the
+    // flag changes nothing but the lookarounds.
+    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/i,
     captureGroup: 1,
     minEntropy: 4.5,
     // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
@@ -51342,46 +51569,8 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
 }
 
 /**
- * Append the Phase 6.3 incremental-suppression note to the model's summary.
- *
- * The note is appended (with a blank-line separator) so reviewers can see how
- * many previously-resolved findings were elided. Returns the (possibly empty)
- * summary with the note appended. Kept as a pure helper so it can be unit
- * tested in isolation if needed.
- *
- * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
- * only the incremental count was reported, so a run that suppressed 5 findings
- * via learnings showed no note at all — reviewers had no signal that the bot
- * had intentionally dropped findings. Both suppression reasons now contribute
- * to a single note so the summary reflects the total elided count.
- *
- * @param {string} summary  The model's original summary prose.
- * @param {number} suppressedCount  How many findings were suppressed (incremental).
- * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
- * @returns {string}
- */
-function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
-  const base = typeof summary === 'string' ? summary : '';
-  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
-  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
-  const total = inc + lrn;
-  if (total === 0) return base;
-  // Compose a note that reflects BOTH suppression reasons when both fired.
-  const parts = [];
-  if (inc > 0) {
-    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
-  }
-  if (lrn > 0) {
-    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
-  }
-  // English join: "a and b" or just "a".
-  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
-  const note = `_${what} suppressed (incremental review)._`;
-  return base.length === 0 ? note : `${base}\n\n${note}`;
-}
-
-/**
- * Insert the W17-C1-3 skipped-files note into a rendered body.
+ * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
+ * into a rendered body.
  *
  * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
  * review, but nothing surfaced that to the reviewer — a run that skipped
@@ -51393,17 +51582,36 @@ function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0
  * comment). Rendering happens here — after the renderer returns — because
  * the note must appear on every path without touching each renderer.
  *
+ * W18-D2-3: skippedFiles counts only zero-entry files; PARTIAL drops of
+ * multi-chunk files (skippedEntries) were surfaced nowhere — a file with
+ * 2/15 chunks reviewed still posted the bare all-clear. When
+ * `skippedEntries > 0` a matching portions note is rendered too (when both
+ * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
+ * "N file(s) (M chunk(s) unreviewed)" style).
+ *
  * @param {string} body   Rendered body ending in the marker (typically).
  * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
  * @returns {string}
  */
-function src_insertSkippedFilesNote(body, skippedFiles) {
+function src_insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0) {
   const n =
     typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
       ? Math.floor(skippedFiles)
       : 0;
-  if (n === 0 || typeof body !== 'string' || body.length === 0) return body;
-  const note = `_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`;
+  const e =
+    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
+      ? Math.floor(skippedEntries)
+      : 0;
+  if ((n === 0 && e === 0) || typeof body !== 'string' || body.length === 0) return body;
+  const notes = [];
+  if (n > 0) {
+    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (e > 0) {
+    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  const note = notes.join('\n\n');
   const idx = body.lastIndexOf(MARKER);
   if (idx === -1) return `${body}\n\n${note}`;
   return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
@@ -51955,6 +52163,12 @@ async function run(context, deps = {}) {
       typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
         ? result.metadata.skippedFiles
         : 0;
+    // W18-D2-3: partial drops (multi-chunk files with some chunks dropped)
+    // ride the same note inserter as the whole-file drops.
+    const skippedEntryCount =
+      typeof result.metadata.skippedEntries === 'number' && result.metadata.skippedEntries > 0
+        ? result.metadata.skippedEntries
+        : 0;
     const reviewMetadata = {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
@@ -51988,7 +52202,8 @@ async function run(context, deps = {}) {
       );
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
-      const baseBodyWithNote = src_insertSkippedFilesNote(baseBody, skippedFileCount);
+      // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+      const baseBodyWithNote = src_insertSkippedFilesNote(baseBody, skippedFileCount, skippedEntryCount);
       const shaBlock = buildShaBlock(sha);
       const reviewBody = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
@@ -52078,7 +52293,8 @@ async function run(context, deps = {}) {
     });
     // W17-C1-3: surface the skipped-files drop in the summary comment too
     // (before the trailers so the marker/SHA ordering is untouched).
-    const commentBodyWithNote = src_insertSkippedFilesNote(commentBody, skippedFileCount);
+    // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+    const commentBodyWithNote = src_insertSkippedFilesNote(commentBody, skippedFileCount, skippedEntryCount);
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
     const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
@@ -52261,6 +52477,10 @@ async function run(context, deps = {}) {
       // W17-C2-1: real incremental filter so scheduled runs suppress
       // previously-reported findings exactly like the push path.
       filterIncrementalFindings: filterIncrementalFindingsFn,
+      // W18-D1-2: real bot-review finder so scheduled incremental reads ALSO
+      // see the hash blocks the inline path deposited in review bodies (the
+      // comments-only read left them invisible and findings were re-reported).
+      listBotReviews: listBotReviewsFn,
     });
     return;
   }
