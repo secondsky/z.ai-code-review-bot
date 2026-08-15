@@ -478,6 +478,66 @@ describe('createReviewBatches', () => {
     expect(batches.length).toBe(1);
     expect(batches[0].length).toBe(1);
   });
+
+  // W15-A8-1: MAX_DIFF_CHARS is a documented hard cap ("defends against cost
+  // abuse from fork PRs") but was a silent no-op on the batched auto-review
+  // pipeline: the prompt-side W6-6 skip disables maxDiffChars truncation
+  // whenever a batch envelope is present. The cap must bind at BATCH
+  // CONSTRUCTION — each batch's entry-char budget is clamped to
+  // min(maxBatchChars, maxDiffChars).
+  test('W15-A8-1: maxDiffChars clamps the per-batch char budget', () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(400) }));
+    }
+    const { batches } = createReviewBatches(files, { maxDiffChars: 1000 });
+    expect(batches.length).toBeGreaterThan(1); // the cap forced a split
+    for (const batch of batches) {
+      const total = batch.reduce((sum, e) => sum + formatEntry(e).length, 0);
+      expect(total).toBeLessThanOrEqual(1000);
+    }
+  });
+
+  test('W15-A8-1: an entry larger than maxDiffChars still gets its own batch', () => {
+    // smalls are high-risk (.js → priority 25) and processed FIRST; huge.md
+    // (priority 7) is processed LAST, after the smalls filled a batch. With
+    // the clamped budget (500), huge.md must flush into its own batch rather
+    // than be merged — the default maxBatchChars (120000) would otherwise
+    // absorb it, making maxDiffChars a no-op.
+    const files = [
+      makeFile({ filename: 'small1.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'small2.js', patch: 'x'.repeat(100) }),
+      makeFile({ filename: 'docs/huge.md', patch: 'x'.repeat(5000) }),
+    ];
+    const { batches } = createReviewBatches(files, { maxDiffChars: 500 });
+    const hugeBatchIdx = batches.findIndex((b) =>
+      b.some((e) => e.filename === 'docs/huge.md'),
+    );
+    expect(hugeBatchIdx).toBeGreaterThan(0); // not the first batch
+    expect(batches[hugeBatchIdx][0].filename).toBe('docs/huge.md');
+    expect(batches[hugeBatchIdx]).toHaveLength(1); // alone in its batch
+    // Every non-oversized batch respects the clamped budget.
+    for (let i = 0; i < batches.length; i++) {
+      if (i === hugeBatchIdx) continue;
+      const total = batches[i].reduce((sum, e) => sum + formatEntry(e).length, 0);
+      expect(total).toBeLessThanOrEqual(500);
+    }
+  });
+
+  test('W15-A8-1: maxDiffChars 0/unset → maxBatchChars governs (behavior unchanged)', () => {
+    const files = [];
+    for (let i = 0; i < 10; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(900) }));
+    }
+    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: 0 });
+    const unset = createReviewBatches(files, { maxBatchChars: 3000 });
+    expect(capped.batches.length).toBeGreaterThan(1);
+    expect(capped.batches.length).toBe(unset.batches.length); // 0 == unset
+    for (const batch of capped.batches) {
+      const total = batch.reduce((sum, e) => sum + formatEntry(e).length, 0);
+      expect(total).toBeLessThanOrEqual(3000);
+    }
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -1131,6 +1191,55 @@ describe('runStructuredReview', () => {
       { callApi },
     );
     expect(maxInFlight).toBe(1);
+  });
+
+  // W15-A8-1: MAX_DIFF_CHARS must actually bind on the batched auto-review
+  // path. Before the fix, executeStructuredBatch always set
+  // batchNumber/totalBatches, so the prompt-side W6-6 skip disabled
+  // maxDiffChars truncation and the whole PR went out in prompts that ignored
+  // the cap. With the cap wired into batch construction, each batch's diff
+  // content stays within the cap and the review splits into multiple batches.
+  test('W15-A8-1: maxDiffChars is honored — every batch prompt stays within the cap', async () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(400) }));
+    }
+    const prompts = [];
+    const callApi = async (_k, _m, prompt) => {
+      prompts.push(prompt);
+      return structuredPayload('s', []);
+    };
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxDiffChars: 1000 },
+      { callApi },
+    );
+    expect(prompts.length).toBeGreaterThan(1); // actually split into batches
+    expect(out.metadata.totalBatches).toBe(prompts.length);
+    // Each captured prompt includes only files whose COMBINED patch content
+    // fits the cap. (Files are single-chunk and uniquely named, so each
+    // appears in exactly one prompt.)
+    for (const prompt of prompts) {
+      const included = files.filter((f) => prompt.includes(`name="${f.filename}"`));
+      expect(included.length).toBeGreaterThan(0);
+      const diffTotal = included.reduce((sum, f) => sum + f.patch.length, 0);
+      expect(diffTotal).toBeLessThanOrEqual(1000);
+    }
+  });
+
+  test('W15-A8-1: maxDiffChars unset → single-batch behavior unchanged', async () => {
+    const files = [];
+    for (let i = 0; i < 6; i++) {
+      files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(400) }));
+    }
+    let calls = 0;
+    const callApi = async () => {
+      calls++;
+      return structuredPayload('s', []);
+    };
+    await runStructuredReview(files, { apiKey: 'k', model: 'm' }, { callApi });
+    // No cap → all entries fit the default 120000-char budget → one batch.
+    expect(calls).toBe(1);
   });
 });
 

@@ -236,14 +236,30 @@ export function formatEntry(entry) {
  * Pack entries into char+file-budgeted batches.
  *
  * Returns `{ entries, batches, metadata }`. Greedy packing: an entry is added
- * to the current batch unless doing so would exceed `maxBatchChars` OR push
+ * to the current batch unless doing so would exceed the char budget OR push
  * the distinct-file count over `maxFilesPerBatch`, in which case the current
  * batch is flushed first. A single oversized entry still gets its own batch.
+ *
+ * W15-A8-1: the char budget is `min(maxBatchChars, maxDiffChars)` when
+ * `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap against
+ * cost abuse from oversized PRs, but the prompt-side truncation (W6-6 in
+ * buildStructuredReviewPrompt) is intentionally skipped whenever a batch
+ * envelope is present — post-hoc truncation would silently drop entries
+ * already counted in the batch metadata. Enforcing the cap HERE, at batch
+ * construction, keeps the cap effective on the batched auto-review path
+ * without breaking batch metadata. The oversized-single-entry guarantee is
+ * preserved with the clamped budget: an entry larger than the budget still
+ * forms its own batch.
  */
 export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
+      ? options.maxDiffChars
+      : 0;
+  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
@@ -266,7 +282,7 @@ export function createReviewBatches(files, options = {}) {
       : currentFiles.size + 1;
     if (
       currentEntries.length > 0 &&
-      (currentChars + entryLen > maxBatchChars ||
+      (currentChars + entryLen > charBudget ||
         nextDistinctFiles > maxFilesPerBatch)
     ) {
       flush();
@@ -517,6 +533,11 @@ export async function runStructuredReview(files, config, deps = {}) {
     maxBatchChars: config.maxBatchChars || DEFAULTS.maxBatchChars,
     maxFilesPerBatch: config.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch,
     maxPatchChars: config.maxPatchChars || DEFAULTS.maxPatchChars,
+    // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
+    // W6-6 truncation is skipped whenever batched, so the cap is enforced by
+    // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
+    // inside createReviewBatches).
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
   };
 
   const batchState = {

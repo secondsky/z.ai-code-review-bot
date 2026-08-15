@@ -89,10 +89,28 @@ export function categorizeError(error) {
   }
   // Lowercase once — `ECONNREFUSED` becomes `econnrefused`, so a single
   // lowercase check suffices (the fork had redundant mixed-case checks).
-  if (message.includes('econnrefused') || message.includes('enetunreach')) {
+  // W15-A7-1: beyond connect-time ECONNREFUSED/ENETUNREACH, the most common
+  // transient failures of long-lived LLM POSTs are mid-body connection resets
+  // (ECONNRESET), broken pipes (EPIPE), premature socket closes
+  // ("socket hang up"), aborted requests, and transient DNS failures
+  // (EAI_AGAIN). Treating any of these as internal/non-retryable lets one
+  // reset in any batch kill the entire review with no comment posted.
+  if (
+    message.includes('econnrefused') ||
+    message.includes('enetunreach') ||
+    message.includes('econnreset') ||
+    message.includes('epipe') ||
+    message.includes('socket hang up') ||
+    message.includes('aborted') ||
+    message.includes('eai_again')
+  ) {
     return { category: 'provider', retryable: true };
   }
-  if (message.includes('empty response')) {
+  // W15-A7-2: a 2xx body that fails JSON.parse ("invalid JSON" — e.g.
+  // truncated by a proxy/gateway) is as transient as an empty 2xx body, so it
+  // gets the same retryable-provider treatment. A garbled 200 must not end
+  // the whole review.
+  if (message.includes('empty response') || message.includes('invalid json')) {
     return { category: 'provider', retryable: true };
   }
   return { category: 'internal', retryable: false };

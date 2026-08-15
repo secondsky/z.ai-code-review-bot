@@ -206,6 +206,55 @@ describe('categorizeError', () => {
     });
   });
 
+  // W15-A7-1: the most common transient failures for long-lived LLM POSTs —
+  // mid-body resets (read ECONNRESET), broken pipes (write EPIPE), premature
+  // socket close ("socket hang up"), aborted requests, and transient DNS
+  // (EAI_AGAIN) — must classify as provider/retryable. Classifying them as
+  // internal/non-retryable lets ONE reset in any batch kill the entire review
+  // with no comment posted.
+  test('W15-A7-1: transient connection failures → provider/retryable', () => {
+    const messages = [
+      'read ECONNRESET',
+      'write EPIPE',
+      'socket hang up',
+      'aborted',
+      'getaddrinfo EAI_AGAIN api.z.ai:443',
+    ];
+    for (const message of messages) {
+      expect(categorizeError(new Error(message))).toEqual({
+        category: 'provider',
+        retryable: true,
+      });
+    }
+  });
+
+  // W15-A7-2: a 2xx body that fails JSON.parse (truncated by a proxy/gateway)
+  // rejects "invalid JSON". Like its sibling "empty response" case, it is a
+  // transient provider hiccup — one garbled 200 must not end the whole review.
+  test('W15-A7-2: "invalid JSON" → provider/retryable', () => {
+    expect(categorizeError(new Error('Z.ai API returned invalid JSON'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+  });
+
+  // The new retryable classifications must NOT bleed into genuinely internal
+  // errors: unrelated messages still fall through to internal/non-retryable.
+  test('W15-A7-1: unrelated internal errors remain non-retryable', () => {
+    expect(categorizeError(new Error('something else entirely'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+    expect(categorizeError(new Error('a bug in our own code'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+    expect(categorizeError(new Error('Z.ai API error 413: too large'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+  });
+
   test('413 (not in matrix) → internal/non-retryable', () => {
     // 413 is neither 429/401/403/400 nor 5xx; falls through to internal.
     expect(categorizeError(new Error('Z.ai API error 413: too large'))).toEqual({
@@ -902,6 +951,106 @@ describe('createApiClient', () => {
     expect(out.success).toBe(true);
     expect(out.data).toBe('ok after retry');
     expect(request.calls).toHaveLength(2);
+  });
+
+  // W15-A7-1: a connection reset MID-BODY (2xx response, partial body chunk
+  // received, then ECONNRESET) is transient. client.call must retry it and
+  // resolve when the second attempt returns a full body — previously the reset
+  // classified as internal/non-retryable and a single attempt killed the call.
+  test('W15-A7-1: call() retries a mid-body ECONNRESET and resolves on attempt 2', async () => {
+    const calls = [];
+    const request = (url, options) => {
+      const callIdx = calls.length;
+      const captured = { url, options, headers: options?.headers || {} };
+      calls.push(captured);
+      let responseCb = null;
+      let errorCb = null;
+      const req = {
+        on(event, cb) {
+          if (event === 'response') responseCb = cb;
+          else if (event === 'error') errorCb = cb;
+          return req;
+        },
+        setTimeout() {
+          return req;
+        },
+        destroy(err) {
+          if (err && errorCb) errorCb(err);
+          return req;
+        },
+        write(d) {
+          captured.writes = (captured.writes || []);
+          captured.writes.push(d);
+          return req;
+        },
+        end() {
+          captured.body = (captured.writes || []).join('');
+          queueMicrotask(() => {
+            if (callIdx === 0) {
+              // Attempt 1: response starts 2xx, a partial body chunk arrives,
+              // then the connection resets — a real IncomingMessage 'error'.
+              const res = new Readable({ read() {} });
+              res.statusCode = 200;
+              responseCb(res);
+              res.push(Buffer.from('{"choices":[{"mess'));
+              res.destroy(new Error('read ECONNRESET'));
+            } else {
+              // Attempt 2: a full, valid body.
+              responseCb(
+                buildFakeRes(
+                  [JSON.stringify({ choices: [{ message: { content: 'recovered' } }] })],
+                  { statusCode: 200 },
+                ),
+              );
+            }
+          });
+          return req;
+        },
+      };
+      captured.req = req;
+      return req;
+    };
+    const client = createApiClient({ maxRetries: 3 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('recovered');
+    expect(calls).toHaveLength(2); // exactly 2 attempts: reset, then success
+  });
+
+  // W15-A7-2: a truncated 2xx body (proxy/gateway cut the transfer mid-JSON)
+  // fails JSON.parse and rejects "invalid JSON". Two garbled 200s then a valid
+  // one → the client must retry and resolve, not give up on the first attempt.
+  test('W15-A7-2: call() retries invalid-JSON 2xx responses and resolves on attempt 3', async () => {
+    let attempt = 0;
+    const bodies = [
+      '{"choices":[{"mess', // truncated by the proxy
+      '{"partial": tru', // truncated again
+      JSON.stringify({ choices: [{ message: { content: 'ok after garbage' } }] }),
+    ];
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([bodies[attempt++] ?? bodies[bodies.length - 1]], {
+        statusCode: 200,
+      }),
+    }));
+    const client = createApiClient({ maxRetries: 3 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('ok after garbage');
+    expect(request.calls).toHaveLength(3); // garbage, garbage, then success
   });
 
   test('call() fallback end-to-end: timeout at attempts 0+1 fires fallback, and the fallback prompt reaches the transport', async () => {
