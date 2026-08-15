@@ -38910,10 +38910,28 @@ function categorizeError(error) {
   }
   // Lowercase once — `ECONNREFUSED` becomes `econnrefused`, so a single
   // lowercase check suffices (the fork had redundant mixed-case checks).
-  if (message.includes('econnrefused') || message.includes('enetunreach')) {
+  // W15-A7-1: beyond connect-time ECONNREFUSED/ENETUNREACH, the most common
+  // transient failures of long-lived LLM POSTs are mid-body connection resets
+  // (ECONNRESET), broken pipes (EPIPE), premature socket closes
+  // ("socket hang up"), aborted requests, and transient DNS failures
+  // (EAI_AGAIN). Treating any of these as internal/non-retryable lets one
+  // reset in any batch kill the entire review with no comment posted.
+  if (
+    message.includes('econnrefused') ||
+    message.includes('enetunreach') ||
+    message.includes('econnreset') ||
+    message.includes('epipe') ||
+    message.includes('socket hang up') ||
+    message.includes('aborted') ||
+    message.includes('eai_again')
+  ) {
     return { category: 'provider', retryable: true };
   }
-  if (message.includes('empty response')) {
+  // W15-A7-2: a 2xx body that fails JSON.parse ("invalid JSON" — e.g.
+  // truncated by a proxy/gateway) is as transient as an empty 2xx body, so it
+  // gets the same retryable-provider treatment. A garbled 200 must not end
+  // the whole review.
+  if (message.includes('empty response') || message.includes('invalid json')) {
     return { category: 'provider', retryable: true };
   }
   return { category: 'internal', retryable: false };
@@ -39747,10 +39765,17 @@ function neutralizeAlerts(text) {
 function stripForgedHashBlocks(text) {
   // Drop any HTML comment containing a `zai-` prefix. Apply globally (not line-
   // anchored) so a mid-line forgery like `text <!-- zai-sha:x --> more` is also
-  // stripped (W2-SEC-2A). `[^>]*` is sufficient here: HTML comment bodies do not
-  // contain `>` in practice, and we are sanitizing untrusted model output, not
-  // parsing arbitrary HTML.
-  return text.replace(/<!--\s*zai-[^>]*-->/g, '');
+  // stripped (W2-SEC-2A).
+  // W15-A3-3: the payload class used to be `[^>]*`, which stops at ANY `>` —
+  // so a forged marker like `<!-- zai-hashes:HEX,> -->` survived sanitization
+  // and was later parsed as a TRUSTED prior-hash block (suppressing findings).
+  // The parsers on the reading side (parseFindingsHashBlock, hasReviewForSha)
+  // match non-greedily up to the nearest `-->`, tolerating `>` and newlines in
+  // the payload; the stripper must be at least as tolerant. `[\s\S]*?` matches
+  // any char (including newlines) non-greedily up to the CLOSEST `-->`, and
+  // still leaves non-`zai-` HTML comments (which must start with `zai-` right
+  // after `<!--\s*`) untouched.
+  return text.replace(/<!--\s*zai-[\s\S]*?-->/g, '');
 }
 
 /**
@@ -39785,7 +39810,14 @@ function sanitizeModelOutput(text, options = {}) {
 
   // 2. Length cap. Compare on the post-sanitization length.
   if (out.length > maxChars) {
-    out = out.slice(0, maxChars) + TRUNCATION_MARKER;
+    // W15-A3-9: slice() cuts on UTF-16 code units. If unit maxChars-1 is the
+    // HIGH half of a surrogate pair, the kept prefix would end with a lone
+    // surrogate (rendered as U+FFFD garbage in the posted comment). Back off
+    // one code unit so the boundary never splits a pair.
+    let end = maxChars;
+    const lastUnit = out.charCodeAt(maxChars - 1);
+    if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end = maxChars - 1;
+    out = out.slice(0, end) + TRUNCATION_MARKER;
   }
 
   return out;
@@ -39943,13 +39975,69 @@ function appendTrailers(body, trailers = []) {
 }
 
 /**
+ * Find the bot-authored marker comment on an issue/PR.
+ *
+ * Extracted from the lookup loop inside {@link upsertReviewComment} (W15-A8-3)
+ * so other call sites can reuse the exact same pagination + bot-authority
+ * gating — notably the incremental-review hash-block read in src/index.js,
+ * which must never trust a human comment carrying a forged marker/hash block.
+ *
+ * Pagination mirrors {@link upsertReviewComment}: per_page=100, loop until a
+ * short page, the marker comment is found, or {@link MAX_COMMENT_PAGES} is
+ * reached (CORE-4 loop guard). Bot authorship is REQUIRED (comment hijack
+ * defense): only `user.type === 'Bot'` OR `user.login` ending in `[bot]` is
+ * eligible.
+ *
+ * `listComments` rejections propagate (not swallowed) — callers wrap in their
+ * own fail-soft boundary.
+ *
+ * @param {object} args
+ * @param {object} args.octokit      Octokit instance (rest.issues.listComments used).
+ * @param {string} args.owner        Repository owner.
+ * @param {string} args.repo         Repository name.
+ * @param {number} args.issueNumber  PR / issue number.
+ * @param {string} [args.marker]     Marker used to locate the comment (default {@link MARKER}).
+ * @param {number} [args.perPage=100] Page size for listComments pagination.
+ * @returns {Promise<{id:number, body?:string}|null>} the found comment, or null.
+ */
+async function findBotMarkerComment({
+  octokit,
+  owner,
+  repo,
+  issueNumber,
+  marker = MARKER,
+  perPage = 100,
+}) {
+  // Paginate fully: the marker comment can be anywhere in the history, and a
+  // single page would miss it on high-traffic PRs. CORE-4: cap at
+  // MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us in an
+  // unbounded loop when the marker is absent.
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
+    const { data: comments } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: perPage,
+      page,
+    });
+    const existing =
+      comments.find(
+        (c) => comments_isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
+      ) ?? null;
+    if (existing) return existing; // found it — no need to fetch more pages
+    if (comments.length < perPage) return null; // last page reached
+  }
+  return null;
+}
+
+/**
  * Upsert the single summary review comment on a PR.
  *
  * 1. List issue comments, PAGINATING fully (page=1, per_page=100, loop until a
  *    short page) so the marker lookup inspects EVERY comment — not just the
  *    first 100. Without full pagination a PR with >100 comments would lose the
  *    marker comment from the visible window and create a duplicate summary on
- *    every run.
+ *    every run. (Delegated to {@link findBotMarkerComment}.)
  * 2. Find the first BOT-AUTHORED comment whose body contains `marker` (default
  *    {@link MARKER}). The author check (`user.type === 'Bot'` OR `user.login`
  *    ends with `[bot]`) is mandatory: without it, a non-bot user could post a
@@ -39980,26 +40068,14 @@ async function upsertReviewComment({
   perPage = 100,
   core,
 }) {
-  // Paginate fully: the marker comment can be anywhere in the history, and a
-  // single page would miss it on high-traffic PRs (creating a duplicate).
-  // CORE-4: cap at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us
-  // in an unbounded loop when the marker is absent.
-  let existing = null;
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: perPage,
-      page,
-    });
-    existing =
-      comments.find(
-        (c) => comments_isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
-      ) ?? null;
-    if (existing) break; // found it — no need to fetch more pages
-    if (comments.length < perPage) break; // last page reached
-  }
+  const existing = await findBotMarkerComment({
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    marker,
+    perPage,
+  });
 
   if (existing) {
     await octokit.rest.issues.updateComment({
@@ -40029,6 +40105,43 @@ var picomatch = __nccwpck_require__(4006);
 
 
 /**
+ * Normalize POSIX bracket negation `[!...]` to picomatch's `[^...]` spelling.
+ *
+ * picomatch v4 only special-cases `^` as the negation prefix inside a
+ * character class; an unnormalized `[!a]` compiles as the POSITIVE class
+ * {'!','a'} — exactly backwards vs bash/minimatch, so an exclude like
+ * `[!d]*.js` silently kept exactly the files it was meant to drop (W15-A2-3).
+ *
+ * Only an `!` IMMEDIATELY after an UNESCAPED `[` is rewritten. Backslash
+ * escapes are consumed pairwise, so `\[!a\]` (a literal-bracket pattern) is
+ * left untouched; a `!` elsewhere in the class stays a literal member; and
+ * the already-correct `[^...]` spelling passes through unchanged.
+ *
+ * @param {string} pattern
+ * @returns {string}
+ */
+function normalizeBracketNegation(pattern) {
+  let out = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    // Consume escaped characters pairwise so an escaped `\[` is a literal
+    // bracket, not the start of a class.
+    if (ch === '\\' && i + 1 < pattern.length) {
+      out += ch + pattern[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === '[' && pattern[i + 1] === '!') {
+      out += '[^';
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * Returns true if `filename` matches ANY of the given glob `patterns`.
  *
  * Matching mirrors the upstream action's behavior: each pattern is tested
@@ -40039,13 +40152,14 @@ var picomatch = __nccwpck_require__(4006);
  * filenames and non-array pattern lists are tolerated (return false) and never
  * throw.
  *
- * A leading `!` (picomatch negation) is STRIPPED before testing. This
+ * ALL leading `!`s (picomatch negation) are STRIPPED before testing. This
  * predicate is an "include if any pattern matches" check used by
  * `filterExcludedFiles` as an exclude-list: picomatch negation semantics
  * ("match any file NOT matching this pattern") would invert the intent,
- * causing `!dist/**` to exclude every file outside `dist/`. Stripping
- * the `!` makes `!dist/**` behave as `dist/**`, which is what callers
- * documenting the `!dist/**` exclude syntax expect. (CFG-1 / SCN-13.)
+ * causing `!dist/**` to exclude every file outside `dist/`. Stripping the
+ * `!`s makes `!dist/**` behave as `dist/**` (and a malformed `!!dist/**`
+ * as `dist/**`, not "not under dist/"), which is what callers documenting
+ * the `!dist/**` exclude syntax expect. (CFG-1 / SCN-13, W15-A2-2.)
  *
  * @param {string} filename - Full path or basename of the file to test.
  * @param {string[]} patterns - Glob patterns (picomatch syntax).
@@ -40066,22 +40180,33 @@ function matchesAnyPattern(filename, patterns) {
     if (trimmed === '') {
       continue;
     }
-    // Strip a leading `!` (picomatch negation). Negation is not meaningful
+    // Strip ALL leading `!`s (picomatch negation). Negation is not meaningful
     // for an "include if any matches" / exclude-list predicate and would
-    // invert the caller's intent (CFG-1 / SCN-13).
-    const positive = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
+    // invert the caller's intent (CFG-1 / SCN-13). Stripping only one left a
+    // malformed `!!dist/**` as `!dist/**` ("NOT under dist/"), which matched
+    // every file via the basename-OR fallback and silently emptied the PR;
+    // stripping all `!`s makes `!!dist/**` behave as `dist/**` (W15-A2-2).
+    let positive = trimmed;
+    while (positive.startsWith('!')) positive = positive.slice(1);
     // W5-1: a bare `!` (or `!   `) yields an empty positive after stripping.
     // picomatch throws on empty patterns, which would crash the review when
     // this predicate is fed untrusted globs (.zai.yml path_filters,
     // .zai/learnings.yml file globs). Skip empties; never throw.
     if (positive === '') continue;
+    // W15-A2-3: rewrite POSIX `[!...]` negation to picomatch's `[^...]`.
+    positive = normalizeBracketNegation(positive);
     // Defense in depth: picomatch can also throw on syntactically invalid
     // patterns (e.g. an unmatched `[`). Treat a compile error as "no match"
     // so a malformed untrusted pattern can never break the review pipeline.
     let isMatch;
     try {
+      // W15-A2-1: { dot: true } so `**` crosses dot-directories and stars can
+      // span leading dots — without it, `dist/**` silently missed dotfiles
+      // (dist/.gitkeep, dist/.vite/manifest.json). Aligned with codeowners.js,
+      // which already compiles its patterns with { dot: true }.
       isMatch =
-        picomatch.isMatch(filename, positive) || picomatch.isMatch(base, positive);
+        picomatch.isMatch(filename, positive, { dot: true }) ||
+        picomatch.isMatch(base, positive, { dot: true });
     } catch {
       continue;
     }
@@ -40752,6 +40877,16 @@ function normalizeFinding(finding) {
   const confidence = coerceEnum(f.confidence, CONFIDENCES);
   const category = coerceEnum(f.category, CATEGORIES);
 
+  // W15-A3-5: LLMs commonly emit the filename with incidental whitespace or a
+  // './' prefix (' a.js', 'a.js ', './a.js'). The anti-hallucination filter in
+  // parseFindings matches EXACTLY against changedFiles, so without this
+  // normalization those findings were silently dropped. Canonicalize to the
+  // trimmed, './'-less form; non-string files stay as-is (validation rejects).
+  const file =
+    typeof f.file === 'string'
+      ? f.file.trim().replace(/^\.\//, '')
+      : f.file;
+
   // Apply title truncation BEFORE validation. The contract is:
   //   - validateFinding flags titles > TITLE_MAX (so callers learn the input
   //     was too long), but
@@ -40759,12 +40894,28 @@ function normalizeFinding(finding) {
   // If we validated the un-truncated title, normalizeFinding could never
   // produce a valid normalized finding from a too-long title. So we truncate
   // first, then validate the truncated form.
-  let title = typeof f.title === 'string' ? f.title : '';
-  // W7-5: titles are LLM-emitted and attacker-influenceable. In the walkthrough
-  // path they render inside <details> blocks, so HTML structural tags
-  // (</details>, <details>, <summary>, etc.) would break the collapsible
-  // section. Strip them.
-  title = title.replace(/<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)(?:\s[^>]*)?>/gi, '');
+  // W7-5: free-text fields are LLM-emitted and attacker-influenceable. In the
+  // walkthrough path they render inside <details> blocks, so HTML structural
+  // tags (</details>, <details>, <summary>, etc.) would break the collapsible
+  // section. W15-A3-1: this strip now applies to description, evidence, and
+  // suggestion too — a `</details><details><summary>` sequence in the
+  // description could inject forged collapsible sections into walkthrough
+  // summaries just like it could via the title.
+  // W15-A3-2: newlines are also collapsed to a single space (same rationale as
+  // CORE-2 in review.js): a raw "\n\n#### heading" in a model field would
+  // otherwise break markdown structure when rendered by
+  // formatFindingsAsSummary / formatWalkthroughSummary.
+  const sanitizeTextField = (value) =>
+    typeof value === 'string'
+      ? value
+          .replace(
+            /<\/?(?:details|summary|table|tr|td|th|thead|tbody|a|img|svg|script|style|iframe)(?:\s[^>]*)?>/gi,
+            '',
+          )
+          .replace(/\r?\n/g, ' ')
+      : value;
+
+  let title = sanitizeTextField(typeof f.title === 'string' ? f.title : '');
   if (title.length > TITLE_MAX) {
     title = title.slice(0, TITLE_MAX - TITLE_TRUNC_SUFFIX.length) + TITLE_TRUNC_SUFFIX;
   }
@@ -40773,20 +40924,41 @@ function normalizeFinding(finding) {
   // simply omitted `evidence`/`suggestion`/`rule` (legitimate) still passes.
   // Required fields (file, line, description, title) are NOT defaulted — a
   // missing required field remains an error.
-  const evidence = typeof f.evidence === 'string' ? f.evidence : '';
+  const evidence = sanitizeTextField(
+    typeof f.evidence === 'string' ? f.evidence : '',
+  );
   const suggestion =
-    typeof f.suggestion === 'string' ? f.suggestion : null;
+    typeof f.suggestion === 'string'
+      ? sanitizeTextField(f.suggestion)
+      : null;
   const rule = typeof f.rule === 'string' ? f.rule : 'llm';
+  // W15-A3-1: description is required (never defaulted) but still
+  // model-controlled — strip structural tags while preserving the
+  // "non-string description fails validation" contract.
+  const description = sanitizeTextField(f.description);
+
+  // W15-A3-7: coerce `line` BEFORE validation. validateFinding legitimately
+  // rejects line:0 / '42' / 1.5, but LLMs emit string lines ('42') constantly —
+  // validating the raw value dropped the WHOLE finding and made the
+  // post-validation coercion below dead code. Coerce per the schema contract:
+  // numeric strings → number; 0/negative/float/garbage → null (file-level).
+  const line =
+    Number.isFinite(+f.line) && Number.isInteger(+f.line) && +f.line >= 1
+      ? +f.line
+      : null;
 
   // Pre-coerce + pre-truncate + pre-defaulted copy for validation: validate
   // the coerced enum values, the truncated title, and the defaulted optionals
   // so `CRITICAL` + long titles + omitted optionals all pass after normalize.
   const coerced = {
     ...f,
+    file,
+    line,
     severity,
     confidence,
     category,
     title,
+    description,
     evidence,
     suggestion,
     rule,
@@ -40795,16 +40967,14 @@ function normalizeFinding(finding) {
   const { ok } = validateFinding(coerced);
   if (!ok) return null;
 
-  const line = isPositiveInteger(f.line) ? f.line : null;
-
   const normalized = {
-    file: f.file,
+    file,
     line,
     severity,
     confidence,
     category,
     title,
-    description: f.description,
+    description,
     evidence,
     suggestion,
     rule,
@@ -40819,10 +40989,50 @@ function normalizeFinding(finding) {
 // ---------------------------------------------------------------------------
 
 /**
+ * W15-A3-4: last-resort repair for classic LLM JSON failures. A single
+ * trailing comma before `]`/`}` — and bare `NaN`/`Infinity`/`-Infinity`
+ * literals — are invalid JSON, so every extraction strategy failed and
+ * parseFindings returned [] (the bot then posted a false "No issues
+ * found ✅"). Returns the repaired text; callers only JSON.parse it when the
+ * direct parse already failed.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function repairJson(text) {
+  return text
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/([:\[,]\s*)(?:NaN|-?Infinity)(?=\s*[,\}\]]|$)/g, '$1null');
+}
+
+/**
+ * Parse `text` as JSON, falling back to the W15-A3-4 repair when the direct
+ * parse fails. Returns `undefined` on failure (JSON.parse never returns
+ * undefined, so it is a safe failure sentinel).
+ *
+ * @param {string} text
+ * @returns {unknown}
+ */
+function parseJsonWithRepair(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    /* fall through to repair */
+  }
+  try {
+    return JSON.parse(repairJson(text));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Extract a JSON array from raw model output. Tries, in order:
  *   a. The entire trimmed text as JSON.
  *   b. The first fenced ```json (or ```) code block.
  *   c. The substring from the first `[` to the last `]`.
+ * Each strategy retries on a W15-A3-4-repaired copy when the direct parse
+ * fails (trailing commas, NaN/Infinity literals).
  *
  * Returns the parsed array, or `null` if no strategy yields an array.
  *
@@ -40835,24 +41045,16 @@ function extractJsonArray(text) {
   // a. The entire text trimmed as JSON.
   const trimmed = text.trim();
   if (trimmed.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {
-      /* fall through */
-    }
+    const parsed = parseJsonWithRepair(trimmed);
+    if (Array.isArray(parsed)) return parsed;
   }
 
   // b. A fenced ```json (or bare ```) code block.
   const fence = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
   if (fence) {
     const inner = fence[1].trim();
-    try {
-      const parsed = JSON.parse(inner);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {
-      /* fall through */
-    }
+    const parsed = parseJsonWithRepair(inner);
+    if (Array.isArray(parsed)) return parsed;
   }
 
   // c. First `[` to last `]` (greedy, brace-tolerant).
@@ -40860,12 +41062,8 @@ function extractJsonArray(text) {
   const lastBracket = text.lastIndexOf(']');
   if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
     const slice = text.slice(firstBracket, lastBracket + 1);
-    try {
-      const parsed = JSON.parse(slice);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {
-      /* fall through */
-    }
+    const parsed = parseJsonWithRepair(slice);
+    if (Array.isArray(parsed)) return parsed;
   }
 
   return null;
@@ -40983,7 +41181,9 @@ function parseStructuredReview(rawModelOutput, options = {}) {
 
 /**
  * Extract a JSON OBJECT from raw model output. Mirrors {@link extractJsonArray}
- * but requires the result to be a plain object (not an array).
+ * but requires the result to be a plain object (not an array). Each strategy
+ * retries on a W15-A3-4-repaired copy when the direct parse fails (trailing
+ * commas, NaN/Infinity literals).
  *
  * @param {string} text
  * @returns {Record<string, unknown> | null}
@@ -40997,13 +41197,9 @@ function extractJsonObject(text) {
   // the caller can delegate to parseFindings (bare-array fallback).
   if (trimmed.startsWith('[')) return null;
   if (trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return /** @type {Record<string, unknown>} */ (parsed);
-      }
-    } catch {
-      /* fall through */
+    const parsed = parseJsonWithRepair(trimmed);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return /** @type {Record<string, unknown>} */ (parsed);
     }
   }
 
@@ -41015,13 +41211,9 @@ function extractJsonObject(text) {
     if (inner.startsWith('[')) {
       /* fall through to brace scan, but guard below */
     } else {
-      try {
-        const parsed = JSON.parse(inner);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return /** @type {Record<string, unknown>} */ (parsed);
-        }
-      } catch {
-        /* fall through */
+      const parsed = parseJsonWithRepair(inner);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return /** @type {Record<string, unknown>} */ (parsed);
       }
     }
   }
@@ -41038,17 +41230,13 @@ function extractJsonObject(text) {
     const lastBrace = text.lastIndexOf('}');
     if (lastBrace !== -1 && lastBrace > firstBrace) {
       const slice = text.slice(firstBrace, lastBrace + 1);
-      try {
-        const parsed = JSON.parse(slice);
-        if (
-          parsed &&
-          typeof parsed === 'object' &&
-          !Array.isArray(parsed)
-        ) {
-          return /** @type {Record<string, unknown>} */ (parsed);
-        }
-      } catch {
-        /* fall through */
+      const parsed = parseJsonWithRepair(slice);
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
+      ) {
+        return /** @type {Record<string, unknown>} */ (parsed);
       }
     }
   }
@@ -41275,6 +41463,19 @@ function formatFindingsAsSummary(findings, options = {}) {
   lines.push(`## ${reviewerName}`);
   lines.push('');
 
+  // W15-A8-2: mirror formatWalkthroughSummary — render the summary prose
+  // right after the header. metadata.summary carries both the model's prose
+  // and the incremental-suppression note ("N previously-reported finding(s)
+  // suppressed (incremental review)."); without this, a run where ALL
+  // findings were suppressed posted exactly "No issues found ... ✅" with
+  // zero indication findings were elided.
+  const summaryProse =
+    typeof metadata.summary === 'string' ? metadata.summary : '';
+  if (summaryProse.length > 0) {
+    lines.push(summaryProse);
+    lines.push('');
+  }
+
   // Optional deterministic-findings line.
   const detCount = typeof metadata.deterministicFindingsCount === 'number' ? metadata.deterministicFindingsCount : 0;
   if (detCount > 0) {
@@ -41470,6 +41671,12 @@ function parseFindingsHashBlock(reviewBody) {
   if (!match) return out;
   const inner = match[1];
   if (typeof inner !== 'string' || inner.length === 0) return out;
+  // W15-A3-3 (defense-in-depth): the regex above is lax, so an injected body
+  // could carry an arbitrary payload inside the comment. The canonical block
+  // is machine-generated SHA-256 hex — reject any payload containing
+  // characters outside [0-9a-fA-F, \t] so a forged payload can never be
+  // honored (e.g. treated as real prior hashes for suppression).
+  if (/[^0-9a-fA-F, \t]/.test(inner)) return out;
   for (const piece of inner.split(',')) {
     const trimmed = piece.trim();
     if (trimmed.length > 0) out.add(trimmed);
@@ -41747,14 +41954,30 @@ function formatEntry(entry) {
  * Pack entries into char+file-budgeted batches.
  *
  * Returns `{ entries, batches, metadata }`. Greedy packing: an entry is added
- * to the current batch unless doing so would exceed `maxBatchChars` OR push
+ * to the current batch unless doing so would exceed the char budget OR push
  * the distinct-file count over `maxFilesPerBatch`, in which case the current
  * batch is flushed first. A single oversized entry still gets its own batch.
+ *
+ * W15-A8-1: the char budget is `min(maxBatchChars, maxDiffChars)` when
+ * `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap against
+ * cost abuse from oversized PRs, but the prompt-side truncation (W6-6 in
+ * buildStructuredReviewPrompt) is intentionally skipped whenever a batch
+ * envelope is present — post-hoc truncation would silently drop entries
+ * already counted in the batch metadata. Enforcing the cap HERE, at batch
+ * construction, keeps the cap effective on the batched auto-review path
+ * without breaking batch metadata. The oversized-single-entry guarantee is
+ * preserved with the clamped budget: an entry larger than the budget still
+ * forms its own batch.
  */
 function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
+      ? options.maxDiffChars
+      : 0;
+  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
@@ -41777,7 +42000,7 @@ function createReviewBatches(files, options = {}) {
       : currentFiles.size + 1;
     if (
       currentEntries.length > 0 &&
-      (currentChars + entryLen > maxBatchChars ||
+      (currentChars + entryLen > charBudget ||
         nextDistinctFiles > maxFilesPerBatch)
     ) {
       flush();
@@ -42028,6 +42251,11 @@ async function runStructuredReview(files, config, deps = {}) {
     maxBatchChars: config.maxBatchChars || DEFAULTS.maxBatchChars,
     maxFilesPerBatch: config.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch,
     maxPatchChars: config.maxPatchChars || DEFAULTS.maxPatchChars,
+    // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
+    // W6-6 truncation is skipped whenever batched, so the cap is enforced by
+    // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
+    // inside createReviewBatches).
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
   };
 
   const batchState = {
@@ -42531,7 +42759,7 @@ function severityRank(sev) {
  * @param {{ reviewerName?: string, metadata?: Record<string, unknown> }} [options]
  * @returns {string}
  */
-function formatWalkthroughSummary(findings, files, options = {}) {
+function walkthrough_formatWalkthroughSummary(findings, files, options = {}) {
   const reviewerName =
     typeof options.reviewerName === 'string' && options.reviewerName.length > 0
       ? options.reviewerName
@@ -42699,8 +42927,11 @@ function parseFullHunkHeader(line) {
  *   - `{type:'ctx', newLine, oldLine, text}`       — a ` text` context line
  *
  * Tracking rules (both counters advance through the body):
- *   - `+++`/`---` file headers inside the body are skipped (not real additions
- *     or removals — they only appear at patch scope, but we defend anyway).
+ *   - `+++`/`---` FILE HEADERS appear only OUTSIDE hunks (before the first
+ *     `@@` header) and are skipped by the `!cur` branch. INSIDE a hunk body a
+ *     `+++`/`---` row is an added/removed line whose content starts with
+ *     `++`/`--` (e.g. a bare `+++` row is an addition of `++`, `--- x` is a
+ *     removal of `-- x`) and must advance the counters (W15-A3-8).
  *   - `\ No newline at end of file` is metadata — skipped, counters unchanged.
  *   - A truly empty line is treated as a context line (git emits context as a
  *     leading space, but a bare empty line is also context).
@@ -42747,13 +42978,6 @@ function parseHunks(patch) {
     }
     if (!cur) {
       // Lines before the first hunk (diff metadata) are skipped entirely.
-      continue;
-    }
-    if (/^(?:\+\+\+|---)(?:\s|$)/.test(raw)) {
-      // File headers — `+++ b/path` or `--- a/path` (space-delimited), or a
-      // bare `+++`/`---` at end-of-line. NOT an added/removed line whose
-      // content happens to start with `++`/`--` (e.g. `++i;` → `+++i;` has
-      // no space after the third `+`). W5-5.
       continue;
     }
     if (raw.startsWith('+')) {
@@ -43163,10 +43387,14 @@ async function upsertPrDescription(
  *
  * Idempotency model (mirrors `comments.js`): the review body carries the
  * {@link MARKER} HTML comment. On each run, {@link upsertReview} lists prior
- * reviews whose body includes the marker, DISMISSES them (so stale inline
- * comments disappear on re-push), then creates the fresh review. This
- * "dismiss-stale-then-post" sequence keeps exactly one active bot review per
- * PR head SHA without piling up duplicates.
+ * BOT-AUTHORED reviews whose body includes the marker (W15-A3-6: a human
+ * "Quote reply" copies the marker and must never be matched), CREATES the
+ * fresh review, then DISMISSES the prior ones — excluding the new review — so
+ * stale inline comments disappear on re-push. This "create-then-dismiss-stale"
+ * sequence (W15-A7-5) keeps exactly one active bot review per PR head SHA
+ * without piling up duplicates, and guarantees a transient createReview
+ * failure can never leave the PR with the prior review already dismissed and
+ * no replacement posted.
  *
  * @module src/lib/review.js
  */
@@ -43263,7 +43491,7 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
       // Render the summary-only findings as a dependency-ordered walkthrough.
       // Strip the walkthrough's own header (## reviewerName) and trailing marker
       // so the review body retains exactly one header and one marker.
-      const rendered = formatWalkthroughSummary(summaryOnly, metadata.files, {
+      const rendered = walkthrough_formatWalkthroughSummary(summaryOnly, metadata.files, {
         reviewerName: reviewerName ?? 'Z.ai Code Review',
         metadata: { summary: '' },
       });
@@ -43437,14 +43665,41 @@ function resolveReviewEvent(findings, config) {
 const MAX_REVIEW_PAGES = 100;
 
 /**
+ * Determine whether a review was authored by a bot. Gates marker-based
+ * matching in {@link listBotReviews} so a HUMAN review carrying the marker —
+ * e.g. created via GitHub's "Quote reply", which copies the invisible
+ * {@link MARKER} — is never treated as the bot's own review and never
+ * dismissed (W15-A3-6: dismissing a human REQUEST_CHANGES review would
+ * silently unblock the PR merge). Mirrors `isBotComment` in comments.js:
+ * accepts EITHER signal GitHub surfaces for bot accounts, `user.type ===
+ * 'Bot'` (GitHub Apps bot accounts) OR `user.login` ending in `[bot]`
+ * (actions and other bots). Reviews with a missing/absent `user` object
+ * cannot prove authorship and are treated as non-bot.
+ *
+ * @param {{user?: {type?: string, login?: string}}} review
+ * @returns {boolean}
+ */
+function isBotReview(review) {
+  const user = review?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * List prior reviews posted by the bot on a PR.
  *
  * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
- * page). Filters to reviews whose `body` includes `marker`. The marker is the
- * canonical idempotency signal — every review this action posts carries it —
- * so the broad `[bot]`-login fallback that previously matched ANY bot (e.g.
- * dependabot, github-actions) was removed to avoid dismissing reviews this
- * action never posted (CORE-3).
+ * page). Filters to reviews that BOTH carry `marker` in `body` AND are
+ * bot-authored ({@link isBotReview}). The marker is the canonical idempotency
+ * signal — every review this action posts carries it — so the broad
+ * `[bot]`-login fallback that previously matched ANY bot (e.g. dependabot,
+ * github-actions) was removed to avoid dismissing reviews this action never
+ * posted (CORE-3). Bot authorship is additionally REQUIRED (W15-A3-6): a
+ * human "Quote reply" copies the invisible marker, and marker-only matching
+ * made the next run dismiss the human's review — silently unblocking a human
+ * REQUEST_CHANGES review. This mirrors the authorship gate `comments.js`
+ * applies to marker comments.
  *
  * CORE-4: pagination is also capped at {@link MAX_REVIEW_PAGES} as a safety
  * net against a misbehaving endpoint that never returns a short page.
@@ -43481,7 +43736,9 @@ async function listBotReviews({ octokit, context, marker = MARKER }) {
     // dependabot, github-actions, etc.), causing upsertReview to dismiss
     // reviews this action never posted. The marker alone is sufficient for
     // idempotency (every review we post carries it).
-    return body.includes(marker);
+    // W15-A3-6: the marker must ALSO be paired with bot authorship — a human
+    // "Quote reply" copies the marker, and that must never be dismissed.
+    return body.includes(marker) && isBotReview(r);
   });
 }
 
@@ -43526,13 +43783,23 @@ async function dismissStaleReviews({ octokit, context, reviews, reason, core }) 
 }
 
 /**
- * Post a review with inline comments. Idempotent per SHA: dismisses prior bot
- * reviews first, then creates the new one.
+ * Post a review with inline comments. Idempotent per SHA: creates the new
+ * review first, then dismisses prior bot reviews.
  *
  * Flow:
- *   1. `listBotReviews` → prior reviews (matched by marker in body).
- *   2. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`.
- *   3. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
+ *   1. `listBotReviews` → prior reviews (matched by marker in body AND bot
+ *      authorship).
+ *   2. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
+ *   3. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`,
+ *      EXCLUDING the review created in step 2.
+ *
+ * W15-A7-5: the new review is created BEFORE the stale ones are dismissed. The
+ * previous dismiss-first order meant a transient `createReview` failure (502,
+ * secondary rate limit) left the prior run's inline review already dismissed
+ * with nothing replacing it — the findings were silently lost. Create-first
+ * guarantees a dismissal only ever happens once the replacement exists; if
+ * `createReview` throws, no dismissals occur and the error propagates to the
+ * caller (which falls back to an issue comment).
  *
  * Returns `{ id, commentCount, dismissedCount }`.
  *
@@ -43546,7 +43813,6 @@ async function upsertReview({ octokit, context, marker = MARKER, sha, body, comm
 
   const prior = await listBotReviews({ octokit, context, marker });
   const reason = `Superseded by re-review at ${sha ?? ''}`.trim();
-  await dismissStaleReviews({ octokit, context, reviews: prior, reason, core });
 
   const payload = buildReviewPayload({ body, comments, event });
   const { data } = await octokit.rest.pulls.createReview({
@@ -43558,10 +43824,17 @@ async function upsertReview({ octokit, context, marker = MARKER, sha, body, comm
     comments: payload.comments,
   });
 
+  // The fresh review must never be dismissed as stale. `prior` was listed
+  // BEFORE creation so the new id cannot be in it, but filter defensively —
+  // the contract is "exactly the stale bot reviews are dismissed".
+  const newId = data?.id;
+  const stale = prior.filter((r) => r?.id !== newId);
+  await dismissStaleReviews({ octokit, context, reviews: stale, reason, core });
+
   return {
-    id: data?.id,
+    id: newId,
     commentCount: payload.comments.length,
-    dismissedCount: prior.length,
+    dismissedCount: stale.length,
   };
 }
 
@@ -43647,8 +43920,19 @@ function parseCommand(text) {
   const trimmed = firstLine.trim();
   const lower = trimmed.toLowerCase();
 
-  // Find a recognised prefix at the start.
-  const prefix = PREFIXES.find((p) => lower.startsWith(p));
+  // Find a recognised prefix at the start. W15-A4-7: the prefix must end at
+  // a token boundary — the next character (if any) must be whitespace or the
+  // string must end. Without this, '/zai-botask hi' matched '/zai-bot' and
+  // parsed as command 'ask' with args 'hi', and '/zaihelp' parsed as 'help',
+  // so comments addressed to other tools ("zai-botask") triggered command
+  // runs. The longer prefixes are listed first, and the '-bot' suffixes
+  // cannot satisfy the boundary for a shorter prefix (the next char would be
+  // '-'), so first-match-wins here cannot mis-select an alias.
+  const prefix = PREFIXES.find(
+    (p) =>
+      lower.startsWith(p) &&
+      (lower.length === p.length || /\s/.test(lower[p.length])),
+  );
   if (!prefix) {
     return { command: null, args: null, raw: text, error: 'NOT_A_COMMAND' };
   }
@@ -43703,6 +43987,14 @@ const MAX_CONTEXT_CHARS = 8000;
  */
 const MAX_QUESTION_CHARS = 4000;
 
+/**
+ * W15-A4-5: hard cap on the PR body length. The PR description is
+ * attacker-controllable (fork PRs) and was previously interpolated
+ * UNTRUNCATED — a 60k body made a 60k prompt even though the question is
+ * capped at 4000 and the diffs at 8000.
+ */
+const MAX_BODY_CHARS = 4000;
+
 /** Fixed error comment (no raw error leakage). */
 const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
@@ -43724,13 +44016,28 @@ function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
+  let skippedOversized = false;
   for (const f of patchable) {
     const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (used + entry.length > maxChars) break;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
     lines.push(entry);
     used += entry.length + 2; // +2 for the '\n\n' joiner
   }
-  if (lines.length === 0) return '(no textual diffs available)';
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
   return lines.join('\n\n');
 }
 
@@ -43746,7 +44053,12 @@ function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
  */
 function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
-  const body = pr?.body ? `**Description:**\n${pr.body}\n` : '';
+  // W15-A4-5: cap the (attacker-controllable) PR body before interpolation.
+  // The whole prContext (title + body + diffs) is wrapped via wrapUntrusted
+  // below, so the truncation does not weaken the untrusted-content wrapping.
+  const body = pr?.body
+    ? `**Description:**\n${pr.body.slice(0, MAX_BODY_CHARS)}\n`
+    : '';
   const prContext = `${title}${body}${buildDiffContext(files)}`;
   // W2-SEC-1: the user's question is the most direct prompt-injection vector
   // and must be wrapped in <untrusted_input> tags before being interpolated
@@ -44017,7 +44329,14 @@ async function handleReviewCommand(
     }
 
     // ---- whole-PR path ----
-    const patchable = filterPatchableFiles(files || []);
+    // W15-A8-8: apply the action-level EXCLUDE_PATTERNS before the patchable
+    // filter, mirroring the auto-review path in index.js — previously only
+    // filterPatchableFiles ran here, so lockfiles got reviewed despite the
+    // default excludes. (.zai.yml path_filters are merged into a repoConfig
+    // that is local to index.js run() and is not passed to comment handlers;
+    // action-level excludePatterns are the reachable, correct scope here.)
+    const notExcluded = filterExcludedFiles(files || [], config.excludePatterns);
+    const patchable = filterPatchableFiles(notExcluded);
     if (patchable.length === 0) {
       await post('> No textual changes to review in this PR.');
       return;
@@ -44079,6 +44398,16 @@ const MAX_WINDOW_CHARS = 16000;
 
 /** Separators accepted in a range token. */
 const RANGE_SEPARATORS = ['-', ':', '..'];
+
+/**
+ * W15-A4-6: binary-content marker. A binary file under the 1MB contents-API
+ * limit returns base64 that decodes to non-empty mojibake — U+FFFD
+ * replacement chars (invalid UTF-8 byte sequences) and/or C0 control bytes.
+ * Deliberately conservative: a SINGLE replacement char or a single C0
+ * control char (excluding the whitespace controls \t \n \r) marks the file
+ * as binary. Valid-UTF-8 text with accented/CJK characters never matches.
+ */
+const BINARY_CONTENT_RE = /\uFFFD|[\x00-\x08\x0E-\x1F]/;
 
 /**
  * Parse a range token into `{ start, end }`.
@@ -44292,7 +44621,9 @@ async function handleExplainCommand(
     // CMD-12: when the file has no textual content (binary file, directory
     // entry, or a file too large for the API to return), post a guidance
     // comment instead of calling the API with an empty code window.
-    if (!content || content.trim() === '') {
+    // W15-A4-6: a binary file UNDER the 1MB API limit decodes to non-empty
+    // mojibake (replacement chars / C0 controls) — same guidance, no callApi.
+    if (!content || content.trim() === '' || BINARY_CONTENT_RE.test(content)) {
       await post(`> No textual content available for \`${target}\`.`);
       return;
     }
@@ -44301,6 +44632,19 @@ async function handleExplainCommand(
     // visible range reported to the model reflects the clamp.
     const clampedEnd = Math.min(range.end, range.start + MAX_WINDOW_LINES - 1);
     let window = extractLineWindow(content, range.start, clampedEnd);
+    // W15-A4-1: CMD-12 only guarded whole-file emptiness. A range entirely
+    // past EOF on a non-empty file (e.g. 5000-5001 on a 5-line file) yields an
+    // EMPTY window here — sending that to the API invites the model to
+    // hallucinate the requested lines. Post guidance instead.
+    if (window.trim() === '') {
+      const lines = content.split('\n');
+      const lineCount =
+        lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+      await post(
+        `> No lines in range ${range.start}-${range.end} — \`${target}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
+      );
+      return;
+    }
     if (window.length > MAX_WINDOW_CHARS) {
       window = window.slice(0, MAX_WINDOW_CHARS);
     }
@@ -44457,14 +44801,28 @@ async function handleDescribeCommand(
     await post(safeDescription);
     // OPT-IN mutation: when ZAI_DESCRIBE_WRITE_BODY is true, upsert a marked
     // description block into the PR body. Only the marked block is mutated.
+    // W15-A4-2: the upsert gets its OWN fail-soft try/catch. It previously
+    // shared the outer catch with callApi, so a pulls.update failure posted a
+    // FALSE "> ⚠️ Z.ai request failed." comment AFTER the description was
+    // already posted. Per SECURITY.md's fail-soft write-surfaces contract, a
+    // mutation failure only core.warning's — the description comment stays
+    // the only comment.
     if (config.describeWriteBody && typeof pullNumber === 'number') {
-      await upsertDescription({
-        octokit,
-        owner,
-        repo,
-        pullNumber,
-        description: safeDescription,
-      });
+      try {
+        await upsertDescription({
+          octokit,
+          owner,
+          repo,
+          pullNumber,
+          description: safeDescription,
+        });
+      } catch (mutationError) {
+        if (core?.warning) {
+          core.warning(
+            `describe body upsert failed: ${mutationError?.message ?? mutationError}`,
+          );
+        }
+      }
     }
   } catch (error) {
     if (core?.warning) {
@@ -44556,24 +44914,27 @@ function parseSeverity(text) {
   );
   const cleaned = raw.replace(NEGATED_RE, 'neutral');
   const firstLine = cleaned.split('\n')[0];
-  // Check emoji + word forms in priority order (critical first).
-  for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
-    const mapped = SEVERITY_KEYS[key];
-    if (!mapped) continue;
-    if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
-      // Emoji keys have no word boundaries; use includes. W5-7: restrict to
-      // the FIRST line (where the prompt puts the level), consistent with the
-      // word-form match below. Previously `raw.includes(key)` scanned the whole
-      // body, so a 🔴 appearing in the rationale overrode the declared level.
-      if (firstLine.includes(key)) return mapped;
-    } else {
-      // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
-      // so "highlighted" → no match, "noncritical" → no match, and
-      // "high-availability" → no match (hyphen is NOT a word boundary here).
-      // Only match on the FIRST line (where the prompt puts the level).
-      const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
-      if (re.test(firstLine)) return mapped;
-    }
+  // W15-A4-3: the EMOJI forms are the canonical format the prompt requests
+  // (`🔴 critical`, `🟠 high`, …), so check ALL FOUR emoji first (in severity
+  // order). Only when no emoji is on the first line fall back to word-form
+  // matching. The previous interleaved loop (🔴, critical, 🟠, high, …) let a
+  // stray higher-severity WORD override the declared emoji: '🟡 medium — not
+  // in the critical path' matched the word 'critical' first → wrong
+  // zai:critical label.
+  for (const key of ['🔴', '🟠', '🟡', '🟢']) {
+    // Emoji keys have no word boundaries; use includes. W5-7: restrict to
+    // the FIRST line (where the prompt puts the level), consistent with the
+    // word-form match below. Previously `raw.includes(key)` scanned the whole
+    // body, so a 🔴 appearing in the rationale overrode the declared level.
+    if (firstLine.includes(key)) return SEVERITY_KEYS[key];
+  }
+  for (const key of ['critical', 'high', 'medium', 'low']) {
+    // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
+    // so "highlighted" → no match, "noncritical" → no match, and
+    // "high-availability" → no match (hyphen is NOT a word boundary here).
+    // Only match on the FIRST line (where the prompt puts the level).
+    const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
+    if (re.test(firstLine)) return SEVERITY_KEYS[key];
   }
   return null;
 }
@@ -44591,13 +44952,28 @@ function impact_buildDiffContext(files, maxChars = impact_MAX_CONTEXT_CHARS) {
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
+  let skippedOversized = false;
   for (const f of patchable) {
     const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (used + entry.length > maxChars) break;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
     lines.push(entry);
     used += entry.length + 2;
   }
-  if (lines.length === 0) return '(no textual diffs available)';
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
   return lines.join('\n\n');
 }
 
@@ -44703,16 +45079,30 @@ async function handleImpactCommand(
     await post(assessment);
     // OPT-IN mutation: when ZAI_IMPACT_LABELS is true, apply a scoped zai:
     // severity label (removing prior zai: labels for idempotency).
+    // W15-A4-2: the label application gets its OWN fail-soft try/catch. It
+    // previously shared the outer catch with callApi, so an addLabels
+    // failure posted a FALSE "> ⚠️ Z.ai request failed." comment AFTER the
+    // assessment was already posted. Per SECURITY.md's fail-soft
+    // write-surfaces contract, a mutation failure only core.warning's — the
+    // assessment comment stays the only comment.
     if (config.impactLabels && typeof pullNumber === 'number') {
-      const severity = parseSeverity(assessment);
-      await applyLabel({
-        octokit,
-        owner,
-        repo,
-        issueNumber: pullNumber,
-        severity,
-        labelMap: config.impactLabelMap,
-      });
+      try {
+        const severity = parseSeverity(assessment);
+        await applyLabel({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          severity,
+          labelMap: config.impactLabelMap,
+        });
+      } catch (mutationError) {
+        if (core?.warning) {
+          core.warning(
+            `impact label application failed: ${mutationError?.message ?? mutationError}`,
+          );
+        }
+      }
     }
   } catch (error) {
     if (core?.warning) {
@@ -44760,6 +45150,147 @@ const HANDLERS = {
   impact: handleImpactCommand,
 };
 
+;// CONCATENATED MODULE: ./src/lib/status.js
+/**
+ * Commit-status feedback for PR reviews (pending → success/failure).
+ *
+ * Mirrors CodeRabbit's `commit_status` feature: post a `pending` status at the
+ * START of the review so developers see progress immediately, then flip it to
+ * `success` (with a findings summary) or `failure` (on hard error) when done.
+ * High DX value, near-zero cost.
+ *
+ * Octokit and a `@actions/core`-like `core` are INJECTED — never imported at
+ * module load — so this module stays pure and unit-testable. Status feedback
+ * is BEST-EFFORT: any API error (e.g. a missing `statuses: write` scope) is
+ * logged via `core.warning` and swallowed — it must NEVER break the review.
+ */
+
+/** The fixed GitHub commit-status `context` label (the row in the checks UI). */
+const STATUS_CONTEXT = 'Z.ai Code Review';
+
+/** GitHub truncates commit-status descriptions to 140 characters. */
+const MAX_DESCRIPTION_LEN = 140;
+
+/**
+ * The set of valid GitHub commit-status states. Used to validate `state`
+ * before it reaches the API so a typo (e.g. 'completed') does not produce a
+ * noisy 422. GitHub only accepts these four values.
+ */
+const VALID_STATES = new Set(['pending', 'success', 'failure', 'error']);
+
+/**
+ * Truncate a description to GitHub's 140-character limit. Returns the input
+ * unchanged when it already fits.
+ *
+ * @param {string} description
+ * @returns {string}
+ */
+function truncateDescription(description) {
+  const s = String(description ?? '');
+  if (s.length <= MAX_DESCRIPTION_LEN) return s;
+  return s.slice(0, MAX_DESCRIPTION_LEN);
+}
+
+/**
+ * Build the success description from review results.
+ *
+ * Returns the "no issues" emoji form when `findingCount` is 0 (or missing),
+ * otherwise the "N findings (M critical, H high)" form. Counts default to 0
+ * when missing so a partial object is still safe.
+ *
+ * @param {{ findingCount?: number, criticalCount?: number, highCount?: number }} counts
+ * @returns {string}
+ */
+function status_buildStatusDescription({
+  findingCount = 0,
+  criticalCount = 0,
+  highCount = 0,
+} = {}) {
+  const findings = Number(findingCount) || 0;
+  const critical = Number(criticalCount) || 0;
+  const high = Number(highCount) || 0;
+  if (findings === 0) {
+    return 'Review complete: no issues found ✅';
+  }
+  return `Review complete: ${findings} findings (${critical} critical, ${high} high)`;
+}
+
+/**
+ * Post a commit status to the PR's head SHA.
+ *
+ * Calls `octokit.rest.repos.createCommitStatus` with the `STATUS_CONTEXT`
+ * label (or `opts.reviewerName` when provided — W15-A8-7). Owner/repo come
+ * from `context.repo`; the SHA comes from `opts.sha`
+ * (the caller passes `context.payload.pull_request.head.sha`).
+ *
+ * FAIL-SOFT: if the API call throws (e.g. missing `statuses: write` scope),
+ * the error is logged via `deps.core.warning` (when a core is provided) and
+ * `false` is returned. This function NEVER throws — status feedback is
+ * best-effort and must not break the review. Missing `sha`, `context.repo`,
+ * or `octokit` are treated as a no-op and return `false`.
+ *
+ * @param {object} opts
+ * @param {object} opts.octokit     Octokit instance (rest.repos.createCommitStatus used).
+ * @param {object} opts.context     @actions/github context (`.repo` read for owner/repo).
+ * @param {string} opts.sha         The PR head SHA to attach the status to.
+ * @param {'pending'|'success'|'failure'|'error'} opts.state  Commit-status state.
+ * @param {string} opts.description Short human message (truncated to 140 chars).
+ * @param {string} [opts.targetUrl] Optional link (e.g. the workflow run URL).
+ * @param {string} [opts.reviewerName] Optional custom status `context` label
+ *   (from ZAI_REVIEWER_NAME); falls back to {@link STATUS_CONTEXT} when absent
+ *   or empty so the default checks-tab label is unchanged (W15-A8-7).
+ * @param {{ core?: { warning?: (m: string) => void } }} [deps]  Optional core-like logger.
+ * @returns {Promise<boolean>} true on success, false on failure/no-op (fail-soft).
+ */
+async function setReviewStatus(opts, deps = {}) {
+  const { octokit, context, sha, state, description, targetUrl, reviewerName } =
+    opts || {};
+
+  // W15-A8-7: custom reviewer branding (ZAI_REVIEWER_NAME) must reach the
+  // checks tab. Only a non-empty string overrides the default label, so the
+  // default behavior is byte-identical.
+  const statusContext =
+    typeof reviewerName === 'string' && reviewerName.trim() !== ''
+      ? reviewerName
+      : STATUS_CONTEXT;
+
+  // CFG-7: validate the state enum BEFORE any other check so an invalid state
+  // short-circuits without hitting the API. GitHub only accepts these four.
+  if (!VALID_STATES.has(state)) return false;
+
+  // Defense: missing octokit, SHA, or context.repo is a no-op. The caller in
+  // src/index.js guards the sha too, but be belt-and-suspenders so a misuse
+  // from any other call site can never trigger a noisy GitHub API error.
+  if (!octokit) return false;
+  if (typeof sha !== 'string' || sha.length === 0) return false;
+  const owner = context?.repo?.owner;
+  const repo = context?.repo?.repo;
+  if (!owner || !repo) return false;
+
+  try {
+    await octokit.rest.repos.createCommitStatus({
+      owner,
+      repo,
+      sha,
+      state,
+      description: truncateDescription(description),
+      context: statusContext,
+      target_url: targetUrl,
+    });
+    return true;
+  } catch (error) {
+    // Fail-soft: status feedback must never break the review. Log and move on.
+    const core = deps?.core;
+    if (core && typeof core.warning === 'function') {
+      core.warning(
+        `Failed to post commit status (${error?.message ?? String(error)}); ` +
+          'continuing without status feedback.',
+      );
+    }
+    return false;
+  }
+}
+
 ;// CONCATENATED MODULE: ./src/lib/schedule.js
 /**
  * Scheduled batch review: re-review open, non-draft PRs whose head SHA has not
@@ -44787,8 +45318,48 @@ const HANDLERS = {
 
 
 
+
+
 /** Default cap on the number of PRs reviewed per scheduled run. */
 const DEFAULT_MAX_PRS = 10;
+
+/* ------------------------------------------------------------------ *
+ * W15-A8-4 feature-parity default deps.
+ *
+ * The new collaborators (repo config, scanners, learnings, commit statuses)
+ * are OPTIONAL and default to INERT no-ops so schedule.js stays hermetic when
+ * called without the full dep kit (existing tests, embedding). src/index.js's
+ * schedule branch wires the REAL functions for production runs. Pure helpers
+ * (renderers, description builders) default to their real implementations —
+ * they never touch the network.
+ * ------------------------------------------------------------------ */
+
+/** Inert `.zai.yml` loader: never fetches; behaves like a repo without one. */
+const defaultLoadRepoConfig = async () => ({});
+
+/** Inert merge: pass the action config through unchanged (no repo narrowing). */
+const defaultMergeRepoConfig = (actionConfig = {}) => ({ ...actionConfig });
+
+/** Inert scanner orchestrator: no findings, no metrics, no scanners run. */
+const defaultRunScanners = async () => ({ findings: [], metrics: {}, scannerNames: [] });
+
+/** Inert scanner-context formatter: contributes nothing to the prompt. */
+const defaultFormatScannerContext = () => '';
+
+/** Inert learnings loader: behaves like a repo without `.zai/learnings.yml`. */
+const defaultLoadLearnings = async () => [];
+
+/** Inert learnings prompt formatter: no prompt context. */
+const defaultFormatLearningsForPrompt = () => '';
+
+/** Inert learnings suppression: keep everything, suppress nothing. */
+const defaultFilterFindingsByLearnings = (findings) => ({
+  kept: Array.isArray(findings) ? findings : [],
+  suppressed: 0,
+});
+
+/** Inert status poster: never touches the API (status feedback is opt-in). */
+const defaultSetReviewStatus = async () => false;
 
 /**
  * Build the hidden HTML comment that embeds the PR head SHA in a posted
@@ -44864,7 +45435,15 @@ async function listOpenPrs({
     // true so the loop terminated after page 1 even though page 2 had reviewable
     // PRs. Comparing against the requested size (10 < 10 → false) makes
     // pagination continue until the API truly returns a short page.
-    const requestedPerPage = Math.min(perPage, Math.max(1, maxPrs - out.length) || perPage);
+    //
+    // W15-A6-1: the per_page must also be CONSTANT across pages. GitHub
+    // paginates by offset ((page-1)*per_page); recomputing a SMALLER per_page
+    // for page 2 (the old `min(perPage, maxPrs - out.length)` clamp) moved the
+    // offset window BACKWARD over items already seen when drafts were skipped
+    // on page 1 — returning DUPLICATE PRs (verified: [2,3,4,5,6,8,9,10,3,4])
+    // and starving tail PRs of review. The clamp is dropped entirely: the
+    // ingest loop below already stops at maxPrs, so the cap is still honored.
+    const requestedPerPage = perPage;
     const { data } = await octokit.rest.pulls.list({
       owner,
       repo,
@@ -44987,12 +45566,15 @@ async function hasReviewForSha({
  * again to postFallbackComment if the review submission itself fails — the
  * review is never silently lost.
  *
- * KNOWN LIMITATION (W8-3): unlike the `pull_request` path, the scheduled path
- * does not currently load `.zai.yml` repo config or run deterministic scanners
- * (gitleaks/ast-grep). This means `path_filters`, `path_instructions`,
- * `tone_instructions`, the `chill` profile, and deterministic secret/pattern
- * findings are absent on scheduled reviews. Schedule is opt-in; this gap is
- * tracked for a future enhancement.
+ * KNOWN LIMITATION → RESOLVED (W8-3 / W15-A8-4): the scheduled path now loads
+ * and merges `.zai.yml` repo config (path_filters, path/tone instructions,
+ * chill profile narrowing), runs the deterministic scanners (gitleaks /
+ * ast-grep / metrics, with the repo's disable-only toggles), loads
+ * `.zai/learnings.yml` (prompt context + post-review suppression), posts
+ * pending/success commit statuses, and renders walkthrough summaries — the
+ * same feature set as the `pull_request` path. Every collaborator is
+ * deps-injectable with inert defaults so tests stay hermetic; src/index.js's
+ * schedule branch wires the real functions.
  *
  * All collaborators are injected. Never throws — failures are returned as
  * `{ ok: false, error }` so the caller can log and continue the batch.
@@ -45023,13 +45605,184 @@ async function reviewOnePr({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
+  // W15-A6-4: walkthrough parity — index.js renders the summary-only branch
+  // via formatWalkthroughSummary when config.walkthrough is on; the scheduled
+  // path must mirror that so cron and push runs render the same PR the same
+  // way. Optional dep (default: the real renderer from walkthrough.js).
+  formatWalkthroughSummary = walkthrough_formatWalkthroughSummary,
+  // W15-A8-4 feature-parity deps (all OPTIONAL with inert defaults so existing
+  // tests/hermetic callers stay green; src/index.js's schedule branch wires the
+  // real functions — see run()'s schedule wiring).
+  // (a) .zai.yml repo config: load (fail-soft, returns {} on any error by
+  //     contract) + merge (action inputs always win; repo can only narrow).
+  loadRepoConfig = defaultLoadRepoConfig,
+  mergeRepoConfig = defaultMergeRepoConfig,
+  // (b) deterministic scanners: run over the patchable files; findings flow
+  //     into runStructuredReview as `deterministicFindings` and their formatted
+  //     context rides the LLM prompt as `scannerContext`.
+  runScanners = defaultRunScanners,
+  formatScannerContext = defaultFormatScannerContext,
+  // (c) learnings: load `.zai/learnings.yml` (fail-soft → []), format the
+  //     accepted patterns as prompt context, and suppress matching findings
+  //     after the review (same three seams as index.js).
+  loadLearnings = defaultLoadLearnings,
+  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  // (d) commit statuses: `pending` at the start of the review work and
+  //     `success` computed from the FINAL kept findings (post-suppression).
+  //     setReviewStatus is fail-soft by contract; buildStatusDescription is a
+  //     pure helper (defaults to the real one from status.js).
+  setReviewStatus = defaultSetReviewStatus,
+  buildStatusDescription = status_buildStatusDescription,
 }) {
   try {
     let files = await getChangedFiles({ octokit, owner, repo, pullNumber: pr.number });
     files = filterExcludedFiles(files, config.excludePatterns);
-    const patchable = filterPatchableFiles(files);
+    let patchable = filterPatchableFiles(files);
     if (patchable.length === 0) {
       return { ok: true, action: 'skipped-no-patchable' };
+    }
+
+    // Synthetic @actions/github-like context. upsertReview reads
+    // context.payload.pull_request.number; postFallbackComment delegates to the
+    // shared postComment helper, which reads context.payload.issue.number — so
+    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
+    const ctx = {
+      repo: { owner, repo },
+      payload: {
+        pull_request: { number: pr.number, head: { sha: pr.headSha } },
+        issue: { number: pr.number },
+      },
+    };
+
+    // W15-A8-4d: `pending` commit status parity — the push path posts it right
+    // after the zero-patchable short-circuit (so an empty PR never gets a
+    // dangling status) and before the heavier review work, so developers see
+    // immediate feedback on a cron tick too. Fail-soft; gated by config so an
+    // operator without `statuses: write` can turn it off.
+    if (config.commitStatus) {
+      await setReviewStatus(
+        {
+          octokit,
+          context: ctx,
+          sha: pr.headSha,
+          state: 'pending',
+          description: 'Z.ai review in progress…',
+          reviewerName: config.reviewerName,
+        },
+        { core },
+      );
+    }
+
+    // W15-A8-4a: `.zai.yml` parity. The push path (src/index.js) loads the
+    // in-repo config at the head SHA, merges it under the action config, and
+    // RE-FILTERS the patchable set with the merged path_filters (W6-1: the
+    // initial filter ran before the merge, so repo-defined excludes were
+    // silently ignored). The scheduled path previously skipped all of this
+    // (the old "KNOWN LIMITATION (W8-3)" gap). loadRepoConfig is fail-soft by
+    // contract (any failure → {} + warning); a throwing injectable is guarded
+    // here too so one broken config fetch can never fail the whole PR review.
+    let rawRepoConfig = {};
+    if (config.repoConfigEnabled) {
+      try {
+        rawRepoConfig = await loadRepoConfig(
+          { octokit, context: ctx, headSha: pr.headSha },
+          { core },
+        );
+      } catch (repoConfigError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: .zai.yml load failed for PR #${pr.number} (${repoConfigError?.message ?? String(repoConfigError)}); continuing without repo config.`,
+          );
+        }
+        rawRepoConfig = {};
+      }
+    }
+    const repoConfig = mergeRepoConfig(config, rawRepoConfig);
+    if (Array.isArray(repoConfig.excludePatterns) && repoConfig.excludePatterns.length > 0) {
+      patchable = filterExcludedFiles(patchable, repoConfig.excludePatterns);
+      if (patchable.length === 0) {
+        if (core?.info) {
+          core.info(`Scheduled review: PR #${pr.number} — all patchable files excluded by .zai.yml path_filters; skipping.`);
+        }
+        // W15-A7-3 parity: the `pending` status was already posted above;
+        // returning without a TERMINAL status would leave the check spinning
+        // pending forever on a required-status repo. Post terminal `success`
+        // (there is genuinely nothing to review) — same fail-soft helper, same
+        // commitStatus gate as index.js.
+        if (config.commitStatus) {
+          await setReviewStatus(
+            {
+              octokit,
+              context: ctx,
+              sha: pr.headSha,
+              state: 'success',
+              description: 'No reviewable files (.zai.yml path_filters excluded all changes)',
+              reviewerName: config.reviewerName,
+            },
+            { core },
+          );
+        }
+        return { ok: true, action: 'skipped-no-patchable' };
+      }
+    }
+
+    // W15-A8-4c: learnings / memory (`.zai/learnings.yml`) parity — mirrors
+    // the push path. The file records "previously-reviewed / won't-fix"
+    // patterns so the bot doesn't re-raise the same finding on every cron
+    // tick. OPT-IN via config.learningsEnabled (the file is
+    // attacker-controllable in fork PRs). loadLearnings is fail-soft by
+    // contract (any error → [] + warning); a throwing injectable is guarded
+    // here too. The accepted patterns ride the prompt (learningsContext) and
+    // are applied as post-review suppression below.
+    let learnings = [];
+    if (config.learningsEnabled) {
+      try {
+        learnings = await loadLearnings(
+          { octokit, context: ctx, headSha: pr.headSha },
+          { core },
+        );
+      } catch (learningsError) {
+        if (core?.warning) {
+          core.warning(
+            `Scheduled review: learnings load failed for PR #${pr.number} (${learningsError?.message ?? String(learningsError)}); continuing without learnings.`,
+          );
+        }
+        learnings = [];
+      }
+    }
+    const learningsContext = formatLearningsForPrompt(learnings);
+
+    // W15-A8-4b: deterministic scanners run BEFORE the LLM (mirrors the push
+    // path). Their findings become high-confidence findings (merged over LLM
+    // findings at the same file:line+title inside runStructuredReview via
+    // `deterministicFindings`) and are injected into the prompt as
+    // "already detected, don't re-report" context via `scannerContext`. The
+    // `.zai.yml` scanners map onto the orchestrator's per-scanner toggles
+    // (gitleaks → secrets, ast_grep → patterns, metrics → metrics; the repo
+    // can only DISABLE a scanner the action enabled — enforced by
+    // mergeRepoConfig). runScanners is fail-soft by contract.
+    const scannerRepoConfig = {
+      scanners: {
+        secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
+        patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+        // W15-A1-2: `.zai.yml` `scanners.metrics: false` must reach the
+        // orchestrator's per-scanner toggle — same mapping as index.js.
+        metrics: repoConfig.scanners?.metrics === false ? false : undefined,
+      },
+    };
+    const scannerResult = await runScanners({
+      files: patchable,
+      repoPath: process.cwd(),
+      cacheDir: config.scannersCacheDir,
+      config: { scannersEnabled: repoConfig.scannersEnabled },
+      repoConfig: scannerRepoConfig,
+    });
+    const scannerContext = formatScannerContext(scannerResult.findings, scannerResult.metrics);
+    if (scannerResult.scannerNames.length > 0 && core?.info) {
+      core.info(
+        `Scheduled review: PR #${pr.number} scanners: ${scannerResult.findings.length} finding(s) from ${scannerResult.scannerNames.join(', ')}.`,
+      );
     }
 
     // W11-10: `largePrFileThreshold` used to be parsed in config, exported as
@@ -45044,21 +45797,57 @@ async function reviewOnePr({
       }
     }
 
-    const result = await runStructuredReview(patchable, config, { callApi, core });
-
-    // Synthetic @actions/github-like context. upsertReview reads
-    // context.payload.pull_request.number; postFallbackComment delegates to the
-    // shared postComment helper, which reads context.payload.issue.number — so
-    // expose BOTH shapes (mirrors how src/index.js builds reviewContext).
-    const ctx = {
-      repo: { owner, repo },
-      payload: {
-        pull_request: { number: pr.number, head: { sha: pr.headSha } },
-        issue: { number: pr.number },
+    const result = await runStructuredReview(
+      patchable,
+      {
+        ...config,
+        maxFindings: repoConfig.maxFindings,
+        minSeverity: repoConfig.minSeverity ?? config.minSeverity,
+        pathInstructions: repoConfig.pathInstructions,
+        toneInstructions: repoConfig.toneInstructions,
+        deterministicFindings: scannerResult.findings,
+        scannerContext,
+        learningsContext,
       },
-    };
+      { callApi, core },
+    );
 
-    const { inline, summaryOnly } = partitionFindings(result.findings, patchable);
+    // W15-A8-4c: drop findings that match a previously-reviewed / won't-fix
+    // learning (mirrors the push path; applied to the final findings set so the
+    // posted review, the commit status, and the SHA-dedup hash all describe the
+    // SAME kept set). When learningsEnabled is off (or nothing matched) this is
+    // a no-op passthrough.
+    const { kept: keptFindings } = filterFindingsByLearnings(result.findings, learnings);
+
+    // W15-A8-4d: flip the commit status to `success` with a findings summary
+    // now that the review completed. Mirrors index.js (W15-A6-2): computed from
+    // the FINAL kept-findings set — AFTER learnings suppression — so the checks
+    // tab never contradicts the posted review. Fail-soft.
+    if (config.commitStatus) {
+      const criticalCount = keptFindings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = keptFindings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatus(
+        {
+          octokit,
+          context: ctx,
+          sha: pr.headSha,
+          state: 'success',
+          description: buildStatusDescription({
+            findingCount: keptFindings.length,
+            criticalCount,
+            highCount,
+          }),
+          reviewerName: config.reviewerName,
+        },
+        { core },
+      );
+    }
+
+    const { inline, summaryOnly } = partitionFindings(keptFindings, patchable);
 
     if (inline.length > 0) {
       const baseBody = buildReviewBody(result.summary, summaryOnly, {
@@ -45078,7 +45867,7 @@ async function reviewOnePr({
       const shaBlock = buildShaBlock(pr.headSha);
       const body = appendTrailers(baseBody, [shaBlock]);
       const comments = buildReviewComments(inline);
-      const event = resolveReviewEvent(result.findings, config);
+      const event = resolveReviewEvent(keptFindings, config);
       try {
         await upsertReview({
           octokit,
@@ -45119,17 +45908,31 @@ async function reviewOnePr({
     }
 
     // No inline-mappable findings: post the whole summary as an issue comment
-    // via the existing marker-upsert path (legacy summary comment).
-    const content = formatFindingsAsSummary(result.findings, {
-      reviewerName: config.reviewerName,
-      metadata: {
-        deterministicFindingsCount: result.metadata.deterministicFindingsCount,
-        truncated: Math.max(
-          0,
-          (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
-        ),
-      },
-    });
+    // via the existing marker-upsert path (legacy summary comment). W15-A6-4:
+    // mirror index.js — when walkthrough is on AND there are findings, render
+    // the dependency-ordered walkthrough instead of the flat summary (previously
+    // the scheduled path ALWAYS rendered flat, so cron and push runs disagreed
+    // on the same PR). The metadata shape (summary prose carried to both
+    // renderers) matches index.js's summary-only branch.
+    const useWalkthrough =
+      config.walkthrough && Array.isArray(keptFindings) && keptFindings.length > 0;
+    const summaryMetadata = {
+      deterministicFindingsCount: result.metadata.deterministicFindingsCount,
+      truncated: Math.max(
+        0,
+        (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
+      ),
+      summary: typeof result.summary === 'string' ? result.summary : '',
+    };
+    const content = useWalkthrough
+      ? formatWalkthroughSummary(keptFindings, patchable, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        })
+      : formatFindingsAsSummary(keptFindings, {
+          reviewerName: config.reviewerName,
+          metadata: summaryMetadata,
+        });
 
     const commentBody = buildCommentBody({
       title: config.reviewerName,
@@ -45182,6 +45985,16 @@ async function reviewOnePr({
  * @param {Function} args.upsertReview
  * @param {Function} args.postFallbackComment
  * @param {Function} args.resolveReviewEvent
+ * @param {Function} [args.formatWalkthroughSummary]  Walkthrough renderer (W15-A6-4).
+ * @param {Function} [args.loadRepoConfig]  .zai.yml loader (W15-A8-4a).
+ * @param {Function} [args.mergeRepoConfig]  .zai.yml merge (W15-A8-4a).
+ * @param {Function} [args.runScanners]  Scanner orchestrator (W15-A8-4b).
+ * @param {Function} [args.formatScannerContext]  Scanner prompt context (W15-A8-4b).
+ * @param {Function} [args.loadLearnings]  .zai/learnings.yml loader (W15-A8-4c).
+ * @param {Function} [args.formatLearningsForPrompt]  Learnings prompt context (W15-A8-4c).
+ * @param {Function} [args.filterFindingsByLearnings]  Learnings suppression (W15-A8-4c).
+ * @param {Function} [args.setReviewStatus]  Commit-status poster (W15-A8-4d).
+ * @param {Function} [args.buildStatusDescription]  Status description builder (W15-A8-4d).
  * @returns {Promise<{reviewed: number, skipped: number, failed: number}>}
  */
 async function runScheduledReview({
@@ -45211,6 +46024,18 @@ async function runScheduledReview({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
+  // W15-A6-4 walkthrough parity dep (optional; default: real renderer).
+  formatWalkthroughSummary: formatWalkthroughSummaryFn = walkthrough_formatWalkthroughSummary,
+  // W15-A8-4 feature-parity deps (optional; inert defaults — see reviewOnePr).
+  loadRepoConfig = defaultLoadRepoConfig,
+  mergeRepoConfig = defaultMergeRepoConfig,
+  runScanners = defaultRunScanners,
+  formatScannerContext = defaultFormatScannerContext,
+  loadLearnings = defaultLoadLearnings,
+  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  setReviewStatus = defaultSetReviewStatus,
+  buildStatusDescription = status_buildStatusDescription,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -45271,10 +46096,29 @@ async function runScheduledReview({
       upsertReview,
       postFallbackComment,
       resolveReviewEvent,
+      formatWalkthroughSummary: formatWalkthroughSummaryFn,
+      loadRepoConfig,
+      mergeRepoConfig,
+      runScanners,
+      formatScannerContext,
+      loadLearnings,
+      formatLearningsForPrompt,
+      filterFindingsByLearnings,
+      setReviewStatus,
+      buildStatusDescription,
     });
 
     if (result.ok) {
-      reviewed += 1;
+      // W15-A6-3: an ok result is not necessarily a REVIEW. reviewOnePr returns
+      // {ok:true, action:'skipped-no-patchable'} for PRs with nothing to
+      // review; counting those as reviewed made the log say "skipped-no-
+      // patchable" while the summary said {reviewed:1}. Only real reviews count
+      // as reviewed; skip-actions count as skipped.
+      if (result.action === 'skipped-no-patchable') {
+        skipped += 1;
+      } else {
+        reviewed += 1;
+      }
       if (core?.info) core.info(`Scheduled review: PR #${pr.number} ${result.action}.`);
     } else {
       failed += 1;
@@ -45402,6 +46246,26 @@ function parseAddedLines(patch) {
     newLine++;
   }
   return out;
+}
+
+/**
+ * Build the set of changed-file filenames from a GitHub PR `files` array
+ * (each entry `{ filename, patch?, status?, ... }`). Used to scope
+ * whole-repo/whole-history binary-scanner output down to the PR's diff —
+ * binary findings in files the PR never touched must not surface.
+ * Pure (no I/O).
+ *
+ * @param {Array<{filename?: string}>} files
+ * @returns {Set<string>}
+ */
+function changedFileNames(files) {
+  const set = new Set();
+  for (const f of Array.isArray(files) ? files : []) {
+    if (f && typeof f === 'object' && typeof f.filename === 'string' && f.filename) {
+      set.add(f.filename);
+    }
+  }
+  return set;
 }
 
 ;// CONCATENATED MODULE: ./src/lib/scanners/ensure-binary.js
@@ -45729,10 +46593,15 @@ async function tarGzExtractor(bytes, destPath, deps = {}) {
 /**
  * Extract a `.zip` archive to destPath.
  *
- * Writes `bytes` to a temp archive, shells out to system `tar -xf` (bsdtar can
- * read zip; works on macOS, Linux with bsdtar, and Windows System32). On
- * Windows, falls back to `powershell Expand-Archive` if `tar` is unavailable
- * (older Windows images / custom runners).
+ * Writes `bytes` to a temp archive, then tries extractors in order until one
+ * succeeds:
+ *   - non-Windows: `tar -xf` (bsdtar reads zip on macOS; GNU tar — the default
+ *     on ubuntu-latest — CANNOT), then `unzip -o`, then `python3 -m zipfile`
+ *     (both are present on GitHub-hosted runners). [W15-A5-4]
+ *   - Windows: `tar -xf` (System32 bsdtar), then `powershell Expand-Archive`.
+ *
+ * Throws a single error listing every failed attempt only when ALL extractors
+ * fail.
  *
  * @param {Buffer} bytes
  * @param {string} destPath
@@ -45751,37 +46620,53 @@ async function zipExtractor(bytes, destPath, deps = {}) {
 
   await writeFile(tmpArchive, bytes);
   await mkdir(extractDir);
-  try {
-    // `-xf` works for zip on bsdtar (macOS, Windows). On Linux, GNU tar ≥ 1.27
-    // also reads zip via libarchive fallback; if the runner has only classic
-    // GNU tar without libarchive, this throws and we fall through to Expand.
-    await runCommand('tar', ['-xf', tmpArchive, '-C', extractDir]);
-  } catch (tarErr) {
-    if (platform === 'win32') {
-      try {
-        // PowerShell Expand-Archive is universally available on Windows runners.
-        // Quoting: use single quotes around the path literals; PS handles spaces.
-        await runCommand('powershell.exe', [
-          '-NoProfile',
-          '-Command',
-          `Expand-Archive -LiteralPath '${tmpArchive}' -DestinationPath '${extractDir}' -Force`,
-        ]);
-      } catch (psErr) {
-        await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
-        await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
-        throw new Error(
-          `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
-            `Expand-Archive failed (${psErr?.message ?? String(psErr)})`,
-        );
-      }
-    } else {
-      await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
-      await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
-      throw new Error(
-        `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
-          `no Expand-Archive fallback on platform=${platform}`,
-      );
+
+  // W15-A5-4: GNU tar (the default `tar` on ubuntu-latest) cannot read zip
+  // archives — only bsdtar can — so `tar -xf` alone made extraction ALWAYS
+  // fail on the default Linux runner and every run re-downloaded + re-failed.
+  // Ordered extractor attempts: first success wins; all-fail throws below.
+  /** @type {Array<[string, string[]]>} */
+  const attempts =
+    platform === 'win32'
+      ? [
+          ['tar', ['-xf', tmpArchive, '-C', extractDir]],
+          [
+            // PowerShell Expand-Archive is universally available on Windows
+            // runners. Quoting: single quotes around the path literals.
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `Expand-Archive -LiteralPath '${tmpArchive}' -DestinationPath '${extractDir}' -Force`,
+            ],
+          ],
+        ]
+      : [
+          ['tar', ['-xf', tmpArchive, '-C', extractDir]],
+          ['unzip', ['-o', tmpArchive, '-d', extractDir]],
+          ['python3', ['-m', 'zipfile', '-e', tmpArchive, `${extractDir}/`]],
+        ];
+
+  /** @type {string[]} */
+  const failures = [];
+  let succeeded = false;
+  for (const [cmd, args] of attempts) {
+    try {
+      await runCommand(cmd, args);
+      succeeded = true;
+      break;
+    } catch (err) {
+      failures.push(`${cmd}: ${err?.message ?? String(err)}`);
     }
+  }
+  if (!succeeded) {
+    // Best-effort cleanup before rethrowing.
+    await promises_namespaceObject.unlink(tmpArchive).catch(() => {});
+    await promises_namespaceObject.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(
+      `zipExtractor: all extraction attempts failed on platform=${platform}: ` +
+        failures.join('; '),
+    );
   }
 
   // Best-effort cleanup of the temp archive.
@@ -46096,7 +46981,10 @@ const SECRET_PATTERNS = [
     // by an assignment and a quoted value of length >= 8. Capture group 1 is
     // the value, on which we run an entropy check (≥ 3.5 Shannon) to suppress
     // false positives like `password = "password"`.
-    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-.]{8,})['"]/i,
+    // W15-A5-6: the value charset now also includes `/` and `,;:=~|` — real
+    // secrets routinely contain them (JWT fragments, base64 with `/`, scoped
+    // tokens), and their omission made those values unmatchable.
+    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-/.,;:=~|]{8,})['"]/i,
     captureGroup: 1,
     minEntropy: 3.5,
     title: 'Hardcoded credential assigned to a key',
@@ -46112,6 +47000,18 @@ const SECRET_PATTERNS = [
     regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
     captureGroup: 1,
     minEntropy: 4.5,
+    // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
+    // Before accepting a candidate, the preceding context on the same line is
+    // tested against each regex — data URIs and subresource-integrity hashes
+    // are high-entropy BY DESIGN and flooded reviews with critical FPs.
+    skipIfPrecededBy: [
+      // `data:image/png;base64,<candidate>` (data URIs)
+      /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,\s*$/,
+      // `"integrity": "sha512-<candidate>"`, `integrity="sha384-..."`,
+      // `sha256:<candidate>`, etc. (SRI hashes / digest prefixes). The first
+      // `["']?` allows the JSON key's closing quote (`integrity": "sha512-`).
+      /(?:integrity|sha256|sha384|sha512)["']?[=:]?\s*["']?(?:sha\d+-)?$/i,
+    ],
     title: 'High-entropy string (possible secret)',
     description:
       'A long, high-entropy string was found in the diff. This often indicates an ' +
@@ -46191,6 +47091,14 @@ function scanSecretsRegex(files) {
         pattern.regex.lastIndex = 0; // defense in depth for stateful regexes
         const match = pattern.regex.exec(text);
         if (!match) continue;
+
+        // W15-A5-5: suppress candidates that sit in a known-benign base64
+        // context (data URIs, SRI integrity hashes). Look at up to 40 chars
+        // immediately before the match on the same line.
+        if (Array.isArray(pattern.skipIfPrecededBy) && typeof match.index === 'number') {
+          const before = text.slice(Math.max(0, match.index - 40), match.index);
+          if (pattern.skipIfPrecededBy.some((re) => re.test(before))) continue;
+        }
 
         // Resolve the value used for evidence + entropy check.
         const groupIdx = typeof pattern.captureGroup === 'number' ? pattern.captureGroup : 0;
@@ -46402,7 +47310,14 @@ async function scanSecrets(opts, deps = {}) {
       maxBuffer: 10 * 1024 * 1024,
     });
     const stdout = typeof result === 'string' ? result : String(result?.stdout ?? '');
-    const findings = parseGitleaksJson(stdout);
+    // W15-A5-1: gitleaks scans the repo's HISTORY (`detect --source`), so its
+    // report includes leaks in files this PR never touched (with line numbers
+    // from the historical file, not the diff). Scope findings to the PR's
+    // changed files before returning.
+    const changedFiles = changedFileNames(files);
+    const findings = parseGitleaksJson(stdout).filter((f) =>
+      changedFiles.has(typeof f.file === 'string' ? f.file : ''),
+    );
     if (core?.info) {
       core.info(`gitleaks: ${findings.length} secret finding(s).`);
     }
@@ -46617,6 +47532,13 @@ function astGrepPatternToRegex(pattern) {
   const startsWithIdentifier = /^[A-Za-z_][A-Za-z0-9_]*/.test(pattern);
   if (startsWithIdentifier) {
     translated = '\\b' + translated;
+    // W15-A5-7: a BARE-identifier pattern (letters/digits/underscore only —
+    // e.g. the TODO/FIXME rules) also needs a TRAILING boundary, otherwise
+    // `TODO` prefix-matches `TODOS` (same bug class metrics.js fixed with
+    // `\bTODO\b`).
+    if (/^[A-Za-z0-9_]+$/.test(pattern)) {
+      translated = translated + '\\b';
+    }
   }
   // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
   // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
@@ -46635,6 +47557,38 @@ function astGrepPatternToRegex(pattern) {
 }
 
 /**
+ * File-extension → ast-grep language-name map (lowercased extensions).
+ * js → js/mjs/cjs, ts → ts, jsx → jsx, tsx → tsx. Shared by the regex
+ * fallback's language filter and the binary path's needed-language
+ * computation.
+ *
+ * @type {Record<string, string>}
+ */
+const EXT_TO_LANG = {
+  js: 'js',
+  mjs: 'js',
+  cjs: 'js',
+  ts: 'ts',
+  jsx: 'jsx',
+  tsx: 'tsx',
+};
+
+/**
+ * Map a filename to its ast-grep language name via its extension, or `null`
+ * when the extension is unknown/absent. Pure (no I/O).
+ *
+ * @param {string} filename
+ * @returns {string | null}
+ */
+function filenameToLanguage(filename) {
+  if (typeof filename !== 'string') return null;
+  const base = filename.split('/').pop() || filename;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return null;
+  return EXT_TO_LANG[base.slice(dot + 1).toLowerCase()] || null;
+}
+
+/**
  * Determine whether a filename matches a rule's language set.
  *
  * - `'*'` in `languages` → matches anything
@@ -46649,20 +47603,7 @@ function astGrepPatternToRegex(pattern) {
 function fileMatchesLanguages(filename, languages) {
   if (!Array.isArray(languages) || languages.length === 0) return true;
   if (languages.includes('*')) return true;
-  if (typeof filename !== 'string') return false;
-  const base = filename.split('/').pop() || filename;
-  const dot = base.lastIndexOf('.');
-  if (dot <= 0) return false;
-  const ext = base.slice(dot + 1).toLowerCase();
-  const extToLang = {
-    js: 'js',
-    mjs: 'js',
-    cjs: 'js',
-    ts: 'ts',
-    jsx: 'jsx',
-    tsx: 'tsx',
-  };
-  const lang = extToLang[ext];
+  const lang = filenameToLanguage(filename);
   return lang ? languages.includes(lang) : false;
 }
 
@@ -46870,6 +47811,16 @@ function parseAstGrepJson(jsonText, ruleIndex) {
  * deps.runBinary); on ANY error warns via `deps.core.warning` and falls back
  * to `scanPatternsRegex(files, rules)`. NEVER throws.
  *
+ * Binary path scoping (W15):
+ *   - A5-1: ast-grep runs over the whole repo tree, so findings are filtered
+ *     down to the PR's changed files (`opts.files` filenames).
+ *   - A5-2: each rule runs once per language it declares that is ALSO needed
+ *     by a changed file's extension (js/ts/jsx/tsx) — not just `languages[0]`.
+ *   - A5-3: `*`-language rules (TODO/FIXME) cannot run via `ast-grep run`
+ *     (it needs a concrete --lang); their diff-scoped regex findings are
+ *     appended on the success path instead of being dropped.
+ *   - Findings are deduped by `${file}:${line}:${rule}` before returning.
+ *
  * @param {{ files: Array, repoPath: string, cacheDir?: string, rules?: Array }} opts
  * @param {{
  *   ensureBinary?: Function,
@@ -46905,24 +47856,46 @@ async function scanPatterns(opts, deps = {}) {
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
+
+    // W15-A5-1: ast-grep runs over the WHOLE repo tree — scope reported
+    // findings down to the PR's changed files.
+    const changedFiles = changedFileNames(files);
+
+    // W15-A5-2: compute the set of languages actually needed from the
+    // extensions present in the changed files (js/mjs/cjs→js, ts→ts,
+    // jsx→jsx, tsx→tsx). A rule then runs once per language it declares
+    // that is needed — previously `rule.languages[0]` meant a js/ts/jsx/tsx
+    // rule only ever ran as `js`, so .ts/.tsx files were never scanned.
+    const neededLangs = new Set();
+    for (const f of files) {
+      const lang = filenameToLanguage(f && typeof f === 'object' ? f.filename : undefined);
+      if (lang) neededLangs.add(lang);
+    }
+
     // Run each rule via `ast-grep run --pattern <PATTERN> --json`. We do one
     // rule at a time to keep the JSON output shape simple (and to attribute
     // findings back to a specific rule via the ruleIndex lookup).
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
     const ruleIndex = new Map(rules.map((r) => [r.id, r]));
+    // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a
+    // specific language, so they cannot go through the binary path. Collect
+    // them here; their diff-scoped regex findings are APPENDED on success
+    // (previously the success path returned only binary findings and the
+    // TODO/FIXME rules silently vanished whenever ast-grep worked).
+    /** @type {object[]} */
+    const starRules = [];
     for (const rule of rules) {
       if (!rule || !rule.id || !rule.pattern) continue;
-      // `--lang '*'` rules (TODO/FIXME) — ast-grep `run` requires a specific
-      // language; skip `*`-language rules in the ast-grep path and rely on
-      // the regex fallback to catch them.
-      if (
-        Array.isArray(rule.languages) &&
-        rule.languages.length > 0 &&
-        !rule.languages.includes('*')
-      ) {
-        // Use the first language hint (ast-grep takes a single --lang).
-        const lang = rule.languages[0];
+      const languages = Array.isArray(rule.languages) ? rule.languages : [];
+      const runnableLanguages =
+        languages.length > 0 && !languages.includes('*') ? languages : null;
+      if (!runnableLanguages) {
+        starRules.push(rule);
+        continue;
+      }
+      for (const lang of runnableLanguages) {
+        if (!neededLangs.has(lang)) continue;
         const args = [
           'run',
           '--pattern', rule.pattern,
@@ -46949,10 +47922,29 @@ async function scanPatterns(opts, deps = {}) {
         for (const f of enriched) allFindings.push(f);
       }
     }
-    if (core?.info) {
-      core.info(`ast-grep: ${allFindings.length} pattern finding(s).`);
+
+    // W15-A5-3: keep `*`-rule (TODO/FIXME) findings from the diff-scoped
+    // regex fallback on the binary success path.
+    if (starRules.length > 0) {
+      for (const f of scanPatternsRegex(files, starRules)) allFindings.push(f);
     }
-    return { findings: allFindings, scanner: 'ast-grep' };
+
+    // W15-A5-1/A5-2: scope to changed files + dedup by file:line:rule.
+    const seen = new Set();
+    /** @type {Record<string, unknown>[]} */
+    const scoped = [];
+    for (const f of allFindings) {
+      if (!changedFiles.has(typeof f.file === 'string' ? f.file : '')) continue;
+      const key = `${f.file}:${f.line}:${f.rule}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      scoped.push(f);
+    }
+
+    if (core?.info) {
+      core.info(`ast-grep: ${scoped.length} pattern finding(s).`);
+    }
+    return { findings: scoped, scanner: 'ast-grep' };
   } catch (err) {
     if (core?.warning) {
       core.warning(
@@ -47495,134 +48487,6 @@ async function runScanners(opts, deps = {}) {
   return { findings: deduped, metrics, scannerNames };
 }
 
-;// CONCATENATED MODULE: ./src/lib/status.js
-/**
- * Commit-status feedback for PR reviews (pending → success/failure).
- *
- * Mirrors CodeRabbit's `commit_status` feature: post a `pending` status at the
- * START of the review so developers see progress immediately, then flip it to
- * `success` (with a findings summary) or `failure` (on hard error) when done.
- * High DX value, near-zero cost.
- *
- * Octokit and a `@actions/core`-like `core` are INJECTED — never imported at
- * module load — so this module stays pure and unit-testable. Status feedback
- * is BEST-EFFORT: any API error (e.g. a missing `statuses: write` scope) is
- * logged via `core.warning` and swallowed — it must NEVER break the review.
- */
-
-/** The fixed GitHub commit-status `context` label (the row in the checks UI). */
-const STATUS_CONTEXT = 'Z.ai Code Review';
-
-/** GitHub truncates commit-status descriptions to 140 characters. */
-const MAX_DESCRIPTION_LEN = 140;
-
-/**
- * The set of valid GitHub commit-status states. Used to validate `state`
- * before it reaches the API so a typo (e.g. 'completed') does not produce a
- * noisy 422. GitHub only accepts these four values.
- */
-const VALID_STATES = new Set(['pending', 'success', 'failure', 'error']);
-
-/**
- * Truncate a description to GitHub's 140-character limit. Returns the input
- * unchanged when it already fits.
- *
- * @param {string} description
- * @returns {string}
- */
-function truncateDescription(description) {
-  const s = String(description ?? '');
-  if (s.length <= MAX_DESCRIPTION_LEN) return s;
-  return s.slice(0, MAX_DESCRIPTION_LEN);
-}
-
-/**
- * Build the success description from review results.
- *
- * Returns the "no issues" emoji form when `findingCount` is 0 (or missing),
- * otherwise the "N findings (M critical, H high)" form. Counts default to 0
- * when missing so a partial object is still safe.
- *
- * @param {{ findingCount?: number, criticalCount?: number, highCount?: number }} counts
- * @returns {string}
- */
-function buildStatusDescription({
-  findingCount = 0,
-  criticalCount = 0,
-  highCount = 0,
-} = {}) {
-  const findings = Number(findingCount) || 0;
-  const critical = Number(criticalCount) || 0;
-  const high = Number(highCount) || 0;
-  if (findings === 0) {
-    return 'Review complete: no issues found ✅';
-  }
-  return `Review complete: ${findings} findings (${critical} critical, ${high} high)`;
-}
-
-/**
- * Post a commit status to the PR's head SHA.
- *
- * Calls `octokit.rest.repos.createCommitStatus` with the `STATUS_CONTEXT`
- * label. Owner/repo come from `context.repo`; the SHA comes from `opts.sha`
- * (the caller passes `context.payload.pull_request.head.sha`).
- *
- * FAIL-SOFT: if the API call throws (e.g. missing `statuses: write` scope),
- * the error is logged via `deps.core.warning` (when a core is provided) and
- * `false` is returned. This function NEVER throws — status feedback is
- * best-effort and must not break the review. Missing `sha`, `context.repo`,
- * or `octokit` are treated as a no-op and return `false`.
- *
- * @param {object} opts
- * @param {object} opts.octokit     Octokit instance (rest.repos.createCommitStatus used).
- * @param {object} opts.context     @actions/github context (`.repo` read for owner/repo).
- * @param {string} opts.sha         The PR head SHA to attach the status to.
- * @param {'pending'|'success'|'failure'|'error'} opts.state  Commit-status state.
- * @param {string} opts.description Short human message (truncated to 140 chars).
- * @param {string} [opts.targetUrl] Optional link (e.g. the workflow run URL).
- * @param {{ core?: { warning?: (m: string) => void } }} [deps]  Optional core-like logger.
- * @returns {Promise<boolean>} true on success, false on failure/no-op (fail-soft).
- */
-async function setReviewStatus(opts, deps = {}) {
-  const { octokit, context, sha, state, description, targetUrl } = opts || {};
-
-  // CFG-7: validate the state enum BEFORE any other check so an invalid state
-  // short-circuits without hitting the API. GitHub only accepts these four.
-  if (!VALID_STATES.has(state)) return false;
-
-  // Defense: missing octokit, SHA, or context.repo is a no-op. The caller in
-  // src/index.js guards the sha too, but be belt-and-suspenders so a misuse
-  // from any other call site can never trigger a noisy GitHub API error.
-  if (!octokit) return false;
-  if (typeof sha !== 'string' || sha.length === 0) return false;
-  const owner = context?.repo?.owner;
-  const repo = context?.repo?.repo;
-  if (!owner || !repo) return false;
-
-  try {
-    await octokit.rest.repos.createCommitStatus({
-      owner,
-      repo,
-      sha,
-      state,
-      description: truncateDescription(description),
-      context: STATUS_CONTEXT,
-      target_url: targetUrl,
-    });
-    return true;
-  } catch (error) {
-    // Fail-soft: status feedback must never break the review. Log and move on.
-    const core = deps?.core;
-    if (core && typeof core.warning === 'function') {
-      core.warning(
-        `Failed to post commit status (${error?.message ?? String(error)}); ` +
-          'continuing without status feedback.',
-      );
-    }
-    return false;
-  }
-}
-
 ;// CONCATENATED MODULE: ./src/lib/repo-config.js
 /**
  * Load and validate a `.zai.yml` file from the PR's head SHA.
@@ -47770,7 +48634,7 @@ const REVIEW_KEYS = new Set([
 /** Known sub-fields of a `path_instructions` entry object. */
 const PATH_INSTRUCTION_FIELDS = new Set(['path', 'instructions']);
 /** Known keys under `scanners:`. */
-const SCANNER_KEYS = new Set(['gitleaks', 'ast_grep']);
+const SCANNER_KEYS = new Set(['gitleaks', 'ast_grep', 'metrics']);
 
 /**
  * Parse a minimal YAML subset into a plain object.
@@ -48028,6 +48892,9 @@ function validateRepoConfig(parsed) {
     const sv = {};
     if (typeof s.gitleaks === 'boolean') sv.gitleaks = s.gitleaks;
     if (typeof s.ast_grep === 'boolean') sv.ast_grep = s.ast_grep;
+    // W15-A1-2: metrics was missing from the boolean set, so the documented
+    // `.zai.yml` `scanners.metrics: false` toggle was silently dropped.
+    if (typeof s.metrics === 'boolean') sv.metrics = s.metrics;
     if (Object.keys(sv).length > 0) out.scanners = sv;
   }
 
@@ -48168,8 +49035,12 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
         // `false` in repo disables; otherwise the action default (enabled) applies.
         gitleaks: scanners.gitleaks !== false,
         ast_grep: scanners.ast_grep !== false,
+        // W15-A1-2: metrics rides the same disable-only seam so src/index.js
+        // can forward it to the scanner orchestrator (which already honors
+        // repoScanners.metrics === false).
+        metrics: scanners.metrics !== false,
       }
-    : { gitleaks: false, ast_grep: false };
+    : { gitleaks: false, ast_grep: false, metrics: false };
 
   return {
     ...a,
@@ -48853,8 +49724,24 @@ function learnings_stripComment(line) {
           inSingle = !inSingle;
         }
       }
-    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === '#' && !inSingle && !inDouble) {
+    } else if (ch === '"' && !inSingle) {
+      // W15-A6-6: mirror the W8-4 apostrophe guard for `"` — a double quote
+      // glued to a word character (like the inches mark in `5" floppy`) is
+      // not a delimiter; treating it as one flips inDouble permanently and
+      // disables comment stripping for the rest of the line (the trailing
+      // `# comment` then survives into the parsed value). As with W8-4, the
+      // guard must NOT apply when already inside a double-quoted string — a
+      // `"` inside is always the closing delimiter (values legitimately end
+      // in word characters, e.g. `"x # not comment"`).
+      if (inDouble) {
+        inDouble = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inDouble = !inDouble;
+        }
+      }
+    } else if (ch === '#' && !inSingle && !inDouble) {
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {
         return line.slice(0, i);
@@ -48905,7 +49792,11 @@ function parseLearningsYml(text) {
   const entries = [];
   if (typeof text !== 'string' || text.length === 0) return entries;
 
-  const lines = text.split(/\r?\n/);
+  // W15-A6-5: strip a leading UTF-8 BOM. Editors that write a BOM made the
+  // first line "\uFEFFlearnings:", which failed the top-level key match, so
+  // every entry was silently skipped (the feature disabled itself).
+  const src = text.replace(/^\uFEFF/, '');
+  const lines = src.split(/\r?\n/);
   let inLearnings = false;
   /** @type {Record<string, string> | null} */
   let pending = null;
@@ -49719,7 +50610,7 @@ async function run(context, deps = {}) {
     isLargePr: isLargePrFn = isLargePr,
     resolveSystemPrompt: resolveSystemPromptFn = resolveSystemPrompt,
     formatFindingsAsSummary: formatFindingsAsSummaryFn = formatFindingsAsSummary,
-    formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummary,
+    formatWalkthroughSummary: formatWalkthroughSummaryFn = walkthrough_formatWalkthroughSummary,
     partitionFindings: partitionFindingsFn = partitionFindings,
     buildReviewBody: buildReviewBodyFn = buildReviewBody,
     buildReviewComments: buildReviewCommentsFn = buildReviewComments,
@@ -49735,13 +50626,14 @@ async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
+    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
     createApiClient: createApiClientFn = createApiClient,
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
-    buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
+    buildStatusDescription: buildStatusDescriptionFn = status_buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
     loadCodeowners: loadCodeownersFn = loadCodeowners,
@@ -49831,6 +50723,7 @@ async function run(context, deps = {}) {
           sha,
           state: 'pending',
           description: 'Z.ai review in progress…',
+          reviewerName: config.reviewerName,
         },
         { core: coreDep },
       );
@@ -49868,6 +50761,25 @@ async function run(context, deps = {}) {
       patchable = filterExcludedFilesFn(patchable, repoConfig.excludePatterns);
       if (patchable.length === 0) {
         coreDep.info('All patchable files excluded by .zai.yml path_filters; skipping.');
+        // W15-A7-3: the `pending` status was already posted above; returning
+        // here without a TERMINAL status left the check spinning pending
+        // forever (blocking merges when the status is required). There is
+        // genuinely nothing to review, so post a terminal `success` — same
+        // fail-soft helper, same commitStatus gate.
+        if (config.commitStatus) {
+          await setReviewStatusFn(
+            {
+              octokit,
+              context,
+              sha,
+              state: 'success',
+              description:
+                'No reviewable files (.zai.yml path_filters excluded all changes)',
+              reviewerName: config.reviewerName,
+            },
+            { core: coreDep },
+          );
+        }
         return;
       }
     }
@@ -49905,6 +50817,11 @@ async function run(context, deps = {}) {
       scanners: {
         secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
         patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+        // W15-A1-2: `.zai.yml` `scanners.metrics: false` must reach the
+        // orchestrator's per-scanner toggle (runScanners honors
+        // repoScanners.metrics === false) — previously no metrics key was
+        // mapped, so the documented repo-level toggle was impossible.
+        metrics: repoConfig.scanners?.metrics === false ? false : undefined,
       },
     };
     const scannerResult = await runScannersFn(
@@ -49954,32 +50871,6 @@ async function run(context, deps = {}) {
       },
     );
 
-    // Phase 5: flip the commit status to "success" with a findings summary now
-    // that the review itself completed. The downstream review/comment posting
-    // is UI delivery; the review result is what determines success. Fail-soft.
-    if (config.commitStatus) {
-      const criticalCount = result.findings.filter(
-        (f) => f?.severity === 'critical',
-      ).length;
-      const highCount = result.findings.filter(
-        (f) => f?.severity === 'high',
-      ).length;
-      await setReviewStatusFn(
-        {
-          octokit,
-          context,
-          sha,
-          state: 'success',
-          description: buildStatusDescriptionFn({
-            findingCount: result.findings.length,
-            criticalCount,
-            highCount,
-          }),
-        },
-        { core: coreDep },
-      );
-    }
-
     // Phase 2: partition findings into inline-mappable (anchored to diff lines
     // via pulls.createReview) and summary-only. When at least one finding maps
     // to a diff line, post a GitHub REVIEW with inline comments — the
@@ -50022,6 +50913,25 @@ async function run(context, deps = {}) {
         if (withHashBlock) {
           priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
         }
+        // W15-A8-3: when findings don't map to diff lines (file-level), run 1
+        // posts the hash block into the bot's marker ISSUE COMMENT (the
+        // summary path) instead of a review — so reading reviews alone left
+        // priorHashes empty and every finding was re-reported on re-push.
+        // Read the hash block from the bot's marker comment too and MERGE the
+        // two sets. findBotMarkerComment enforces the same bot-authority gate
+        // as upsertReviewComment, so a human comment quoting the marker (and a
+        // forged hash block) can never feed suppression.
+        const priorComment = await findBotMarkerCommentFn({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          marker: MARKER,
+        });
+        if (priorComment && typeof priorComment.body === 'string') {
+          const commentHashes = parseFindingsHashBlockFn(priorComment.body);
+          for (const h of commentHashes) priorHashes.add(h);
+        }
       } catch (priorErr) {
         if (coreDep?.warning) {
           coreDep.warning(
@@ -50048,6 +50958,39 @@ async function run(context, deps = {}) {
     if (learningsSuppressed > 0 && coreDep?.info) {
       coreDep.info(
         `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    // W15-A6-2: the status is computed from the FINAL kept-findings set —
+    // AFTER incremental suppression and learnings suppression. It was
+    // previously computed from `result.findings` before those stages ran, so
+    // a re-push where every finding was already reported posted
+    // "N findings (...)" to the checks tab while the PR comment said
+    // "No issues found ✅" — contradictory signals on the same run.
+    if (config.commitStatus) {
+      const criticalCount = keptFindings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = keptFindings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: keptFindings.length,
+            criticalCount,
+            highCount,
+          }),
+          reviewerName: config.reviewerName,
+        },
+        { core: coreDep },
       );
     }
 
@@ -50415,6 +51358,29 @@ async function run(context, deps = {}) {
       upsertReview: upsertReviewFn,
       postFallbackComment: postFallbackCommentFn,
       resolveReviewEvent: resolveReviewEventFn,
+      // W15-A6-4 walkthrough parity.
+      formatWalkthroughSummary: formatWalkthroughSummaryFn,
+      // W15-A8-4 feature parity with the push path: wire the REAL repo-config,
+      // scanner, learnings, and commit-status collaborators (schedule.js's
+      // defaults are inert no-ops so hermetic callers are unaffected). The
+      // scanner wrapper closes over the production scanner-deps kit + expanded
+      // cache dir, exactly like the pull_request branch's runScanners call.
+      loadRepoConfig: loadRepoConfigFn,
+      mergeRepoConfig: mergeRepoConfigFn,
+      runScanners: (opts) =>
+        runScannersFn(
+          { ...opts, cacheDir: expandHome(config.scannersCacheDir) },
+          createScannerDeps({
+            core: coreDep,
+            cacheDir: expandHome(config.scannersCacheDir),
+          }),
+        ),
+      formatScannerContext: formatScannerContextFn,
+      loadLearnings: loadLearningsFn,
+      formatLearningsForPrompt: formatLearningsForPromptFn,
+      filterFindingsByLearnings: filterFindingsByLearningsFn,
+      setReviewStatus: setReviewStatusFn,
+      buildStatusDescription: buildStatusDescriptionFn,
     });
     return;
   }
@@ -50509,6 +51475,7 @@ async function main() {
             sha,
             state: 'failure',
             description: 'Z.ai review failed',
+            reviewerName: config.reviewerName,
           },
           { core: core },
         );
