@@ -193,33 +193,54 @@ export function buildImpactPrompt(files, excludePatterns) {
  * is added. Previously `if (!severity) return false;` bailed before the
  * removal loop, leaving e.g. a stale zai:high on the PR forever.
  *
+ * W19-E2-3: that null-severity removal is now restricted to the bot's
+ * DEFAULT-managed `zai:` namespace ONLY. With a custom flat map (P0..P3) the
+ * bot cannot prove it applied a label — removing a human triager's P2 on an
+ * unparseable assessment was destructive mutation of labels the bot never
+ * owned (the documented contract says human labels are never touched). Under
+ * a custom map nothing is removed and `core.warning` explains why; under the
+ * default `zai:` scheme the W18-D3-2 cleanup is preserved byte-for-byte.
+ *
  * Injected via deps so tests never touch the GitHub API.
  *
- * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
+ * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap, core? }`
  * @returns {Promise<boolean>} true if a label was applied, false otherwise.
  */
-async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
+async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap, core }) {
   const targetLabel = severity ? labelMap?.[severity] : null;
 
   // Fetch current labels and remove any existing managed labels (idempotent).
   // A label is "managed" if it appears as a value in the labelMap; this is
   // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
-  // With a null severity there is no target, so ALL managed labels are removed.
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
     issue_number: issueNumber,
   });
   const managed = new Set(Object.values(labelMap || {}));
+  // W19-E2-3: with a null severity there is no target. Only `zai:`-prefixed
+  // managed labels (the bot's default-managed namespace) are removed; a
+  // managed label under a CUSTOM map may have been applied by a human triager
+  // and is left strictly alone (declined via core.warning below).
+  let declinedUnparsedManaged = false;
   for (const label of current) {
     const name = label?.name ?? '';
-    if (managed.has(name) && name !== targetLabel) {
-      try {
-        await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
-      } catch {
-        // A label may already be gone; ignore.
-      }
+    if (!managed.has(name) || name === targetLabel) continue;
+    if (severity == null && !name.startsWith('zai:')) {
+      declinedUnparsedManaged = true;
+      continue;
     }
+    try {
+      await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
+    } catch {
+      // A label may already be gone; ignore.
+    }
+  }
+  if (declinedUnparsedManaged && core?.warning) {
+    core.warning(
+      'impact: assessment unparseable; leaving labels unchanged ' +
+        '(cannot prove the bot applied non-zai: labels)',
+    );
   }
   // Nothing to add when the severity is null (unparseable) or unmappable —
   // the stale-label cleanup above is the whole job.
@@ -285,6 +306,9 @@ export async function handleImpactCommand(
           issueNumber: pullNumber,
           severity,
           labelMap: config.impactLabelMap,
+          // W19-E2-3: the default applyLabel warns when an unparseable
+          // assessment declines to touch custom-map labels.
+          core,
         });
       } catch (mutationError) {
         if (core?.warning) {

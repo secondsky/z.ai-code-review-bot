@@ -531,6 +531,22 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
       // review. Rethrowing here would propagate through runWithConcurrency and
       // cancel every other batch; returning an empty findings array lets the
       // caller still get results for the remaining batches.
+      // W19-E1-1: the drop is no longer SILENT. Count it on the out-param
+      // counter (threaded unchanged through the halving recursion via deps —
+      // halved halves ARE retried, so only this base case drops entries
+      // permanently) and warn, so runStructuredReview can surface
+      // skippedEntries instead of posting a bare "No issues found ✅".
+      if (deps.skipCounter && typeof deps.skipCounter === 'object') {
+        deps.skipCounter.entries =
+          (typeof deps.skipCounter.entries === 'number' ? deps.skipCounter.entries : 0) + 1;
+      }
+      if (core?.warning) {
+        core.warning(
+          `Context limit hit on batch ${state.batchNumber}: skipping entry ` +
+            `'${entries[0]?.filename ?? '(unknown)'}' (single entry still overflows ` +
+            `after halving); its content goes unreviewed.`,
+        );
+      }
       return [];
     }
     const mid = Math.ceil(entries.length / 2);
@@ -645,6 +661,12 @@ export async function runStructuredReview(files, config, deps = {}) {
     );
   }
 
+  // W19-E1-1: out-param counter threaded through executeStructuredBatch's
+  // halving recursion (via deps) so single-entry context-limit drops are
+  // COUNTED, not silently discarded. The counter object is shared across all
+  // batches of this run and merged into skippedMeta below.
+  const contextSkipCounter = { entries: 0 };
+
   // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
   // `batchConcurrency` calls in flight at once. runWithConcurrency returns
   // results in INPUT order, so the downstream parse/merge/dedup stays
@@ -657,9 +679,19 @@ export async function runStructuredReview(files, config, deps = {}) {
     return executeBatch(
       batch,
       { ...batchState, batchNumber: i + 1, totalBatches },
-      { callApi, core },
+      { callApi, core, skipCounter: contextSkipCounter },
     );
   });
+
+  // W19-E1-1: merge the context-drop count into skippedMeta.skippedEntries so
+  // the existing portion-note machinery (index.js / schedule.js read
+  // result.metadata.skippedEntries) renders it. Previously only
+  // batchMetadata.rawTextCount:0 recorded the drop — which nothing consumed.
+  if (contextSkipCounter.entries > 0) {
+    skippedMeta.skippedEntries =
+      (typeof skippedMeta.skippedEntries === 'number' ? skippedMeta.skippedEntries : 0) +
+      contextSkipCounter.entries;
+  }
 
   /** @type {Record<string, unknown>[]} */
   const allFindings = [];

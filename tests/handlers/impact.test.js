@@ -348,6 +348,82 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
     expect(removed).toEqual(['P0']);
     expect(octokit.__calls.addLabels[0].labels).toEqual(['P3']);
   });
+
+  /* ---------- W19-E2-3: null severity never deletes human labels ---------- */
+
+  // W19-E2-3: the W18-D3-2 null-severity removal deleted labels under the
+  // CONFIGURED map — with a flat map (P0..P3), an unparseable assessment
+  // REMOVED a human triager's P2: destructive mutation of labels the bot
+  // can't prove it applied. On null severity, removal is restricted to the
+  // bot's default-managed `zai:` namespace ONLY; with a custom flat map
+  // nothing is removed and a warning explains why.
+  it('W19-E2-3: custom flat map + null severity + human P2 → NO removeLabel, warning logged', async () => {
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'P2' }] });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => 'I cannot assess the impact of these changes.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+    // The human triager's P2 is NEVER removed by an unparseable assessment…
+    expect(octokit.__calls.removeLabel).toHaveLength(0);
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+    // …and the decline is visible in the log.
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('assessment unparseable; leaving labels unchanged'),
+    );
+    // The assessment comment still posted.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
+  it('W19-E2-3: default zai: map + null severity → zai:high removed, human P2 untouched (W18-D3-2 preserved)', async () => {
+    const octokit = makeOctokit({ labels: [{ name: 'zai:high' }, { name: 'P2' }] });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => 'No severity keyword here.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+    // The bot's own namespace is still cleaned up (stale zai:high removed)…
+    expect(octokit.__calls.removeLabel).toHaveLength(1);
+    expect(octokit.__calls.removeLabel[0].name).toBe('zai:high');
+    // …nothing added, and the human P2 label is untouched.
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+  });
+
+  it('W19-E2-3: normal severity path unchanged for the flat map (add + remove managed)', async () => {
+    // Guard: the null-severity restriction must not weaken the NORMAL path —
+    // a parsed severity still swaps managed labels for a flat map.
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'P3' }, { name: 'P2' }] });
+    const callApi = vi.fn(async () => '🔴 critical\nhuge blast radius');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    const removed = octokit.__calls.removeLabel.map((c) => c.name).sort();
+    expect(removed).toEqual(['P2', 'P3']);
+    expect(octokit.__calls.addLabels[0].labels).toEqual(['P0']);
+  });
 });
 
 /* ------------------------------------------------------------------ *

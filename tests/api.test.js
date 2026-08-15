@@ -856,6 +856,87 @@ describe('callWithRetry', () => {
     expect(fallbackCalled).toBe(0);
   });
 
+  // W19-E2-2/E2-1: after the W18-D3-1 reorder, 'Z.ai API error 504: gateway
+  // timeout' classifies as PROVIDER (extractable status wins over message
+  // substrings), so the `category === 'timeout'` fallback gate never fired
+  // for gateway timeouts — the configured ZAI_FALLBACK_PROMPT silently never
+  // ran on the exact scenario it exists for. The fallback must ALSO fire for
+  // a 504 (scoped deliberately: 504 is THE gateway-timeout status; a plain
+  // 500/503 without 504 still does not fire — see the test below).
+  test('W19-E2-2: 504 gateway timeout FIRES the fallback; retries still happen per config', async () => {
+    let fallbackCalled = 0;
+    const fn = recordingFn([
+      new Error('Z.ai API error 504: gateway timeout'), // attempt 0 — 504, but attempt < 1, no fallback
+      new Error('Z.ai API error 504: gateway timeout'), // attempt 1 — 504 + attempt>=1 → fallback
+      'FB_OK', // attempt 2 — the fallback attempt succeeds
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FALLBACK_PROMPT' }),
+      onFallback: (info) => {
+        fallbackCalled++;
+        // The triggering error is surfaced to the observer.
+        expect(info.originalError.message).toContain('504');
+      },
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('FB_OK');
+    expect(out.usedFallback).toBe(true);
+    expect(fallbackCalled).toBe(1);
+    // Retry cadence unchanged: attempts 0, 1 (504s) and 2 (fallback) all ran.
+    expect(fn.calls).toHaveLength(3);
+  });
+
+  test('W19-E2-2: plain 500 (no timeout text) and 503 still do NOT fire the fallback (scope: 504 only)', async () => {
+    let fallbackCalled = 0;
+    const opts = {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+      onFallback: () => {
+        fallbackCalled++;
+      },
+    };
+    // Plain 500 (regression guard for the existing behavior).
+    const out500 = await callWithRetry(
+      recordingFn([new Error('Z.ai API error 500: oops'), 'OK']),
+      opts,
+    );
+    expect(out500.usedFallback).toBe(false);
+    // 503 with "timeout" in the body: provider-category, but NOT the 504
+    // gateway-timeout status — the fallback stays out (deliberate scoping).
+    const out503 = await callWithRetry(
+      recordingFn([new Error('Z.ai API error 503: gateway timeout'), 'OK']),
+      opts,
+    );
+    expect(out503.usedFallback).toBe(false);
+    expect(fallbackCalled).toBe(0);
+  });
+
+  // Regression: client-side timeouts (no extractable status) still fire the
+  // fallback exactly as before the 504 gate was added.
+  test('W19-E2-2: client timeout (no status code) still fires the fallback (regression)', async () => {
+    const fn = recordingFn([
+      new Error('Request timed out'), // attempt 0 — timeout, but attempt < 1
+      new Error('Request timed out'), // attempt 1 — timeout + attempt>=1 → fallback
+      'FB_OK', // attempt 2 — fallback attempt succeeds
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 10,
+      baseTimeout: 1000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+  });
+
   // W5-2: when a timeout triggers the fallback on the FINAL allowed attempt
   // (attempt === maxRetries), the old code did `attempt += 1; continue;` which
   // pushed attempt past maxRetries, exited the loop, and threw the internal

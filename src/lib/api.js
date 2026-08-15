@@ -426,7 +426,19 @@ export async function callWithRetry(fn, options = {}) {
     } catch (error) {
       const { category, retryable } = categorizeError(error);
 
-      // Fallback fires ONLY on a timeout-category error at attempt >= 1,
+      // W19-E2-2/E2-1: the fallback fires on a timeout-category error OR a
+      // 504. After the W18-D3-1 reorder, 'Z.ai API error 504: gateway
+      // timeout' classifies as PROVIDER (the extractable status wins over
+      // message substrings), so a `category === 'timeout'`-only gate never
+      // fired on the exact gateway-timeout scenario ZAI_FALLBACK_PROMPT
+      // exists for. extractStatusCode is consulted HERE (rather than widening
+      // categorizeError's return shape) so the pinned {category, retryable}
+      // contract is untouched; the scope is deliberately 504-only — a plain
+      // 500/503 (even with "timeout" in the body) keeps the old behavior.
+      const fallbackEligible =
+        category === 'timeout' || extractStatusCode(error?.message) === 504;
+
+      // Fallback fires ONLY on a fallback-eligible error at attempt >= 1,
       // when a fallback is configured and hasn't been used yet, AND there is
       // at least one remaining loop iteration to actually run the fallback
       // attempt. W5-2: previously, firing the fallback on the final attempt
@@ -434,7 +446,7 @@ export async function callWithRetry(fn, options = {}) {
       // exited the loop, and threw the internal "unreachable" error instead
       // of returning a clean failure.
       if (
-        category === 'timeout' &&
+        fallbackEligible &&
         attempt >= 1 &&
         attempt < maxRetries &&
         fallbackPrompt &&

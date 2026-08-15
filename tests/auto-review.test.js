@@ -774,6 +774,31 @@ describe('executeStructuredBatch', () => {
     expect(out).toEqual([]);
   });
 
+  // W19-E1-1: the single-entry base case used to return [] SILENTLY — no log,
+  // no count — so a batch that halved down to a single still-overflowing entry
+  // surfaced NOTHING to runStructuredReview and callers posted a bare
+  // "No issues found ✅" while file content went entirely unreviewed. The drop
+  // must be COUNTED on the out-param counter (threaded through the halving
+  // recursion via deps — the return shape stays string[] for every existing
+  // caller) and a core.warning must fire at the base case.
+  test('W19-E1-1: single-entry skip is COUNTED on deps.skipCounter and core.warning fires', async () => {
+    const callApi = async () => {
+      throw new Error('maximum context length is 1024 tokens');
+    };
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const skipCounter = { entries: 0 };
+    const entries = [{ filename: 'huge.js', status: 'modified', patch: 'X', chunkIndex: 1, chunkCount: 1 }];
+    const out = await executeStructuredBatch(
+      entries,
+      { apiKey: 'k', model: 'm', batchNumber: 1, totalBatches: 1 },
+      { callApi, core, skipCounter },
+    );
+    expect(out).toEqual([]);
+    expect(skipCounter.entries).toBe(1);
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('huge.js'));
+  });
+
   test('non-context error → rethrows', async () => {
     const callApi = async () => {
       throw new Error('some random network failure');
@@ -1428,6 +1453,62 @@ describe('runStructuredReview', () => {
     expect(out.metadata.skippedEntries).toBe(1);
     // skippedFiles stays ABSENT when zero (the field's presence is itself
     // the wholesale-skip signal — same contract as the no-truncation case).
+    expect(out.metadata.skippedFiles).toBeUndefined();
+  });
+
+  // W19-E1-1: executeStructuredBatch's single-entry context-limit base case
+  // returned [] silently; runStructuredReview recorded only
+  // batchMetadata[].rawTextCount:0, which NOTHING consumes. A whole file's
+  // content could go unreviewed while the metadata carried neither
+  // skippedFiles nor skippedEntries — callers posted a bare "No issues
+  // found ✅". The context-drop count must merge into the same
+  // skippedMeta.skippedEntries the portion-note machinery already renders.
+  test('W19-E1-1: single file always context-overflowing → metadata.skippedEntries === 1', async () => {
+    const files = [makeFile({ filename: 'src/big.js', patch: 'x'.repeat(100) })];
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
+      callApi: async () => {
+        throw new Error('maximum context length is 1024 tokens');
+      },
+      core,
+    });
+    expect(out.findings).toEqual([]);
+    expect(out.metadata.totalBatches).toBe(1);
+    // The context drop reaches the metadata the portion-note machinery reads.
+    expect(out.metadata.skippedEntries).toBe(1);
+    // No file was dropped by the MAX_DIFF_CHARS cap — that signal stays absent.
+    expect(out.metadata.skippedFiles).toBeUndefined();
+    // The base case warned (the drop is never silent).
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('src/big.js'));
+  });
+
+  test('W19-E1-1: multi-entry batch halving down to NOTHING counts every dropped entry', async () => {
+    // Four single-chunk files in ONE batch; callApi ALWAYS context-errors, so
+    // the batch halves 4 → 2+2 → 1+1+1+1 and every single-entry base case
+    // drops one entry permanently (halved halves are retried, so only the
+    // single-entry drops are final). All four drops must be counted.
+    const files = [];
+    for (let i = 0; i < 4; i++) {
+      files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(50) }));
+    }
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
+      callApi: async () => {
+        throw new Error('maximum context length is 1024 tokens');
+      },
+      core: { info: vi.fn(), warning: vi.fn() },
+    });
+    expect(out.metadata.totalBatches).toBe(1);
+    expect(out.metadata.skippedEntries).toBe(4);
+    expect(out.metadata.batchMetadata[0].rawTextCount).toBe(0);
+  });
+
+  // Normal path unchanged: a healthy callApi still yields NO skip fields.
+  test('W19-E1-1: normal path — no context errors → skippedEntries stays absent', async () => {
+    const files = [makeFile({ filename: 'a.js', patch: 'x'.repeat(100) })];
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm' }, {
+      callApi: async () => structuredPayload('s', []),
+    });
+    expect(out.metadata.skippedEntries).toBeUndefined();
     expect(out.metadata.skippedFiles).toBeUndefined();
   });
 });

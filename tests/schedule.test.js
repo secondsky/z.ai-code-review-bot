@@ -26,6 +26,7 @@ import {
   parseFindingsHashBlock,
 } from '../src/lib/findings.js';
 import { setReviewStatus, buildStatusDescription } from '../src/lib/status.js';
+import { runStructuredReview as realRunStructuredReview } from '../src/lib/auto-review.js';
 import {
   buildReviewBody,
   buildReviewComments,
@@ -41,7 +42,16 @@ const mkPr = (number, headSha, { draft = false, title = 'PR' } = {}) => ({
   title,
 });
 
-function makeOctokit({ prs = [], commentsByPr = {}, reviewsByPr = {} } = {}) {
+function makeOctokit({
+  prs = [],
+  commentsByPr = {},
+  reviewsByPr = {},
+  // W19-E1-2: fake for GET /repos/{owner}/{repo}/commits/{sha}/status. A
+  // function returning the combined-status payload; when omitted the bot's
+  // own context ('Z.ai Code Review') sits at 'pending' — the stuck state the
+  // W18-D2-4 reconciliation exists to repair.
+  combinedStatus = null,
+} = {}) {
   const calls = {
     pullsList: [],
     listComments: [],
@@ -49,6 +59,7 @@ function makeOctokit({ prs = [], commentsByPr = {}, reviewsByPr = {} } = {}) {
     listFiles: [],
     createComment: [],
     updateComment: [],
+    getCombinedStatus: [],
   };
   // Convert the simplified mkPr shape ({number, headSha, draft, title}) into
   // the GitHub API shape listOpenPrs reads ({number, head:{sha}, draft, title})
@@ -97,6 +108,15 @@ function makeOctokit({ prs = [], commentsByPr = {}, reviewsByPr = {} } = {}) {
         async updateComment(params) {
           calls.updateComment.push(params);
           return { data: { id: params.comment_id } };
+        },
+      },
+      repos: {
+        async getCombinedStatusForRef(params) {
+          calls.getCombinedStatus.push(params);
+          const data = typeof combinedStatus === 'function'
+            ? combinedStatus(params)
+            : { state: 'pending', statuses: [{ context: 'Z.ai Code Review', state: 'pending' }] };
+          return { data };
         },
       },
     },
@@ -2258,6 +2278,35 @@ describe('reviewOnePr — W18-D2-3 partial-drop portion note', () => {
     // …and the partial-drop portion note rides alongside it (index.js parity).
     expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
   });
+
+  // W19-E1-1: end-to-end rendering. When the REAL runStructuredReview drops
+  // every entry to context-limit errors (its halving bottoms out at
+  // single-entry base cases that skip rather than abort), the surfaced
+  // metadata.skippedEntries must reach the posted body via the existing
+  // portion-note machinery — never a bare "No issues found ✅" while the
+  // file's content went entirely unreviewed.
+  it('W19-E1-1: context-limit skip (real runStructuredReview) → summary body carries the portion note', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: realRunStructuredReview,
+      // Real renderer so the posted body reflects production output.
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+    const callApi = vi.fn(async () => {
+      throw new Error('maximum context length is 1024 tokens');
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(97, 'sha97'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi, ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    expect(body).toContain('No issues found');
+    expect(body).toContain('1 portion not reviewed');
+  });
 });
 
 /* ---------- runScheduledReview — W18-D2-4 commit-status reconciliation ---------- */
@@ -2379,5 +2428,195 @@ describe('runScheduledReview — W18-D2-4 commit-status reconciliation', () => {
     // The batch survives; the PR still counts as skipped (not failed).
     expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('sha103'));
+  });
+});
+
+/* ---------- runScheduledReview — W19-E1-2/E2-1 conditional reconciliation ---------- */
+
+// The W18-D2-4 skip branch posted "Review complete (reconciled)" for EVERY
+// already-reviewed PR on EVERY tick — overwriting the informative
+// "Review complete: N findings (...)" description one tick after every
+// review, plus a redundant status write per PR per tick forever. The
+// reconciliation must be CONDITIONAL: read the SHA's combined status first
+// (GET /repos/{owner}/{repo}/commits/{sha}/status) and post ONLY when THIS
+// bot context's latest state is 'pending' (the stuck state). When the read
+// fails, do NOT post (conservative — the next tick retries).
+describe('runScheduledReview — W19-E1-2/E2-1 conditional status reconciliation', () => {
+  it('W19: our context latest state is success → NO reconciled post (the informative description survives)', async () => {
+    const octokit = makeOctokit({
+      prs: [mkPr(110, 'sha110')],
+      commentsByPr: {},
+      combinedStatus: () => ({
+        state: 'success',
+        statuses: [{ context: 'Z.ai Code Review', state: 'success' }],
+      }),
+    });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    // The combined status WAS read for the right ref…
+    expect(octokit.__calls.getCombinedStatus).toHaveLength(1);
+    expect(octokit.__calls.getCombinedStatus[0].ref).toBe('sha110');
+    // …but no status write happened (no redundant per-tick post).
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  it('W19: our context latest state is pending → reconciled success IS posted (stuck pending repaired)', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(111, 'sha111')], commentsByPr: {} });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(s.setReviewStatus).toHaveBeenCalledTimes(1);
+    const [statusArgs] = s.setReviewStatus.mock.calls[0];
+    expect(statusArgs.sha).toBe('sha111');
+    expect(statusArgs.state).toBe('success');
+    expect(statusArgs.description).toBe('Review complete (reconciled)');
+  });
+
+  it('W19: the status READ throws (5xx) → no post, batch continues (conservative)', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(112, 'sha112'), mkPr(113, 'sha113')], commentsByPr: {} });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+      getContextStatusState: vi.fn(async () => {
+        throw new Error('500 Internal Server Error');
+      }),
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    // Must resolve (not reject): the read failure never breaks the batch.
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 0, skipped: 2, failed: 0 });
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('W19: pending under a DIFFERENT context + our context success → NO post (reviewerName context respected)', async () => {
+    const octokit = makeOctokit({
+      prs: [mkPr(114, 'sha114')],
+      commentsByPr: {},
+      combinedStatus: () => ({
+        state: 'pending',
+        statuses: [
+          { context: 'ci/build', state: 'pending' }, // someone else's stuck check
+          { context: 'Z.ai Code Review', state: 'success' },
+        ],
+      }),
+    });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+
+    await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    // ci/build's pending is NOT ours to repair; our context is already green.
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  it('W19: custom reviewerName context — pending under the DEFAULT context only → no post; pending under OUR context → post', async () => {
+    // (a) The pending belongs to the default context; the custom reviewer's
+    // context is absent → nothing to reconcile for us.
+    const octokitA = makeOctokit({
+      prs: [mkPr(115, 'sha115')],
+      commentsByPr: {},
+      combinedStatus: () => ({
+        state: 'pending',
+        statuses: [{ context: 'Z.ai Code Review', state: 'pending' }],
+      }),
+    });
+    const sA = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+    await runScheduledReview({
+      octokit: octokitA, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true, reviewerName: 'custom-bot' }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...sA,
+    });
+    expect(sA.setReviewStatus).not.toHaveBeenCalled();
+
+    // (b) The pending sits on the custom reviewer's own context → reconcile.
+    const octokitB = makeOctokit({
+      prs: [mkPr(116, 'sha116')],
+      commentsByPr: {},
+      combinedStatus: () => ({
+        state: 'pending',
+        statuses: [{ context: 'custom-bot', state: 'pending' }],
+      }),
+    });
+    const sB = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+    await runScheduledReview({
+      octokit: octokitB, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true, reviewerName: 'custom-bot' }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...sB,
+    });
+    expect(sB.setReviewStatus).toHaveBeenCalledTimes(1);
+    expect(sB.setReviewStatus.mock.calls[0][0].state).toBe('success');
+  });
+});
+
+/* ---------- runScheduledReview — W19-E2-4 batch-loop dedup-read isolation ---------- */
+
+// The hasReviewForSha await in the batch loop was unguarded: a transient
+// issues.listComments 500 propagated out of runScheduledReview → run() →
+// main() → setFailed, aborting the ENTIRE batch (PR #1's read throwing meant
+// 0 of 2 reviewed). Per the module's per-PR isolation contract, a failed
+// dedup read must degrade to "treat as NOT already reviewed" and continue —
+// reviewOnePr has its own isolation, and re-reviewing is idempotent.
+describe('runScheduledReview — W19-E2-4 dedup-read isolation', () => {
+  it('W19-E2-4: a THROWING issues.listComments for PR #1 no longer aborts the batch — PR #2 still reviewed', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(1, 'sha1'), mkPr(2, 'sha2')], commentsByPr: {} });
+    // The REAL hasReviewForSha path: a transient 500 on PR #1's comments read.
+    octokit.rest.issues.listComments = vi.fn(async (params) => {
+      if (params.issue_number === 1) throw new Error('500 Internal Server Error');
+      return { data: [] };
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const s = makeStubs();
+
+    // Must RESOLVE — currently the rejection propagates and kills the batch.
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig(), core, callApi: vi.fn(), ...s,
+    });
+
+    // Chosen semantics: a failed dedup read treats the PR as NOT already
+    // reviewed, so PR #1 proceeds through reviewOnePr (idempotent re-review
+    // at worst) and BOTH PRs are reviewed; nothing is failed or skipped.
+    expect(result).toEqual({ reviewed: 2, skipped: 0, failed: 0 });
+    expect(s.runStructuredReview).toHaveBeenCalledTimes(2);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('PR #1'));
   });
 });

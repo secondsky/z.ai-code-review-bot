@@ -24,7 +24,10 @@
 
 import { MARKER, appendTrailers } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
-import { buildStatusDescription as buildStatusDescriptionDefault } from './status.js';
+import {
+  buildStatusDescription as buildStatusDescriptionDefault,
+  STATUS_CONTEXT,
+} from './status.js';
 import {
   parseFindingsHashBlock as parseFindingsHashBlockDefault,
   buildFindingsHashBlock as buildFindingsHashBlockDefault,
@@ -87,6 +90,35 @@ const defaultFilterFindingsByLearnings = (findings) => ({
 
 /** Inert status poster: never touches the API (status feedback is opt-in). */
 const defaultSetReviewStatus = async () => false;
+
+/**
+ * W19-E1-2/E2-1: read the LATEST state of OUR commit-status context on a SHA
+ * via GET /repos/{owner}/{repo}/commits/{sha}/status
+ * (octokit.rest.repos.getCombinedStatusForRef). The combined status lists the
+ * latest status per context; we match `context === statusContext` so a
+ * pending under someone ELSE'S context never triggers our reconciliation.
+ *
+ * FAIL-SOFT: any read failure returns null, which the caller treats as "do
+ * NOT post" (conservative — avoids the redundant write-forever cost; the next
+ * tick retries). Returns null when our context has no status on the SHA.
+ *
+ * @param {object} args `{ octokit, owner, repo, sha, statusContext }`
+ * @returns {Promise<string|null>} 'pending'|'success'|'failure'|'error'|null
+ */
+async function defaultGetContextStatusState({ octokit, owner, repo, sha, statusContext }) {
+  try {
+    const { data } = await octokit.rest.repos.getCombinedStatusForRef({
+      owner,
+      repo,
+      ref: sha,
+    });
+    const statuses = Array.isArray(data?.statuses) ? data.statuses : [];
+    const ours = statuses.find((s) => s?.context === statusContext);
+    return typeof ours?.state === 'string' ? ours.state : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Inert marker-comment finder: never fetches; behaves like a PR with no prior
@@ -1024,6 +1056,7 @@ export async function reviewOnePr({
  * @param {Function} [args.formatLearningsForPrompt]  Learnings prompt context (W15-A8-4c).
  * @param {Function} [args.filterFindingsByLearnings]  Learnings suppression (W15-A8-4c).
  * @param {Function} [args.setReviewStatus]  Commit-status poster (W15-A8-4d).
+ * @param {Function} [args.getContextStatusState]  Commit-status context-state reader (W19-E1-2/E2-1).
  * @param {Function} [args.buildStatusDescription]  Status description builder (W15-A8-4d).
  * @param {Function} [args.findBotMarkerComments]  Bot marker-comment finder (W16-B2-2).
  * @param {Function} [args.parseFindingsHashBlock]  Hash-block parser (W16-B2-2).
@@ -1081,6 +1114,9 @@ export async function runScheduledReview({
   // W18-D1-2: bot-review finder for review-side prior-hash reads (inert
   // default; src/index.js wires the real review.js listBotReviews).
   listBotReviews = defaultListBotReviews,
+  // W19-E1-2/E2-1: commit-status context-state reader used by the skip-branch
+  // reconciliation (default: the real octokit-backed read; injectable).
+  getContextStatusState = defaultGetContextStatusState,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -1107,13 +1143,31 @@ export async function runScheduledReview({
       continue;
     }
     // Dedup: skip PRs already reviewed at this head SHA.
-    const already = await hasReviewFn({
-      octokit,
-      owner,
-      repo,
-      pullNumber: pr.number,
-      headSha: pr.headSha,
-    });
+    // W19-E2-4: the dedup read is GUARDED. A transient issues.listComments
+    // 500 used to propagate out of runScheduledReview → run() → main() →
+    // setFailed, aborting the ENTIRE batch (one PR's read failing meant zero
+    // PRs reviewed) — violating this module's per-PR isolation contract. On a
+    // failed read, degrade to "NOT already reviewed" and proceed:
+    // reviewOnePr has its own isolation, and re-reviewing an already-reviewed
+    // SHA is idempotent (the worst case is a harmless duplicate comment).
+    let already = false;
+    try {
+      already = await hasReviewFn({
+        octokit,
+        owner,
+        repo,
+        pullNumber: pr.number,
+        headSha: pr.headSha,
+      });
+    } catch (dedupError) {
+      if (core?.warning) {
+        core.warning(
+          `Scheduled review: dedup check failed for PR #${pr.number} (${pr.headSha}) ` +
+            `(${dedupError?.message ?? String(dedupError)}); treating as not reviewed.`,
+        );
+      }
+      already = false;
+    }
     if (already) {
       // W18-D2-4: commit-status reconciliation. If the tick that reviewed
       // this SHA landed `pending` but its SUCCESS post failed transiently
@@ -1124,24 +1178,59 @@ export async function runScheduledReview({
       // statuses for the same SHA) — fail-soft, and only when commitStatus is
       // on. We cannot know the recorded findings count from here, so the
       // plain "review complete" description is used.
+      //
+      // W19-E1-2/E2-1: the reconciliation is now CONDITIONAL. Posting for
+      // EVERY already-reviewed PR on EVERY tick overwrote the informative
+      // "Review complete: N findings (...)" description one tick after every
+      // review and burned a redundant status write per PR per tick forever.
+      // Read the SHA's combined status first and post ONLY when OUR context's
+      // latest state is 'pending' (the stuck state this exists to repair).
+      // A failed read → no post (conservative; the next tick retries).
       if (config.commitStatus) {
+        // Same context resolution as setReviewStatus (ZAI_REVIEWER_NAME
+        // override, else the default checks-tab label).
+        const statusContext =
+          typeof config.reviewerName === 'string' && config.reviewerName.trim() !== ''
+            ? config.reviewerName
+            : STATUS_CONTEXT;
+        let contextState = null;
         try {
-          await setReviewStatus(
-            {
-              octokit,
-              context: { repo: { owner, repo } },
-              sha: pr.headSha,
-              state: 'success',
-              description: 'Review complete (reconciled)',
-              reviewerName: config.reviewerName,
-            },
-            { core },
-          );
-        } catch (statusError) {
+          contextState = await getContextStatusState({
+            octokit,
+            owner,
+            repo,
+            sha: pr.headSha,
+            statusContext,
+          });
+        } catch (readError) {
+          // Defensive: the default helper is fail-soft, but an injected one
+          // may throw. Treat as unreadable — do NOT post.
           if (core?.warning) {
             core.warning(
-              `Scheduled review: failed to reconcile success status for PR #${pr.number} (${pr.headSha}) (${statusError?.message ?? String(statusError)}).`,
+              `Scheduled review: could not read commit status for PR #${pr.number} (${pr.headSha}) (${readError?.message ?? String(readError)}); skipping reconciliation this tick.`,
             );
+          }
+          contextState = null;
+        }
+        if (contextState === 'pending') {
+          try {
+            await setReviewStatus(
+              {
+                octokit,
+                context: { repo: { owner, repo } },
+                sha: pr.headSha,
+                state: 'success',
+                description: 'Review complete (reconciled)',
+                reviewerName: config.reviewerName,
+              },
+              { core },
+            );
+          } catch (statusError) {
+            if (core?.warning) {
+              core.warning(
+                `Scheduled review: failed to reconcile success status for PR #${pr.number} (${pr.headSha}) (${statusError?.message ?? String(statusError)}).`,
+              );
+            }
           }
         }
       }
