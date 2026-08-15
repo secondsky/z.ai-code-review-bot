@@ -476,6 +476,55 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     });
   });
 
+  // ==================================================================
+  // W18-D1-1: the W17-C1-6 lookarounds `(?!sha\d{3}-)(?<!sha\d{3})` were
+  // CASE-SENSITIVE while the sha-adjacency skip alternative
+  // `/(?:sha\d{3}-)$/i` is case-insensitive. CSP3/SRI hash-algorithm names
+  // match ASCII case-insensitively, so a valid CSP like
+  // `script-src 'SHA512-<digest>'` fired as a CRITICAL false positive
+  // (→ REQUEST_CHANGES under strictMode): the case-sensitive lookarounds did
+  // not reject the uppercase prefix, the leftmost candidate ABSORBED
+  // `SHA512-`, and the before-text (`'`) then failed the adjacency skip.
+  // The candidate regex is now compiled with the `i` flag — the lookahead
+  // rejects the match at `SHA512-`, the lookbehind rejects the orphan `-`,
+  // and the match lands on the bare digest, which the (already /i)
+  // adjacency alternative suppresses. The candidate class
+  // `[A-Za-z0-9+/\-_]` already covers both cases, so `i` changes nothing
+  // else.
+  // ==================================================================
+  describe('case-insensitive SRI digest suppression [W18-D1-1]', () => {
+    const HI64 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL2mN4pQ6rS8tU0vW2xY4zA6bC8dE0f';
+    const heFindings = (line) =>
+      scanSecretsRegex([{ filename: 'src/csp.conf', patch: buildPatch([line]) }])
+        .filter((f) => f.rule === 'regex:high-entropy-string');
+
+    it("CSP `script-src 'SHA512-<digest>'` (uppercase) → no finding", () => {
+      expect(shannonEntropy(HI64)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`script-src 'self' 'SHA512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it("CSP `script-src 'Sha512-<digest>'` (mixed case) → no finding", () => {
+      expect(heFindings(`script-src 'self' 'Sha512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it("CSP `script-src 'sha512-<digest>'` (lowercase) → still no finding (regression)", () => {
+      expect(heFindings(`script-src 'self' 'sha512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it('integrity="SHA512-<digest>" (uppercase HTML attribute form) → no finding', () => {
+      expect(heFindings(`<script src="a.js" integrity="SHA512-${HI64}"></script>`)).toHaveLength(0);
+    });
+
+    it('plain high-entropy value with no digest prefix → still flagged', () => {
+      expect(heFindings(`x = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('candidate regex is compiled case-insensitively (pin)', () => {
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      expect(he.regex.flags).toContain('i');
+    });
+  });
+
   it('detects api-key variants (api-key, apikey, apiKey, secret, token, auth_token, access_token, client_secret)', () => {
     const value = 'Xy9P3kMNBq2VtRZ7'; // high-entropy
     const variants = [

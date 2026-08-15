@@ -157,7 +157,16 @@ export const SECRET_PATTERNS = [
     // literal `(?<!sha\d{3}-)` at the match start is a no-op here — the
     // leftmost match starts AT `sha512`, and positions after `sha###-` are
     // never attempted — hence the two-assertion form.
-    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
+    //
+    // W18-D1-1: compiled with the `i` flag. CSP3/SRI hash-algorithm names
+    // match ASCII case-insensitively, but these lookarounds were
+    // case-sensitive while the sha-adjacency skipIfPrecededBy alternative is
+    // /i — so valid digests like `script-src 'SHA512-<digest>'` absorbed the
+    // uppercase prefix and fired as critical FPs. With /i the assertions
+    // reject uppercase/mixed-case prefixes exactly as they do lowercase. The
+    // candidate class `[A-Za-z0-9+/\-_]` already covers both cases, so the
+    // flag changes nothing but the lookarounds.
+    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/i,
     captureGroup: 1,
     minEntropy: 4.5,
     // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
