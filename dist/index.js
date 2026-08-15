@@ -39254,7 +39254,19 @@ async function callWithRetry(fn, options = {}) {
     } catch (error) {
       const { category, retryable } = categorizeError(error);
 
-      // Fallback fires ONLY on a timeout-category error at attempt >= 1,
+      // W19-E2-2/E2-1: the fallback fires on a timeout-category error OR a
+      // 504. After the W18-D3-1 reorder, 'Z.ai API error 504: gateway
+      // timeout' classifies as PROVIDER (the extractable status wins over
+      // message substrings), so a `category === 'timeout'`-only gate never
+      // fired on the exact gateway-timeout scenario ZAI_FALLBACK_PROMPT
+      // exists for. extractStatusCode is consulted HERE (rather than widening
+      // categorizeError's return shape) so the pinned {category, retryable}
+      // contract is untouched; the scope is deliberately 504-only — a plain
+      // 500/503 (even with "timeout" in the body) keeps the old behavior.
+      const fallbackEligible =
+        category === 'timeout' || extractStatusCode(error?.message) === 504;
+
+      // Fallback fires ONLY on a fallback-eligible error at attempt >= 1,
       // when a fallback is configured and hasn't been used yet, AND there is
       // at least one remaining loop iteration to actually run the fallback
       // attempt. W5-2: previously, firing the fallback on the final attempt
@@ -39262,7 +39274,7 @@ async function callWithRetry(fn, options = {}) {
       // exited the loop, and threw the internal "unreachable" error instead
       // of returning a clean failure.
       if (
-        category === 'timeout' &&
+        fallbackEligible &&
         attempt >= 1 &&
         attempt < maxRetries &&
         fallbackPrompt &&
@@ -42497,6 +42509,22 @@ async function executeStructuredBatch(entries, state, deps = {}) {
       // review. Rethrowing here would propagate through runWithConcurrency and
       // cancel every other batch; returning an empty findings array lets the
       // caller still get results for the remaining batches.
+      // W19-E1-1: the drop is no longer SILENT. Count it on the out-param
+      // counter (threaded unchanged through the halving recursion via deps —
+      // halved halves ARE retried, so only this base case drops entries
+      // permanently) and warn, so runStructuredReview can surface
+      // skippedEntries instead of posting a bare "No issues found ✅".
+      if (deps.skipCounter && typeof deps.skipCounter === 'object') {
+        deps.skipCounter.entries =
+          (typeof deps.skipCounter.entries === 'number' ? deps.skipCounter.entries : 0) + 1;
+      }
+      if (core?.warning) {
+        core.warning(
+          `Context limit hit on batch ${state.batchNumber}: skipping entry ` +
+            `'${entries[0]?.filename ?? '(unknown)'}' (single entry still overflows ` +
+            `after halving); its content goes unreviewed.`,
+        );
+      }
       return [];
     }
     const mid = Math.ceil(entries.length / 2);
@@ -42611,6 +42639,12 @@ async function runStructuredReview(files, config, deps = {}) {
     );
   }
 
+  // W19-E1-1: out-param counter threaded through executeStructuredBatch's
+  // halving recursion (via deps) so single-entry context-limit drops are
+  // COUNTED, not silently discarded. The counter object is shared across all
+  // batches of this run and merged into skippedMeta below.
+  const contextSkipCounter = { entries: 0 };
+
   // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
   // `batchConcurrency` calls in flight at once. runWithConcurrency returns
   // results in INPUT order, so the downstream parse/merge/dedup stays
@@ -42623,9 +42657,19 @@ async function runStructuredReview(files, config, deps = {}) {
     return executeBatch(
       batch,
       { ...batchState, batchNumber: i + 1, totalBatches },
-      { callApi, core },
+      { callApi, core, skipCounter: contextSkipCounter },
     );
   });
+
+  // W19-E1-1: merge the context-drop count into skippedMeta.skippedEntries so
+  // the existing portion-note machinery (index.js / schedule.js read
+  // result.metadata.skippedEntries) renders it. Previously only
+  // batchMetadata.rawTextCount:0 recorded the drop — which nothing consumed.
+  if (contextSkipCounter.entries > 0) {
+    skippedMeta.skippedEntries =
+      (typeof skippedMeta.skippedEntries === 'number' ? skippedMeta.skippedEntries : 0) +
+      contextSkipCounter.entries;
+  }
 
   /** @type {Record<string, unknown>[]} */
   const allFindings = [];
@@ -45500,33 +45544,54 @@ function buildImpactPrompt(files, excludePatterns) {
  * is added. Previously `if (!severity) return false;` bailed before the
  * removal loop, leaving e.g. a stale zai:high on the PR forever.
  *
+ * W19-E2-3: that null-severity removal is now restricted to the bot's
+ * DEFAULT-managed `zai:` namespace ONLY. With a custom flat map (P0..P3) the
+ * bot cannot prove it applied a label — removing a human triager's P2 on an
+ * unparseable assessment was destructive mutation of labels the bot never
+ * owned (the documented contract says human labels are never touched). Under
+ * a custom map nothing is removed and `core.warning` explains why; under the
+ * default `zai:` scheme the W18-D3-2 cleanup is preserved byte-for-byte.
+ *
  * Injected via deps so tests never touch the GitHub API.
  *
- * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
+ * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap, core? }`
  * @returns {Promise<boolean>} true if a label was applied, false otherwise.
  */
-async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
+async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap, core }) {
   const targetLabel = severity ? labelMap?.[severity] : null;
 
   // Fetch current labels and remove any existing managed labels (idempotent).
   // A label is "managed" if it appears as a value in the labelMap; this is
   // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
-  // With a null severity there is no target, so ALL managed labels are removed.
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
     issue_number: issueNumber,
   });
   const managed = new Set(Object.values(labelMap || {}));
+  // W19-E2-3: with a null severity there is no target. Only `zai:`-prefixed
+  // managed labels (the bot's default-managed namespace) are removed; a
+  // managed label under a CUSTOM map may have been applied by a human triager
+  // and is left strictly alone (declined via core.warning below).
+  let declinedUnparsedManaged = false;
   for (const label of current) {
     const name = label?.name ?? '';
-    if (managed.has(name) && name !== targetLabel) {
-      try {
-        await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
-      } catch {
-        // A label may already be gone; ignore.
-      }
+    if (!managed.has(name) || name === targetLabel) continue;
+    if (severity == null && !name.startsWith('zai:')) {
+      declinedUnparsedManaged = true;
+      continue;
     }
+    try {
+      await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
+    } catch {
+      // A label may already be gone; ignore.
+    }
+  }
+  if (declinedUnparsedManaged && core?.warning) {
+    core.warning(
+      'impact: assessment unparseable; leaving labels unchanged ' +
+        '(cannot prove the bot applied non-zai: labels)',
+    );
   }
   // Nothing to add when the severity is null (unparseable) or unmappable —
   // the stale-label cleanup above is the whole job.
@@ -45592,6 +45657,9 @@ async function handleImpactCommand(
           issueNumber: pullNumber,
           severity,
           labelMap: config.impactLabelMap,
+          // W19-E2-3: the default applyLabel warns when an unparseable
+          // assessment declines to touch custom-map labels.
+          core,
         });
       } catch (mutationError) {
         if (core?.warning) {
@@ -45873,6 +45941,35 @@ const defaultFilterFindingsByLearnings = (findings) => ({
 
 /** Inert status poster: never touches the API (status feedback is opt-in). */
 const defaultSetReviewStatus = async () => false;
+
+/**
+ * W19-E1-2/E2-1: read the LATEST state of OUR commit-status context on a SHA
+ * via GET /repos/{owner}/{repo}/commits/{sha}/status
+ * (octokit.rest.repos.getCombinedStatusForRef). The combined status lists the
+ * latest status per context; we match `context === statusContext` so a
+ * pending under someone ELSE'S context never triggers our reconciliation.
+ *
+ * FAIL-SOFT: any read failure returns null, which the caller treats as "do
+ * NOT post" (conservative — avoids the redundant write-forever cost; the next
+ * tick retries). Returns null when our context has no status on the SHA.
+ *
+ * @param {object} args `{ octokit, owner, repo, sha, statusContext }`
+ * @returns {Promise<string|null>} 'pending'|'success'|'failure'|'error'|null
+ */
+async function defaultGetContextStatusState({ octokit, owner, repo, sha, statusContext }) {
+  try {
+    const { data } = await octokit.rest.repos.getCombinedStatusForRef({
+      owner,
+      repo,
+      ref: sha,
+    });
+    const statuses = Array.isArray(data?.statuses) ? data.statuses : [];
+    const ours = statuses.find((s) => s?.context === statusContext);
+    return typeof ours?.state === 'string' ? ours.state : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Inert marker-comment finder: never fetches; behaves like a PR with no prior
@@ -46810,6 +46907,7 @@ async function reviewOnePr({
  * @param {Function} [args.formatLearningsForPrompt]  Learnings prompt context (W15-A8-4c).
  * @param {Function} [args.filterFindingsByLearnings]  Learnings suppression (W15-A8-4c).
  * @param {Function} [args.setReviewStatus]  Commit-status poster (W15-A8-4d).
+ * @param {Function} [args.getContextStatusState]  Commit-status context-state reader (W19-E1-2/E2-1).
  * @param {Function} [args.buildStatusDescription]  Status description builder (W15-A8-4d).
  * @param {Function} [args.findBotMarkerComments]  Bot marker-comment finder (W16-B2-2).
  * @param {Function} [args.parseFindingsHashBlock]  Hash-block parser (W16-B2-2).
@@ -46867,6 +46965,9 @@ async function runScheduledReview({
   // W18-D1-2: bot-review finder for review-side prior-hash reads (inert
   // default; src/index.js wires the real review.js listBotReviews).
   listBotReviews = defaultListBotReviews,
+  // W19-E1-2/E2-1: commit-status context-state reader used by the skip-branch
+  // reconciliation (default: the real octokit-backed read; injectable).
+  getContextStatusState = defaultGetContextStatusState,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
   // ZAI_SCHEDULE_MAX_PRS) is the PRIMARY source — the operator-set knob. The
@@ -46893,13 +46994,31 @@ async function runScheduledReview({
       continue;
     }
     // Dedup: skip PRs already reviewed at this head SHA.
-    const already = await hasReviewFn({
-      octokit,
-      owner,
-      repo,
-      pullNumber: pr.number,
-      headSha: pr.headSha,
-    });
+    // W19-E2-4: the dedup read is GUARDED. A transient issues.listComments
+    // 500 used to propagate out of runScheduledReview → run() → main() →
+    // setFailed, aborting the ENTIRE batch (one PR's read failing meant zero
+    // PRs reviewed) — violating this module's per-PR isolation contract. On a
+    // failed read, degrade to "NOT already reviewed" and proceed:
+    // reviewOnePr has its own isolation, and re-reviewing an already-reviewed
+    // SHA is idempotent (the worst case is a harmless duplicate comment).
+    let already = false;
+    try {
+      already = await hasReviewFn({
+        octokit,
+        owner,
+        repo,
+        pullNumber: pr.number,
+        headSha: pr.headSha,
+      });
+    } catch (dedupError) {
+      if (core?.warning) {
+        core.warning(
+          `Scheduled review: dedup check failed for PR #${pr.number} (${pr.headSha}) ` +
+            `(${dedupError?.message ?? String(dedupError)}); treating as not reviewed.`,
+        );
+      }
+      already = false;
+    }
     if (already) {
       // W18-D2-4: commit-status reconciliation. If the tick that reviewed
       // this SHA landed `pending` but its SUCCESS post failed transiently
@@ -46910,24 +47029,59 @@ async function runScheduledReview({
       // statuses for the same SHA) — fail-soft, and only when commitStatus is
       // on. We cannot know the recorded findings count from here, so the
       // plain "review complete" description is used.
+      //
+      // W19-E1-2/E2-1: the reconciliation is now CONDITIONAL. Posting for
+      // EVERY already-reviewed PR on EVERY tick overwrote the informative
+      // "Review complete: N findings (...)" description one tick after every
+      // review and burned a redundant status write per PR per tick forever.
+      // Read the SHA's combined status first and post ONLY when OUR context's
+      // latest state is 'pending' (the stuck state this exists to repair).
+      // A failed read → no post (conservative; the next tick retries).
       if (config.commitStatus) {
+        // Same context resolution as setReviewStatus (ZAI_REVIEWER_NAME
+        // override, else the default checks-tab label).
+        const statusContext =
+          typeof config.reviewerName === 'string' && config.reviewerName.trim() !== ''
+            ? config.reviewerName
+            : STATUS_CONTEXT;
+        let contextState = null;
         try {
-          await setReviewStatus(
-            {
-              octokit,
-              context: { repo: { owner, repo } },
-              sha: pr.headSha,
-              state: 'success',
-              description: 'Review complete (reconciled)',
-              reviewerName: config.reviewerName,
-            },
-            { core },
-          );
-        } catch (statusError) {
+          contextState = await getContextStatusState({
+            octokit,
+            owner,
+            repo,
+            sha: pr.headSha,
+            statusContext,
+          });
+        } catch (readError) {
+          // Defensive: the default helper is fail-soft, but an injected one
+          // may throw. Treat as unreadable — do NOT post.
           if (core?.warning) {
             core.warning(
-              `Scheduled review: failed to reconcile success status for PR #${pr.number} (${pr.headSha}) (${statusError?.message ?? String(statusError)}).`,
+              `Scheduled review: could not read commit status for PR #${pr.number} (${pr.headSha}) (${readError?.message ?? String(readError)}); skipping reconciliation this tick.`,
             );
+          }
+          contextState = null;
+        }
+        if (contextState === 'pending') {
+          try {
+            await setReviewStatus(
+              {
+                octokit,
+                context: { repo: { owner, repo } },
+                sha: pr.headSha,
+                state: 'success',
+                description: 'Review complete (reconciled)',
+                reviewerName: config.reviewerName,
+              },
+              { core },
+            );
+          } catch (statusError) {
+            if (core?.warning) {
+              core.warning(
+                `Scheduled review: failed to reconcile success status for PR #${pr.number} (${pr.headSha}) (${statusError?.message ?? String(statusError)}).`,
+              );
+            }
           }
         }
       }
