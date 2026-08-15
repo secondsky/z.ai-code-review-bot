@@ -56,10 +56,26 @@ export function isUnsafePath(path) {
 /**
  * Build the focused single-file review USER prompt. Pure (exported for testing).
  *
+ * W16-B4-3: the patch is capped using the SAME resolution as the whole-PR
+ * path (MAX_WHOLE_PR_DIFF_CHARS default; `options.maxDiffChars` override
+ * where 0 = the config-level "unlimited" sentinel). Previously the patch was
+ * interpolated raw — a 3000-line file produced a ~104k-char prompt while the
+ * whole-PR path capped at 8000.
+ *
  * @param {{filename: string, status?: string, patch?: string}} file
+ * @param {{maxDiffChars?: number}} [options]
  * @returns {string}
  */
-export function buildFileReviewPrompt(file) {
+export function buildFileReviewPrompt(file, options = {}) {
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars >= 0
+      ? options.maxDiffChars
+      : MAX_WHOLE_PR_DIFF_CHARS;
+  let patch = file.patch || '(no textual diff available)';
+  // 0 = unlimited sentinel (config.js) — skip truncation, like the whole-PR path.
+  if (maxDiffChars > 0 && patch.length > maxDiffChars) {
+    patch = `${patch.slice(0, maxDiffChars)}\n… (diff truncated)`;
+  }
   return [
     'Please review the following file change from this pull request.',
     'Focus on concrete bugs, security issues, risky logic, and architecture',
@@ -68,7 +84,7 @@ export function buildFileReviewPrompt(file) {
     wrapUntrusted(
       `### ${file.filename} (${file.status || 'modified'})\n` +
         '```diff\n' +
-        `${file.patch || '(no textual diff available)'}\n` +
+        `${patch}\n` +
         '```',
       'file-diff',
     ),
@@ -119,7 +135,9 @@ export async function handleReviewCommand(
       const review = await callApi(
         config.apiKey,
         config.model,
-        buildFileReviewPrompt(match),
+        // W16-B4-3: thread config.maxDiffChars so the single-file path uses
+        // the same cap resolution as the whole-PR path below.
+        buildFileReviewPrompt(match, { maxDiffChars: config.maxDiffChars }),
       );
       await post(review);
       return;

@@ -14,7 +14,11 @@
  */
 import { postComment, getPRContext } from './_shared.js';
 import { wrapUntrusted } from '../prompt.js';
-import { getChangedFiles, filterPatchableFiles } from '../changed-files.js';
+import {
+  getChangedFiles,
+  filterExcludedFiles,
+  filterPatchableFiles,
+} from '../changed-files.js';
 
 /** Soft cap on the diff context bundled into the prompt. */
 const MAX_CONTEXT_CHARS = 8000;
@@ -47,10 +51,23 @@ const EMPTY_ARGS_COMMENT =
  *
  * @param {Array<{filename: string, patch?: string}>} files
  * @param {number} [maxChars]
+ * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
+ *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
+ *   review.js: production config always carries the default exclude list).
  * @returns {string}
  */
-export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
-  const patchable = filterPatchableFiles(files || []);
+export function buildDiffContext(
+  files,
+  maxChars = MAX_CONTEXT_CHARS,
+  excludePatterns,
+) {
+  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
+  // filter, mirroring review.js's W15-A8-8 fix. Previously a default-excluded
+  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
+  // and ate the ENTIRE budget — the model saw only the lockfile and real
+  // changes (e.g. src/auth.js) were invisible to /zai ask.
+  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
+  const patchable = filterPatchableFiles(notExcluded);
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
@@ -87,9 +104,16 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
  * @param {string} p.commenterLogin
  * @param {{title?: string, body?: string}} p.pr
  * @param {Array<{filename: string, patch?: string}>} p.files
+ * @param {string[]} [p.excludePatterns]  Threaded to buildDiffContext (W16-B4-4).
  * @returns {string}
  */
-export function buildAskPrompt({ question, commenterLogin, pr, files }) {
+export function buildAskPrompt({
+  question,
+  commenterLogin,
+  pr,
+  files,
+  excludePatterns,
+}) {
   const title = pr?.title ? `**Title:** ${pr.title}\n` : '';
   // W15-A4-5: cap the (attacker-controllable) PR body before interpolation.
   // The whole prContext (title + body + diffs) is wrapped via wrapUntrusted
@@ -97,7 +121,11 @@ export function buildAskPrompt({ question, commenterLogin, pr, files }) {
   const body = pr?.body
     ? `**Description:**\n${pr.body.slice(0, MAX_BODY_CHARS)}\n`
     : '';
-  const prContext = `${title}${body}${buildDiffContext(files)}`;
+  const prContext = `${title}${body}${buildDiffContext(
+    files,
+    MAX_CONTEXT_CHARS,
+    excludePatterns,
+  )}`;
   // W2-SEC-1: the user's question is the most direct prompt-injection vector
   // and must be wrapped in <untrusted_input> tags before being interpolated
   // into the prompt (the PR context was already wrapped via wrapUntrusted;
@@ -141,16 +169,21 @@ export async function handleAskCommand(
     0,
     MAX_QUESTION_CHARS,
   );
-  if (question === '') {
-    await post(EMPTY_ARGS_COMMENT);
-    return;
-  }
 
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
   try {
+    // W16-B4-2: this post (like every other in the handler) must be inside
+    // the try — it previously executed OUTSIDE it, so a transient 502 on this
+    // single createComment rejected the whole handler and failed the entire
+    // action (the router dispatches with no catch).
+    if (question === '') {
+      await post(EMPTY_ARGS_COMMENT);
+      return;
+    }
+
     const [pr, files] = await Promise.all([
       getCtx({ octokit, context }),
       typeof pullNumber === 'number'
@@ -163,6 +196,7 @@ export async function handleAskCommand(
       commenterLogin: commenter?.login,
       pr: pr || {},
       files: files || [],
+      excludePatterns: config.excludePatterns,
     });
 
     const answer = await callApi(config.apiKey, config.model, prompt);

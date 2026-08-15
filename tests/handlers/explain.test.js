@@ -486,6 +486,146 @@ describe('handleExplainCommand — W15-A4-6: binary content guard', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * W16-B4-1: binary detection must be scoped to the EXTRACTED WINDOW
+ *
+ * BINARY_CONTENT_RE previously ran on the WHOLE file content before range
+ * extraction — a single legal control char on line 50 of a 100-line text
+ * fixture disabled /zai explain for EVERY clean range (10-20) with a wrong
+ * "No textual content" message. The detector must run on the extracted
+ * window (after extractLineWindow), so clean ranges still work while any
+ * window of a UTF-16 file (decoded as UTF-8 → NUL bytes) is still caught.
+ * The whole-file emptiness check (CMD-12) stays whole-file.
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — W16-B4-1: window-scoped binary detection', () => {
+  it('control char OUTSIDE the window no longer blocks a clean range', async () => {
+    // 100 lines; line 50 contains a lone \x01 control char. The requested
+    // window 10-20 is entirely clean text and must still be explained.
+    const lines = Array.from({ length: 100 }, (_, i) =>
+      i === 49 ? 'line50\x01' : `line${i + 1}`,
+    );
+    const octokit = makeOctokit({ content: { content: b64(lines.join('\n')) } });
+    const callApi = vi.fn(async () => 'EXPLANATION');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '10-20 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('line10');
+    expect(prompt).toContain('line20');
+    // The control-char line is outside the window and must not leak in.
+    expect(prompt).not.toContain('line50');
+    expect(octokit.__calls.createComment[0].body).toContain('EXPLANATION');
+  });
+
+  it('a range that INCLUDES the control-char line still gets the binary guidance', async () => {
+    const lines = Array.from({ length: 100 }, (_, i) =>
+      i === 49 ? 'line50\x01' : `line${i + 1}`,
+    );
+    const octokit = makeOctokit({ content: { content: b64(lines.join('\n')) } });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '50 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available');
+    expect(body).toContain('src/a.js');
+  });
+
+  it('UTF-16LE content (NUL bytes in ANY window) → guidance comment, no callApi', async () => {
+    // UTF-16LE bytes decoded as UTF-8 interleave a NUL after every ASCII
+    // char, so every window matches BINARY_CONTENT_RE and stays caught.
+    const utf16leBase64 = Buffer.from('line1\nline2\n', 'utf16le').toString(
+      'base64',
+    );
+    const octokit = makeOctokit({ content: { content: utf16leBase64 } });
+    const callApi = vi.fn(async () => 'should not be called');
+
+    await handleExplainCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '1-2 src/a.js',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('No textual content available');
+    expect(body).toContain('src/a.js');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-2: the FIRST guidance post must be inside the try block
+ *
+ * The first `post(USAGE_COMMENT)` (unparseable args) executed OUTSIDE the
+ * handler's try — a transient 502 on that single createComment rejected the
+ * whole handler, propagated through the router (index.js dispatches with no
+ * catch) and failed the entire action. It must be guarded like every other
+ * post.
+ * ------------------------------------------------------------------ */
+
+describe('handleExplainCommand — W16-B4-2: guarded first post', () => {
+  it('unparseable args + a FAILING post → resolves, never rejects', async () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    await expect(
+      handleExplainCommand(
+        {
+          octokit: makeOctokit(),
+          context: makeContext(),
+          config: {},
+          commenter: { login: 'a' },
+          args: 'abc',
+          callApi: vi.fn(),
+          core,
+        },
+        { post: async () => { throw new Error('502 bad gateway'); } },
+      ),
+    ).resolves.toBeUndefined();
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('valid args + a FAILING post (first post is the answer) still resolves (regression)', async () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    await expect(
+      handleExplainCommand(
+        {
+          octokit: makeOctokit(),
+          context: makeContext(),
+          config: { apiKey: 'k', model: 'm' },
+          commenter: { login: 'a' },
+          args: '1-2 src/a.js',
+          callApi: vi.fn(async () => 'EX'),
+          core,
+        },
+        { post: async () => { throw new Error('502 bad gateway'); } },
+      ),
+    ).resolves.toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * parseRange — edge cases (Task 11)
  *
  * These pin behavior for the three supported separators, the single-line

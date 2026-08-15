@@ -9,7 +9,11 @@
  *  - callApi rejects → short error comment, no throw.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleReviewCommand, isUnsafePath } from '../../src/lib/handlers/review.js';
+import {
+  handleReviewCommand,
+  isUnsafePath,
+  buildFileReviewPrompt,
+} from '../../src/lib/handlers/review.js';
 
 function makeOctokit({
   files = [
@@ -272,6 +276,102 @@ describe('handleReviewCommand — specific file', () => {
       callApi,
     });
     expect(callApi).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-3: the single-file path caps the patch
+ *
+ * buildFileReviewPrompt interpolated file.patch raw with NO cap — a
+ * 3000-line file produced a ~104k-char prompt, unlike the whole-PR path
+ * (MAX_WHOLE_PR_DIFF_CHARS = 8000, overridable by config.maxDiffChars
+ * where 0 = unlimited). The single-file patch must be capped with the SAME
+ * resolution and marked when truncated.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W16-B4-3: single-file diff cap', () => {
+  const longPatch = () =>
+    Array.from({ length: 3000 }, (_, i) => `+line ${i + 1}`).join('\n');
+
+  it('buildFileReviewPrompt: a 3000-line patch is truncated with a marker (default 8000 cap)', () => {
+    const prompt = buildFileReviewPrompt({
+      filename: 'src/big.js',
+      status: 'modified',
+      patch: longPatch(),
+    });
+    expect(prompt).toContain('diff truncated');
+    // The tail of the raw patch is NOT present (only the capped prefix is).
+    expect(prompt).not.toContain('line 3000');
+    expect(prompt.length).toBeLessThan(10000);
+  });
+
+  it('buildFileReviewPrompt: a small patch is included unchanged (no marker)', () => {
+    const prompt = buildFileReviewPrompt({
+      filename: 'src/a.js',
+      status: 'modified',
+      patch: '+a\n+b',
+    });
+    expect(prompt).toContain('+a\n+b');
+    expect(prompt).not.toContain('diff truncated');
+  });
+
+  it('buildFileReviewPrompt: maxDiffChars 0 (unlimited sentinel) disables truncation, mirroring the whole-PR path', () => {
+    const prompt = buildFileReviewPrompt(
+      { filename: 'src/big.js', status: 'modified', patch: longPatch() },
+      { maxDiffChars: 0 },
+    );
+    expect(prompt).toContain('line 3000');
+    expect(prompt).not.toContain('diff truncated');
+  });
+
+  it('handler: explicit-file review of a huge patch is capped via the same config resolution', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/big.js', status: 'modified', patch: longPatch() }],
+    });
+    const callApi = vi.fn(async () => 'FILE-REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: 'src/big.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('diff truncated');
+    expect(prompt).not.toContain('line 3000');
+  });
+
+  it('handler: explicit-file review of a default-excluded file still reviews it (intended)', async () => {
+    // Excludes only apply to the whole-PR/auto paths; an EXPLICIT
+    // `/zai review package-lock.json` must keep working.
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'FILE-REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: 'package-lock.json',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('package-lock.json');
+    expect(callApi.mock.calls[0][2]).toContain('+lockdata');
+    expect(octokit.__calls.createComment[0].body).toContain('FILE-REVIEW');
   });
 });
 

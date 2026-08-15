@@ -17,6 +17,7 @@ import { postComment } from './_shared.js';
 import { wrapUntrusted } from '../prompt.js';
 import {
   getChangedFiles,
+  filterExcludedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
 
@@ -109,10 +110,23 @@ export function parseSeverity(text) {
  *
  * @param {Array<{filename: string, patch?: string}>} files
  * @param {number} [maxChars]
+ * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
+ *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
+ *   review.js: production config always carries the default exclude list).
  * @returns {string}
  */
-export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
-  const patchable = filterPatchableFiles(files || []);
+export function buildDiffContext(
+  files,
+  maxChars = MAX_CONTEXT_CHARS,
+  excludePatterns,
+) {
+  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
+  // filter, mirroring review.js's W15-A8-8 fix (identical copy of the fix in
+  // ask.js's buildDiffContext). Previously a default-excluded
+  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
+  // and ate the ENTIRE budget — real changes were invisible to /zai impact.
+  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
+  const patchable = filterPatchableFiles(notExcluded);
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
@@ -145,9 +159,10 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
  * Build the impact USER prompt. Pure (exported for testing).
  *
  * @param {Array<{filename: string, patch?: string}>} files
+ * @param {string[]} [excludePatterns]  Threaded to buildDiffContext (W16-B4-4).
  * @returns {string}
  */
-export function buildImpactPrompt(files) {
+export function buildImpactPrompt(files, excludePatterns) {
   return [
     'Assess the impact and risk of the following pull-request changes.',
     'Begin your response with a severity level on its own first line, using',
@@ -157,7 +172,10 @@ export function buildImpactPrompt(files) {
     'security/auth/data-loss concerns, and anything a reviewer should verify.',
     'Be concise and concrete; cite filenames where relevant.',
     '',
-    wrapUntrusted(`## Changes under review\n${buildDiffContext(files)}`, 'pr-changes'),
+    wrapUntrusted(
+      `## Changes under review\n${buildDiffContext(files, MAX_CONTEXT_CHARS, excludePatterns)}`,
+      'pr-changes',
+    ),
   ].join('\n');
 }
 
@@ -238,7 +256,7 @@ export async function handleImpactCommand(
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
         : [];
-    const prompt = buildImpactPrompt(files || []);
+    const prompt = buildImpactPrompt(files || [], config.excludePatterns);
     const assessment = await callApi(config.apiKey, config.model, prompt);
     await post(assessment);
     // OPT-IN mutation: when ZAI_IMPACT_LABELS is true, apply a scoped zai:

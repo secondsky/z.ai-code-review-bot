@@ -512,3 +512,72 @@ describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', 
     expect(context).not.toContain('no textual diffs');
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-4 (impact copy): excluded files dropped BEFORE the diff budget.
+ * impact.js carries an identical buildDiffContext; the same fix applies —
+ * filterExcludedFiles BEFORE filterPatchableFiles, mirroring review.js's
+ * W15-A8-8 fix. See tests/handlers/ask.test.js for the full rationale.
+ * ------------------------------------------------------------------ */
+
+const DEFAULT_EXCLUDES = [
+  '*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+];
+
+describe('buildDiffContext — W16-B4-4 (impact): excluded files dropped before the budget', () => {
+  const files = () => [
+    { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+    { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+  ];
+
+  it('default excludes: lockfile dropped, src/auth.js visible in the context', () => {
+    const context = buildDiffContext(files(), undefined, DEFAULT_EXCLUDES);
+    expect(context).toContain('src/auth.js');
+    expect(context).not.toContain('package-lock.json');
+  });
+
+  it('custom excludePatterns are respected', () => {
+    const context = buildDiffContext(files(), undefined, ['src/**']);
+    expect(context).toContain('package-lock.json');
+    expect(context).not.toContain('src/auth.js');
+  });
+
+  it('no excludes at all → all patchable files included (consistent with review.js)', () => {
+    const context = buildDiffContext(files());
+    expect(context).toContain('package-lock.json');
+    expect(context).toContain('src/auth.js');
+  });
+});
+
+describe('handleImpactCommand — W16-B4-4: threads config.excludePatterns', () => {
+  it('default excludes: prompt contains src/auth.js, NOT the lockfile', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => '## Impact: 🟢 low\n...');
+
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: DEFAULT_EXCLUDES,
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/auth.js');
+    expect(prompt).not.toContain('package-lock.json');
+  });
+});

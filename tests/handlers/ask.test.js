@@ -327,6 +327,164 @@ describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', 
 });
 
 /* ------------------------------------------------------------------ *
+ * W16-B4-2: the EMPTY_ARGS post must be inside the try block
+ *
+ * The `post(EMPTY_ARGS_COMMENT)` executed OUTSIDE the handler's try — a
+ * transient 502 on that single createComment rejected the whole handler,
+ * propagated through the router (index.js dispatches with no catch) and
+ * failed the entire action. It must be guarded like every other post.
+ * ------------------------------------------------------------------ */
+
+describe('handleAskCommand — W16-B4-2: guarded first post', () => {
+  it('empty args + a FAILING post → resolves, never rejects', async () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    await expect(
+      handleAskCommand(
+        {
+          octokit: makeOctokit(),
+          context: makeContext(),
+          config: { apiKey: 'k', model: 'm' },
+          commenter: { login: 'alice' },
+          args: '',
+          callApi: vi.fn(),
+          core,
+        },
+        { post: async () => { throw new Error('502 bad gateway'); } },
+      ),
+    ).resolves.toBeUndefined();
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('empty args + a working post still posts the guidance (happy path unchanged)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'alice' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createComment[0].body).toContain(
+      'Please provide a question',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-4: excluded files dropped BEFORE the diff budget
+ *
+ * buildDiffContext applied only filterPatchableFiles, so a default-excluded
+ * package-lock.json (typically FIRST and huge) ate the ENTIRE 8000-char
+ * budget and the model saw ONLY the lockfile — src/auth.js changes were
+ * invisible to /zai ask. filterExcludedFiles(files, excludePatterns) must
+ * run BEFORE filterPatchableFiles, mirroring review.js's W15-A8-8 fix.
+ * ------------------------------------------------------------------ */
+
+// The default EXCLUDE_PATTERNS list from src/lib/config.js (populated by
+// loadConfig when the action input is empty).
+const DEFAULT_EXCLUDES = [
+  '*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+];
+
+describe('buildDiffContext — W16-B4-4: excluded files dropped before the budget', () => {
+  const files = () => [
+    { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+    { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+  ];
+
+  it('default excludes: lockfile dropped, src/auth.js visible in the context', () => {
+    const context = buildDiffContext(files(), undefined, DEFAULT_EXCLUDES);
+    expect(context).toContain('src/auth.js');
+    expect(context).toContain('+auth change');
+    expect(context).not.toContain('package-lock.json');
+  });
+
+  it('custom excludePatterns are respected', () => {
+    const context = buildDiffContext(files(), undefined, ['src/**']);
+    expect(context).toContain('package-lock.json');
+    expect(context).not.toContain('src/auth.js');
+  });
+
+  it('no excludes at all → all patchable files included (consistent with review.js)', () => {
+    const context = buildDiffContext(files());
+    expect(context).toContain('package-lock.json');
+    expect(context).toContain('src/auth.js');
+  });
+
+  it('lockfile-only PR with default excludes → no-diffs placeholder', () => {
+    const context = buildDiffContext(
+      [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+      undefined,
+      DEFAULT_EXCLUDES,
+    );
+    expect(context).toBe('(no textual diffs available)');
+  });
+});
+
+describe('handleAskCommand — W16-B4-4: threads config.excludePatterns', () => {
+  it('default excludes: prompt contains src/auth.js, NOT the lockfile', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'ans');
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: DEFAULT_EXCLUDES,
+      },
+      commenter: { login: 'alice' },
+      args: 'what changed in auth?',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/auth.js');
+    expect(prompt).not.toContain('package-lock.json');
+  });
+
+  it('no excludePatterns configured → behavior unchanged (lockfile still included)', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'ans');
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'alice' },
+      args: 'q',
+      callApi,
+    });
+
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('package-lock.json');
+    expect(prompt).toContain('src/auth.js');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * W15-A4-5: PR body is capped
  *
  * The user question is capped at 4000 chars (CMD-9) and the diff context at

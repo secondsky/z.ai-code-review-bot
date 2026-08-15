@@ -213,12 +213,17 @@ export async function handleExplainCommand(
   const pullNumber = context?.payload?.issue?.number;
 
   const { range, file } = parseExplainArgs(args);
-  if (!range) {
-    await post(USAGE_COMMENT);
-    return;
-  }
 
   try {
+    // W16-B4-2: this post (like every other in the handler) must be inside
+    // the try — it previously executed OUTSIDE it, so a transient 502 on this
+    // single createComment rejected the whole handler and failed the entire
+    // action (the router dispatches with no catch).
+    if (!range) {
+      await post(USAGE_COMMENT);
+      return;
+    }
+
     const files =
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
@@ -253,9 +258,7 @@ export async function handleExplainCommand(
     // CMD-12: when the file has no textual content (binary file, directory
     // entry, or a file too large for the API to return), post a guidance
     // comment instead of calling the API with an empty code window.
-    // W15-A4-6: a binary file UNDER the 1MB API limit decodes to non-empty
-    // mojibake (replacement chars / C0 controls) — same guidance, no callApi.
-    if (!content || content.trim() === '' || BINARY_CONTENT_RE.test(content)) {
+    if (!content || content.trim() === '') {
       await post(`> No textual content available for \`${target}\`.`);
       return;
     }
@@ -274,6 +277,20 @@ export async function handleExplainCommand(
         lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
       await post(
         `> No lines in range ${range.start}-${range.end} — \`${target}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
+      );
+      return;
+    }
+    // W15-A4-6 / W16-B4-1: a binary file UNDER the 1MB API limit decodes to
+    // non-empty mojibake (replacement chars / C0 controls) — post guidance,
+    // no callApi. The detector runs on the EXTRACTED WINDOW, not the whole
+    // file: previously a single legal control char anywhere in the file
+    // (e.g. \x01 on line 50 of a 100-line text fixture) disabled /zai explain
+    // for every clean range with a wrong "No textual content" message.
+    // Scoping to the window keeps clean ranges working while any window of a
+    // UTF-16 file (decoded as UTF-8 → NUL bytes) is still caught.
+    if (BINARY_CONTENT_RE.test(window)) {
+      await post(
+        `> No textual content available for lines ${range.start}-${clampedEnd} of \`${target}\`.`,
       );
       return;
     }
