@@ -24,6 +24,7 @@ import {
   rankAndCapFindings,
   mergeFindings,
   formatFindingsAsSummary,
+  sanitizeTextField,
   hashFinding,
   buildFindingsHashBlock,
   parseFindingsHashBlock,
@@ -339,6 +340,24 @@ describe('normalizeFinding', () => {
     expect(out.suggestion).not.toMatch(/\r|\n/);
   });
 
+  // W17-C1-2: CommonMark treats a lone \r (U+000D) as a line ending, but
+  // sanitizeTextField only collapsed \r?\n — 'Everything fine.\r#### FREE
+  // iPHONES' passed through unchanged and rendered as a real heading.
+  it('W17-C1-2: collapses lone CR line endings like any other line ending', () => {
+    const out = normalizeFinding({
+      ...validFinding(),
+      title: 'First\rSecond',
+      description: 'line one\rline two',
+      evidence: 'a\rb',
+      suggestion: 'x\ry',
+    });
+    expect(out.title).toBe('First Second');
+    expect(out.description).toBe('line one line two');
+    for (const field of ['title', 'description', 'evidence', 'suggestion']) {
+      expect(out[field]).not.toMatch(/\r|\n/);
+    }
+  });
+
   // W15-A3-5: the anti-hallucination filter matched the file EXACTLY, so an
   // LLM emitting incidental whitespace or a './' prefix (' a.js', 'a.js ',
   // './a.js') had its findings silently dropped. normalizeFinding now trims
@@ -501,6 +520,34 @@ describe('normalizeFinding', () => {
     expect(out.evidence).toBe('');
     expect(out.suggestion).toBeNull();
     expect(out.rule).toBe('llm');
+  });
+});
+
+describe('sanitizeTextField', () => {
+  it('W17-C1-2: normalizes lone CR line endings (no \r survives)', () => {
+    expect(sanitizeTextField('a\rb')).toBe('a b');
+    expect(sanitizeTextField('a\rb')).not.toContain('\r');
+  });
+
+  it('W17-C1-2: neutralizes a heading injected after a lone CR', () => {
+    const out = sanitizeTextField('Everything fine.\r#### FREE iPHONES [link]');
+    expect(out).not.toMatch(/^#{1,6} FREE/m);
+    // The prose survives, flattened onto a single line.
+    expect(out).toContain('Everything fine. #### FREE iPHONES [link]');
+    expect(out).not.toContain('\r');
+  });
+
+  it('W17-C1-2: still collapses CRLF and LF line endings (existing contract)', () => {
+    expect(sanitizeTextField('a\r\nb\nc')).toBe('a b c');
+  });
+
+  it('still HTML-escapes angle brackets (W16-B1-2 contract)', () => {
+    expect(sanitizeTextField('<img src=x>')).toBe('&lt;img src=x&gt;');
+  });
+
+  it('passes non-strings through unchanged (type-validation contract)', () => {
+    expect(sanitizeTextField(42)).toBe(42);
+    expect(sanitizeTextField(null)).toBeNull();
   });
 });
 

@@ -20,6 +20,8 @@ import {
   postFallbackComment,
 } from '../src/lib/review.js';
 import { MARKER } from '../src/lib/comments.js';
+import { formatFindingsAsSummary } from '../src/lib/findings.js';
+import { formatWalkthroughSummary } from '../src/lib/walkthrough.js';
 
 /* ------------------------------------------------------------------ *
  * Pure builders
@@ -94,6 +96,52 @@ describe('buildReviewBody', () => {
   it('includes a truncation note when metadata says so', () => {
     const body = buildReviewBody('s', [], { truncated: 2 });
     expect(body).toContain('2 findings truncated');
+  });
+
+  // W17-C1-1: W16's summary sanitization (B1-4) covered formatFindingsAsSummary
+  // and formatWalkthroughSummary but MISSED buildReviewBody — the body of the
+  // PRIMARY inline-review path (index.js/schedule.js), also recycled by
+  // buildFallbackBody — which pushed the model summary prose verbatim. A
+  // summary like 'ok\n#### X\n<img src=x>' injected a real heading and raw
+  // HTML into the bot's trusted review body. The summary now gets the same
+  // sanitizeTextField treatment (newline collapse + angle-bracket escaping).
+  it('W17-C1-1: sanitizes the model summary prose (no heading line, no raw HTML)', () => {
+    const body = buildReviewBody('ok\n#### X\n<img src=x>', [], {});
+    expect(body).toContain('&lt;img src=x&gt;');
+    expect(body).not.toContain('<img');
+    // No line of the body starts a heading introduced by the summary.
+    expect(body).not.toMatch(/^#{1,6} X$/m);
+    // The prose survives, flattened onto a single line.
+    expect(body).toContain('ok #### X');
+  });
+
+  it('W17-C1-1: parity — the same hostile summary is inert through all three summary renderers', () => {
+    const hostile =
+      'Looks fine.\n\n#### INJECTED HEADING\n\n<img src=x onerror=alert(1)> and </details><script>alert(1)</script>';
+    const bodies = {
+      buildReviewBody: buildReviewBody(hostile, [], {}),
+      formatFindingsAsSummary: formatFindingsAsSummary([], {
+        metadata: { summary: hostile },
+      }),
+      formatWalkthroughSummary: formatWalkthroughSummary([], [], {
+        metadata: { summary: hostile },
+      }),
+    };
+    for (const [renderer, body] of Object.entries(bodies)) {
+      expect(body, renderer).not.toContain('<img');
+      expect(body, renderer).not.toContain('<script');
+      expect(body, renderer).not.toContain('</details>');
+      expect(body, renderer).not.toMatch(/^#{1,6} INJECTED HEADING/m);
+    }
+  });
+
+  it('W17-C1-1: a benign multi-word summary still renders', () => {
+    const body = buildReviewBody(
+      'The changes look good overall; only minor nits were found.',
+      [],
+      {},
+    );
+    expect(body).toContain('The changes look good overall; only minor nits were found.');
   });
 });
 
@@ -229,6 +277,35 @@ describe('buildReviewComments', () => {
     expect(body).toContain('`normal_code [Click here](https://evil.com)`');
     // And no standalone newline splits the evidence from the link.
     expect(body).not.toMatch(/normal_code\r?\n\[Click here\]/);
+  });
+
+  // W17-C1-2: CommonMark treats a lone \r (U+000D) as a line ending, but
+  // renderCommentBody's stripNewlines only collapsed \r?\n — a title like
+  // 'a\rb' kept the raw \r, and GitHub's renderer splits the line there,
+  // letting text after the \r start a heading/quote/link line of its own.
+  it('W17-C1-2: collapses lone CR line endings in title/description/evidence/suggestion', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'low',
+          title: 'a\rb\r\n# NotAHeading',
+          description: 'd1\rd2',
+          evidence: 'code\rbreak',
+          suggestion: 's1\rs2',
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    // No CR survives anywhere in the rendered comment body.
+    expect(body).not.toContain('\r');
+    expect(body).toContain('a b');
+    expect(body).toContain('d1 d2');
+    // The evidence code span is preserved across the former CR boundary.
+    expect(body).toContain('`code break`');
+    expect(body).toContain('s1 s2');
+    // And the collapsed title cannot start a heading line.
+    expect(body).not.toMatch(/^# NotAHeading/m);
   });
 });
 

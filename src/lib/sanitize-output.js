@@ -61,7 +61,9 @@ const ALERT_TYPES = ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'];
 const ALERT_RE = new RegExp(
   // An optional blockquote prefix (one or more `>`), then the [!TYPE] marker.
   // We anchor on start-of-line so a quoted `[!NOTE]` mid-paragraph is unaffected.
-  String.raw`(^|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  // W17-C1-2: CommonMark treats a lone `\r` as a line ending — the boundary
+  // now covers CRLF, CR, and LF so a forged banner after any of them matches.
+  String.raw`(^|\r\n|\r|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
   'gi',
 );
 
@@ -102,7 +104,13 @@ const ALERT_RE = new RegExp(
 const MENTION_RE = /(^|[^\w`\\])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
-  const lines = text.split('\n');
+  // W17-C1-2: CommonMark treats a lone `\r` (U+000D) as a line ending, but the
+  // split below only recognized `\n` — a forged `> [!WARNING]` or an @mention
+  // on a `\r`-delimited "line" was never at line-start for the per-line
+  // regexes and survived (GitHub happily rendered the banner). Normalize ALL
+  // line endings (\r\n and lone \r → \n) at entry; the joined output then
+  // carries canonical \n line endings only.
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
   let inFence = false; // ``` fence state, tracked across lines
   // Index in `out` of the most recent OPENING fence line, or -1 when the last
   // seen fence was properly closed. If the loop ends with inFence === true

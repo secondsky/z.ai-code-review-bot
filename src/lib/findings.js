@@ -151,9 +151,13 @@ function isPositiveInteger(value) {
  *     `payload <img src=x onerror=alert(1)>` lost the very payload it quoted.
  *     GitHub renders `&lt;` as a literal `<` (in code spans and prose), so
  *     escaped tags still read correctly.
- *   - Collapse `\r?\n` to a single space (W15-A3-2): a raw
+ *   - Collapse line endings to a single space (W15-A3-2): a raw
  *     "\n\n#### heading" in a model field would otherwise break markdown
- *     structure in the rendered comment.
+ *     structure in the rendered comment. W17-C1-2: CommonMark treats a LONE
+ *     `\r` (U+000D) as a line ending too, so CR (`\r`), LF (`\n`), and CRLF
+ *     (`\r\n`) are ALL normalized at entry (`\r\n?` → `\n`) before the
+ *     collapse — previously "Everything fine.\r#### FREE iPHONES" passed
+ *     through unchanged and injected a real heading.
  *
  * Non-strings are returned as-is (callers rely on the pass-through so the
  * downstream type validation rejects them).
@@ -164,6 +168,7 @@ function isPositiveInteger(value) {
 export function sanitizeTextField(value) {
   if (typeof value !== 'string') return value;
   return value
+    .replace(/\r\n?/g, '\n')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/\r?\n/g, ' ');

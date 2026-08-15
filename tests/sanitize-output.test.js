@@ -124,6 +124,15 @@ describe('sanitizeModelOutput — @mention neutralization', () => {
     expect(out).toContain('@\u200bspam1');
     expect(out).toContain('@\u200bspam2');
   });
+
+  // W17-C1-2: a lone \r is a CommonMark line ending — a mention after one
+  // must be neutralized exactly like a mention after \n. (Coverage for the
+  // split-on-all-three-endings fix in neutralizeMentionsOutsideCode.)
+  it('W17-C1-2: neutralizes a mention on a line after a lone CR', () => {
+    const out = sanitizeModelOutput('x\r@everyone');
+    expect(out).toContain('@\u200beveryone');
+    expect(out).not.toContain('\r');
+  });
 });
 
 describe('sanitizeModelOutput — injected hash-block stripping (SCN-15)', () => {
@@ -259,6 +268,24 @@ describe('sanitizeModelOutput — GitHub alert neutralization', () => {
     // prefix). Without `>`, it is plain text and must be left alone.
     const input = '[!CAUTION]\nbig risk';
     expect(sanitizeModelOutput(input)).toBe(input);
+  });
+
+  // W17-C1-2: CommonMark treats a lone \r (U+000D) as a line ending, but the
+  // sanitizer split lines on '\n' only — 'x\r> [!CAUTION]\ry' kept the forged
+  // banner intact on the \r-delimited line, and GitHub rendered a real callout.
+  it('W17-C1-2: neutralizes a forged banner after a lone CR line ending', () => {
+    const out = sanitizeModelOutput('x\r> [!CAUTION]\ry');
+    expect(out).not.toContain('[!CAUTION]');
+    expect(out).toContain('!CAUTION');
+    expect(out).not.toMatch(/^> \[!CAUTION\]/m);
+    // The lone CR line endings are normalized away (no CR survives).
+    expect(out).not.toContain('\r');
+  });
+
+  it('W17-C1-2: neutralizes a forged banner after a CRLF line ending too', () => {
+    const out = sanitizeModelOutput('x\r\n> [!WARNING]\r\ny');
+    expect(out).not.toContain('[!WARNING]');
+    expect(out).toContain('!WARNING');
   });
 });
 
@@ -428,6 +455,21 @@ describe('neutralizeAlerts — alert-type & positioning cases', () => {
     // same line does not match.
     const input = 'Some text [!WARNING] more text';
     expect(neutralizeAlerts(input)).toBe(input);
+  });
+
+  // W17-C1-2: the ALERT_RE line boundary only recognized \n — a forged banner
+  // after a lone \r (a valid CommonMark line ending) survived the full-text
+  // variant too. The boundary now covers \r\n, \r, and \n.
+  it('W17-C1-2: neutralizes a banner after a lone CR boundary', () => {
+    const out = neutralizeAlerts('x\r> [!NOTE]');
+    expect(out).not.toContain('[!NOTE]');
+    expect(out).toContain('!NOTE');
+  });
+
+  it('W17-C1-2: neutralizes a banner after a CRLF boundary', () => {
+    const out = neutralizeAlerts('x\r\n> [!TIP]');
+    expect(out).not.toContain('[!TIP]');
+    expect(out).toContain('!TIP');
   });
 });
 

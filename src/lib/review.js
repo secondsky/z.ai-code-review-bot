@@ -25,6 +25,7 @@
 
 import { MARKER } from './comments.js';
 import { sanitizeModelOutput, sanitizeCommentBody } from './sanitize-output.js';
+import { sanitizeTextField } from './findings.js';
 import { postComment } from './handlers/_shared.js';
 import { formatWalkthroughSummary } from './walkthrough.js';
 
@@ -102,7 +103,14 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
   }
 
   if (typeof summary === 'string' && summary.length > 0) {
-    lines.push(summary);
+    // W17-C1-1: the summary is model-controlled prose rendered into the bot's
+    // trusted review body — the PRIMARY inline-review path (index.js /
+    // schedule.js), also recycled by buildFallbackBody. W16's B1-4 sanitization
+    // covered formatFindingsAsSummary and formatWalkthroughSummary but MISSED
+    // this renderer, so 'ok\n#### X\n<img src=x>' injected a real heading and
+    // raw HTML here. Apply the same sanitizeTextField treatment (newline
+    // collapse + angle-bracket escaping) as the other two summary renderers.
+    lines.push(sanitizeTextField(summary));
     lines.push('');
   }
 
@@ -179,7 +187,14 @@ function renderCommentBody(finding) {
   // CORE-2: collapse newlines in title/description/suggestion so model output
   // carrying stray newlines can't break the markdown structure or inject
   // unescaped markdown (e.g. a newline mid-title would split the bold span).
-  const stripNewlines = (s) => String(s).replace(/\r?\n/g, ' ');
+  // W17-C1-2: CommonMark treats a LONE \r as a line ending too, so normalize
+  // \r\n? → \n first — otherwise 'a\rb' kept its raw \r and GitHub's renderer
+  // split the line there, letting the text after it start a heading/quote of
+  // its own.
+  const stripNewlines = (s) =>
+    String(s)
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n/g, ' ');
   const title =
     typeof finding.title === 'string' ? stripNewlines(finding.title) : '';
   const description =
@@ -197,7 +212,12 @@ function renderCommentBody(finding) {
     // CORE-2: escape backticks AND collapse newlines in evidence so the inline
     // code span is preserved. A newline would close the span early and let the
     // remaining content render as markdown (e.g. a clickable malicious link).
-    const safeEvidence = evidence.replace(/`/g, "'").replace(/\r?\n/g, ' ');
+    // W17-C1-2: lone \r is a CommonMark line ending too — normalize \r\n? → \n
+    // before collapsing so a CR cannot split the code span either.
+    const safeEvidence = evidence
+      .replace(/`/g, "'")
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n/g, ' ');
     parts.push(`> \`${safeEvidence}\``);
   }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
