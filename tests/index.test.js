@@ -2005,6 +2005,89 @@ describe('run — pull_request skipped-files note (W17-C1-3)', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * W18-D2-3 — partial-drop portion note (skippedEntries)
+ *
+ * skippedFiles counts only zero-entry files, but skippedEntries (partial
+ * drops of multi-chunk files) was surfaced NOWHERE: a file with 2/15 chunks
+ * reviewed posted a bare "No issues found ✅". When files were partially
+ * dropped (skippedEntries > 0 && skippedFiles === 0), the body must carry a
+ * portion note in the same italic style; when both kinds fired, both notes.
+ * ------------------------------------------------------------------ */
+
+describe('run — pull_request partial-drop portion note (W18-D2-3)', () => {
+  it('W18-D2-3: partial drops only (skippedFiles 0, skippedEntries 13) → summary body carries the portion note, not the file note', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({ files: [file('src/a.js')] });
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [],
+      summary: '',
+      metadata: {
+        totalBatches: 1,
+        totalFindingsBeforeCap: 0,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+        skippedFiles: 0,
+        skippedEntries: 13,
+      },
+    }));
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+    });
+
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    // The all-clear is NOT bare: the portion note is rendered next to it.
+    expect(body).toContain('No issues found');
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+    // No file was skipped wholesale → no file note.
+    expect(body).not.toContain('files not reviewed');
+  });
+
+  it('W18-D2-3: both full-file and partial drops → BOTH notes render in the inline review body', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    const runStructuredReviewSpy = vi.fn(async () => ({
+      findings: [
+        { file: 'src/a.js', line: 2, severity: 'high', title: 'T', description: 'd' },
+      ],
+      summary: 's',
+      metadata: {
+        totalBatches: 1,
+        totalFindingsBeforeCap: 1,
+        deterministicFindingsCount: 0,
+        batchMetadata: [],
+        skippedFiles: 1,
+        skippedEntries: 13,
+      },
+    }));
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: runStructuredReviewSpy,
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    const body = octokit.__calls.createReview[0].body;
+    // The existing W17-C1-3 file note is unchanged…
+    expect(body).toContain('1 file not reviewed (MAX_DIFF_CHARS cap).');
+    // …and the partial-drop portion note rides alongside it.
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * issue_comment path
  * ------------------------------------------------------------------ */
 
@@ -2371,6 +2454,33 @@ describe('run — schedule + unknown events', () => {
     });
     // The pipeline helpers were wired through.
     expect(runScheduledReview.mock.calls[0][0].callApi).toBeTypeOf('function');
+  });
+
+  // W18-D1-2: the scheduled incremental read must ALSO read prior hashes from
+  // bot REVIEWS (the inline path deposits its hash block there). The schedule
+  // branch wires the real review.js listBotReviews — pin the wiring.
+  it('schedule: enabled → threads listBotReviews (W18-D1-2 review-side prior-hash reads)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit();
+    const callApi = vi.fn(async () => 'review');
+    const runScheduledReview = vi.fn(async () => ({ reviewed: 0, skipped: 0, failed: 0 }));
+    const listBotReviews = vi.fn(async () => []);
+
+    await run(
+      { eventName: 'schedule', repo: { owner: 'o', repo: 'r' }, payload: {} },
+      {
+        config: makeConfig({ scheduleEnabled: true }),
+        core,
+        octokit,
+        callApi,
+        apiClient: { call: vi.fn() },
+        runScheduledReview,
+        listBotReviews,
+      },
+    );
+
+    expect(runScheduledReview).toHaveBeenCalledTimes(1);
+    expect(runScheduledReview.mock.calls[0][0].listBotReviews).toBe(listBotReviews);
   });
 
   it('unknown event: graceful no-op', async () => {

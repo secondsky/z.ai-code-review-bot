@@ -622,17 +622,26 @@ export async function runStructuredReview(files, config, deps = {}) {
   // metadata, the same way totalFindingsBeforeCap/deterministicFindingsCount
   // are exposed — index.js assembles its reviewMetadata from result.metadata
   // and can render the skip note later without touching this module.
-  const skippedMeta =
-    typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0
-      ? {
-          skippedFiles: batchMetadata.skippedFiles,
-          skippedEntries: batchMetadata.skippedEntries,
-        }
-      : {};
-  if (core?.info && skippedMeta.skippedFiles) {
+  // W18-D2-3: each key is gated INDEPENDENTLY. The old single gate
+  // (`skippedFiles > 0 ? {skippedFiles, skippedEntries} : {}`) dropped the
+  // entries count whenever no file was skipped wholesale — a file with 2/15
+  // chunks reviewed surfaced NOTHING and callers posted a bare
+  // "No issues found ✅". skippedEntries>0 alone (pure partial drops) must
+  // still reach the result metadata.
+  const skippedMeta = {};
+  if (typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0) {
+    skippedMeta.skippedFiles = batchMetadata.skippedFiles;
+  }
+  if (
+    typeof batchMetadata.skippedEntries === 'number' &&
+    batchMetadata.skippedEntries > 0
+  ) {
+    skippedMeta.skippedEntries = batchMetadata.skippedEntries;
+  }
+  if (core?.info && (skippedMeta.skippedFiles || skippedMeta.skippedEntries)) {
     core.info(
-      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles} file(s) ` +
-        `(${skippedMeta.skippedEntries} chunk(s) unreviewed).`,
+      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles ?? 0} file(s) ` +
+        `(${skippedMeta.skippedEntries ?? 0} chunk(s) unreviewed).`,
     );
   }
 

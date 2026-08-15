@@ -1931,3 +1931,453 @@ describe('reviewOnePr — W17-C2-3 bounded hash union on the summary path', () =
     expect(hashes.has(hashFinding(fileLevelFinding))).toBe(true);
   });
 });
+
+/* ---------- reviewOnePr — W18-D1-2/D2-1 review-side prior-hash reads ---------- */
+
+// The scheduled incremental path read prior hashes ONLY from marker comments
+// (findBotMarkerComments) — but the scheduled INLINE path deposits its hash
+// block exclusively in the REVIEW body (upsertReview), so on the common path
+// every tick after a re-push re-reported unchanged findings. src/index.js
+// unions reviews (listBotReviews) + marker comments; the scheduled path must
+// do the same, via an injected (inert-by-default) listBotReviews dep.
+describe('reviewOnePr — W18-D2-1 review-side prior-hash reads (listBotReviews)', () => {
+  const reviewResult = (findings) => ({
+    findings,
+    summary: 'inline review',
+    metadata: { totalBatches: 1, totalFindingsBeforeCap: findings.length, deterministicFindingsCount: 0, batchMetadata: [] },
+  });
+
+  it('W18-D2-1: two-tick scenario — a hash block deposited in a bot REVIEW suppresses unchanged findings on the next tick', async () => {
+    // TICK 1: fresh SHA, no prior data → inline review posted carrying the
+    // hash block in the REVIEW body (the inline path's only deposit).
+    const s1 = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(async () => []),
+      listBotReviews: vi.fn(async () => []),
+    });
+    const r1 = await reviewOnePr({
+      pr: mkPr(90, 'sha90-a'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s1,
+    });
+    expect(r1).toEqual({ ok: true, action: 'reviewed' });
+    expect(s1.upsertReview).toHaveBeenCalledTimes(1);
+    const tick1Body = s1.upsertReview.mock.calls[0][0].body;
+    expect(tick1Body).toContain('<!-- zai-hashes:');
+
+    // TICK 2: same PR, NEW head SHA after a re-push. No bot marker comments
+    // exist (tick 1 posted a REVIEW, not a summary comment), but a bot review
+    // carries tick 1's hash block — the union read must suppress the
+    // unchanged finding.
+    const s2 = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(async () => []),
+      listBotReviews: vi.fn(async () => [
+        { id: 1, body: tick1Body, user: { login: 'github-actions[bot]', type: 'Bot' } },
+      ]),
+    });
+    const core2 = { info: vi.fn(), warning: vi.fn() };
+    const r2 = await reviewOnePr({
+      pr: mkPr(90, 'sha90-b'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: core2, callApi: vi.fn(), ...s2,
+    });
+
+    expect(r2).toEqual({ ok: true, action: 'reviewed' });
+    // The review-side read happened…
+    expect(s2.listBotReviews).toHaveBeenCalledTimes(1);
+    expect(core2.info).toHaveBeenCalledWith(
+      expect.stringContaining('suppressed 1 previously-reported finding'),
+    );
+    // …and the unchanged finding is NOT re-reported: no inline review; the
+    // summary fallback body carries no trace of it.
+    expect(s2.upsertReview).not.toHaveBeenCalled();
+    const body2 = s2.upsertReviewComment.mock.calls[0][0].body;
+    expect(body2).not.toContain(INLINE_FINDING.title);
+  });
+
+  it('W18-D2-1: a throwing listBotReviews is fail-soft — warning logged, review proceeds unsuppressed', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(async () => []),
+      listBotReviews: vi.fn(async () => {
+        throw new Error('reviews API down');
+      }),
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    const result = await reviewOnePr({
+      pr: mkPr(91, 'sha91'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('prior bot reviews'));
+    // Degraded, not broken: no review-side hashes → the finding still posts.
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    expect(s.upsertReview.mock.calls[0][0].comments[0].body).toContain(INLINE_FINDING.title);
+  });
+
+  it('W18-D2-1: incrementalReview off → listBotReviews is NOT called (no wasted reviews pagination)', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(async () => []),
+      listBotReviews: vi.fn(async () => {
+        throw new Error('must not be called');
+      }),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(92, 'sha92'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.listBotReviews).not.toHaveBeenCalled();
+    expect(s.findBotMarkerComments).not.toHaveBeenCalled();
+  });
+
+  it('W18-D2-1: runScheduledReview threads listBotReviews into reviewOnePr (batch wiring)', async () => {
+    // End-to-end wiring: a dep passed to runScheduledReview must reach
+    // reviewOnePr's incremental read.
+    const octokit = makeOctokit({ prs: [mkPr(93, 'sha93')], commentsByPr: {} });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(async () => []),
+      listBotReviews: vi.fn(async () => []),
+    });
+
+    await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info() {}, warning() {} }, callApi: vi.fn(), ...s,
+    });
+
+    expect(s.listBotReviews).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* ---------- reviewOnePr — W18-D1-3/D2-2 incremental/learnings suppression note ---------- */
+
+// The scheduled path applied incremental/learnings suppression but passed
+// result.summary RAW to its renderers — no "_N previously-reported finding(s)
+// suppressed (incremental review)._". A fully-suppressed tick therefore posted
+// a false bare "No issues found ✅" (index.js appends the note via
+// appendIncrementalNote). The scheduled path must apply the SAME note (same
+// wording) to the summary on BOTH branches.
+describe('reviewOnePr — W18-D2-2 incremental/learnings suppression note', () => {
+  // A second line-mappable finding (line 3 is the second added line of
+  // INLINE_PATCH) so the inline branch is taken even when the first finding
+  // is suppressed.
+  const NEW_FINDING = {
+    file: 'a.js',
+    line: 3,
+    severity: 'medium',
+    title: 'Fresh issue',
+    description: 'd2',
+  };
+  const reviewResult = (findings) => ({
+    findings,
+    summary: 'scheduled review',
+    metadata: { totalBatches: 1, totalFindingsBeforeCap: findings.length, deterministicFindingsCount: 0, batchMetadata: [] },
+  });
+  const priorMarkerComment = (hashes) => ({
+    id: 1,
+    body: `prior push summary\n\n${MARKER}\n<!-- zai-hashes:${hashes.join(',')} -->`,
+    user: { login: 'github-actions[bot]', type: 'Bot' },
+  });
+
+  it('W18-D2-2: fully-suppressed tick (incremental) → summary body carries the note next to the all-clear (not a bare all-clear)', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: { 94: [priorMarkerComment([hashFinding(INLINE_FINDING)])] },
+    });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      findBotMarkerComments: vi.fn(findBotMarkerComments),
+      // Real renderer so the posted body reflects production output.
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(94, 'sha94'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    // The all-clear is still there…
+    expect(body).toContain('No issues found');
+    // …but it is NOT bare: the suppression note must be visible (index.js
+    // wording, byte-identical).
+    expect(body).toContain('suppressed (incremental review)');
+    expect(body).toContain('1 previously-reported finding suppressed (incremental review).');
+  });
+
+  it('W18-D2-2: partially-suppressed tick (incremental) → INLINE review body carries the note', async () => {
+    const octokit = makeOctokit({
+      commentsByPr: { 95: [priorMarkerComment([hashFinding(INLINE_FINDING)])] },
+    });
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING, NEW_FINDING])),
+      findBotMarkerComments: vi.fn(findBotMarkerComments),
+      // buildReviewBody defaults to the REAL renderer in makeStubs.
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(95, 'sha95'),
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ incrementalReview: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.upsertReview).toHaveBeenCalledTimes(1);
+    const body = s.upsertReview.mock.calls[0][0].body;
+    expect(body).toContain('1 previously-reported finding suppressed (incremental review).');
+  });
+
+  it('W18-D2-2: learnings-only suppression → note uses the learnings wording (index.js parity)', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => reviewResult([INLINE_FINDING])),
+      loadLearnings: vi.fn(async () => [{ file: 'a.js', pattern: 'Bad' }]),
+      formatLearningsForPrompt: vi.fn(() => ''),
+      filterFindingsByLearnings, // real suppression semantics
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(96, 'sha96'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ learningsEnabled: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    // Same composed wording index.js renders for a learnings-only drop.
+    expect(body).toContain('1 previously-accepted learning suppressed (incremental review).');
+  });
+
+  it('W18-D2-2: nothing suppressed → no note in the posted body', async () => {
+    const s = makeStubs({
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+
+    await reviewOnePr({
+      pr: mkPr(97, 'sha97'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    expect(body).not.toContain('suppressed (incremental review)');
+  });
+});
+
+/* ---------- reviewOnePr — W18-D2-3 partial-drop portion note ---------- */
+
+// Mirrors the index.js fix: skippedEntries (partial drops of multi-chunk
+// files) must surface as a portion note — a scheduled run that reviewed only
+// some chunks of a file previously posted a bare "No issues found ✅".
+describe('reviewOnePr — W18-D2-3 partial-drop portion note', () => {
+  it('W18-D2-3: partial drops only (skippedFiles 0, skippedEntries 13) → summary body carries the portion note, not the file note', async () => {
+    const s = makeStubs({
+      runStructuredReview: vi.fn(async () => ({
+        findings: [],
+        summary: '',
+        metadata: {
+          totalBatches: 0,
+          totalFindingsBeforeCap: 0,
+          deterministicFindingsCount: 0,
+          batchMetadata: [],
+          skippedFiles: 0,
+          skippedEntries: 13,
+        },
+      })),
+      // Real renderer so the posted body reflects production output.
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(98, 'sha98'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    expect(body).toContain('No issues found');
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+    expect(body).not.toContain('files not reviewed');
+  });
+
+  it('W18-D2-3: both full-file and partial drops → BOTH notes render in the inline review body', async () => {
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline',
+        metadata: {
+          totalBatches: 1,
+          totalFindingsBeforeCap: 1,
+          deterministicFindingsCount: 0,
+          batchMetadata: [],
+          skippedFiles: 1,
+          skippedEntries: 13,
+        },
+      })),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(99, 'sha99'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    const body = s.upsertReview.mock.calls[0][0].body;
+    // The existing W17-C1-3 file note is unchanged…
+    expect(body).toContain('1 file not reviewed (MAX_DIFF_CHARS cap).');
+    // …and the partial-drop portion note rides alongside it (index.js parity).
+    expect(body).toContain('13 portions not reviewed (MAX_DIFF_CHARS cap).');
+  });
+});
+
+/* ---------- runScheduledReview — W18-D2-4 commit-status reconciliation ---------- */
+
+// If pending lands but the SUCCESS status post fails transiently (403/5xx —
+// setReviewStatus returns false), the check stayed pending forever on that
+// SHA: the next tick hit hasReviewForSha → true and skipped BEFORE any status
+// work. The skip branch must reconcile — post the terminal success status
+// (idempotent: GitHub overwrites same-context statuses) — and the immediate
+// path must WARN when its success post did not land.
+describe('runScheduledReview — W18-D2-4 commit-status reconciliation', () => {
+  it('W18-D2-4: hasReviewForSha skip + commitStatus on → ONE terminal success status posted for that SHA', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(100, 'sha100')], commentsByPr: {} });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+      buildStatusDescription,
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    // Still counted as skipped (no re-review)…
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(s.runStructuredReview).not.toHaveBeenCalled();
+    // …but exactly ONE status was posted for the already-reviewed SHA: the
+    // terminal success reconciliation (never a second pending).
+    expect(s.setReviewStatus).toHaveBeenCalledTimes(1);
+    const [statusArgs] = s.setReviewStatus.mock.calls[0];
+    expect(statusArgs.sha).toBe('sha100');
+    expect(statusArgs.state).toBe('success');
+    expect(statusArgs.description).toContain('Review complete');
+    expect(statusArgs.context.repo).toEqual({ owner: 'o', repo: 'r' });
+    expect(statusArgs.reviewerName).toBe('Z.ai Code Review');
+  });
+
+  it('W18-D2-4: hasReviewForSha skip + commitStatus OFF → no status posted (flag honored)', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(101, 'sha101')], commentsByPr: {} });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: false }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(s.setReviewStatus).not.toHaveBeenCalled();
+  });
+
+  it('W18-D2-4: success post returns false on the reviewed tick → warning logged, and the NEXT tick still reconciles', async () => {
+    // TICK 1: the review runs, pending lands, but the SUCCESS status post
+    // returns false (transient 403/5xx) — a warning must be logged and the
+    // review itself must still complete.
+    const octokit1 = makeOctokit({ prs: [mkPr(102, 'sha102')], commentsByPr: {} });
+    const s1 = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      })),
+      // pending → true, success → false (the transient failure under test).
+      setReviewStatus: vi.fn(async (opts) => opts.state !== 'success'),
+    });
+    const core1 = { info: vi.fn(), warning: vi.fn() };
+    const r1 = await runScheduledReview({
+      octokit: octokit1, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: core1, callApi: vi.fn(), ...s1,
+    });
+    expect(r1).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
+    expect(s1.setReviewStatus.mock.calls.map((c) => c[0].state)).toEqual(['pending', 'success']);
+    expect(core1.warning).toHaveBeenCalledWith(
+      expect.stringContaining('success commit status'),
+    );
+
+    // TICK 2: the SHA is now reviewed (hasReviewForSha → true) — the skip
+    // branch must STILL reconcile the stuck-pending SHA with a success post.
+    const octokit2 = makeOctokit({ prs: [mkPr(102, 'sha102')], commentsByPr: {} });
+    const s2 = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => true),
+    });
+    const r2 = await runScheduledReview({
+      octokit: octokit2, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s2,
+    });
+    expect(r2).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(s2.setReviewStatus).toHaveBeenCalledTimes(1);
+    const [reconcileArgs] = s2.setReviewStatus.mock.calls[0];
+    expect(reconcileArgs.sha).toBe('sha102');
+    expect(reconcileArgs.state).toBe('success');
+  });
+
+  it('W18-D2-4: a THROWING setReviewStatus during skip reconciliation is fail-soft (never breaks the batch)', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(103, 'sha103')], commentsByPr: {} });
+    const s = makeStubs({
+      hasReviewForSha: vi.fn(async () => true),
+      setReviewStatus: vi.fn(async () => {
+        throw new Error('statuses API exploded');
+      }),
+    });
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig({ commitStatus: true }),
+      core, callApi: vi.fn(), ...s,
+    });
+
+    // The batch survives; the PR still counts as skipped (not failed).
+    expect(result).toEqual({ reviewed: 0, skipped: 1, failed: 0 });
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('sha103'));
+  });
+});

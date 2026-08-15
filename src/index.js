@@ -69,6 +69,9 @@ import {
   buildFindingsHashBlock,
   parseFindingsHashBlock,
   filterIncrementalFindings,
+  // W18-D1-3: extracted verbatim into the shared pure module so schedule.js
+  // can render the identical suppression note (index.js behavior unchanged).
+  appendIncrementalNote,
 } from './lib/findings.js';
 import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
@@ -377,46 +380,8 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
 }
 
 /**
- * Append the Phase 6.3 incremental-suppression note to the model's summary.
- *
- * The note is appended (with a blank-line separator) so reviewers can see how
- * many previously-resolved findings were elided. Returns the (possibly empty)
- * summary with the note appended. Kept as a pure helper so it can be unit
- * tested in isolation if needed.
- *
- * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
- * only the incremental count was reported, so a run that suppressed 5 findings
- * via learnings showed no note at all — reviewers had no signal that the bot
- * had intentionally dropped findings. Both suppression reasons now contribute
- * to a single note so the summary reflects the total elided count.
- *
- * @param {string} summary  The model's original summary prose.
- * @param {number} suppressedCount  How many findings were suppressed (incremental).
- * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
- * @returns {string}
- */
-function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
-  const base = typeof summary === 'string' ? summary : '';
-  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
-  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
-  const total = inc + lrn;
-  if (total === 0) return base;
-  // Compose a note that reflects BOTH suppression reasons when both fired.
-  const parts = [];
-  if (inc > 0) {
-    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
-  }
-  if (lrn > 0) {
-    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
-  }
-  // English join: "a and b" or just "a".
-  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
-  const note = `_${what} suppressed (incremental review)._`;
-  return base.length === 0 ? note : `${base}\n\n${note}`;
-}
-
-/**
- * Insert the W17-C1-3 skipped-files note into a rendered body.
+ * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
+ * into a rendered body.
  *
  * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
  * review, but nothing surfaced that to the reviewer — a run that skipped
@@ -428,17 +393,36 @@ function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0
  * comment). Rendering happens here — after the renderer returns — because
  * the note must appear on every path without touching each renderer.
  *
+ * W18-D2-3: skippedFiles counts only zero-entry files; PARTIAL drops of
+ * multi-chunk files (skippedEntries) were surfaced nowhere — a file with
+ * 2/15 chunks reviewed still posted the bare all-clear. When
+ * `skippedEntries > 0` a matching portions note is rendered too (when both
+ * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
+ * "N file(s) (M chunk(s) unreviewed)" style).
+ *
  * @param {string} body   Rendered body ending in the marker (typically).
  * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
  * @returns {string}
  */
-function insertSkippedFilesNote(body, skippedFiles) {
+function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0) {
   const n =
     typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
       ? Math.floor(skippedFiles)
       : 0;
-  if (n === 0 || typeof body !== 'string' || body.length === 0) return body;
-  const note = `_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`;
+  const e =
+    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
+      ? Math.floor(skippedEntries)
+      : 0;
+  if ((n === 0 && e === 0) || typeof body !== 'string' || body.length === 0) return body;
+  const notes = [];
+  if (n > 0) {
+    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (e > 0) {
+    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  const note = notes.join('\n\n');
   const idx = body.lastIndexOf(MARKER);
   if (idx === -1) return `${body}\n\n${note}`;
   return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
@@ -990,6 +974,12 @@ export async function run(context, deps = {}) {
       typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
         ? result.metadata.skippedFiles
         : 0;
+    // W18-D2-3: partial drops (multi-chunk files with some chunks dropped)
+    // ride the same note inserter as the whole-file drops.
+    const skippedEntryCount =
+      typeof result.metadata.skippedEntries === 'number' && result.metadata.skippedEntries > 0
+        ? result.metadata.skippedEntries
+        : 0;
     const reviewMetadata = {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
@@ -1023,7 +1013,8 @@ export async function run(context, deps = {}) {
       );
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
-      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount);
+      // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+      const baseBodyWithNote = insertSkippedFilesNote(baseBody, skippedFileCount, skippedEntryCount);
       const shaBlock = buildShaBlock(sha);
       const reviewBody = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
@@ -1113,7 +1104,8 @@ export async function run(context, deps = {}) {
     });
     // W17-C1-3: surface the skipped-files drop in the summary comment too
     // (before the trailers so the marker/SHA ordering is untouched).
-    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount);
+    // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+    const commentBodyWithNote = insertSkippedFilesNote(commentBody, skippedFileCount, skippedEntryCount);
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
     const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
@@ -1296,6 +1288,10 @@ export async function run(context, deps = {}) {
       // W17-C2-1: real incremental filter so scheduled runs suppress
       // previously-reported findings exactly like the push path.
       filterIncrementalFindings: filterIncrementalFindingsFn,
+      // W18-D1-2: real bot-review finder so scheduled incremental reads ALSO
+      // see the hash blocks the inline path deposited in review bodies (the
+      // comments-only read left them invisible and findings were re-reported).
+      listBotReviews: listBotReviewsFn,
     });
     return;
   }

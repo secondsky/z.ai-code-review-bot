@@ -1193,4 +1193,51 @@ export function filterIncrementalFindings(newFindings, priorHashes) {
   return { kept, suppressed };
 }
 
+// ---------------------------------------------------------------------------
+// Incremental/learnings suppression note (W18-D1-3 shared helper)
+// ---------------------------------------------------------------------------
+
+/**
+ * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ *
+ * The note is appended (with a blank-line separator) so reviewers can see how
+ * many previously-resolved findings were elided. Returns the (possibly empty)
+ * summary with the note appended. Kept as a pure helper so it can be unit
+ * tested in isolation if needed.
+ *
+ * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
+ * only the incremental count was reported, so a run that suppressed 5 findings
+ * via learnings showed no note at all — reviewers had no signal that the bot
+ * had intentionally dropped findings. Both suppression reasons now contribute
+ * to a single note so the summary reflects the total elided count.
+ *
+ * W18-D1-3: extracted verbatim from src/index.js (the entry module cannot be
+ * imported by schedule.js — the entry imports IT) so the scheduled path can
+ * render the exact same note. Behavior is byte-identical.
+ *
+ * @param {string} summary  The model's original summary prose.
+ * @param {number} suppressedCount  How many findings were suppressed (incremental).
+ * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
+ * @returns {string}
+ */
+export function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
+  const base = typeof summary === 'string' ? summary : '';
+  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
+  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
+  const total = inc + lrn;
+  if (total === 0) return base;
+  // Compose a note that reflects BOTH suppression reasons when both fired.
+  const parts = [];
+  if (inc > 0) {
+    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
+  }
+  if (lrn > 0) {
+    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
+  }
+  // English join: "a and b" or just "a".
+  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  const note = `_${what} suppressed (incremental review)._`;
+  return base.length === 0 ? note : `${base}\n\n${note}`;
+}
+
 // Exported internals for testing (none beyond the public exports today).

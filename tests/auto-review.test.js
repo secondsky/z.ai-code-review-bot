@@ -1398,6 +1398,38 @@ describe('runStructuredReview', () => {
     expect(out.metadata.skippedFiles).toBeUndefined();
     expect(out.metadata.skippedEntries).toBeUndefined();
   });
+
+  // W18-D2-3: skippedEntries must reach runStructuredReview's metadata EVEN
+  // WHEN skippedFiles === 0 (pure partial drops). The old skippedMeta gate
+  // (`skippedFiles > 0 ? {skippedFiles, skippedEntries} : {}`) dropped the
+  // entries count whenever no file was skipped wholesale — so a file with
+  // 2/15 chunks reviewed surfaced NOTHING and callers posted a bare
+  // "No issues found ✅".
+  test('W18-D2-3: skippedEntries reaches runStructuredReview metadata even when skippedFiles === 0 (partial drops)', async () => {
+    // Same construction as the W17-C1-3 createReviewBatches test: f0.js is
+    // 'added' (+8) so it sorts first; a.js splits into two 20-char chunks
+    // under maxPatchChars 25. With maxDiffChars 100, f0.js is packed, a.js
+    // chunk 1 is rescued by the single-entry tolerance, and a.js chunk 2
+    // hits the exhausted cumulative budget and is dropped — a.js is
+    // PARTIALLY reviewed: skippedFiles 0, skippedEntries 1.
+    const files = [
+      makeFile({ filename: 'f0.js', status: 'added', patch: 'y'.repeat(24) }),
+      makeFile({
+        filename: 'a.js',
+        patch: 'x'.repeat(20) + '\n' + 'x'.repeat(20),
+      }),
+    ];
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxDiffChars: 100, maxPatchChars: 25 },
+      { callApi: async () => structuredPayload('s', []) },
+    );
+    // The partial drop is visible on the metadata callers consume.
+    expect(out.metadata.skippedEntries).toBe(1);
+    // skippedFiles stays ABSENT when zero (the field's presence is itself
+    // the wholesale-skip signal — same contract as the no-truncation case).
+    expect(out.metadata.skippedFiles).toBeUndefined();
+  });
 });
 
 /* ================================================================== *
