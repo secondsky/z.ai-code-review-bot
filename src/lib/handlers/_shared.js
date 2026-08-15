@@ -201,6 +201,12 @@ export async function upsertPrDescription(
     newBody = currentBody ? `${currentBody}\n\n${block}` : block;
   }
 
+  // W18-D3-3: re-running with an UNCHANGED description reconstructs a
+  // byte-identical body. Skip the update in that case — calling pulls.update
+  // anyway churned the PR's edit history on every re-run.
+  if (newBody === currentBody) {
+    return { updated: false };
+  }
   await updatePr({ owner, repo, pull_number: pullNumber, body: newBody });
   return { updated: true };
 }

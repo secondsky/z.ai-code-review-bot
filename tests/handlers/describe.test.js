@@ -518,3 +518,75 @@ describe('upsertPrDescription — CMD-8: strip model-emitted markers', () => {
     expect((newBody.match(/<!-- zai-description -->/g) || []).length).toBe(1);
   });
 });
+
+describe('upsertPrDescription — W18-D3-3: no-op guard (byte-identical body)', () => {
+  // W18-D3-3: re-running with an UNCHANGED description reconstructs a
+  // byte-identical PR body. The previous code still called pulls.update,
+  // churning the PR's edit history on every re-run. The fix returns
+  // { updated: false } WITHOUT calling update when newBody === currentBody.
+  it('W18-D3-3: identical description → updatePr NOT called, { updated: false }', async () => {
+    const calls = { get: [], update: [] };
+    const currentBody =
+      'PRE\n<!-- zai-description -->\nSAME DESC\n<!-- /zai-description -->\nPOST';
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: currentBody } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    const result = await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'SAME DESC',
+    });
+
+    expect(result).toEqual({ updated: false });
+    expect(calls.update).toHaveLength(0);
+  });
+
+  it('W18-D3-3: changed description → updatePr called once, { updated: true }', async () => {
+    const calls = { get: [], update: [] };
+    const currentBody =
+      'PRE\n<!-- zai-description -->\nOLD DESC\n<!-- /zai-description -->\nPOST';
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: currentBody } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    const result = await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'NEW DESC',
+    });
+
+    expect(result).toEqual({ updated: true });
+    expect(calls.update).toHaveLength(1);
+    expect(calls.update[0].body).toContain('NEW DESC');
+    // Human text outside the markers is preserved.
+    expect(calls.update[0].body).toContain('PRE');
+    expect(calls.update[0].body).toContain('POST');
+  });
+});

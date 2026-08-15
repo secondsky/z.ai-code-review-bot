@@ -264,6 +264,34 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
     expect(octokit.__calls.createComment).toHaveLength(1);
   });
 
+  // W18-D3-2: when the model's output is unparseable (parseSeverity → null),
+  // a previously applied managed label is now STALE — the new assessment
+  // disagrees with (or at least does not confirm) it. The label must be
+  // REMOVED (all managed severities) with nothing added. Before the fix,
+  // `if (!severity) return false;` returned before the removal loop, so a
+  // stale zai:high survived a run whose assessment couldn't be parsed.
+  it('W18-D3-2: null severity REMOVES existing managed labels and adds nothing', async () => {
+    const octokit = makeOctokit({
+      labels: [{ name: 'zai:high' }, { name: 'bug' }],
+    });
+    const callApi = vi.fn(async () => 'I cannot assess the impact of these changes.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    // The stale managed label was removed...
+    expect(octokit.__calls.removeLabel).toHaveLength(1);
+    expect(octokit.__calls.removeLabel[0].name).toBe('zai:high');
+    // ...nothing was added, and human labels ("bug") were untouched.
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+    // The assessment was still posted.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
   it('does NOT apply labels when impactLabels is false even with a clear severity', async () => {
     const octokit = makeOctokit();
     const callApi = vi.fn(async () => '🔴 critical');

@@ -75,9 +75,12 @@ export function extractStatusCode(message) {
 export function categorizeError(error) {
   const message = String(error?.message ?? '').toLowerCase();
 
-  if (message.includes('timeout') || message.includes('timed out')) {
-    return { category: 'timeout', retryable: true };
-  }
+  // W18-D3-1: status-code checks run FIRST. The production error shape
+  // `Z.ai API error NNN: <provider body>` embeds the real HTTP status in the
+  // message, and provider bodies often contain the word "timeout" (e.g. a 400
+  // whose body says "request timeout exceeded", or a 503 "gateway timeout").
+  // The status the provider actually returned must win over message
+  // substrings, or a permanent 400 was misclassified as a retryable timeout.
   const statusCode = extractStatusCode(message);
   if (statusCode === 429) return { category: 'rate-limit', retryable: true };
   if (statusCode === 401 || statusCode === 403) {
@@ -87,6 +90,9 @@ export function categorizeError(error) {
   if (statusCode >= 500 && statusCode < 600) {
     return { category: 'provider', retryable: true };
   }
+  if (message.includes('timeout') || message.includes('timed out')) {
+    return { category: 'timeout', retryable: true };
+  }
   // Lowercase once — `ECONNREFUSED` becomes `econnrefused`, so a single
   // lowercase check suffices (the fork had redundant mixed-case checks).
   // W15-A7-1: beyond connect-time ECONNREFUSED/ENETUNREACH, the most common
@@ -95,9 +101,16 @@ export function categorizeError(error) {
   // ("socket hang up"), aborted requests, and transient DNS failures
   // (EAI_AGAIN). Treating any of these as internal/non-retryable lets one
   // reset in any batch kill the entire review with no comment posted.
+  // W18-D3-1: add ETIMEDOUT and EHOSTUNREACH. The OS connect-timeout errno is
+  // one of the most common transient errors on GitHub runners, but 'etimedout'
+  // does NOT contain the substring 'timeout', so it previously fell through to
+  // internal/non-retryable and killed the whole review after ONE attempt.
+  // EHOSTUNREACH is the missing sibling of the already-covered ENETUNREACH.
   if (
     message.includes('econnrefused') ||
     message.includes('enetunreach') ||
+    message.includes('ehostunreach') ||
+    message.includes('etimedout') ||
     message.includes('econnreset') ||
     message.includes('epipe') ||
     message.includes('socket hang up') ||

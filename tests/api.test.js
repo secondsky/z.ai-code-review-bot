@@ -238,6 +238,38 @@ describe('categorizeError', () => {
     });
   });
 
+  // W18-D3-1: OS connect-time errno codes. 'connect ETIMEDOUT' is one of the
+  // most common transient failures on GitHub runners, but 'etimedout' does NOT
+  // contain the substring 'timeout', so it fell through to internal/
+  // NON-retryable and killed the whole review after a single attempt. Its
+  // sibling EHOSTUNREACH was equally missing while ENETUNREACH was covered.
+  test('W18-D3-1: connect ETIMEDOUT and EHOSTUNREACH → provider/retryable', () => {
+    expect(categorizeError(new Error('connect ETIMEDOUT 1.2.3.4:443'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+    expect(categorizeError(new Error('connect EHOSTUNREACH 1.2.3.4:443'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+  });
+
+  // W18-D3-1: the provider's HTTP status must WIN over message substrings.
+  // A 4xx body containing the word "timeout" (e.g. a 400 whose body says
+  // "request timeout exceeded") is a validation error, NOT a retryable
+  // timeout — retrying a deterministic 400 only burns the review budget.
+  test('W18-D3-1: 400 body containing "timeout" stays validation/non-retryable', () => {
+    expect(
+      categorizeError(new Error('Z.ai API error 400: request timeout exceeded')),
+    ).toEqual({ category: 'validation', retryable: false });
+  });
+
+  test('W18-D3-1: 5xx body containing "timeout" classifies by status → provider/retryable', () => {
+    expect(
+      categorizeError(new Error('Z.ai API error 503: gateway timeout')),
+    ).toEqual({ category: 'provider', retryable: true });
+  });
+
   // The new retryable classifications must NOT bleed into genuinely internal
   // errors: unrelated messages still fall through to internal/non-retryable.
   test('W15-A7-1: unrelated internal errors remain non-retryable', () => {
@@ -730,6 +762,28 @@ describe('callWithRetry', () => {
     expect(out.error.attempts).toBe(1);
     expect(typeof out.error.totalDuration).toBe('number');
     expect(out.error.totalDuration).toBeGreaterThanOrEqual(0);
+  });
+
+  // W18-D3-1: an OS connect timeout (ETIMEDOUT) is a transient network error.
+  // Before the fix it classified as internal/non-retryable, so an
+  // always-ETIMEDOUT fn got exactly ONE attempt instead of maxRetries+1.
+  test('W18-D3-1: always-ETIMEDOUT fn is retried → maxRetries+1 attempts', async () => {
+    const fn = recordingFn([
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+    });
+    expect(out.success).toBe(false);
+    expect(out.error.retryable).toBe(true);
+    expect(out.error.attempts).toBe(4); // maxRetries(3) + 1
+    expect(fn.calls).toHaveLength(4);
   });
 
   test('timeout at attempt 0 does NOT trigger fallback; timeout at attempt 1 DOES, then success', async () => {
@@ -1426,7 +1480,9 @@ describe('extractStatusCode (edge cases)', () => {
 describe('categorizeError (table-driven branches)', () => {
   // Each case drives exactly one branch of the if/else chain in categorizeError.
   const cases = [
-    // timeout branch — keyword match, takes precedence over status codes
+    // timeout branch — keyword match (no extractable status code in these
+    // messages; per W18-D3-1 an extractable status code now wins over the
+    // timeout keyword)
     { name: 'message containing "timeout" → timeout/retryable', message: 'Request timeout', expected: { category: 'timeout', retryable: true } },
     { name: 'message containing "timed out" → timeout/retryable', message: 'operation timed out', expected: { category: 'timeout', retryable: true } },
     // rate-limit branch
@@ -1466,10 +1522,12 @@ describe('categorizeError (table-driven branches)', () => {
     expect(categorizeError(error)).toEqual({ category: 'internal', retryable: false });
   });
 
-  test('timeout keyword takes precedence over an embedded 5xx status code', () => {
-    // The timeout check runs first; even though 503 is in the message, the
-    // category is timeout. Pin this precedence so reordering the if-chain
-    // would surface as a test failure.
+  test('timeout keyword still wins when the embedded 5xx number is NOT extractable', () => {
+    // W18-D3-1 reordered categorizeError so an EXTRACTABLE status code wins
+    // over the timeout keyword. The 503 here sits in '(503)' — no
+    // error/status/code keyword in front — so extractStatusCode returns null
+    // and the timeout branch classifies it. Pin that a bare parenthesized
+    // number does not get mistaken for an HTTP status.
     expect(categorizeError(new Error('Request timed out (503)'))).toEqual({
       category: 'timeout',
       retryable: true,

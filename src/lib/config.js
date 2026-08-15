@@ -181,7 +181,14 @@ export function loadConfig(inputs = {}, options = {}) {
   const largePrFileThreshold = clampPositive(
     read(inputs, 'ZAI_LARGE_PR_FILE_THRESHOLD'), 50,
   );
-  const maxBatchChars = clampPositive(read(inputs, 'ZAI_MAX_BATCH_CHARS'), 120000);
+  // W18-D3-4: floor at 1000 chars. A min of 1 accepted e.g.
+  // ZAI_MAX_BATCH_CHARS=1 → a degenerate one-batch-per-entry split (30 files
+  // → 30 API calls), contradicting the clamp's stated purpose of preventing
+  // degenerate batching. Below-floor values fall back to the default, the
+  // same below-min→default semantics clampPositive applies to ZAI_TIMEOUT_MS.
+  const maxBatchChars = clampPositive(
+    read(inputs, 'ZAI_MAX_BATCH_CHARS'), 120000, 1000,
+  );
   const maxFilesPerBatch = clampPositive(read(inputs, 'ZAI_MAX_FILES_PER_BATCH'), 40);
   const maxPatchChars = clampPositive(read(inputs, 'ZAI_MAX_PATCH_CHARS'), 18000);
   const timeoutMs = clampPositive(read(inputs, 'ZAI_TIMEOUT_MS'), 120000, 1000);

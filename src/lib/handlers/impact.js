@@ -187,19 +187,24 @@ export function buildImpactPrompt(files, excludePatterns) {
  * This works for any label-map shape — `zai:`-prefixed maps AND flat value
  * sets like `{ critical: 'P0', high: 'P1', ... }`.
  *
+ * W18-D3-2: when `severity` is null (model output unparseable), the managed
+ * labels from a PREVIOUS run are stale — the new assessment does not confirm
+ * them. They are still removed (all of them; there is no target), and nothing
+ * is added. Previously `if (!severity) return false;` bailed before the
+ * removal loop, leaving e.g. a stale zai:high on the PR forever.
+ *
  * Injected via deps so tests never touch the GitHub API.
  *
  * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
- * @returns {Promise<boolean>} true if a label was applied, false if unmappable.
+ * @returns {Promise<boolean>} true if a label was applied, false otherwise.
  */
 async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
-  if (!severity) return false;
-  const targetLabel = labelMap?.[severity];
-  if (!targetLabel) return false;
+  const targetLabel = severity ? labelMap?.[severity] : null;
 
   // Fetch current labels and remove any existing managed labels (idempotent).
   // A label is "managed" if it appears as a value in the labelMap; this is
   // shape-agnostic (works for `zai:*` prefixes AND flat value sets like P0/P1).
+  // With a null severity there is no target, so ALL managed labels are removed.
   const { data: current } = await octokit.rest.issues.listLabelsOnIssue({
     owner,
     repo,
@@ -216,6 +221,9 @@ async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, 
       }
     }
   }
+  // Nothing to add when the severity is null (unparseable) or unmappable —
+  // the stale-label cleanup above is the whole job.
+  if (!targetLabel) return false;
   await octokit.rest.issues.addLabels({
     owner,
     repo,
