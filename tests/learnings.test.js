@@ -193,6 +193,53 @@ learnings:
 });
 
 /* ------------------------------------------------------------------ *
+ * parseLearnings — W15 parser hardening
+ * ------------------------------------------------------------------ */
+
+describe('parseLearnings — W15 parser hardening', () => {
+  // W15-A6-5: editors that write a UTF-8 BOM (\uFEFF) at the start of the file
+  // broke the top-level `learnings:` key match (the line became
+  // "\uFEFFlearnings:"), so inLearnings never turned on and every entry was
+  // silently skipped — the feature disabled itself with no warning.
+  it('W15-A6-5: a leading UTF-8 BOM does not disable parsing', () => {
+    const text = '﻿learnings:\n  - file: "a.js"\n    pattern: "x"\n';
+    expect(parseLearnings(text)).toEqual([{ file: 'a.js', pattern: 'x' }]);
+  });
+
+  it('W15-A6-5: the same document without a BOM parses identically', () => {
+    const text = 'learnings:\n  - file: "a.js"\n    pattern: "x"\n';
+    expect(parseLearnings(text)).toEqual([{ file: 'a.js', pattern: 'x' }]);
+  });
+
+  // W15-A6-6: the `"` toggle had no word-boundary guard (unlike the `'` toggle,
+  // W8-4). In `pattern: 5" floppy # legacy` the `"` glued to the `5` flipped
+  // inDouble, the trailing `#` comment looked quoted, and it survived into the
+  // parsed value — so the learning could never match anything.
+  it('W15-A6-6: a double quote glued to a word does not disable comment stripping', () => {
+    const text = 'learnings:\n  - file: a.js\n    pattern: 5" floppy # legacy\n';
+    const out = parseLearnings(text);
+    expect(out).toHaveLength(1);
+    expect(out[0].pattern).toBe('5" floppy');
+  });
+
+  it('W15-A6-6: a properly-quoted value still strips a real trailing comment', () => {
+    const text =
+      'learnings:\n  - file: "a.js"\n    pattern: "x # not comment" # real comment\n';
+    expect(parseLearnings(text)).toEqual([
+      { file: 'a.js', pattern: 'x # not comment' },
+    ]);
+  });
+
+  it('W15-A6-6: quoted words inside an unquoted reason keep comment stripping', () => {
+    const text =
+      'learnings:\n  - file: a.js\n    pattern: x\n    reason: He said "hi" # note\n';
+    const out = parseLearnings(text);
+    expect(out).toHaveLength(1);
+    expect(out[0].reason).toBe('He said "hi"');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * matchesLearning
  * ------------------------------------------------------------------ */
 

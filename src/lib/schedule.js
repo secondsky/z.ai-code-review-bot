@@ -374,6 +374,7 @@ export async function reviewOnePr({
           sha: pr.headSha,
           state: 'pending',
           description: 'Z.ai review in progress…',
+          reviewerName: config.reviewerName,
         },
         { core },
       );
@@ -423,6 +424,7 @@ export async function reviewOnePr({
               sha: pr.headSha,
               state: 'success',
               description: 'No reviewable files (.zai.yml path_filters excluded all changes)',
+              reviewerName: config.reviewerName,
             },
             { core },
           );
@@ -545,6 +547,7 @@ export async function reviewOnePr({
             criticalCount,
             highCount,
           }),
+          reviewerName: config.reviewerName,
         },
         { core },
       );

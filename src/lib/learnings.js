@@ -77,8 +77,24 @@ function stripComment(line) {
           inSingle = !inSingle;
         }
       }
-    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === '#' && !inSingle && !inDouble) {
+    } else if (ch === '"' && !inSingle) {
+      // W15-A6-6: mirror the W8-4 apostrophe guard for `"` — a double quote
+      // glued to a word character (like the inches mark in `5" floppy`) is
+      // not a delimiter; treating it as one flips inDouble permanently and
+      // disables comment stripping for the rest of the line (the trailing
+      // `# comment` then survives into the parsed value). As with W8-4, the
+      // guard must NOT apply when already inside a double-quoted string — a
+      // `"` inside is always the closing delimiter (values legitimately end
+      // in word characters, e.g. `"x # not comment"`).
+      if (inDouble) {
+        inDouble = false;
+      } else {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (!/[A-Za-z0-9]/.test(prev)) {
+          inDouble = !inDouble;
+        }
+      }
+    } else if (ch === '#' && !inSingle && !inDouble) {
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {
         return line.slice(0, i);
@@ -129,7 +145,11 @@ function parseLearningsYml(text) {
   const entries = [];
   if (typeof text !== 'string' || text.length === 0) return entries;
 
-  const lines = text.split(/\r?\n/);
+  // W15-A6-5: strip a leading UTF-8 BOM. Editors that write a BOM made the
+  // first line "\uFEFFlearnings:", which failed the top-level key match, so
+  // every entry was silently skipped (the feature disabled itself).
+  const src = text.replace(/^\uFEFF/, '');
+  const lines = src.split(/\r?\n/);
   let inLearnings = false;
   /** @type {Record<string, string> | null} */
   let pending = null;

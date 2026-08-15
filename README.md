@@ -46,13 +46,14 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   pull-requests: write
+  contents: read          # to load .zai.yml / .zai/learnings.yml from the PR head
   statuses: write          # for commit-status feedback (or set ZAI_COMMIT_STATUS: false)
 jobs:
   review:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: <your-org>/z.ai-code-review-bot@v2
+      - uses: <your-org>/z.ai-code-review-bot@v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```

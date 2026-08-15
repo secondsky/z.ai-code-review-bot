@@ -575,6 +575,7 @@ export async function run(context, deps = {}) {
           sha,
           state: 'pending',
           description: 'Z.ai review in progress…',
+          reviewerName: config.reviewerName,
         },
         { core: coreDep },
       );
@@ -626,6 +627,7 @@ export async function run(context, deps = {}) {
               state: 'success',
               description:
                 'No reviewable files (.zai.yml path_filters excluded all changes)',
+              reviewerName: config.reviewerName,
             },
             { core: coreDep },
           );
@@ -838,6 +840,7 @@ export async function run(context, deps = {}) {
             criticalCount,
             highCount,
           }),
+          reviewerName: config.reviewerName,
         },
         { core: coreDep },
       );
@@ -1324,6 +1327,7 @@ export async function main() {
             sha,
             state: 'failure',
             description: 'Z.ai review failed',
+            reviewerName: config.reviewerName,
           },
           { core },
         );

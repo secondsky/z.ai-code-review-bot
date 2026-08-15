@@ -6,7 +6,7 @@
 #
 # Copy this into .github/workflows/ in the consuming repo and adjust the `uses:`
 # line (point it at a version tag once you publish one, e.g.
-# <your-org>/z.ai-code-review-bot@v1).
+# <your-org>/z.ai-code-review-bot@v2.0.0).
 
 name: Z.ai Review
 
@@ -17,10 +17,12 @@ on:
 # Auto-review needs to post a comment AND (optionally) a commit status. Keep the
 # token scope minimal. `pull-requests: write` is required for the review
 # comment; `statuses: write` is required for the pending → success/failure
-# commit-status feedback (ZAI_COMMIT_STATUS, on by default). If you disable
-# ZAI_COMMIT_STATUS you can drop `statuses: write`.
+# commit-status feedback (ZAI_COMMIT_STATUS, on by default). `contents: read`
+# is required to load the in-repo `.zai.yml` / `.zai/learnings.yml` (default
+# on). If you disable ZAI_COMMIT_STATUS you can drop `statuses: write`.
 permissions:
   pull-requests: write
+  contents: read        # read .zai.yml / .zai/learnings.yml from the PR head
   statuses: write
 
 # Serialize reviews per head SHA: a new push supersedes the in-flight review of
@@ -39,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Review with Z.ai
-        uses: <your-org>/z.ai-code-review-bot@v1
+        uses: <your-org>/z.ai-code-review-bot@v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           # Optional knobs — these are shown with their action.yml defaults:
