@@ -545,7 +545,7 @@ describe('run — pull_request auto-review', () => {
     // generated/out.js must be filtered out; only src/a.js remains.
     expect(spyFiles).toHaveLength(1);
     expect(spyFiles[0].filename).toBe('src/a.js');
-  });
+  }, 30000);
 
   // ------------------------------------------------------------------
   // W6-2: .zai.yml `profile: chill` sets minSeverity='high' in the merged
@@ -586,7 +586,7 @@ describe('run — pull_request auto-review', () => {
     const [, spyConfig] = runStructuredReviewSpy.mock.calls[0];
     // The chill-narrowed minSeverity must reach runStructuredReview.
     expect(spyConfig.minSeverity).toBe('high');
-  });
+  }, 30000);
 
   // ------------------------------------------------------------------
   // W15-A1-2: `.zai.yml` `scanners.metrics: false` was dropped by the

@@ -25,7 +25,7 @@ Commands are gated by **two independent layers**. Both must agree.
 
 The consuming repo's workflow gates the job on `author_association` *before the
 job starts* — before checkout, secrets, or our code. See
-`.github/workflows/zai-commands.example.yml`:
+`.github/workflows/zai-commands.yml.example`:
 
 ```yaml
 on:
