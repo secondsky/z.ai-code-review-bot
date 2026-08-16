@@ -20,6 +20,8 @@ import {
   postFallbackComment,
 } from '../src/lib/review.js';
 import { MARKER } from '../src/lib/comments.js';
+import { formatFindingsAsSummary } from '../src/lib/findings.js';
+import { formatWalkthroughSummary } from '../src/lib/walkthrough.js';
 
 /* ------------------------------------------------------------------ *
  * Pure builders
@@ -94,6 +96,72 @@ describe('buildReviewBody', () => {
   it('includes a truncation note when metadata says so', () => {
     const body = buildReviewBody('s', [], { truncated: 2 });
     expect(body).toContain('2 findings truncated');
+  });
+
+  // W17-C1-1: W16's summary sanitization (B1-4) covered formatFindingsAsSummary
+  // and formatWalkthroughSummary but MISSED buildReviewBody — the body of the
+  // PRIMARY inline-review path (index.js/schedule.js), also recycled by
+  // buildFallbackBody — which pushed the model summary prose verbatim. A
+  // summary like 'ok\n#### X\n<img src=x>' injected a real heading and raw
+  // HTML into the bot's trusted review body. The summary now gets the same
+  // sanitizeTextField treatment (newline collapse + angle-bracket escaping).
+  it('W17-C1-1: sanitizes the model summary prose (no heading line, no raw HTML)', () => {
+    const body = buildReviewBody('ok\n#### X\n<img src=x>', [], {});
+    expect(body).toContain('&lt;img src=x&gt;');
+    expect(body).not.toContain('<img');
+    // No line of the body starts a heading introduced by the summary.
+    expect(body).not.toMatch(/^#{1,6} X$/m);
+    // The prose survives, flattened onto a single line.
+    expect(body).toContain('ok #### X');
+  });
+
+  it('W17-C1-1: parity — the same hostile summary is inert through all three summary renderers', () => {
+    const hostile =
+      'Looks fine.\n\n#### INJECTED HEADING\n\n<img src=x onerror=alert(1)> and </details><script>alert(1)</script>';
+    const bodies = {
+      buildReviewBody: buildReviewBody(hostile, [], {}),
+      formatFindingsAsSummary: formatFindingsAsSummary([], {
+        metadata: { summary: hostile },
+      }),
+      formatWalkthroughSummary: formatWalkthroughSummary([], [], {
+        metadata: { summary: hostile },
+      }),
+    };
+    for (const [renderer, body] of Object.entries(bodies)) {
+      expect(body, renderer).not.toContain('<img');
+      expect(body, renderer).not.toContain('<script');
+      expect(body, renderer).not.toContain('</details>');
+      expect(body, renderer).not.toMatch(/^#{1,6} INJECTED HEADING/m);
+    }
+  });
+
+  it('W17-C1-1: a benign multi-word summary still renders', () => {
+    const body = buildReviewBody(
+      'The changes look good overall; only minor nits were found.',
+      [],
+      {},
+    );
+    expect(body).toContain('The changes look good overall; only minor nits were found.');
+  });
+
+  // W17-C1-1 carryover (defensive): primary-path findings are pre-sanitized by
+  // normalizeFinding, but the "Additional findings" bullet rendered
+  // `title` RAW — a caller passing un-normalized findings would post
+  // unsanitized titles (raw HTML / injected heading lines) into the trusted
+  // review body. The bullet must apply the same sanitizeTextField treatment
+  // (angle-bracket escaping + newline collapse) itself.
+  it('W17-C1-1 carryover: defensively sanitizes an un-normalized finding title', () => {
+    const body = buildReviewBody(
+      'Summary.',
+      [{ file: 'src/a.js', title: '<img src=x>\n# H', severity: 'high' }],
+      {},
+    );
+    expect(body).toContain('&lt;img');
+    expect(body).not.toContain('<img');
+    // The newline in the title is collapsed — the trailing '# H' stays on the
+    // bullet line and never starts a heading of its own.
+    expect(body).not.toContain('\n# H');
+    expect(body).not.toMatch(/^# H$/m);
   });
 });
 
@@ -230,6 +298,35 @@ describe('buildReviewComments', () => {
     // And no standalone newline splits the evidence from the link.
     expect(body).not.toMatch(/normal_code\r?\n\[Click here\]/);
   });
+
+  // W17-C1-2: CommonMark treats a lone \r (U+000D) as a line ending, but
+  // renderCommentBody's stripNewlines only collapsed \r?\n — a title like
+  // 'a\rb' kept the raw \r, and GitHub's renderer splits the line there,
+  // letting text after the \r start a heading/quote/link line of its own.
+  it('W17-C1-2: collapses lone CR line endings in title/description/evidence/suggestion', () => {
+    const inline = [
+      {
+        finding: {
+          severity: 'low',
+          title: 'a\rb\r\n# NotAHeading',
+          description: 'd1\rd2',
+          evidence: 'code\rbreak',
+          suggestion: 's1\rs2',
+        },
+        comment: { path: 'a.js', line: 1, side: 'RIGHT' },
+      },
+    ];
+    const body = buildReviewComments(inline)[0].body;
+    // No CR survives anywhere in the rendered comment body.
+    expect(body).not.toContain('\r');
+    expect(body).toContain('a b');
+    expect(body).toContain('d1 d2');
+    // The evidence code span is preserved across the former CR boundary.
+    expect(body).toContain('`code break`');
+    expect(body).toContain('s1 s2');
+    // And the collapsed title cannot start a heading line.
+    expect(body).not.toMatch(/^# NotAHeading/m);
+  });
 });
 
 describe('buildReviewPayload', () => {
@@ -364,22 +461,36 @@ describe('resolveReviewEvent', () => {
 /**
  * Build a fake octokit whose rest.pulls.{listReviews, dismissReview,
  * createReview} and rest.issues.createComment record every call.
+ *
+ * `calls.order` records the cross-method call SEQUENCE (method names in call
+ * order) so tests can assert on ordering between createReview and
+ * dismissReview (W15-A7-5).
+ *
+ * Options:
+ * - `reviews` / `listReviewsPages`: what listReviews returns.
+ * - `dismissFailsFor`: review ids whose dismissReview throws 422.
+ * - `createReviewId` (default 999): the id createReview returns.
+ * - `createReviewError`: when set, createReview records the call then throws.
  */
 function makeReviewOctokit({
   reviews = [],
   listReviewsPages = null,
   dismissFailsFor = null,
+  createReviewId = 999,
+  createReviewError = null,
 } = {}) {
   const calls = {
     listReviews: [],
     dismissReview: [],
     createReview: [],
     createComment: [],
+    order: [],
   };
   const octokit = {
     rest: {
       pulls: {
         async listReviews(params) {
+          calls.order.push('listReviews');
           calls.listReviews.push(params);
           if (listReviewsPages) {
             const page = params.page ?? 1;
@@ -388,6 +499,7 @@ function makeReviewOctokit({
           return { data: reviews };
         },
         async dismissReview(params) {
+          calls.order.push('dismissReview');
           calls.dismissReview.push(params);
           if (dismissFailsFor && dismissFailsFor.includes(params.review_id)) {
             const err = new Error('Validation Failed');
@@ -397,8 +509,10 @@ function makeReviewOctokit({
           return { data: {} };
         },
         async createReview(params) {
+          calls.order.push('createReview');
           calls.createReview.push(params);
-          return { data: { id: 999 } };
+          if (createReviewError) throw createReviewError;
+          return { data: { id: createReviewId } };
         },
       },
       issues: {
@@ -436,7 +550,7 @@ describe('listBotReviews', () => {
       user: { login: 'someone' },
     }));
     const page2 = [
-      { id: 200, body: `r\n\n${MARKER}`, user: { login: 'other' } },
+      { id: 200, body: `r\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
     ];
     const { octokit, calls } = makeReviewOctokit({ listReviewsPages: [page1, page2] });
 
@@ -459,8 +573,8 @@ describe('listBotReviews', () => {
 
   it('filters by marker in body', async () => {
     const reviews = [
-      { id: 1, body: 'unrelated', user: { login: 'human' } },
-      { id: 2, body: `r\n\n${MARKER}`, user: { login: 'human' } },
+      { id: 1, body: 'unrelated', user: { login: 'zai-code-review[bot]', type: 'Bot' } },
+      { id: 2, body: `r\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
     ];
     const { octokit } = makeReviewOctokit({ reviews });
     const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
@@ -480,15 +594,50 @@ describe('listBotReviews', () => {
     expect(out.map((r) => r.id)).toEqual([]);
   });
 
-  it('returns only marker-matching reviews (marker is sufficient for idempotency)', async () => {
+  it('requires BOTH the marker and bot authorship (bot-login-only reviews stay excluded)', async () => {
+    // W15-A3-6 reversed the old "marker alone is sufficient" contract: a
+    // marker-bearing review must ALSO be bot-authored. A bot login WITHOUT the
+    // marker still never matches (CORE-3), and neither does a bare human.
     const reviews = [
-      { id: 1, body: `m\n\n${MARKER}`, user: { login: 'human' } }, // marker
+      { id: 1, body: `m\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } }, // both → kept
       { id: 2, body: 'x', user: { login: 'github-actions[bot]' } }, // bot login only — excluded
       { id: 3, body: 'x', user: { login: 'human2' } }, // neither — excluded
     ];
     const { octokit } = makeReviewOctokit({ reviews });
     const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
     expect(out.map((r) => r.id).sort()).toEqual([1]);
+  });
+
+  // W15-A3-6: GitHub's "Quote reply" copies the bot's review body — including
+  // the invisible marker — into a HUMAN review. Matching on the marker alone
+  // made upsertReview DISMISS the human's review on the next push; if it was
+  // REQUEST_CHANGES, that silently unblocked the PR merge. Marker-bearing
+  // reviews must also be bot-authored (user.type === 'Bot' OR user.login ends
+  // with '[bot]' — the same gate comments.js applies to marker comments).
+  it('excludes marker-bearing HUMAN reviews (W15-A3-6 quote-reply dismissal)', async () => {
+    const reviews = [
+      // Human quoting the bot's review — marker copied verbatim.
+      { id: 1, body: `quoted reply\n\n${MARKER}`, user: { login: 'alice', type: 'User' } },
+      // The bot's own review — still matched.
+      { id: 2, body: `mine\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
+      // Missing user object entirely — excluded (cannot prove authorship).
+      { id: 3, body: `no user\n\n${MARKER}` },
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id)).toEqual([2]);
+  });
+
+  it('accepts a bot-suffixed login even when user.type is absent (W15-A3-6)', async () => {
+    // Some payloads surface bot identity only via the `[bot]` login suffix
+    // (mirrors isBotComment in comments.js — either signal suffices).
+    const reviews = [
+      { id: 4, body: `b\n\n${MARKER}`, user: { login: 'zai-code-review[bot]' } },
+      { id: 5, body: `h\n\n${MARKER}`, user: { login: 'alice' } },
+    ];
+    const { octokit } = makeReviewOctokit({ reviews });
+    const out = await listBotReviews({ octokit, context: ctx(), marker: MARKER });
+    expect(out.map((r) => r.id)).toEqual([4]);
   });
 
   it('excludes dependabot[bot] reviews that lack the marker (CORE-3)', async () => {
@@ -586,9 +735,13 @@ describe('dismissStaleReviews', () => {
 /* ---------- upsertReview ---------- */
 
 describe('upsertReview', () => {
-  it('lists → dismisses → creates in order, returns id + counts', async () => {
+  // W15-A7-5: the intended order is now list → CREATE → dismiss (was
+  // list → dismiss → create). Creating first means a transient createReview
+  // failure (502, secondary rate limit) can no longer leave the PR with the
+  // prior run's inline review already dismissed and nothing replacing it.
+  it('lists → creates → dismisses in order, returns id + counts', async () => {
     const existing = [
-      { id: 5, body: `old\n\n${MARKER}`, user: { login: 'h' } },
+      { id: 5, body: `old\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
     ];
     const { octokit, calls } = makeReviewOctokit({ reviews: existing });
 
@@ -602,7 +755,8 @@ describe('upsertReview', () => {
     });
 
     expect(result).toEqual({ id: 999, commentCount: 1, dismissedCount: 1 });
-    // Order: listReviews, dismissReview, createReview.
+    // Order: listReviews, createReview, THEN dismissReview (create-before-dismiss).
+    expect(calls.order).toEqual(['listReviews', 'createReview', 'dismissReview']);
     expect(calls.listReviews).toHaveLength(1);
     expect(calls.dismissReview).toHaveLength(1);
     expect(calls.dismissReview[0].review_id).toBe(5);
@@ -615,6 +769,84 @@ describe('upsertReview', () => {
       event: 'COMMENT',
       comments: [{ path: 'a.js', line: 1, side: 'RIGHT', body: 'c' }],
     });
+  });
+
+  // W15-A3-6 (upsert path): a human "Quote reply" review carrying the marker
+  // is excluded by listBotReviews, so upsertReview must never dismiss it —
+  // dismissing it would silently unblock a human REQUEST_CHANGES review.
+  it('does NOT dismiss a marker-bearing HUMAN review (W15-A3-6)', async () => {
+    const existing = [
+      { id: 7, body: `human quote\n\n${MARKER}`, user: { login: 'alice', type: 'User' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({ reviews: existing });
+
+    const result = await upsertReview({
+      octokit,
+      context: ctx({ sha: 'sha1' }),
+      marker: MARKER,
+      sha: 'sha1',
+      body: 'new review',
+      comments: [],
+    });
+
+    expect(calls.createReview).toHaveLength(1);
+    expect(calls.dismissReview).toHaveLength(0);
+    expect(result.dismissedCount).toBe(0);
+  });
+
+  // W15-A7-5: dismissals must only happen AFTER the new review exists. When
+  // createReview fails transiently (502 / secondary rate limit), the prior
+  // bot review must remain undismissed (no lost inline review) and the error
+  // must propagate to the caller (which falls back to an issue comment).
+  it('createReview failure → NO dismissals and the error propagates (W15-A7-5)', async () => {
+    const existing = [
+      { id: 101, body: `prior\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
+    ];
+    const boom = new Error('Server Error');
+    boom.status = 502;
+    const { octokit, calls } = makeReviewOctokit({
+      reviews: existing,
+      createReviewError: boom,
+    });
+
+    await expect(
+      upsertReview({
+        octokit,
+        context: ctx({ sha: 'sha1' }),
+        marker: MARKER,
+        sha: 'sha1',
+        body: 'new review',
+        comments: [],
+      }),
+    ).rejects.toBe(boom);
+
+    expect(calls.createReview).toHaveLength(1);
+    expect(calls.dismissReview).toHaveLength(0);
+  });
+
+  // W15-A7-5 (success path): exactly the stale bot review (101) is dismissed;
+  // the newly created review (202) is never dismissed.
+  it('on createReview success dismisses the stale review but never the new one (W15-A7-5)', async () => {
+    const existing = [
+      { id: 101, body: `prior\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
+    ];
+    const { octokit, calls } = makeReviewOctokit({
+      reviews: existing,
+      createReviewId: 202,
+    });
+
+    const result = await upsertReview({
+      octokit,
+      context: ctx({ sha: 'sha1' }),
+      marker: MARKER,
+      sha: 'sha1',
+      body: 'new review',
+      comments: [],
+    });
+
+    expect(result).toEqual({ id: 202, commentCount: 0, dismissedCount: 1 });
+    expect(calls.dismissReview.map((c) => c.review_id)).toEqual([101]);
+    expect(calls.dismissReview.some((c) => c.review_id === 202)).toBe(false);
   });
 
   it('passes event through to createReview', async () => {
@@ -645,7 +877,9 @@ describe('upsertReview', () => {
   });
 
   it('dismisses with a reason referencing the new SHA', async () => {
-    const existing = [{ id: 9, body: `x\n\n${MARKER}`, user: { login: 'h' } }];
+    const existing = [
+      { id: 9, body: `x\n\n${MARKER}`, user: { login: 'zai-code-review[bot]', type: 'Bot' } },
+    ];
     const { octokit, calls } = makeReviewOctokit({ reviews: existing });
     await upsertReview({
       octokit,

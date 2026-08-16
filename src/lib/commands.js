@@ -66,8 +66,19 @@ export function parseCommand(text) {
   const trimmed = firstLine.trim();
   const lower = trimmed.toLowerCase();
 
-  // Find a recognised prefix at the start.
-  const prefix = PREFIXES.find((p) => lower.startsWith(p));
+  // Find a recognised prefix at the start. W15-A4-7: the prefix must end at
+  // a token boundary — the next character (if any) must be whitespace or the
+  // string must end. Without this, '/zai-botask hi' matched '/zai-bot' and
+  // parsed as command 'ask' with args 'hi', and '/zaihelp' parsed as 'help',
+  // so comments addressed to other tools ("zai-botask") triggered command
+  // runs. The longer prefixes are listed first, and the '-bot' suffixes
+  // cannot satisfy the boundary for a shorter prefix (the next char would be
+  // '-'), so first-match-wins here cannot mis-select an alias.
+  const prefix = PREFIXES.find(
+    (p) =>
+      lower.startsWith(p) &&
+      (lower.length === p.length || /\s/.test(lower[p.length])),
+  );
   if (!prefix) {
     return { command: null, args: null, raw: text, error: 'NOT_A_COMMAND' };
   }

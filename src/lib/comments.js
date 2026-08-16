@@ -113,13 +113,98 @@ export function appendTrailers(body, trailers = []) {
 }
 
 /**
+ * Find ALL bot-authored marker comments on an issue/PR, in API order.
+ *
+ * W16-B2-3: {@link findBotMarkerComment} returns only the FIRST bot marker
+ * comment in API order. When a fallback comment exists (created after an
+ * inline-review failure — the fallback path always CREATES a new comment),
+ * its hash block (the newest full set) was never read — orphaned suppression
+ * data. Consumers that aggregate per-comment payloads (e.g. the
+ * incremental-review hash union in src/index.js) need the FULL list.
+ *
+ * Pagination + bot-authority gating mirror {@link upsertReviewComment}:
+ * per_page=100, loop until a short page or {@link MAX_COMMENT_PAGES} is
+ * reached (CORE-4 loop guard). Bot authorship is REQUIRED (comment hijack
+ * defense): only `user.type === 'Bot'` OR `user.login` ending in `[bot]` is
+ * eligible — a human comment quoting the marker (and a forged hash block)
+ * can never feed suppression.
+ *
+ * `listComments` rejections propagate (not swallowed) — callers wrap in their
+ * own fail-soft boundary.
+ *
+ * @param {object} args
+ * @param {object} args.octokit      Octokit instance (rest.issues.listComments used).
+ * @param {string} args.owner        Repository owner.
+ * @param {string} args.repo         Repository name.
+ * @param {number} args.issueNumber  PR / issue number.
+ * @param {string} [args.marker]     Marker used to locate the comments (default {@link MARKER}).
+ * @param {number} [args.perPage=100] Page size for listComments pagination.
+ * @returns {Promise<Array<{id:number, body?:string}>>} every bot marker comment (API order); [] when none.
+ */
+export async function findBotMarkerComments({
+  octokit,
+  owner,
+  repo,
+  issueNumber,
+  marker = MARKER,
+  perPage = 100,
+}) {
+  // Paginate fully: marker comments can be anywhere in the history (the
+  // original summary comment AND a later fallback comment may live pages
+  // apart), and a single page would miss all but the first 100. CORE-4: cap
+  // at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us in an
+  // unbounded loop.
+  const out = [];
+  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
+    const { data: comments } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: perPage,
+      page,
+    });
+    for (const c of comments) {
+      if (isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker)) {
+        out.push(c);
+      }
+    }
+    if (comments.length < perPage) break; // last page reached
+  }
+  return out;
+}
+
+/**
+ * Find the FIRST bot-authored marker comment on an issue/PR.
+ *
+ * Extracted from the lookup loop inside {@link upsertReviewComment} (W15-A8-3)
+ * so other call sites can reuse the exact same pagination + bot-authority
+ * gating — notably the incremental-review hash-block read in src/index.js,
+ * which must never trust a human comment carrying a forged marker/hash block.
+ *
+ * W16-B2-3: now a thin first-match wrapper over {@link findBotMarkerComments}
+ * (the plural finder owns the pagination + bot-authority loop) so existing
+ * callers keep their semantics: the first bot marker comment in API order, or
+ * null when none exists.
+ *
+ * `listComments` rejections propagate (not swallowed) — callers wrap in their
+ * own fail-soft boundary.
+ *
+ * @param {object} args  Same shape as {@link findBotMarkerComments}.
+ * @returns {Promise<{id:number, body?:string}|null>} the found comment, or null.
+ */
+export async function findBotMarkerComment(args) {
+  const all = await findBotMarkerComments(args);
+  return all.length > 0 ? all[0] : null;
+}
+
+/**
  * Upsert the single summary review comment on a PR.
  *
  * 1. List issue comments, PAGINATING fully (page=1, per_page=100, loop until a
  *    short page) so the marker lookup inspects EVERY comment — not just the
  *    first 100. Without full pagination a PR with >100 comments would lose the
  *    marker comment from the visible window and create a duplicate summary on
- *    every run.
+ *    every run. (Delegated to {@link findBotMarkerComment}.)
  * 2. Find the first BOT-AUTHORED comment whose body contains `marker` (default
  *    {@link MARKER}). The author check (`user.type === 'Bot'` OR `user.login`
  *    ends with `[bot]`) is mandatory: without it, a non-bot user could post a
@@ -150,26 +235,14 @@ export async function upsertReviewComment({
   perPage = 100,
   core,
 }) {
-  // Paginate fully: the marker comment can be anywhere in the history, and a
-  // single page would miss it on high-traffic PRs (creating a duplicate).
-  // CORE-4: cap at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us
-  // in an unbounded loop when the marker is absent.
-  let existing = null;
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: perPage,
-      page,
-    });
-    existing =
-      comments.find(
-        (c) => isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker),
-      ) ?? null;
-    if (existing) break; // found it — no need to fetch more pages
-    if (comments.length < perPage) break; // last page reached
-  }
+  const existing = await findBotMarkerComment({
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    marker,
+    perPage,
+  });
 
   if (existing) {
     await octokit.rest.issues.updateComment({

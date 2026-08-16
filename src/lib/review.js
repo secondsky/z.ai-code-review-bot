@@ -11,16 +11,21 @@
  *
  * Idempotency model (mirrors `comments.js`): the review body carries the
  * {@link MARKER} HTML comment. On each run, {@link upsertReview} lists prior
- * reviews whose body includes the marker, DISMISSES them (so stale inline
- * comments disappear on re-push), then creates the fresh review. This
- * "dismiss-stale-then-post" sequence keeps exactly one active bot review per
- * PR head SHA without piling up duplicates.
+ * BOT-AUTHORED reviews whose body includes the marker (W15-A3-6: a human
+ * "Quote reply" copies the marker and must never be matched), CREATES the
+ * fresh review, then DISMISSES the prior ones — excluding the new review — so
+ * stale inline comments disappear on re-push. This "create-then-dismiss-stale"
+ * sequence (W15-A7-5) keeps exactly one active bot review per PR head SHA
+ * without piling up duplicates, and guarantees a transient createReview
+ * failure can never leave the PR with the prior review already dismissed and
+ * no replacement posted.
  *
  * @module src/lib/review.js
  */
 
 import { MARKER } from './comments.js';
 import { sanitizeModelOutput, sanitizeCommentBody } from './sanitize-output.js';
+import { sanitizeTextField } from './findings.js';
 import { postComment } from './handlers/_shared.js';
 import { formatWalkthroughSummary } from './walkthrough.js';
 
@@ -98,7 +103,14 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
   }
 
   if (typeof summary === 'string' && summary.length > 0) {
-    lines.push(summary);
+    // W17-C1-1: the summary is model-controlled prose rendered into the bot's
+    // trusted review body — the PRIMARY inline-review path (index.js /
+    // schedule.js), also recycled by buildFallbackBody. W16's B1-4 sanitization
+    // covered formatFindingsAsSummary and formatWalkthroughSummary but MISSED
+    // this renderer, so 'ok\n#### X\n<img src=x>' injected a real heading and
+    // raw HTML here. Apply the same sanitizeTextField treatment (newline
+    // collapse + angle-bracket escaping) as the other two summary renderers.
+    lines.push(sanitizeTextField(summary));
     lines.push('');
   }
 
@@ -138,7 +150,11 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
         // W8-1: replace backticks with "'" (backslash escapes do NOT work
         // inside CommonMark code spans, so the W7-4 \` escape was illusory).
         const safeFile = file.replace(/`/g, "'");
-        lines.push(`- \`${safeFile}\` — ${title}`);
+        // W17-C1-1 carryover (defensive): primary-path findings are
+        // pre-sanitized by normalizeFinding, but a caller passing
+        // un-normalized findings would post raw titles (raw HTML / injected
+        // heading lines). Apply the same sanitizeTextField treatment here.
+        lines.push(`- \`${safeFile}\` — ${sanitizeTextField(title)}`);
       }
       lines.push('');
     }
@@ -175,7 +191,14 @@ function renderCommentBody(finding) {
   // CORE-2: collapse newlines in title/description/suggestion so model output
   // carrying stray newlines can't break the markdown structure or inject
   // unescaped markdown (e.g. a newline mid-title would split the bold span).
-  const stripNewlines = (s) => String(s).replace(/\r?\n/g, ' ');
+  // W17-C1-2: CommonMark treats a LONE \r as a line ending too, so normalize
+  // \r\n? → \n first — otherwise 'a\rb' kept its raw \r and GitHub's renderer
+  // split the line there, letting the text after it start a heading/quote of
+  // its own.
+  const stripNewlines = (s) =>
+    String(s)
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n/g, ' ');
   const title =
     typeof finding.title === 'string' ? stripNewlines(finding.title) : '';
   const description =
@@ -193,7 +216,12 @@ function renderCommentBody(finding) {
     // CORE-2: escape backticks AND collapse newlines in evidence so the inline
     // code span is preserved. A newline would close the span early and let the
     // remaining content render as markdown (e.g. a clickable malicious link).
-    const safeEvidence = evidence.replace(/`/g, "'").replace(/\r?\n/g, ' ');
+    // W17-C1-2: lone \r is a CommonMark line ending too — normalize \r\n? → \n
+    // before collapsing so a CR cannot split the code span either.
+    const safeEvidence = evidence
+      .replace(/`/g, "'")
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n/g, ' ');
     parts.push(`> \`${safeEvidence}\``);
   }
   if (suggestion !== null) parts.push(`💡 ${suggestion}`);
@@ -285,14 +313,41 @@ export function resolveReviewEvent(findings, config) {
 const MAX_REVIEW_PAGES = 100;
 
 /**
+ * Determine whether a review was authored by a bot. Gates marker-based
+ * matching in {@link listBotReviews} so a HUMAN review carrying the marker —
+ * e.g. created via GitHub's "Quote reply", which copies the invisible
+ * {@link MARKER} — is never treated as the bot's own review and never
+ * dismissed (W15-A3-6: dismissing a human REQUEST_CHANGES review would
+ * silently unblock the PR merge). Mirrors `isBotComment` in comments.js:
+ * accepts EITHER signal GitHub surfaces for bot accounts, `user.type ===
+ * 'Bot'` (GitHub Apps bot accounts) OR `user.login` ending in `[bot]`
+ * (actions and other bots). Reviews with a missing/absent `user` object
+ * cannot prove authorship and are treated as non-bot.
+ *
+ * @param {{user?: {type?: string, login?: string}}} review
+ * @returns {boolean}
+ */
+function isBotReview(review) {
+  const user = review?.user;
+  if (!user) return false;
+  if (typeof user.type === 'string' && user.type === 'Bot') return true;
+  return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
  * List prior reviews posted by the bot on a PR.
  *
  * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
- * page). Filters to reviews whose `body` includes `marker`. The marker is the
- * canonical idempotency signal — every review this action posts carries it —
- * so the broad `[bot]`-login fallback that previously matched ANY bot (e.g.
- * dependabot, github-actions) was removed to avoid dismissing reviews this
- * action never posted (CORE-3).
+ * page). Filters to reviews that BOTH carry `marker` in `body` AND are
+ * bot-authored ({@link isBotReview}). The marker is the canonical idempotency
+ * signal — every review this action posts carries it — so the broad
+ * `[bot]`-login fallback that previously matched ANY bot (e.g. dependabot,
+ * github-actions) was removed to avoid dismissing reviews this action never
+ * posted (CORE-3). Bot authorship is additionally REQUIRED (W15-A3-6): a
+ * human "Quote reply" copies the invisible marker, and marker-only matching
+ * made the next run dismiss the human's review — silently unblocking a human
+ * REQUEST_CHANGES review. This mirrors the authorship gate `comments.js`
+ * applies to marker comments.
  *
  * CORE-4: pagination is also capped at {@link MAX_REVIEW_PAGES} as a safety
  * net against a misbehaving endpoint that never returns a short page.
@@ -329,7 +384,9 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
     // dependabot, github-actions, etc.), causing upsertReview to dismiss
     // reviews this action never posted. The marker alone is sufficient for
     // idempotency (every review we post carries it).
-    return body.includes(marker);
+    // W15-A3-6: the marker must ALSO be paired with bot authorship — a human
+    // "Quote reply" copies the marker, and that must never be dismissed.
+    return body.includes(marker) && isBotReview(r);
   });
 }
 
@@ -374,13 +431,23 @@ export async function dismissStaleReviews({ octokit, context, reviews, reason, c
 }
 
 /**
- * Post a review with inline comments. Idempotent per SHA: dismisses prior bot
- * reviews first, then creates the new one.
+ * Post a review with inline comments. Idempotent per SHA: creates the new
+ * review first, then dismisses prior bot reviews.
  *
  * Flow:
- *   1. `listBotReviews` → prior reviews (matched by marker in body).
- *   2. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`.
- *   3. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
+ *   1. `listBotReviews` → prior reviews (matched by marker in body AND bot
+ *      authorship).
+ *   2. `pulls.createReview({owner, repo, pull_number, body, event, comments})`.
+ *   3. `dismissStaleReviews` with `message: "Superseded by re-review at <sha>"`,
+ *      EXCLUDING the review created in step 2.
+ *
+ * W15-A7-5: the new review is created BEFORE the stale ones are dismissed. The
+ * previous dismiss-first order meant a transient `createReview` failure (502,
+ * secondary rate limit) left the prior run's inline review already dismissed
+ * with nothing replacing it — the findings were silently lost. Create-first
+ * guarantees a dismissal only ever happens once the replacement exists; if
+ * `createReview` throws, no dismissals occur and the error propagates to the
+ * caller (which falls back to an issue comment).
  *
  * Returns `{ id, commentCount, dismissedCount }`.
  *
@@ -394,7 +461,6 @@ export async function upsertReview({ octokit, context, marker = MARKER, sha, bod
 
   const prior = await listBotReviews({ octokit, context, marker });
   const reason = `Superseded by re-review at ${sha ?? ''}`.trim();
-  await dismissStaleReviews({ octokit, context, reviews: prior, reason, core });
 
   const payload = buildReviewPayload({ body, comments, event });
   const { data } = await octokit.rest.pulls.createReview({
@@ -406,10 +472,17 @@ export async function upsertReview({ octokit, context, marker = MARKER, sha, bod
     comments: payload.comments,
   });
 
+  // The fresh review must never be dismissed as stale. `prior` was listed
+  // BEFORE creation so the new id cannot be in it, but filter defensively —
+  // the contract is "exactly the stale bot reviews are dismissed".
+  const newId = data?.id;
+  const stale = prior.filter((r) => r?.id !== newId);
+  await dismissStaleReviews({ octokit, context, reviews: stale, reason, core });
+
   return {
-    id: data?.id,
+    id: newId,
     commentCount: payload.comments.length,
-    dismissedCount: prior.length,
+    dismissedCount: stale.length,
   };
 }
 

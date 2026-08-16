@@ -171,6 +171,50 @@ describe('setReviewStatus — success path', () => {
   });
 });
 
+describe('setReviewStatus — reviewerName status context (W15-A8-7)', () => {
+  // W15-A8-7: ZAI_REVIEWER_NAME (config.reviewerName) must reach the checks
+  // tab as the status `context` when provided; otherwise the default
+  // STATUS_CONTEXT label is used byte-identically.
+  test('uses reviewerName as the status context when provided', async () => {
+    const { octokit, calls } = makeOctokit();
+    const ok = await setReviewStatus({
+      octokit,
+      context: makeContext(),
+      sha: 'abc123',
+      state: 'pending',
+      description: 'starting',
+      reviewerName: 'Acme Bot',
+    });
+    expect(ok).toBe(true);
+    expect(calls.createCommitStatus[0].context).toBe('Acme Bot');
+  });
+
+  test('defaults to STATUS_CONTEXT when reviewerName is omitted', async () => {
+    const { octokit, calls } = makeOctokit();
+    await setReviewStatus({
+      octokit,
+      context: makeContext(),
+      sha: 'abc123',
+      state: 'pending',
+      description: 'starting',
+    });
+    expect(calls.createCommitStatus[0].context).toBe('Z.ai Code Review');
+  });
+
+  test('defaults to STATUS_CONTEXT for an empty / whitespace reviewerName', async () => {
+    const { octokit, calls } = makeOctokit();
+    await setReviewStatus({
+      octokit,
+      context: makeContext(),
+      sha: 'abc123',
+      state: 'pending',
+      description: 'starting',
+      reviewerName: '   ',
+    });
+    expect(calls.createCommitStatus[0].context).toBe('Z.ai Code Review');
+  });
+});
+
 describe('setReviewStatus — fail-soft on API error', () => {
   test('returns false and warns (never throws) when createCommitStatus throws', async () => {
     const { octokit } = makeOctokit({

@@ -7,7 +7,11 @@
  * throw.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleAskCommand, buildAskPrompt } from '../../src/lib/handlers/ask.js';
+import {
+  handleAskCommand,
+  buildAskPrompt,
+  buildDiffContext,
+} from '../../src/lib/handlers/ask.js';
 
 function makeOctokit({
   pr = { title: 'T', body: 'B', head: { ref: 'f' }, base: { ref: 'm' } },
@@ -273,5 +277,255 @@ describe('handleAskCommand — CMD-9: question length cap', () => {
     });
     const prompt = callApi.mock.calls[0][2];
     expect(prompt).toContain('short question');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-4: oversized entries are SKIPPED, not fatal
+ *
+ * buildDiffContext used 'break' on the first over-budget entry, so a huge
+ * diff FIRST in the list caused '(no textual diffs available)' even though
+ * later, smaller entries fit the budget. Over-sized entries must be skipped
+ * (continue) and, when EVERY entry was oversized, the placeholder must say
+ * the budget was exceeded rather than claiming no diffs exist.
+ * ------------------------------------------------------------------ */
+
+describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', () => {
+  it('big-first: later small entries still make it into the context', () => {
+    const files = [
+      { filename: 'big.js', patch: 'x'.repeat(9000) },
+      { filename: 'small.js', patch: '+tiny change' },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('small.js');
+    expect(context).toContain('+tiny change');
+  });
+
+  it('all entries oversized → budget-exceeded placeholder, not a false no-diffs claim', () => {
+    const files = [
+      { filename: 'big1.js', patch: 'x'.repeat(9000) },
+      { filename: 'big2.js', patch: 'y'.repeat(9000) },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('budget');
+    expect(context).not.toContain('no textual diffs');
+  });
+
+  it('small-only input behaves normally', () => {
+    const files = [{ filename: 'a.js', patch: '+a' }];
+    const context = buildDiffContext(files);
+    expect(context).toContain('a.js');
+    expect(context).toContain('+a');
+  });
+
+  it('no patchable files at all → the original no-diffs placeholder', () => {
+    expect(buildDiffContext([{ filename: 'bin', status: 'modified' }])).toBe(
+      '(no textual diffs available)',
+    );
+    expect(buildDiffContext([])).toBe('(no textual diffs available)');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-2: the EMPTY_ARGS post must be inside the try block
+ *
+ * The `post(EMPTY_ARGS_COMMENT)` executed OUTSIDE the handler's try — a
+ * transient 502 on that single createComment rejected the whole handler,
+ * propagated through the router (index.js dispatches with no catch) and
+ * failed the entire action. It must be guarded like every other post.
+ * ------------------------------------------------------------------ */
+
+describe('handleAskCommand — W16-B4-2: guarded first post', () => {
+  it('empty args + a FAILING post → resolves, never rejects', async () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+
+    await expect(
+      handleAskCommand(
+        {
+          octokit: makeOctokit(),
+          context: makeContext(),
+          config: { apiKey: 'k', model: 'm' },
+          commenter: { login: 'alice' },
+          args: '',
+          callApi: vi.fn(),
+          core,
+        },
+        { post: async () => { throw new Error('502 bad gateway'); } },
+      ),
+    ).resolves.toBeUndefined();
+    expect(core.warning).toHaveBeenCalled();
+  });
+
+  it('empty args + a working post still posts the guidance (happy path unchanged)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'alice' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createComment[0].body).toContain(
+      'Please provide a question',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-4: excluded files dropped BEFORE the diff budget
+ *
+ * buildDiffContext applied only filterPatchableFiles, so a default-excluded
+ * package-lock.json (typically FIRST and huge) ate the ENTIRE 8000-char
+ * budget and the model saw ONLY the lockfile — src/auth.js changes were
+ * invisible to /zai ask. filterExcludedFiles(files, excludePatterns) must
+ * run BEFORE filterPatchableFiles, mirroring review.js's W15-A8-8 fix.
+ * ------------------------------------------------------------------ */
+
+// The default EXCLUDE_PATTERNS list from src/lib/config.js (populated by
+// loadConfig when the action input is empty).
+const DEFAULT_EXCLUDES = [
+  '*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+];
+
+describe('buildDiffContext — W16-B4-4: excluded files dropped before the budget', () => {
+  const files = () => [
+    { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+    { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+  ];
+
+  it('default excludes: lockfile dropped, src/auth.js visible in the context', () => {
+    const context = buildDiffContext(files(), undefined, DEFAULT_EXCLUDES);
+    expect(context).toContain('src/auth.js');
+    expect(context).toContain('+auth change');
+    expect(context).not.toContain('package-lock.json');
+  });
+
+  it('custom excludePatterns are respected', () => {
+    const context = buildDiffContext(files(), undefined, ['src/**']);
+    expect(context).toContain('package-lock.json');
+    expect(context).not.toContain('src/auth.js');
+  });
+
+  it('no excludes at all → all patchable files included (consistent with review.js)', () => {
+    const context = buildDiffContext(files());
+    expect(context).toContain('package-lock.json');
+    expect(context).toContain('src/auth.js');
+  });
+
+  it('lockfile-only PR with default excludes → no-diffs placeholder', () => {
+    const context = buildDiffContext(
+      [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+      undefined,
+      DEFAULT_EXCLUDES,
+    );
+    expect(context).toBe('(no textual diffs available)');
+  });
+});
+
+describe('handleAskCommand — W16-B4-4: threads config.excludePatterns', () => {
+  it('default excludes: prompt contains src/auth.js, NOT the lockfile', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'ans');
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: DEFAULT_EXCLUDES,
+      },
+      commenter: { login: 'alice' },
+      args: 'what changed in auth?',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/auth.js');
+    expect(prompt).not.toContain('package-lock.json');
+  });
+
+  it('no excludePatterns configured → behavior unchanged (lockfile still included)', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'ans');
+
+    await handleAskCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'alice' },
+      args: 'q',
+      callApi,
+    });
+
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('package-lock.json');
+    expect(prompt).toContain('src/auth.js');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-5: PR body is capped
+ *
+ * The user question is capped at 4000 chars (CMD-9) and the diff context at
+ * 8000, but `pr.body` was interpolated UNTRUNCATED — a 60k PR body made a
+ * 60k prompt (cost/quota exposure). The body is now capped at 4000 chars,
+ * still inside the pr-context untrusted wrapper.
+ * ------------------------------------------------------------------ */
+
+describe('buildAskPrompt — W15-A4-5: PR body length cap', () => {
+  it('a 60000-char PR body produces a prompt well under 12000 chars', () => {
+    const prompt = buildAskPrompt({
+      question: 'what changed?',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body: 'B'.repeat(60000) },
+      files: [{ filename: 'a.js', patch: '+a' }],
+    });
+    expect(prompt.length).toBeLessThan(12000);
+  });
+
+  it('a short PR body is included unchanged', () => {
+    const prompt = buildAskPrompt({
+      question: 'q',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body: 'Fixes the login redirect bug.' },
+      files: [],
+    });
+    expect(prompt).toContain('Fixes the login redirect bug.');
+  });
+
+  it('the capped body stays inside the untrusted pr-context wrapper', () => {
+    const marker = 'BODYMARKER';
+    const body = marker + 'B'.repeat(60000);
+    const prompt = buildAskPrompt({
+      question: 'q',
+      commenterLogin: 'alice',
+      pr: { title: 'T', body },
+      files: [],
+    });
+    const ctxStart = prompt.indexOf('<untrusted_input source="pr-context">');
+    const ctxEnd = prompt.indexOf('</untrusted_input>', ctxStart);
+    expect(ctxStart).toBeGreaterThan(-1);
+    expect(prompt.slice(ctxStart, ctxEnd)).toContain(marker);
   });
 });

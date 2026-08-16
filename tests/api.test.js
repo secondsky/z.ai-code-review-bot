@@ -206,6 +206,87 @@ describe('categorizeError', () => {
     });
   });
 
+  // W15-A7-1: the most common transient failures for long-lived LLM POSTs —
+  // mid-body resets (read ECONNRESET), broken pipes (write EPIPE), premature
+  // socket close ("socket hang up"), aborted requests, and transient DNS
+  // (EAI_AGAIN) — must classify as provider/retryable. Classifying them as
+  // internal/non-retryable lets ONE reset in any batch kill the entire review
+  // with no comment posted.
+  test('W15-A7-1: transient connection failures → provider/retryable', () => {
+    const messages = [
+      'read ECONNRESET',
+      'write EPIPE',
+      'socket hang up',
+      'aborted',
+      'getaddrinfo EAI_AGAIN api.z.ai:443',
+    ];
+    for (const message of messages) {
+      expect(categorizeError(new Error(message))).toEqual({
+        category: 'provider',
+        retryable: true,
+      });
+    }
+  });
+
+  // W15-A7-2: a 2xx body that fails JSON.parse (truncated by a proxy/gateway)
+  // rejects "invalid JSON". Like its sibling "empty response" case, it is a
+  // transient provider hiccup — one garbled 200 must not end the whole review.
+  test('W15-A7-2: "invalid JSON" → provider/retryable', () => {
+    expect(categorizeError(new Error('Z.ai API returned invalid JSON'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+  });
+
+  // W18-D3-1: OS connect-time errno codes. 'connect ETIMEDOUT' is one of the
+  // most common transient failures on GitHub runners, but 'etimedout' does NOT
+  // contain the substring 'timeout', so it fell through to internal/
+  // NON-retryable and killed the whole review after a single attempt. Its
+  // sibling EHOSTUNREACH was equally missing while ENETUNREACH was covered.
+  test('W18-D3-1: connect ETIMEDOUT and EHOSTUNREACH → provider/retryable', () => {
+    expect(categorizeError(new Error('connect ETIMEDOUT 1.2.3.4:443'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+    expect(categorizeError(new Error('connect EHOSTUNREACH 1.2.3.4:443'))).toEqual({
+      category: 'provider',
+      retryable: true,
+    });
+  });
+
+  // W18-D3-1: the provider's HTTP status must WIN over message substrings.
+  // A 4xx body containing the word "timeout" (e.g. a 400 whose body says
+  // "request timeout exceeded") is a validation error, NOT a retryable
+  // timeout — retrying a deterministic 400 only burns the review budget.
+  test('W18-D3-1: 400 body containing "timeout" stays validation/non-retryable', () => {
+    expect(
+      categorizeError(new Error('Z.ai API error 400: request timeout exceeded')),
+    ).toEqual({ category: 'validation', retryable: false });
+  });
+
+  test('W18-D3-1: 5xx body containing "timeout" classifies by status → provider/retryable', () => {
+    expect(
+      categorizeError(new Error('Z.ai API error 503: gateway timeout')),
+    ).toEqual({ category: 'provider', retryable: true });
+  });
+
+  // The new retryable classifications must NOT bleed into genuinely internal
+  // errors: unrelated messages still fall through to internal/non-retryable.
+  test('W15-A7-1: unrelated internal errors remain non-retryable', () => {
+    expect(categorizeError(new Error('something else entirely'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+    expect(categorizeError(new Error('a bug in our own code'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+    expect(categorizeError(new Error('Z.ai API error 413: too large'))).toEqual({
+      category: 'internal',
+      retryable: false,
+    });
+  });
+
   test('413 (not in matrix) → internal/non-retryable', () => {
     // 413 is neither 429/401/403/400 nor 5xx; falls through to internal.
     expect(categorizeError(new Error('Z.ai API error 413: too large'))).toEqual({
@@ -683,6 +764,28 @@ describe('callWithRetry', () => {
     expect(out.error.totalDuration).toBeGreaterThanOrEqual(0);
   });
 
+  // W18-D3-1: an OS connect timeout (ETIMEDOUT) is a transient network error.
+  // Before the fix it classified as internal/non-retryable, so an
+  // always-ETIMEDOUT fn got exactly ONE attempt instead of maxRetries+1.
+  test('W18-D3-1: always-ETIMEDOUT fn is retried → maxRetries+1 attempts', async () => {
+    const fn = recordingFn([
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+      new Error('connect ETIMEDOUT 1.2.3.4:443'),
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+    });
+    expect(out.success).toBe(false);
+    expect(out.error.retryable).toBe(true);
+    expect(out.error.attempts).toBe(4); // maxRetries(3) + 1
+    expect(fn.calls).toHaveLength(4);
+  });
+
   test('timeout at attempt 0 does NOT trigger fallback; timeout at attempt 1 DOES, then success', async () => {
     let fallbackCalled = 0;
     const fn = recordingFn([
@@ -751,6 +854,87 @@ describe('callWithRetry', () => {
     expect(out.success).toBe(true);
     expect(out.usedFallback).toBe(false);
     expect(fallbackCalled).toBe(0);
+  });
+
+  // W19-E2-2/E2-1: after the W18-D3-1 reorder, 'Z.ai API error 504: gateway
+  // timeout' classifies as PROVIDER (extractable status wins over message
+  // substrings), so the `category === 'timeout'` fallback gate never fired
+  // for gateway timeouts — the configured ZAI_FALLBACK_PROMPT silently never
+  // ran on the exact scenario it exists for. The fallback must ALSO fire for
+  // a 504 (scoped deliberately: 504 is THE gateway-timeout status; a plain
+  // 500/503 without 504 still does not fire — see the test below).
+  test('W19-E2-2: 504 gateway timeout FIRES the fallback; retries still happen per config', async () => {
+    let fallbackCalled = 0;
+    const fn = recordingFn([
+      new Error('Z.ai API error 504: gateway timeout'), // attempt 0 — 504, but attempt < 1, no fallback
+      new Error('Z.ai API error 504: gateway timeout'), // attempt 1 — 504 + attempt>=1 → fallback
+      'FB_OK', // attempt 2 — the fallback attempt succeeds
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FALLBACK_PROMPT' }),
+      onFallback: (info) => {
+        fallbackCalled++;
+        // The triggering error is surfaced to the observer.
+        expect(info.originalError.message).toContain('504');
+      },
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('FB_OK');
+    expect(out.usedFallback).toBe(true);
+    expect(fallbackCalled).toBe(1);
+    // Retry cadence unchanged: attempts 0, 1 (504s) and 2 (fallback) all ran.
+    expect(fn.calls).toHaveLength(3);
+  });
+
+  test('W19-E2-2: plain 500 (no timeout text) and 503 still do NOT fire the fallback (scope: 504 only)', async () => {
+    let fallbackCalled = 0;
+    const opts = {
+      maxRetries: 3,
+      baseDelay: 2000,
+      baseTimeout: 120000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+      onFallback: () => {
+        fallbackCalled++;
+      },
+    };
+    // Plain 500 (regression guard for the existing behavior).
+    const out500 = await callWithRetry(
+      recordingFn([new Error('Z.ai API error 500: oops'), 'OK']),
+      opts,
+    );
+    expect(out500.usedFallback).toBe(false);
+    // 503 with "timeout" in the body: provider-category, but NOT the 504
+    // gateway-timeout status — the fallback stays out (deliberate scoping).
+    const out503 = await callWithRetry(
+      recordingFn([new Error('Z.ai API error 503: gateway timeout'), 'OK']),
+      opts,
+    );
+    expect(out503.usedFallback).toBe(false);
+    expect(fallbackCalled).toBe(0);
+  });
+
+  // Regression: client-side timeouts (no extractable status) still fire the
+  // fallback exactly as before the 504 gate was added.
+  test('W19-E2-2: client timeout (no status code) still fires the fallback (regression)', async () => {
+    const fn = recordingFn([
+      new Error('Request timed out'), // attempt 0 — timeout, but attempt < 1
+      new Error('Request timed out'), // attempt 1 — timeout + attempt>=1 → fallback
+      'FB_OK', // attempt 2 — fallback attempt succeeds
+    ]);
+    const out = await callWithRetry(fn, {
+      maxRetries: 3,
+      baseDelay: 10,
+      baseTimeout: 1000,
+      sleep: async () => {},
+      fallbackPrompt: () => ({ prompt: 'FB' }),
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
   });
 
   // W5-2: when a timeout triggers the fallback on the FINAL allowed attempt
@@ -902,6 +1086,106 @@ describe('createApiClient', () => {
     expect(out.success).toBe(true);
     expect(out.data).toBe('ok after retry');
     expect(request.calls).toHaveLength(2);
+  });
+
+  // W15-A7-1: a connection reset MID-BODY (2xx response, partial body chunk
+  // received, then ECONNRESET) is transient. client.call must retry it and
+  // resolve when the second attempt returns a full body — previously the reset
+  // classified as internal/non-retryable and a single attempt killed the call.
+  test('W15-A7-1: call() retries a mid-body ECONNRESET and resolves on attempt 2', async () => {
+    const calls = [];
+    const request = (url, options) => {
+      const callIdx = calls.length;
+      const captured = { url, options, headers: options?.headers || {} };
+      calls.push(captured);
+      let responseCb = null;
+      let errorCb = null;
+      const req = {
+        on(event, cb) {
+          if (event === 'response') responseCb = cb;
+          else if (event === 'error') errorCb = cb;
+          return req;
+        },
+        setTimeout() {
+          return req;
+        },
+        destroy(err) {
+          if (err && errorCb) errorCb(err);
+          return req;
+        },
+        write(d) {
+          captured.writes = (captured.writes || []);
+          captured.writes.push(d);
+          return req;
+        },
+        end() {
+          captured.body = (captured.writes || []).join('');
+          queueMicrotask(() => {
+            if (callIdx === 0) {
+              // Attempt 1: response starts 2xx, a partial body chunk arrives,
+              // then the connection resets — a real IncomingMessage 'error'.
+              const res = new Readable({ read() {} });
+              res.statusCode = 200;
+              responseCb(res);
+              res.push(Buffer.from('{"choices":[{"mess'));
+              res.destroy(new Error('read ECONNRESET'));
+            } else {
+              // Attempt 2: a full, valid body.
+              responseCb(
+                buildFakeRes(
+                  [JSON.stringify({ choices: [{ message: { content: 'recovered' } }] })],
+                  { statusCode: 200 },
+                ),
+              );
+            }
+          });
+          return req;
+        },
+      };
+      captured.req = req;
+      return req;
+    };
+    const client = createApiClient({ maxRetries: 3 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('recovered');
+    expect(calls).toHaveLength(2); // exactly 2 attempts: reset, then success
+  });
+
+  // W15-A7-2: a truncated 2xx body (proxy/gateway cut the transfer mid-JSON)
+  // fails JSON.parse and rejects "invalid JSON". Two garbled 200s then a valid
+  // one → the client must retry and resolve, not give up on the first attempt.
+  test('W15-A7-2: call() retries invalid-JSON 2xx responses and resolves on attempt 3', async () => {
+    let attempt = 0;
+    const bodies = [
+      '{"choices":[{"mess', // truncated by the proxy
+      '{"partial": tru', // truncated again
+      JSON.stringify({ choices: [{ message: { content: 'ok after garbage' } }] }),
+    ];
+    const request = makeFakeRequest(() => ({
+      res: buildFakeRes([bodies[attempt++] ?? bodies[bodies.length - 1]], {
+        statusCode: 200,
+      }),
+    }));
+    const client = createApiClient({ maxRetries: 3 });
+    const out = await client.call({
+      apiKey: 'k',
+      model: 'm',
+      systemPrompt: 's',
+      userPrompt: 'u',
+      sleep: async () => {},
+      request,
+    });
+    expect(out.success).toBe(true);
+    expect(out.data).toBe('ok after garbage');
+    expect(request.calls).toHaveLength(3); // garbage, garbage, then success
   });
 
   test('call() fallback end-to-end: timeout at attempts 0+1 fires fallback, and the fallback prompt reaches the transport', async () => {
@@ -1277,7 +1561,9 @@ describe('extractStatusCode (edge cases)', () => {
 describe('categorizeError (table-driven branches)', () => {
   // Each case drives exactly one branch of the if/else chain in categorizeError.
   const cases = [
-    // timeout branch — keyword match, takes precedence over status codes
+    // timeout branch — keyword match (no extractable status code in these
+    // messages; per W18-D3-1 an extractable status code now wins over the
+    // timeout keyword)
     { name: 'message containing "timeout" → timeout/retryable', message: 'Request timeout', expected: { category: 'timeout', retryable: true } },
     { name: 'message containing "timed out" → timeout/retryable', message: 'operation timed out', expected: { category: 'timeout', retryable: true } },
     // rate-limit branch
@@ -1317,10 +1603,12 @@ describe('categorizeError (table-driven branches)', () => {
     expect(categorizeError(error)).toEqual({ category: 'internal', retryable: false });
   });
 
-  test('timeout keyword takes precedence over an embedded 5xx status code', () => {
-    // The timeout check runs first; even though 503 is in the message, the
-    // category is timeout. Pin this precedence so reordering the if-chain
-    // would surface as a test failure.
+  test('timeout keyword still wins when the embedded 5xx number is NOT extractable', () => {
+    // W18-D3-1 reordered categorizeError so an EXTRACTABLE status code wins
+    // over the timeout keyword. The 503 here sits in '(503)' — no
+    // error/status/code keyword in front — so extractStatusCode returns null
+    // and the timeout branch classifies it. Pin that a bare parenthesized
+    // number does not get mistaken for an HTTP status.
     expect(categorizeError(new Error('Request timed out (503)'))).toEqual({
       category: 'timeout',
       retryable: true,

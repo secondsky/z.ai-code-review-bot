@@ -48,7 +48,14 @@ import {
 import { loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
 import { authorize } from './lib/auth.js';
-import { upsertReviewComment, buildCommentBody, appendTrailers, MARKER } from './lib/comments.js';
+import {
+  upsertReviewComment,
+  buildCommentBody,
+  appendTrailers,
+  findBotMarkerComment,
+  findBotMarkerComments,
+  MARKER,
+} from './lib/comments.js';
 import {
   getChangedFiles,
   filterExcludedFiles,
@@ -62,6 +69,9 @@ import {
   buildFindingsHashBlock,
   parseFindingsHashBlock,
   filterIncrementalFindings,
+  // W18-D1-3: extracted verbatim into the shared pure module so schedule.js
+  // can render the identical suppression note (index.js behavior unchanged).
+  appendIncrementalNote,
 } from './lib/findings.js';
 import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
@@ -370,42 +380,73 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
 }
 
 /**
- * Append the Phase 6.3 incremental-suppression note to the model's summary.
+ * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
+ * into a rendered body.
  *
- * The note is appended (with a blank-line separator) so reviewers can see how
- * many previously-resolved findings were elided. Returns the (possibly empty)
- * summary with the note appended. Kept as a pure helper so it can be unit
- * tested in isolation if needed.
+ * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
+ * review, but nothing surfaced that to the reviewer — a run that skipped
+ * files still posted a bare "No issues found. The changes look good. ✅".
+ * When the structured pipeline reports `skippedFiles > 0`, an italic note
+ * (mirroring the `_N findings truncated to cap._` style the summary
+ * renderers use) is inserted just before the trailing marker so it lands in
+ * the posted body of BOTH delivery paths (inline review body and summary
+ * comment). Rendering happens here — after the renderer returns — because
+ * the note must appear on every path without touching each renderer.
  *
- * INT-11: also surfaces learnings-suppressed findings (Phase 8.2). Previously
- * only the incremental count was reported, so a run that suppressed 5 findings
- * via learnings showed no note at all — reviewers had no signal that the bot
- * had intentionally dropped findings. Both suppression reasons now contribute
- * to a single note so the summary reflects the total elided count.
+ * W18-D2-3: skippedFiles counts only zero-entry files; PARTIAL drops of
+ * multi-chunk files (skippedEntries) were surfaced nowhere — a file with
+ * 2/15 chunks reviewed still posted the bare all-clear. When
+ * `skippedEntries > 0` a matching portions note is rendered too (when both
+ * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
+ * "N file(s) (M chunk(s) unreviewed)" style).
  *
- * @param {string} summary  The model's original summary prose.
- * @param {number} suppressedCount  How many findings were suppressed (incremental).
- * @param {number} [learningsSuppressed]  How many findings were suppressed by learnings.
+ * W20-F1-1: context-limit drops (contextSkippedEntries — single-entry
+ * batches skipped by executeStructuredBatch when even one entry overflows
+ * the model context) get their OWN note with the correct cause. Summing
+ * them into skippedEntries (the W19-E1-1 approach) rendered the hard-coded
+ * "(MAX_DIFF_CHARS cap)" cause for context drops — with the cap disabled
+ * that was the wrong cause and the wrong implied remedy (real remedies:
+ * smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context model).
+ *
+ * @param {string} body   Rendered body ending in the marker (typically).
+ * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
+ * @param {number} [contextSkippedEntries]  Count of entries dropped by the
+ *   model context limit (NOT MAX_DIFF_CHARS).
  * @returns {string}
  */
-function appendIncrementalNote(summary, suppressedCount, learningsSuppressed = 0) {
-  const base = typeof summary === 'string' ? summary : '';
-  const inc = typeof suppressedCount === 'number' && suppressedCount > 0 ? suppressedCount : 0;
-  const lrn = typeof learningsSuppressed === 'number' && learningsSuppressed > 0 ? learningsSuppressed : 0;
-  const total = inc + lrn;
-  if (total === 0) return base;
-  // Compose a note that reflects BOTH suppression reasons when both fired.
-  const parts = [];
-  if (inc > 0) {
-    parts.push(`${inc} previously-reported finding${inc === 1 ? '' : 's'}`);
+function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
+  const n =
+    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
+      ? Math.floor(skippedFiles)
+      : 0;
+  const e =
+    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
+      ? Math.floor(skippedEntries)
+      : 0;
+  const c =
+    typeof contextSkippedEntries === 'number' &&
+    Number.isFinite(contextSkippedEntries) &&
+    contextSkippedEntries > 0
+      ? Math.floor(contextSkippedEntries)
+      : 0;
+  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
+    return body;
   }
-  if (lrn > 0) {
-    parts.push(`${lrn} previously-accepted learning${lrn === 1 ? '' : 's'}`);
+  const notes = [];
+  if (n > 0) {
+    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
   }
-  // English join: "a and b" or just "a".
-  const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
-  const note = `_${what} suppressed (incremental review)._`;
-  return base.length === 0 ? note : `${base}\n\n${note}`;
+  if (e > 0) {
+    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (c > 0) {
+    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
+  }
+  const note = notes.join('\n\n');
+  const idx = body.lastIndexOf(MARKER);
+  if (idx === -1) return `${body}\n\n${note}`;
+  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
 }
 
 /**
@@ -472,6 +513,8 @@ export async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
+    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
+    findBotMarkerComments: findBotMarkerCommentsFn = findBotMarkerComments,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
     createApiClient: createApiClientFn = createApiClient,
@@ -568,6 +611,7 @@ export async function run(context, deps = {}) {
           sha,
           state: 'pending',
           description: 'Z.ai review in progress…',
+          reviewerName: config.reviewerName,
         },
         { core: coreDep },
       );
@@ -605,6 +649,25 @@ export async function run(context, deps = {}) {
       patchable = filterExcludedFilesFn(patchable, repoConfig.excludePatterns);
       if (patchable.length === 0) {
         coreDep.info('All patchable files excluded by .zai.yml path_filters; skipping.');
+        // W15-A7-3: the `pending` status was already posted above; returning
+        // here without a TERMINAL status left the check spinning pending
+        // forever (blocking merges when the status is required). There is
+        // genuinely nothing to review, so post a terminal `success` — same
+        // fail-soft helper, same commitStatus gate.
+        if (config.commitStatus) {
+          await setReviewStatusFn(
+            {
+              octokit,
+              context,
+              sha,
+              state: 'success',
+              description:
+                'No reviewable files (.zai.yml path_filters excluded all changes)',
+              reviewerName: config.reviewerName,
+            },
+            { core: coreDep },
+          );
+        }
         return;
       }
     }
@@ -642,6 +705,11 @@ export async function run(context, deps = {}) {
       scanners: {
         secrets: repoConfig.scanners?.gitleaks === false ? false : undefined,
         patterns: repoConfig.scanners?.ast_grep === false ? false : undefined,
+        // W15-A1-2: `.zai.yml` `scanners.metrics: false` must reach the
+        // orchestrator's per-scanner toggle (runScanners honors
+        // repoScanners.metrics === false) — previously no metrics key was
+        // mapped, so the documented repo-level toggle was impossible.
+        metrics: repoConfig.scanners?.metrics === false ? false : undefined,
       },
     };
     const scannerResult = await runScannersFn(
@@ -691,32 +759,6 @@ export async function run(context, deps = {}) {
       },
     );
 
-    // Phase 5: flip the commit status to "success" with a findings summary now
-    // that the review itself completed. The downstream review/comment posting
-    // is UI delivery; the review result is what determines success. Fail-soft.
-    if (config.commitStatus) {
-      const criticalCount = result.findings.filter(
-        (f) => f?.severity === 'critical',
-      ).length;
-      const highCount = result.findings.filter(
-        (f) => f?.severity === 'high',
-      ).length;
-      await setReviewStatusFn(
-        {
-          octokit,
-          context,
-          sha,
-          state: 'success',
-          description: buildStatusDescriptionFn({
-            findingCount: result.findings.length,
-            criticalCount,
-            highCount,
-          }),
-        },
-        { core: coreDep },
-      );
-    }
-
     // Phase 2: partition findings into inline-mappable (anchored to diff lines
     // via pulls.createReview) and summary-only. When at least one finding maps
     // to a diff line, post a GitHub REVIEW with inline comments — the
@@ -759,6 +801,33 @@ export async function run(context, deps = {}) {
         if (withHashBlock) {
           priorHashes = parseFindingsHashBlockFn(withHashBlock.body);
         }
+        // W15-A8-3: when findings don't map to diff lines (file-level), run 1
+        // posts the hash block into the bot's marker ISSUE COMMENT (the
+        // summary path) instead of a review — so reading reviews alone left
+        // priorHashes empty and every finding was re-reported on re-push.
+        // Read the hash block from the bot's marker comment too and MERGE the
+        // two sets. The finder enforces the same bot-authority gate as
+        // upsertReviewComment, so a human comment quoting the marker (and a
+        // forged hash block) can never feed suppression.
+        // W16-B2-3: read ALL bot marker comments, not just the first. A
+        // fallback comment (created after an inline-review failure — the
+        // fallback path always CREATES a new comment) carries the newest FULL
+        // hash set; a first-match read orphaned it, so hashes present only
+        // there never suppressed. UNION the parsed hash blocks across every
+        // bot marker comment.
+        const priorMarkerComments = await findBotMarkerCommentsFn({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          marker: MARKER,
+        });
+        for (const priorComment of priorMarkerComments) {
+          if (typeof priorComment?.body === 'string') {
+            const commentHashes = parseFindingsHashBlockFn(priorComment.body);
+            for (const h of commentHashes) priorHashes.add(h);
+          }
+        }
       } catch (priorErr) {
         if (coreDep?.warning) {
           coreDep.warning(
@@ -785,6 +854,39 @@ export async function run(context, deps = {}) {
     if (learningsSuppressed > 0 && coreDep?.info) {
       coreDep.info(
         `Learnings: suppressed ${learningsSuppressed} previously-accepted finding(s).`,
+      );
+    }
+
+    // Phase 5: flip the commit status to "success" with a findings summary now
+    // that the review itself completed. The downstream review/comment posting
+    // is UI delivery; the review result is what determines success. Fail-soft.
+    // W15-A6-2: the status is computed from the FINAL kept-findings set —
+    // AFTER incremental suppression and learnings suppression. It was
+    // previously computed from `result.findings` before those stages ran, so
+    // a re-push where every finding was already reported posted
+    // "N findings (...)" to the checks tab while the PR comment said
+    // "No issues found ✅" — contradictory signals on the same run.
+    if (config.commitStatus) {
+      const criticalCount = keptFindings.filter(
+        (f) => f?.severity === 'critical',
+      ).length;
+      const highCount = keptFindings.filter(
+        (f) => f?.severity === 'high',
+      ).length;
+      await setReviewStatusFn(
+        {
+          octokit,
+          context,
+          sha,
+          state: 'success',
+          description: buildStatusDescriptionFn({
+            findingCount: keptFindings.length,
+            criticalCount,
+            highCount,
+          }),
+          reviewerName: config.reviewerName,
+        },
+        { core: coreDep },
       );
     }
 
@@ -885,10 +987,33 @@ export async function run(context, deps = {}) {
       0,
       (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
     );
+    // W17-C1-3: the cumulative-cap drop count, threaded into BOTH metadata
+    // objects below and rendered as an italic note in the posted body —
+    // previously nothing consumed it, so a run that skipped files posted a
+    // bare "No issues found" all-clear.
+    const skippedFileCount =
+      typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
+        ? result.metadata.skippedFiles
+        : 0;
+    // W18-D2-3: partial drops (multi-chunk files with some chunks dropped)
+    // ride the same note inserter as the whole-file drops.
+    const skippedEntryCount =
+      typeof result.metadata.skippedEntries === 'number' && result.metadata.skippedEntries > 0
+        ? result.metadata.skippedEntries
+        : 0;
+    // W20-F1-1: context-limit drops flow SEPARATELY from cap drops so the
+    // note can state the correct cause ("model context limit", not the
+    // MAX_DIFF_CHARS cap).
+    const contextSkippedCount =
+      typeof result.metadata.contextSkippedEntries === 'number' &&
+      result.metadata.contextSkippedEntries > 0
+        ? result.metadata.contextSkippedEntries
+        : 0;
     const reviewMetadata = {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      skippedFiles: skippedFileCount,
       // Phase 7: walkthrough context for the summary-only section of the
       // review body. When config.walkthrough is true, buildReviewBody renders
       // the summary-only findings as dependency-ordered cohort sections
@@ -915,8 +1040,18 @@ export async function run(context, deps = {}) {
         summaryOnly,
         reviewMetadata,
       );
+      // W17-C1-3: surface the skipped-files drop inside the review body
+      // (before the trailers so the marker/SHA ordering is untouched).
+      // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+      // W20-F1-1: context-limit note rides alongside too.
+      const baseBodyWithNote = insertSkippedFilesNote(
+        baseBody,
+        skippedFileCount,
+        skippedEntryCount,
+        contextSkippedCount,
+      );
       const shaBlock = buildShaBlock(sha);
-      const reviewBody = appendTrailers(baseBody, [hashBlock, shaBlock]);
+      const reviewBody = appendTrailers(baseBodyWithNote, [hashBlock, shaBlock]);
       const comments = buildReviewCommentsFn(inline);
       // Phase 8.3: strict mode escalates the review event from advisory
       // COMMENT to blocking REQUEST_CHANGES when strictMode is on AND there is
@@ -983,6 +1118,7 @@ export async function run(context, deps = {}) {
     const summaryMetadata = {
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
+      skippedFiles: skippedFileCount,
       summary: finalSummary,
       // Phase 8.1: pre-rendered "Suggested reviewers" line.
       suggestedReviewersLine,
@@ -1001,9 +1137,19 @@ export async function run(context, deps = {}) {
       content,
       marker: MARKER,
     });
+    // W17-C1-3: surface the skipped-files drop in the summary comment too
+    // (before the trailers so the marker/SHA ordering is untouched).
+    // W18-D2-3: portions note rides alongside (see insertSkippedFilesNote).
+    // W20-F1-1: context-limit note rides alongside too.
+    const commentBodyWithNote = insertSkippedFilesNote(
+      commentBody,
+      skippedFileCount,
+      skippedEntryCount,
+      contextSkippedCount,
+    );
     // Append hash + SHA blocks (same coexistence model as the inline branch).
     const shaBlock = buildShaBlock(sha);
-    const body = appendTrailers(commentBody, [hashBlock, shaBlock]);
+    const body = appendTrailers(commentBodyWithNote, [hashBlock, shaBlock]);
     await upsertReviewCommentFn({
       octokit,
       owner,
@@ -1152,6 +1298,41 @@ export async function run(context, deps = {}) {
       upsertReview: upsertReviewFn,
       postFallbackComment: postFallbackCommentFn,
       resolveReviewEvent: resolveReviewEventFn,
+      // W15-A6-4 walkthrough parity.
+      formatWalkthroughSummary: formatWalkthroughSummaryFn,
+      // W15-A8-4 feature parity with the push path: wire the REAL repo-config,
+      // scanner, learnings, and commit-status collaborators (schedule.js's
+      // defaults are inert no-ops so hermetic callers are unaffected). The
+      // scanner wrapper closes over the production scanner-deps kit + expanded
+      // cache dir, exactly like the pull_request branch's runScanners call.
+      loadRepoConfig: loadRepoConfigFn,
+      mergeRepoConfig: mergeRepoConfigFn,
+      runScanners: (opts) =>
+        runScannersFn(
+          { ...opts, cacheDir: expandHome(config.scannersCacheDir) },
+          createScannerDeps({
+            core: coreDep,
+            cacheDir: expandHome(config.scannersCacheDir),
+          }),
+        ),
+      formatScannerContext: formatScannerContextFn,
+      loadLearnings: loadLearningsFn,
+      formatLearningsForPrompt: formatLearningsForPromptFn,
+      filterFindingsByLearnings: filterFindingsByLearningsFn,
+      setReviewStatus: setReviewStatusFn,
+      buildStatusDescription: buildStatusDescriptionFn,
+      // W16-B2-2: real marker-comment finder so scheduled summaries preserve
+      // the incremental-review hash block across the wholesale upsert replace
+      // (parseFindingsHashBlock/buildFindingsHashBlock default to the real
+      // pure helpers inside schedule.js).
+      findBotMarkerComments: findBotMarkerCommentsFn,
+      // W17-C2-1: real incremental filter so scheduled runs suppress
+      // previously-reported findings exactly like the push path.
+      filterIncrementalFindings: filterIncrementalFindingsFn,
+      // W18-D1-2: real bot-review finder so scheduled incremental reads ALSO
+      // see the hash blocks the inline path deposited in review bodies (the
+      // comments-only read left them invisible and findings were re-reported).
+      listBotReviews: listBotReviewsFn,
     });
     return;
   }
@@ -1246,6 +1427,7 @@ export async function main() {
             sha,
             state: 'failure',
             description: 'Z.ai review failed',
+            reviewerName: config.reviewerName,
           },
           { core },
         );

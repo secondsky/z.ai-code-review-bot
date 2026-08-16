@@ -13,7 +13,9 @@
  *
  * No real binaries are executed — `deps.runBinary` is always a fake.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import nodePath from 'node:path';
 import {
   scanSecrets,
   scanSecretsRegex,
@@ -263,6 +265,266 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
     expect(he).withContext('URL-safe base64 string should match').toBeTruthy();
   });
 
+  it('does NOT flag data-URI base64 payloads [W15-A5-5]', () => {
+    // data:image/png;base64,<payload> is legitimate inline-image content, not
+    // a secret. The 60-char payload is genuinely high-entropy (guarded below)
+    // so this exercises the context suppression, not the entropy threshold.
+    const payload = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA1b';
+    expect(shannonEntropy(payload)).toBeGreaterThanOrEqual(4.5); // guard
+    const findings = scanSecretsRegex(
+      file(buildPatch([`const img = "data:image/png;base64,${payload}";`])),
+    );
+    const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
+    expect(he).withContext('data URI payload must not be flagged').toBeUndefined();
+  });
+
+  it('does NOT flag subresource-integrity (SRI) hashes [W15-A5-5]', () => {
+    // `"integrity": "sha512-<86 b64 chars>"` is an SRI hash in package-lock /
+    // HTML script tags — legitimate content. Both the JSON key form and the
+    // HTML attribute form must be suppressed.
+    const hash86 = (
+      'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA' +
+      'bC3dE5fGhJ5kL7mN9pQ1sT3uV5wXyZaB1cD'
+    ).slice(0, 86);
+    expect(shannonEntropy(hash86)).toBeGreaterThanOrEqual(4.5); // guard
+    const findings = scanSecretsRegex(
+      file(buildPatch([
+        `"integrity": "sha512-${hash86}",`,
+        `<script src="app.js" integrity="sha384-${hash86}"></script>`,
+      ])),
+    );
+    const he = findings.find((f) => f.rule === 'regex:high-entropy-string');
+    expect(he).withContext('SRI hash must not be flagged').toBeUndefined();
+  });
+
+  it('still flags a high-entropy api_key value outside benign base64 contexts [W15-A5-5]', () => {
+    const value = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3p'; // 40 chars
+    const findings = scanSecretsRegex(file(buildPatch([`api_key = "${value}"`])));
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.some((f) => f.rule === 'regex:high-entropy-string')).toBe(true);
+  });
+
+  // ==================================================================
+  // W16-B3-5: the SRI/data-URI context suppression was too slack — every
+  // suffix in `/(?:integrity|sha256|...)["']?[=:]?\s*["']?(?:sha\d+-)?$/i`
+  // was optional, so prose like `"integrity sha512-<hash>"` (no = or :
+  // between the key and the hash) silently suppressed the high-entropy
+  // backstop: an attacker-controlled off switch for unknown-format secrets.
+  // Suppression now requires STRUCTURAL adjacency.
+  // ==================================================================
+  describe('SRI/data-URI suppression adjacency [W16-B3-5]', () => {
+    // 35-char high-entropy value (entropy 4.90 alone; 5.01 behind sha512-).
+    const V = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL';
+    const scanOne = (line) =>
+      scanSecretsRegex([{ filename: 'src/lock.json', patch: buildPatch([line]) }]);
+    const heFindings = (line) =>
+      scanOne(line).filter((f) => f.rule === 'regex:high-entropy-string');
+
+    it('"integrity sha512-<hash>" (no =/: adjacency) → suppressed [superseded by W17-C1-6]', () => {
+      // W16-B3-5 expected this PRESENT only because the candidate charset
+      // ABSORBED the `sha512-` prefix, so the sha-adjacency alternative was
+      // dead code (its own comment: "the end-to-end adjacency case cannot
+      // arise for THIS pattern"). W17-C1-6 made the match land on the bare
+      // digest, so a directly adjacent sha###- digest now suppresses
+      // uniformly — the value is digest-shaped and indistinguishable from a
+      // real SRI hash, which W16-B3-5's own contract ("a directly adjacent
+      // hyphen-prefixed digest … still suppresses") always intended.
+      expect(heFindings(`"integrity sha512-${V}"`)).toHaveLength(0);
+    });
+
+    it('"integrity <hash>" (no =/: adjacency, no digest prefix) → finding PRESENT [W16-B3-5]', () => {
+      // The W16-B3-5 structural guarantee, now end-to-end: a bare integrity
+      // KEY in prose (no `=`/`:` attachment) must NOT suppress an opaque
+      // high-entropy value.
+      expect(heFindings(`"integrity ${V}"`)).toHaveLength(1);
+    });
+
+    it('"integrity": "sha512-<hash>" (JSON) → still suppressed', () => {
+      expect(heFindings(`"integrity": "sha512-${V}"`)).toHaveLength(0);
+    });
+
+    it('integrity="sha512-<hash>" (quoted HTML attr) → still suppressed', () => {
+      expect(heFindings(`<script src="a.js" integrity="sha512-${V}"></script>`)).toHaveLength(0);
+    });
+
+    it('integrity=sha512-<hash> (unquoted HTML attr) → still suppressed', () => {
+      expect(heFindings(`<a integrity=sha512-${V}>x</a>`)).toHaveLength(0);
+    });
+
+    it('a directly adjacent digest prefix (before-text "sha512-") still suppresses', () => {
+      // Since W17-C1-6 the candidate regex rejects sha-prefixed match starts,
+      // so the match lands on the bare digest and this adjacency case arises
+      // end-to-end (see the W17-C1-4/C1-6 block). Pin the before-text
+      // semantics directly as well: a hyphen-prefixed digest immediately
+      // abutting the candidate suppresses; a colon prefix must NOT.
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha512-'))).toBe(true);
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha384-'))).toBe(true);
+      expect(he.skipIfPrecededBy.some((re) => re.test('sha256:'))).toBe(false);
+      expect(he.skipIfPrecededBy.some((re) => re.test('integrity '))).toBe(false);
+    });
+
+    it('data-URI payloads → still suppressed', () => {
+      const payload = 'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA1b';
+      expect(heFindings(`const img = "data:image/png;base64,${payload}";`)).toHaveLength(0);
+    });
+
+    it('a plain high-entropy value → still flagged', () => {
+      expect(heFindings(`const k = "${V}";`)).toHaveLength(1);
+    });
+
+    it('"sha256:<hash>" without an integrity key → now FLAGGED (slack off-switch removed)', () => {
+      // `sha256:` was one of the verified attacker-controllable suppressions
+      // (a bare digest-colon prefix must not disable secret detection).
+      expect(heFindings(`digest = "sha256:${V}"`)).toHaveLength(1);
+    });
+  });
+
+  // ==================================================================
+  // W17-C1-4: the B3-5 integrity suppression regex
+  // `/integrity["']?\s*[=:]\s*["']?\s*(?:sha\d{3}-)?$/i` matched ANY
+  // identifier ending in `integrity` followed by `=`/`:` — naming a variable
+  // `integrity` (`const integrity = "<64-char hi-entropy>"`) silently
+  // blinded the high-entropy backstop. Suppression is now restricted to the
+  // bare HTML-attribute shape: the token before `=` must BE `integrity`
+  // (preceded by start, `>` or whitespace, not part of a longer identifier
+  // like `data-integrity`) with NO whitespace around the `=`. Colon forms
+  // and spaced assignments no longer suppress an OPAQUE value — real
+  // sha-prefixed digests stay suppressed via the sha-adjacency alternative.
+  // ==================================================================
+  // W17-C1-6: the `(?:sha\d{3}-)$` skip alternative was dead code — the
+  // candidate class includes `-`, so the leftmost match ABSORBED an adjacent
+  // `sha512-` prefix and the before-text could never end with `sha###-`.
+  // Bare SRI digests (CSP `script-src 'self' 'sha512-…'`) therefore fired as
+  // critical FPs. The candidate regex now rejects sha-prefixed match starts
+  // (`(?!sha\d{3}-)`) and the orphan `-`-start between the prefix and the
+  // digest (`(?<!sha\d{3})`), so the match lands on the BARE digest and the
+  // sha-adjacency alternative actually fires.
+  // ==================================================================
+  describe('integrity-adjacency + SRI digest suppression [W17-C1-4/C1-6]', () => {
+    const HI64 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL2mN4pQ6rS8tU0vW2xY4zA6bC8dE0f';
+    const H86 = (
+      'Z9xQ8pLm4BnK2vRt7aS3cD1eF6gH5jK8lM0nO3pQ5rT7uV9wXyA' +
+      'bC3dE5fGhJ5kL7mN9pQ1sT3uV5wXyZaB1cD'
+    ).slice(0, 86);
+    const V35 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL';
+    const heFindings = (line) =>
+      scanSecretsRegex([{ filename: 'src/lock.json', patch: buildPatch([line]) }])
+        .filter((f) => f.rule === 'regex:high-entropy-string');
+
+    // --- W17-C1-4: the integrity off-switch ---------------------------
+    it('const integrity = "<64-char hi-entropy>" → finding PRESENT (variable named integrity must not blind the scanner)', () => {
+      expect(shannonEntropy(HI64)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`const integrity = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('token = "<64-char hi-entropy>" → finding PRESENT (regression)', () => {
+      expect(heFindings(`token = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('"integrity": "<opaque hi-entropy>" (JSON, no sha prefix) → finding PRESENT (opaque value scans)', () => {
+      expect(heFindings(`"integrity": "${HI64}",`)).toHaveLength(1);
+    });
+
+    it('"integrity": "sha512-<hash>" (JSON) → still suppressed', () => {
+      expect(shannonEntropy(H86)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`"integrity": "sha512-${H86}",`)).toHaveLength(0);
+    });
+
+    it('<script integrity="sha512-<hash>"> → still suppressed', () => {
+      expect(heFindings(`<script src="a.js" integrity="sha512-${H86}"></script>`)).toHaveLength(0);
+    });
+
+    it('integrity=sha384-<hash> (unquoted attr) → still suppressed', () => {
+      expect(heFindings(`<a integrity=sha384-${H86}>x</a>`)).toHaveLength(0);
+    });
+
+    it('integrity="<opaque>" (bare attribute, no spaces around =) → suppressed (attribute about to hold a digest)', () => {
+      expect(heFindings(`integrity="${HI64}"`)).toHaveLength(0);
+    });
+
+    it('data-integrity="<opaque>" → finding PRESENT (only the bare `integrity` attribute suppresses)', () => {
+      expect(heFindings(`data-integrity="${HI64}"`)).toHaveLength(1);
+    });
+
+    it('suppression-regex pins: attribute shape only — no spaced =, colon, or longer-identifier forms', () => {
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      const integrityAlt = he.skipIfPrecededBy.find((re) => /integrity/.test(re.source));
+      expect(integrityAlt.test(' integrity="')).toBe(true); // bare HTML attribute
+      expect(integrityAlt.test('integrity=')).toBe(true); // unquoted, about to hold a digest
+      expect(integrityAlt.test('const integrity = "')).toBe(false); // W17-C1-4 attack shape
+      expect(integrityAlt.test('"integrity": "')).toBe(false); // colon form must scan
+      expect(integrityAlt.test('data-integrity="')).toBe(false); // longer identifier
+      expect(integrityAlt.test('integrity ')).toBe(false); // pin kept from W16-B3-5
+    });
+
+    // --- W17-C1-6: bare SRI digests (CSP) -------------------------------
+    it("CSP `script-src 'self' 'sha512-<86-char b64>'` → no high-entropy finding", () => {
+      expect(heFindings(`+script-src 'self' 'sha512-${H86}'`)).toHaveLength(0);
+    });
+
+    it("CSP sha256 variant → no finding", () => {
+      expect(heFindings(`Content-Security-Policy: default-src 'sha256-${H86}'`)).toHaveLength(0);
+    });
+
+    it("'sha384-<hash>' bare → no finding", () => {
+      expect(heFindings(`'sha384-${H86}'`)).toHaveLength(0);
+    });
+
+    it('x = "<random 40>" without prefix → still flagged', () => {
+      expect(heFindings(`x = "${V35}"`)).toHaveLength(1);
+    });
+  });
+
+  // ==================================================================
+  // W18-D1-1: the W17-C1-6 lookarounds `(?!sha\d{3}-)(?<!sha\d{3})` were
+  // CASE-SENSITIVE while the sha-adjacency skip alternative
+  // `/(?:sha\d{3}-)$/i` is case-insensitive. CSP3/SRI hash-algorithm names
+  // match ASCII case-insensitively, so a valid CSP like
+  // `script-src 'SHA512-<digest>'` fired as a CRITICAL false positive
+  // (→ REQUEST_CHANGES under strictMode): the case-sensitive lookarounds did
+  // not reject the uppercase prefix, the leftmost candidate ABSORBED
+  // `SHA512-`, and the before-text (`'`) then failed the adjacency skip.
+  // The candidate regex is now compiled with the `i` flag — the lookahead
+  // rejects the match at `SHA512-`, the lookbehind rejects the orphan `-`,
+  // and the match lands on the bare digest, which the (already /i)
+  // adjacency alternative suppresses. The candidate class
+  // `[A-Za-z0-9+/\-_]` already covers both cases, so `i` changes nothing
+  // else.
+  // ==================================================================
+  describe('case-insensitive SRI digest suppression [W18-D1-1]', () => {
+    const HI64 = 'J8sk2mQX7bN4rT6vY8zA1cD3eF5gH7iJ9kL2mN4pQ6rS8tU0vW2xY4zA6bC8dE0f';
+    const heFindings = (line) =>
+      scanSecretsRegex([{ filename: 'src/csp.conf', patch: buildPatch([line]) }])
+        .filter((f) => f.rule === 'regex:high-entropy-string');
+
+    it("CSP `script-src 'SHA512-<digest>'` (uppercase) → no finding", () => {
+      expect(shannonEntropy(HI64)).toBeGreaterThanOrEqual(4.5); // guard
+      expect(heFindings(`script-src 'self' 'SHA512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it("CSP `script-src 'Sha512-<digest>'` (mixed case) → no finding", () => {
+      expect(heFindings(`script-src 'self' 'Sha512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it("CSP `script-src 'sha512-<digest>'` (lowercase) → still no finding (regression)", () => {
+      expect(heFindings(`script-src 'self' 'sha512-${HI64}'`)).toHaveLength(0);
+    });
+
+    it('integrity="SHA512-<digest>" (uppercase HTML attribute form) → no finding', () => {
+      expect(heFindings(`<script src="a.js" integrity="SHA512-${HI64}"></script>`)).toHaveLength(0);
+    });
+
+    it('plain high-entropy value with no digest prefix → still flagged', () => {
+      expect(heFindings(`x = "${HI64}";`)).toHaveLength(1);
+    });
+
+    it('candidate regex is compiled case-insensitively (pin)', () => {
+      const he = SECRET_PATTERNS.find((p) => p.name === 'high-entropy-string');
+      expect(he.regex.flags).toContain('i');
+    });
+  });
+
   it('detects api-key variants (api-key, apikey, apiKey, secret, token, auth_token, access_token, client_secret)', () => {
     const value = 'Xy9P3kMNBq2VtRZ7'; // high-entropy
     const variants = [
@@ -274,6 +536,61 @@ describe('scanSecretsRegex — generic assignment + entropy', () => {
       `auth_token = "${value}"`,
       `access_token = "${value}"`,
       `client_secret = "${value}"`,
+    ];
+    for (const v of variants) {
+      const findings = scanSecretsRegex(file(buildPatch([v])));
+      const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+      expect(api).withContext(`variant "${v}" should match`).toBeTruthy();
+    }
+  });
+
+  it('detects quoted secret values containing a slash [W15-A5-6]', () => {
+    // The value charset used to omit `/` (and `,;:=~|`), so a quoted secret
+    // with a slash could never match the generic-assignment pattern.
+    const findings = scanSecretsRegex(
+      file(buildPatch(['api_key = "AbCdEfGh/IjKlMnOpQrSt"'])),
+    );
+    const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+    expect(api).withContext('slash-containing secret should match').toBeTruthy();
+  });
+
+  // ==================================================================
+  // W16-B3-6: the broadened value charset (W15-A5-6 added `,;:=~|/`) made
+  // URL VALUES match generic-assignment — `api_key = "https://…"` (entropy
+  // 3.95 ≥ 3.5) fired as a CRITICAL finding. URL-shaped values are
+  // configuration, not secrets: skip them.
+  // ==================================================================
+  it('does NOT flag URL values assigned to credential-like keys [W16-B3-6]', () => {
+    const lines = [
+      'api_key = "https://api.github.com/repos/foo"', // entropy 3.95 → was critical FP
+      'token = "https://xK9mQ2vT5wZ8.bLnM4pR7/sJu6W3yA1"', // entropy 5.01
+      'password = "http://Qz8Xc2Vb5Nm4/Lk9Jh7Gt6"', // entropy 4.46
+    ];
+    for (const line of lines) {
+      const findings = scanSecretsRegex(file(buildPatch([line])));
+      const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+      expect(api).withContext(`URL value must not be flagged: ${line}`).toBeUndefined();
+    }
+  });
+
+  it('still flags a real base64 secret containing slashes (A5-6 regression guard) [W16-B3-6]', () => {
+    const value = 'AbCdEfGh/IjKlMnOpQrSt'; // slash-bearing, NOT a URL
+    expect(shannonEntropy(value)).toBeGreaterThanOrEqual(3.5); // guard
+    const findings = scanSecretsRegex(file(buildPatch([`api_key = "${value}"`])));
+    const api = findings.find((f) => f.rule === 'regex:generic-assignment');
+    expect(api).withContext('non-URL slash-bearing secret must still match').toBeTruthy();
+  });
+
+  it('detects quoted secret values containing , ; : = ~ | [W15-A5-6]', () => {
+    // Each punctuation char newly added to the value charset, embedded in a
+    // high-entropy quoted value.
+    const variants = [
+      'api_key = "aB1,cD2,eF3,gH4,iJ5,kL6"', // ,
+      'api_key = "aB1;cD2;eF3;gH4;iJ5;kL6"', // ;
+      'api_key = "aB1:cD2:eF3:gH4:iJ5:kL6"', // :
+      'api_key = "aB1=cD2=eF3=gH4=iJ5=kL6"', // =
+      'api_key = "aB1~cD2~eF3~gH4~iJ5~kL6"', // ~
+      'api_key = "aB1|cD2|eF3|gH4|iJ5|kL6"', // |
     ];
     for (const v of variants) {
       const findings = scanSecretsRegex(file(buildPatch([v])));
@@ -447,7 +764,11 @@ describe('scanSecrets — gitleaks path (fake runBinary)', () => {
     const fakeRunBinary = vi.fn().mockResolvedValue(gitleaksJson);
     const fakeEnsureBinary = vi.fn().mockResolvedValue('/cache/gitleaks/gitleaks');
     const result = await scanSecrets(
-      { files: [], repoPath: '/repo', cacheDir: '/cache' },
+      {
+        files: [{ filename: 'src/auth.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+        cacheDir: '/cache',
+      },
       {
         ensureBinary: fakeEnsureBinary,
         runBinary: fakeRunBinary,
@@ -469,11 +790,206 @@ describe('scanSecrets — gitleaks path (fake runBinary)', () => {
     expect(args).toContain('--redact');
   });
 
+  it('drops gitleaks findings for files NOT in the PR changed set [W15-A5-1]', async () => {
+    // gitleaks scans repo HISTORY — a leak in a file this PR never touched
+    // must not surface as a finding on it.
+    const gitleaksJson = JSON.stringify([
+      {
+        RuleID: 'generic-api-key',
+        Description: 'Generic API Key',
+        Match: 'zzz',
+        Secret: 'zzz',
+        File: 'legacy/old.js',
+        StartLine: 12,
+      },
+    ]);
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: vi.fn().mockResolvedValue(gitleaksJson),
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('keeps gitleaks findings for files that ARE in the PR changed set [W15-A5-1]', async () => {
+    const gitleaksJson = JSON.stringify([
+      {
+        RuleID: 'aws-access-token',
+        Description: 'AWS',
+        Match: 'AKIAIOSFODNN7EXAMPLE',
+        Secret: 'AKIAIOSFODNN7EXAMPLE',
+        File: 'src/new.js',
+        StartLine: 5,
+      },
+    ]);
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/new.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: vi.fn().mockResolvedValue(gitleaksJson),
+        platform: 'linux',
+        arch: 'x64',
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/new.js',
+      line: 5,
+      rule: 'gitleaks:aws-access-token',
+    });
+  });
+
   it('returns regex fallback when gitleaks reports no findings (empty array)', async () => {
     const fakeRunBinary = vi.fn().mockResolvedValue('[]');
     const result = await scanSecrets(
       { files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }], repoPath: '/r' },
       { ensureBinary: vi.fn().mockResolvedValue('/p'), runBinary: fakeRunBinary },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toEqual([]);
+  });
+});
+
+// W16-B3-3: gitleaks 8.21.2 only writes a JSON report when `--report-path
+// <file>` is passed — WITHOUT it, stdout is empty even when leaks are present,
+// so parseGitleaksJson('') → [] and the scanner silently reported gitleaks
+// success with 0 findings (verified end-to-end with the real binary: AWS key +
+// GitHub PAT → 0 findings). The scanner must write to a temp report file, read
+// it back, and ALWAYS delete it (including on error).
+describe('scanSecrets — gitleaks --report-path temp file [W16-B3-3]', () => {
+  let tmpdir;
+  beforeAll(() => {
+    tmpdir = fs.mkdtempSync(nodePath.join(fs.realpathSync('/tmp'), 'gitleaks-test-'));
+  });
+  afterAll(() => {
+    try { fs.rmSync(tmpdir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const leakReport = (file) =>
+    JSON.stringify([
+      {
+        RuleID: 'aws-access-token',
+        Description: 'AWS',
+        Match: 'AKIAIOSFODNN7EXAMPLE',
+        Secret: 'AKIAIOSFODNN7EXAMPLE',
+        File: file,
+        StartLine: 42,
+      },
+    ]);
+
+  it('passes --report-path <tmpfile> and parses findings from the report FILE', async () => {
+    let reportPathSeen = null;
+    const fakeRunBinary = vi.fn().mockImplementation((_bin, args) => {
+      const idx = args.indexOf('--report-path');
+      reportPathSeen = idx >= 0 ? args[idx + 1] : null;
+      // REAL 8.21.2 behavior: the report goes to the FILE, stdout stays empty.
+      if (reportPathSeen) fs.writeFileSync(reportPathSeen, leakReport('src/auth.js'));
+      return Promise.resolve('');
+    });
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/auth.js', patch: buildPatch(['const x = 1;']) }],
+        repoPath: '/repo',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir, // inject the temp dir so cleanup is assertable
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(fakeRunBinary).toHaveBeenCalledOnce();
+    const args = fakeRunBinary.mock.calls[0][1];
+    const idx = args.indexOf('--report-path');
+    expect(idx).toBeGreaterThan(-1);
+    expect(typeof args[idx + 1]).toBe('string');
+    expect(nodePath.dirname(args[idx + 1])).toBe(tmpdir);
+    // The finding was parsed from the report file (stdout was empty).
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/auth.js',
+      line: 42,
+      rule: 'gitleaks:aws-access-token',
+    });
+    // The temp report file is deleted after the run.
+    expect(fs.existsSync(reportPathSeen)).toBe(false);
+  });
+
+  it('deletes the temp report file even when runBinary throws', async () => {
+    let reportPathSeen = null;
+    const fakeRunBinary = vi.fn().mockImplementation((_bin, args) => {
+      const idx = args.indexOf('--report-path');
+      reportPathSeen = idx >= 0 ? args[idx + 1] : null;
+      if (reportPathSeen) fs.writeFileSync(reportPathSeen, 'partial');
+      return Promise.reject(new Error('gitleaks crashed'));
+    });
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
+    );
+    expect(result.scanner).toBe('regex-fallback'); // error path unchanged
+    expect(fs.existsSync(reportPathSeen)).toBe(false); // temp file cleaned up
+  });
+
+  it('falls back to stdout parsing when the report file is missing/empty', async () => {
+    // Older/other gitleaks builds (and any environment where the file cannot
+    // be written/read) may still emit JSON on stdout — keep that path working.
+    const fakeRunBinary = vi.fn().mockImplementation(() => Promise.resolve(leakReport('src/x.js')));
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'src/x.js', patch: buildPatch(['const a = 1;']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
+    );
+    expect(result.scanner).toBe('gitleaks');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].rule).toBe('gitleaks:aws-access-token');
+  });
+
+  it('report file AND stdout both empty → 0 findings, scanner still gitleaks (exit-code semantics unchanged)', async () => {
+    const fakeRunBinary = vi.fn().mockResolvedValue('');
+    const result = await scanSecrets(
+      {
+        files: [{ filename: 'a.js', patch: buildPatch(['+const k = "AKIAIOSFODNN7EXAMPLE"']) }],
+        repoPath: '/r',
+      },
+      {
+        ensureBinary: vi.fn().mockResolvedValue('/p'),
+        runBinary: fakeRunBinary,
+        platform: 'linux',
+        arch: 'x64',
+        tmpdir: () => tmpdir,
+      },
     );
     expect(result.scanner).toBe('gitleaks');
     expect(result.findings).toEqual([]);

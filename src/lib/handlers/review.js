@@ -14,6 +14,7 @@
 import { postComment } from './_shared.js';
 import {
   getChangedFiles,
+  filterExcludedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
 import { buildStructuredReviewPrompt, wrapUntrusted } from '../prompt.js';
@@ -55,10 +56,26 @@ export function isUnsafePath(path) {
 /**
  * Build the focused single-file review USER prompt. Pure (exported for testing).
  *
+ * W16-B4-3: the patch is capped using the SAME resolution as the whole-PR
+ * path (MAX_WHOLE_PR_DIFF_CHARS default; `options.maxDiffChars` override
+ * where 0 = the config-level "unlimited" sentinel). Previously the patch was
+ * interpolated raw — a 3000-line file produced a ~104k-char prompt while the
+ * whole-PR path capped at 8000.
+ *
  * @param {{filename: string, status?: string, patch?: string}} file
+ * @param {{maxDiffChars?: number}} [options]
  * @returns {string}
  */
-export function buildFileReviewPrompt(file) {
+export function buildFileReviewPrompt(file, options = {}) {
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars >= 0
+      ? options.maxDiffChars
+      : MAX_WHOLE_PR_DIFF_CHARS;
+  let patch = file.patch || '(no textual diff available)';
+  // 0 = unlimited sentinel (config.js) — skip truncation, like the whole-PR path.
+  if (maxDiffChars > 0 && patch.length > maxDiffChars) {
+    patch = `${patch.slice(0, maxDiffChars)}\n… (diff truncated)`;
+  }
   return [
     'Please review the following file change from this pull request.',
     'Focus on concrete bugs, security issues, risky logic, and architecture',
@@ -67,7 +84,7 @@ export function buildFileReviewPrompt(file) {
     wrapUntrusted(
       `### ${file.filename} (${file.status || 'modified'})\n` +
         '```diff\n' +
-        `${file.patch || '(no textual diff available)'}\n` +
+        `${patch}\n` +
         '```',
       'file-diff',
     ),
@@ -107,25 +124,40 @@ export async function handleReviewCommand(
     // ---- specific-file path ----
     if (target !== '') {
       if (isUnsafePath(target)) {
-        await post(`> \`${target}\` is not a valid file path.`);
+        // W17-C3-1: the filename is attacker-controllable and is interpolated
+        // into a backtick code span — a backtick in the name would close the
+        // span early and let the rest render as live markdown (e.g. a phishing
+        // link) in the bot's trusted comment. Replace backticks with "'"
+        // (the W8-1 convention from findings.js).
+        await post(`> \`${target.replace(/`/g, "'")}\` is not a valid file path.`);
         return;
       }
       const match = (files || []).find((f) => f?.filename === target);
       if (!match) {
-        await post(`> File \`${target}\` is not part of this PR.`);
+        // W17-C3-1: backtick-safe filename (same convention as above).
+        await post(`> File \`${target.replace(/`/g, "'")}\` is not part of this PR.`);
         return;
       }
       const review = await callApi(
         config.apiKey,
         config.model,
-        buildFileReviewPrompt(match),
+        // W16-B4-3: thread config.maxDiffChars so the single-file path uses
+        // the same cap resolution as the whole-PR path below.
+        buildFileReviewPrompt(match, { maxDiffChars: config.maxDiffChars }),
       );
       await post(review);
       return;
     }
 
     // ---- whole-PR path ----
-    const patchable = filterPatchableFiles(files || []);
+    // W15-A8-8: apply the action-level EXCLUDE_PATTERNS before the patchable
+    // filter, mirroring the auto-review path in index.js — previously only
+    // filterPatchableFiles ran here, so lockfiles got reviewed despite the
+    // default excludes. (.zai.yml path_filters are merged into a repoConfig
+    // that is local to index.js run() and is not passed to comment handlers;
+    // action-level excludePatterns are the reachable, correct scope here.)
+    const notExcluded = filterExcludedFiles(files || [], config.excludePatterns);
+    const patchable = filterPatchableFiles(notExcluded);
     if (patchable.length === 0) {
       await post('> No textual changes to review in this PR.');
       return;

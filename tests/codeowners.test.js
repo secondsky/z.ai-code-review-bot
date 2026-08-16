@@ -15,6 +15,7 @@ import {
   formatSuggestedReviewersLine,
   pickAssignableReviewers,
 } from '../src/lib/codeowners.js';
+import { sanitizeModelOutput } from '../src/lib/sanitize-output.js';
 
 /* ------------------------------------------------------------------ *
  * parseCodeowners
@@ -591,5 +592,79 @@ describe('loadCodeowners — fail-soft returns []', () => {
     await expect(
       loadCodeowners({ octokit, context: makeContext() }, {}),
     ).resolves.toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W17-C3-2: owner token validation
+ *
+ * Owner tokens were kept iff startsWith('@') with no grammar check — a fork
+ * PR's CODEOWNERS could carry `@r[x](https://evil.phish)` (and an image
+ * beacon) into the "Suggested reviewers" line rendered in the trusted
+ * summary. Owner tokens must match a login / org-team shape
+ * (/^@[\w.-]+(?:\/[\w.-]+)?$/); invalid tokens are dropped at PARSE time
+ * (fail-soft: a line whose owners are all invalid just has no owners; the
+ * pattern still matches files).
+ * ------------------------------------------------------------------ */
+
+describe('parseCodeowners — W17-C3-2: owner token validation', () => {
+  it('drops a markdown-link injection token, keeps valid owners', () => {
+    const rules = parseCodeowners('*.js @alice @r[x](https://evil.phish/x)');
+    expect(rules).toEqual([{ pattern: '*.js', owners: ['@alice'] }]);
+  });
+
+  it('drops an image-beacon injection token', () => {
+    // No spaces: the whole beacon is ONE token starting with `@`.
+    const rules = parseCodeowners('src/ @r![beacon](https://evil.phish/i)');
+    expect(rules).toEqual([{ pattern: 'src/', owners: [] }]);
+  });
+
+  it('drops @weird!char (invalid handle grammar)', () => {
+    const rules = parseCodeowners('src/ @weird!char');
+    expect(rules).toEqual([{ pattern: 'src/', owners: [] }]);
+  });
+
+  it('a line whose owners are ALL invalid still yields the pattern (fail-soft)', () => {
+    const rules = parseCodeowners('*.js @r[x](https://evil.phish) @weird!char');
+    expect(rules).toEqual([{ pattern: '*.js', owners: [] }]);
+    // The pattern still matches files (it just has no owners — same shape as
+    // an intentionally unowned pattern).
+    const m = matchCodeowners(rules, ['a.js']);
+    expect(m.get('a.js')).toEqual([]);
+  });
+
+  it('keeps @org/team forms', () => {
+    const rules = parseCodeowners('docs/ @acme/docs-team');
+    expect(rules).toEqual([{ pattern: 'docs/', owners: ['@acme/docs-team'] }]);
+  });
+
+  it('keeps handles with dots, hyphens, and underscores', () => {
+    const rules = parseCodeowners('* @alice.dev @a-b_c @org/team-x.y');
+    expect(rules).toEqual([
+      { pattern: '*', owners: ['@alice.dev', '@a-b_c', '@org/team-x.y'] },
+    ]);
+  });
+
+  it('space-split tokens behave as before (whitespace splits; bare words dropped)', () => {
+    // `@bad token` splits at the whitespace: `@bad` is a well-formed handle
+    // and is kept; the bare word `token` (no @) is dropped as before.
+    const rules = parseCodeowners('src/ @bad token');
+    expect(rules).toEqual([{ pattern: 'src/', owners: ['@bad'] }]);
+  });
+});
+
+describe('W17-C3-2: suggested-reviewers line is injection-free end to end', () => {
+  it('a hostile CODEOWNERS produces a suggestion line with no live link markdown', () => {
+    const text =
+      '*.js @alice @r[x](https://evil.phish/x) @r2![beacon](https://evil.phish/i)';
+    const { suggestedReviewers } = suggestReviewers(
+      ['x.js'],
+      parseCodeowners(text),
+    );
+    const line = formatSuggestedReviewersLine(suggestedReviewers);
+    // Through the production sanitizer (postComment applies the same pass):
+    // no `](http` means no markdown link/image syntax can survive.
+    expect(sanitizeModelOutput(line)).not.toContain('](http');
+    expect(suggestedReviewers).toEqual(['@alice']);
   });
 });

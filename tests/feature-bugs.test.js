@@ -346,9 +346,13 @@ describe('US-059: ZAI_SCHEDULE_MAX_PRS honored above the default', () => {
       resolveReviewEvent: () => 'COMMENT',
       // NOTE: maxPrs intentionally NOT passed, mirroring src/index.js.
     });
-    // 25 PRs considered (reviewed=25 since all short-circuit to
-    // skipped-no-patchable which counts as ok). Previously the default maxPrs
-    // (10) silently clamped this to 10; this guards against that regression.
-    expect(result.reviewed).toBe(25);
+    // 25 PRs considered by the batch (none dropped by a phantom default cap of
+    // 10) — that is the regression this guards. W15-A6-3 update: all 25
+    // short-circuit to skipped-no-patchable (filterPatchableFiles → []), which
+    // now counts as SKIPPED (previously miscategorized as reviewed); the
+    // processed-count is preserved via result.skipped.
+    expect(result.skipped).toBe(25);
+    expect(result.reviewed).toBe(0);
+    expect(result.failed).toBe(0);
   });
 });

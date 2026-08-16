@@ -6,7 +6,11 @@
  * default read-only path and the opt-in label-application feature.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleImpactCommand, parseSeverity } from '../../src/lib/handlers/impact.js';
+import {
+  handleImpactCommand,
+  parseSeverity,
+  buildDiffContext,
+} from '../../src/lib/handlers/impact.js';
 
 function makeOctokit({
   files = [
@@ -260,6 +264,34 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
     expect(octokit.__calls.createComment).toHaveLength(1);
   });
 
+  // W18-D3-2: when the model's output is unparseable (parseSeverity → null),
+  // a previously applied managed label is now STALE — the new assessment
+  // disagrees with (or at least does not confirm) it. The label must be
+  // REMOVED (all managed severities) with nothing added. Before the fix,
+  // `if (!severity) return false;` returned before the removal loop, so a
+  // stale zai:high survived a run whose assessment couldn't be parsed.
+  it('W18-D3-2: null severity REMOVES existing managed labels and adds nothing', async () => {
+    const octokit = makeOctokit({
+      labels: [{ name: 'zai:high' }, { name: 'bug' }],
+    });
+    const callApi = vi.fn(async () => 'I cannot assess the impact of these changes.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    // The stale managed label was removed...
+    expect(octokit.__calls.removeLabel).toHaveLength(1);
+    expect(octokit.__calls.removeLabel[0].name).toBe('zai:high');
+    // ...nothing was added, and human labels ("bug") were untouched.
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+    // The assessment was still posted.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
   it('does NOT apply labels when impactLabels is false even with a clear severity', async () => {
     const octokit = makeOctokit();
     const callApi = vi.fn(async () => '🔴 critical');
@@ -315,6 +347,126 @@ describe('handleImpactCommand — ZAI_IMPACT_LABELS (opt-in label application)',
     const removed = octokit.__calls.removeLabel.map((c) => c.name);
     expect(removed).toEqual(['P0']);
     expect(octokit.__calls.addLabels[0].labels).toEqual(['P3']);
+  });
+
+  /* ---------- W19-E2-3: null severity never deletes human labels ---------- */
+
+  // W19-E2-3: the W18-D3-2 null-severity removal deleted labels under the
+  // CONFIGURED map — with a flat map (P0..P3), an unparseable assessment
+  // REMOVED a human triager's P2: destructive mutation of labels the bot
+  // can't prove it applied. On null severity, removal is restricted to the
+  // bot's default-managed `zai:` namespace ONLY; with a custom flat map
+  // nothing is removed and a warning explains why.
+  it('W19-E2-3: custom flat map + null severity + human P2 → NO removeLabel, warning logged', async () => {
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'P2' }] });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => 'I cannot assess the impact of these changes.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+    // The human triager's P2 is NEVER removed by an unparseable assessment…
+    expect(octokit.__calls.removeLabel).toHaveLength(0);
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+    // …and the decline is visible in the log.
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('assessment unparseable; leaving labels unchanged'),
+    );
+    // The assessment comment still posted.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+  });
+
+  it('W19-E2-3: default zai: map + null severity → zai:high removed, human P2 untouched (W18-D3-2 preserved)', async () => {
+    const octokit = makeOctokit({ labels: [{ name: 'zai:high' }, { name: 'P2' }] });
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => 'No severity keyword here.');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+    // The bot's own namespace is still cleaned up (stale zai:high removed)…
+    expect(octokit.__calls.removeLabel).toHaveLength(1);
+    expect(octokit.__calls.removeLabel[0].name).toBe('zai:high');
+    // …nothing added, and the human P2 label is untouched.
+    expect(octokit.__calls.addLabels).toHaveLength(0);
+  });
+
+  it('W19-E2-3: normal severity path unchanged for the flat map (add + remove managed)', async () => {
+    // Guard: the null-severity restriction must not weaken the NORMAL path —
+    // a parsed severity still swaps managed labels for a flat map.
+    const flatLabelMap = {
+      critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
+    };
+    const octokit = makeOctokit({ labels: [{ name: 'P3' }, { name: 'P2' }] });
+    const callApi = vi.fn(async () => '🔴 critical\nhuge blast radius');
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: flatLabelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+    const removed = octokit.__calls.removeLabel.map((c) => c.name).sort();
+    expect(removed).toEqual(['P2', 'P3']);
+    expect(octokit.__calls.addLabels[0].labels).toEqual(['P0']);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-2: fail-soft opt-in mutation
+ *
+ * The label application used to share the outer catch with callApi, so an
+ * issues.addLabels failure posted a FALSE "> ⚠️ Z.ai request failed." comment
+ * AFTER the assessment had already been posted (two comments, the second
+ * misleading). Per SECURITY.md's fail-soft write-surfaces contract, a
+ * mutation failure must only core.warning — the assessment comment remains
+ * the only comment.
+ * ------------------------------------------------------------------ */
+
+describe('handleImpactCommand — W15-A4-2: label-application failure is fail-soft', () => {
+  const labelMap = {
+    critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low',
+  };
+
+  it('addLabels rejects → exactly ONE comment (the assessment), no false "request failed"', async () => {
+    const octokit = makeOctokit();
+    octokit.rest.issues.addLabels = async () => {
+      throw new Error('403 Resource not accessible');
+    };
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => '🟡 medium\nassessment body');
+
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', impactLabels: true, impactLabelMap: labelMap },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+
+    // The assessment comment is the ONLY comment — no false error follow-up.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('assessment body');
+    expect(body).not.toContain('request failed');
+    // The mutation failure was logged as a warning (fail-soft write surface).
+    expect(core.warning).toHaveBeenCalled();
   });
 });
 
@@ -394,6 +546,35 @@ describe('parseSeverity — precedence (edge cases)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A4-3: the declared EMOJI is canonical
+ *
+ * The interleaved priority loop (🔴, critical, 🟠, high, …) let a stray
+ * higher-severity WORD override the declared emoji: '🟡 medium — not in the
+ * critical path' matched the word 'critical' first and produced the wrong
+ * zai:critical label. The prompt requests the emoji form, so all four emoji
+ * must be checked FIRST; word-forms are only a fallback when no emoji is on
+ * the first line.
+ * ------------------------------------------------------------------ */
+
+describe('parseSeverity — W15-A4-3: emoji takes precedence over stray words', () => {
+  it('declared emoji wins over a stray higher-severity word on the same line', () => {
+    expect(parseSeverity('🟡 medium — not in the critical path')).toBe('medium');
+    expect(parseSeverity('🟠 high — fixes a critical auth bug')).toBe('high');
+    expect(parseSeverity('🟢 low — avoid a critical-sounding false alarm')).toBe('low');
+  });
+
+  it('word-form still maps when NO emoji is on the first line', () => {
+    expect(parseSeverity('Critical issue in the auth flow')).toBe('critical');
+    expect(parseSeverity('low risk overall')).toBe('low');
+  });
+
+  it('negated words still do not match when no emoji is present', () => {
+    expect(parseSeverity('not critical')).toBeNull();
+    expect(parseSeverity('no high risks')).toBeNull();
+  });
+});
+
 describe('parseSeverity — case-insensitive matching (edge cases)', () => {
   it('"CRITICAL" (all caps) → "critical"', () => {
     expect(parseSeverity('CRITICAL')).toBe('critical');
@@ -405,5 +586,102 @@ describe('parseSeverity — case-insensitive matching (edge cases)', () => {
 
   it('"HiGh" (mixed case) → "high"', () => {
     expect(parseSeverity('HiGh')).toBe('high');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W15-A4-4 (impact copy): oversized entries are SKIPPED, not fatal.
+ * See tests/handlers/ask.test.js for the full rationale — impact.js carries
+ * an identical buildDiffContext.
+ * ------------------------------------------------------------------ */
+
+describe('buildDiffContext — W15-A4-4: oversized entries skipped, not fatal', () => {
+  it('big-first: later small entries still make it into the context', () => {
+    const files = [
+      { filename: 'big.js', patch: 'x'.repeat(9000) },
+      { filename: 'small.js', patch: '+tiny change' },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('small.js');
+    expect(context).toContain('+tiny change');
+  });
+
+  it('all entries oversized → budget-exceeded placeholder, not a false no-diffs claim', () => {
+    const files = [
+      { filename: 'big1.js', patch: 'x'.repeat(9000) },
+      { filename: 'big2.js', patch: 'y'.repeat(9000) },
+    ];
+    const context = buildDiffContext(files);
+    expect(context).toContain('budget');
+    expect(context).not.toContain('no textual diffs');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-4 (impact copy): excluded files dropped BEFORE the diff budget.
+ * impact.js carries an identical buildDiffContext; the same fix applies —
+ * filterExcludedFiles BEFORE filterPatchableFiles, mirroring review.js's
+ * W15-A8-8 fix. See tests/handlers/ask.test.js for the full rationale.
+ * ------------------------------------------------------------------ */
+
+const DEFAULT_EXCLUDES = [
+  '*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+];
+
+describe('buildDiffContext — W16-B4-4 (impact): excluded files dropped before the budget', () => {
+  const files = () => [
+    { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+    { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+  ];
+
+  it('default excludes: lockfile dropped, src/auth.js visible in the context', () => {
+    const context = buildDiffContext(files(), undefined, DEFAULT_EXCLUDES);
+    expect(context).toContain('src/auth.js');
+    expect(context).not.toContain('package-lock.json');
+  });
+
+  it('custom excludePatterns are respected', () => {
+    const context = buildDiffContext(files(), undefined, ['src/**']);
+    expect(context).toContain('package-lock.json');
+    expect(context).not.toContain('src/auth.js');
+  });
+
+  it('no excludes at all → all patchable files included (consistent with review.js)', () => {
+    const context = buildDiffContext(files());
+    expect(context).toContain('package-lock.json');
+    expect(context).toContain('src/auth.js');
+  });
+});
+
+describe('handleImpactCommand — W16-B4-4: threads config.excludePatterns', () => {
+  it('default excludes: prompt contains src/auth.js, NOT the lockfile', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: `+lock ${'x'.repeat(7900)}` },
+        { filename: 'src/auth.js', status: 'modified', patch: '+auth change' },
+      ],
+    });
+    const callApi = vi.fn(async () => '## Impact: 🟢 low\n...');
+
+    await handleImpactCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: DEFAULT_EXCLUDES,
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/auth.js');
+    expect(prompt).not.toContain('package-lock.json');
   });
 });

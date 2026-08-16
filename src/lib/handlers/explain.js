@@ -32,6 +32,16 @@ const MAX_WINDOW_CHARS = 16000;
 const RANGE_SEPARATORS = ['-', ':', '..'];
 
 /**
+ * W15-A4-6: binary-content marker. A binary file under the 1MB contents-API
+ * limit returns base64 that decodes to non-empty mojibake — U+FFFD
+ * replacement chars (invalid UTF-8 byte sequences) and/or C0 control bytes.
+ * Deliberately conservative: a SINGLE replacement char or a single C0
+ * control char (excluding the whitespace controls \t \n \r) marks the file
+ * as binary. Valid-UTF-8 text with accented/CJK characters never matches.
+ */
+const BINARY_CONTENT_RE = /\uFFFD|[\x00-\x08\x0E-\x1F]/;
+
+/**
  * Parse a range token into `{ start, end }`.
  *
  * Accepts `N-M`, `N:M`, `N..M`; a single `N` → `{ start: N, end: N }`.
@@ -112,6 +122,23 @@ export function extractLineWindow(content, start, end) {
     out.push(`${i}: ${line}`);
   }
   return out.join('\n');
+}
+
+/**
+ * W17-C3-1: render an attacker-controllable filename for a GUIDANCE comment.
+ * The guidance messages below interpolate the filename into a backtick code
+ * span; a filename containing a backtick (e.g. a`[x](https://phish)`b.js)
+ * closes the span early, so everything after it renders as LIVE markdown in
+ * the bot's trusted comment — the link survives sanitizeModelOutput (which
+ * neutralizes mentions/alerts, NOT links). Same convention as findings.js
+ * (W8-1): replace backticks with "'" (backslash escapes do not work inside
+ * CommonMark code spans).
+ *
+ * @param {string} file
+ * @returns {string}
+ */
+function displayFile(file) {
+  return String(file).replace(/`/g, "'");
 }
 
 /**
@@ -203,12 +230,17 @@ export async function handleExplainCommand(
   const pullNumber = context?.payload?.issue?.number;
 
   const { range, file } = parseExplainArgs(args);
-  if (!range) {
-    await post(USAGE_COMMENT);
-    return;
-  }
 
   try {
+    // W16-B4-2: this post (like every other in the handler) must be inside
+    // the try — it previously executed OUTSIDE it, so a transient 502 on this
+    // single createComment rejected the whole handler and failed the entire
+    // action (the router dispatches with no catch).
+    if (!range) {
+      await post(USAGE_COMMENT);
+      return;
+    }
+
     const files =
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
@@ -225,7 +257,8 @@ export async function handleExplainCommand(
         return;
       }
     } else if (!filenames.includes(target)) {
-      await post(`> File \`${target}\` is not part of this PR.`);
+      // W17-C3-1: backtick-safe filename (see displayFile).
+      await post(`> File \`${displayFile(target)}\` is not part of this PR.`);
       return;
     }
 
@@ -244,7 +277,8 @@ export async function handleExplainCommand(
     // entry, or a file too large for the API to return), post a guidance
     // comment instead of calling the API with an empty code window.
     if (!content || content.trim() === '') {
-      await post(`> No textual content available for \`${target}\`.`);
+      // W17-C3-1: backtick-safe filename (see displayFile).
+      await post(`> No textual content available for \`${displayFile(target)}\`.`);
       return;
     }
     // Clamp the requested range to a sane window so a `/zai explain 1-50000`
@@ -252,6 +286,35 @@ export async function handleExplainCommand(
     // visible range reported to the model reflects the clamp.
     const clampedEnd = Math.min(range.end, range.start + MAX_WINDOW_LINES - 1);
     let window = extractLineWindow(content, range.start, clampedEnd);
+    // W15-A4-1: CMD-12 only guarded whole-file emptiness. A range entirely
+    // past EOF on a non-empty file (e.g. 5000-5001 on a 5-line file) yields an
+    // EMPTY window here — sending that to the API invites the model to
+    // hallucinate the requested lines. Post guidance instead.
+    if (window.trim() === '') {
+      const lines = content.split('\n');
+      const lineCount =
+        lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+      await post(
+        // W17-C3-1: backtick-safe filename (see displayFile).
+        `> No lines in range ${range.start}-${range.end} — \`${displayFile(target)}\` has ${lineCount} line${lineCount === 1 ? '' : 's'}.`,
+      );
+      return;
+    }
+    // W15-A4-6 / W16-B4-1: a binary file UNDER the 1MB API limit decodes to
+    // non-empty mojibake (replacement chars / C0 controls) — post guidance,
+    // no callApi. The detector runs on the EXTRACTED WINDOW, not the whole
+    // file: previously a single legal control char anywhere in the file
+    // (e.g. \x01 on line 50 of a 100-line text fixture) disabled /zai explain
+    // for every clean range with a wrong "No textual content" message.
+    // Scoping to the window keeps clean ranges working while any window of a
+    // UTF-16 file (decoded as UTF-8 → NUL bytes) is still caught.
+    if (BINARY_CONTENT_RE.test(window)) {
+      await post(
+        // W17-C3-1: backtick-safe filename (see displayFile).
+        `> No textual content available for lines ${range.start}-${clampedEnd} of \`${displayFile(target)}\`.`,
+      );
+      return;
+    }
     if (window.length > MAX_WINDOW_CHARS) {
       window = window.slice(0, MAX_WINDOW_CHARS);
     }

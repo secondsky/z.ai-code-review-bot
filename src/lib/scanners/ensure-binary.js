@@ -322,10 +322,15 @@ export async function tarGzExtractor(bytes, destPath, deps = {}) {
 /**
  * Extract a `.zip` archive to destPath.
  *
- * Writes `bytes` to a temp archive, shells out to system `tar -xf` (bsdtar can
- * read zip; works on macOS, Linux with bsdtar, and Windows System32). On
- * Windows, falls back to `powershell Expand-Archive` if `tar` is unavailable
- * (older Windows images / custom runners).
+ * Writes `bytes` to a temp archive, then tries extractors in order until one
+ * succeeds:
+ *   - non-Windows: `tar -xf` (bsdtar reads zip on macOS; GNU tar — the default
+ *     on ubuntu-latest — CANNOT), then `unzip -o`, then `python3 -m zipfile`
+ *     (both are present on GitHub-hosted runners). [W15-A5-4]
+ *   - Windows: `tar -xf` (System32 bsdtar), then `powershell Expand-Archive`.
+ *
+ * Throws a single error listing every failed attempt only when ALL extractors
+ * fail.
  *
  * @param {Buffer} bytes
  * @param {string} destPath
@@ -344,37 +349,53 @@ export async function zipExtractor(bytes, destPath, deps = {}) {
 
   await writeFile(tmpArchive, bytes);
   await mkdir(extractDir);
-  try {
-    // `-xf` works for zip on bsdtar (macOS, Windows). On Linux, GNU tar ≥ 1.27
-    // also reads zip via libarchive fallback; if the runner has only classic
-    // GNU tar without libarchive, this throws and we fall through to Expand.
-    await runCommand('tar', ['-xf', tmpArchive, '-C', extractDir]);
-  } catch (tarErr) {
-    if (platform === 'win32') {
-      try {
-        // PowerShell Expand-Archive is universally available on Windows runners.
-        // Quoting: use single quotes around the path literals; PS handles spaces.
-        await runCommand('powershell.exe', [
-          '-NoProfile',
-          '-Command',
-          `Expand-Archive -LiteralPath '${tmpArchive}' -DestinationPath '${extractDir}' -Force`,
-        ]);
-      } catch (psErr) {
-        await fs.unlink(tmpArchive).catch(() => {});
-        await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
-        throw new Error(
-          `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
-            `Expand-Archive failed (${psErr?.message ?? String(psErr)})`,
-        );
-      }
-    } else {
-      await fs.unlink(tmpArchive).catch(() => {});
-      await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
-      throw new Error(
-        `zipExtractor: tar failed (${tarErr?.message ?? String(tarErr)}) and ` +
-          `no Expand-Archive fallback on platform=${platform}`,
-      );
+
+  // W15-A5-4: GNU tar (the default `tar` on ubuntu-latest) cannot read zip
+  // archives — only bsdtar can — so `tar -xf` alone made extraction ALWAYS
+  // fail on the default Linux runner and every run re-downloaded + re-failed.
+  // Ordered extractor attempts: first success wins; all-fail throws below.
+  /** @type {Array<[string, string[]]>} */
+  const attempts =
+    platform === 'win32'
+      ? [
+          ['tar', ['-xf', tmpArchive, '-C', extractDir]],
+          [
+            // PowerShell Expand-Archive is universally available on Windows
+            // runners. Quoting: single quotes around the path literals.
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `Expand-Archive -LiteralPath '${tmpArchive}' -DestinationPath '${extractDir}' -Force`,
+            ],
+          ],
+        ]
+      : [
+          ['tar', ['-xf', tmpArchive, '-C', extractDir]],
+          ['unzip', ['-o', tmpArchive, '-d', extractDir]],
+          ['python3', ['-m', 'zipfile', '-e', tmpArchive, `${extractDir}/`]],
+        ];
+
+  /** @type {string[]} */
+  const failures = [];
+  let succeeded = false;
+  for (const [cmd, args] of attempts) {
+    try {
+      await runCommand(cmd, args);
+      succeeded = true;
+      break;
+    } catch (err) {
+      failures.push(`${cmd}: ${err?.message ?? String(err)}`);
     }
+  }
+  if (!succeeded) {
+    // Best-effort cleanup before rethrowing.
+    await fs.unlink(tmpArchive).catch(() => {});
+    await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(
+      `zipExtractor: all extraction attempts failed on platform=${platform}: ` +
+        failures.join('; '),
+    );
   }
 
   // Best-effort cleanup of the temp archive.

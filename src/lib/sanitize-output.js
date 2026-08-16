@@ -38,6 +38,18 @@ export const MAX_OUTPUT_CHARS = 16000;
 const TRUNCATION_MARKER = '\n\n> …(output truncated by Z.ai safety filter)';
 
 /**
+ * W16-B1-6: a trailing (possibly PARTIAL) truncation-marker remnant. Matches
+ * the tail end of TRUNCATION_MARKER — from its `\n> …(output truncat` lead-in
+ * through an optional unterminated tail — anchored at end-of-string. Used to
+ * strip a previous application's marker before a fresh one is appended so
+ * that re-sanitizing already-truncated output is idempotent (the production
+ * fallback path sanitizes twice). The `[^)]*\)?` payload tolerates a slice
+ * that cut the marker mid-text (e.g. after `(output truncat`), and it stops
+ * at the first `)` just like the marker itself.
+ */
+const TRUNCATION_MARKER_TAIL_RE = /\n?> ?…\(output truncat[^)]*\)?\s*$/u;
+
+/**
  * GitHub alert types that render as official callout banners. Matching is
  * case-insensitive (GitHub accepts any casing).
  */
@@ -49,7 +61,9 @@ const ALERT_TYPES = ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'];
 const ALERT_RE = new RegExp(
   // An optional blockquote prefix (one or more `>`), then the [!TYPE] marker.
   // We anchor on start-of-line so a quoted `[!NOTE]` mid-paragraph is unaffected.
-  String.raw`(^|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
+  // W17-C1-2: CommonMark treats a lone `\r` as a line ending — the boundary
+  // now covers CRLF, CR, and LF so a forged banner after any of them matches.
+  String.raw`(^|\r\n|\r|\n)(\s*>+\s*)\[!(${ALERT_TYPES.join('|')})\]`,
   'gi',
 );
 
@@ -90,7 +104,13 @@ const ALERT_RE = new RegExp(
 const MENTION_RE = /(^|[^\w`\\])@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)|(`)@([A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9_-]+)?)/g;
 
 function neutralizeMentionsOutsideCode(text) {
-  const lines = text.split('\n');
+  // W17-C1-2: CommonMark treats a lone `\r` (U+000D) as a line ending, but the
+  // split below only recognized `\n` — a forged `> [!WARNING]` or an @mention
+  // on a `\r`-delimited "line" was never at line-start for the per-line
+  // regexes and survived (GitHub happily rendered the banner). Normalize ALL
+  // line endings (\r\n and lone \r → \n) at entry; the joined output then
+  // carries canonical \n line endings only.
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
   let inFence = false; // ``` fence state, tracked across lines
   // Index in `out` of the most recent OPENING fence line, or -1 when the last
   // seen fence was properly closed. If the loop ends with inFence === true
@@ -236,10 +256,17 @@ function neutralizeAlerts(text) {
 function stripForgedHashBlocks(text) {
   // Drop any HTML comment containing a `zai-` prefix. Apply globally (not line-
   // anchored) so a mid-line forgery like `text <!-- zai-sha:x --> more` is also
-  // stripped (W2-SEC-2A). `[^>]*` is sufficient here: HTML comment bodies do not
-  // contain `>` in practice, and we are sanitizing untrusted model output, not
-  // parsing arbitrary HTML.
-  return text.replace(/<!--\s*zai-[^>]*-->/g, '');
+  // stripped (W2-SEC-2A).
+  // W15-A3-3: the payload class used to be `[^>]*`, which stops at ANY `>` —
+  // so a forged marker like `<!-- zai-hashes:HEX,> -->` survived sanitization
+  // and was later parsed as a TRUSTED prior-hash block (suppressing findings).
+  // The parsers on the reading side (parseFindingsHashBlock, hasReviewForSha)
+  // match non-greedily up to the nearest `-->`, tolerating `>` and newlines in
+  // the payload; the stripper must be at least as tolerant. `[\s\S]*?` matches
+  // any char (including newlines) non-greedily up to the CLOSEST `-->`, and
+  // still leaves non-`zai-` HTML comments (which must start with `zai-` right
+  // after `<!--\s*`) untouched.
+  return text.replace(/<!--\s*zai-[\s\S]*?-->/g, '');
 }
 
 /**
@@ -274,7 +301,25 @@ export function sanitizeModelOutput(text, options = {}) {
 
   // 2. Length cap. Compare on the post-sanitization length.
   if (out.length > maxChars) {
-    out = out.slice(0, maxChars) + TRUNCATION_MARKER;
+    // W15-A3-9: slice() cuts on UTF-16 code units. If unit maxChars-1 is the
+    // HIGH half of a surrogate pair, the kept prefix would end with a lone
+    // surrogate (rendered as U+FFFD garbage in the posted comment). Back off
+    // one code unit so the boundary never splits a pair.
+    let end = maxChars;
+    const lastUnit = out.charCodeAt(maxChars - 1);
+    if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end = maxChars - 1;
+    // W16-B1-6: re-sanitizing an already-truncated output (the production
+    // fallback path double-sanitizes) must be idempotent. When the surrogate
+    // backoff shortened a previous pass's prefix to maxChars-1 units, this
+    // slice keeps a stray '\n' from the previous marker — and re-appending
+    // the marker then produced output DIFFERENT from the first application.
+    // Strip any pre-existing (possibly partial) marker remnant plus trailing
+    // whitespace before appending a fresh marker.
+    out =
+      out
+        .slice(0, end)
+        .replace(TRUNCATION_MARKER_TAIL_RE, '')
+        .replace(/\s+$/, '') + TRUNCATION_MARKER;
   }
 
   return out;

@@ -17,6 +17,7 @@ import { postComment } from './_shared.js';
 import { wrapUntrusted } from '../prompt.js';
 import {
   getChangedFiles,
+  filterExcludedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
 
@@ -78,24 +79,27 @@ export function parseSeverity(text) {
   );
   const cleaned = raw.replace(NEGATED_RE, 'neutral');
   const firstLine = cleaned.split('\n')[0];
-  // Check emoji + word forms in priority order (critical first).
-  for (const key of ['🔴', 'critical', '🟠', 'high', '🟡', 'medium', '🟢', 'low']) {
-    const mapped = SEVERITY_KEYS[key];
-    if (!mapped) continue;
-    if (/[\u{1F300}-\u{1FAFF}]/u.test(key)) {
-      // Emoji keys have no word boundaries; use includes. W5-7: restrict to
-      // the FIRST line (where the prompt puts the level), consistent with the
-      // word-form match below. Previously `raw.includes(key)` scanned the whole
-      // body, so a 🔴 appearing in the rationale overrode the declared level.
-      if (firstLine.includes(key)) return mapped;
-    } else {
-      // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
-      // so "highlighted" → no match, "noncritical" → no match, and
-      // "high-availability" → no match (hyphen is NOT a word boundary here).
-      // Only match on the FIRST line (where the prompt puts the level).
-      const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
-      if (re.test(firstLine)) return mapped;
-    }
+  // W15-A4-3: the EMOJI forms are the canonical format the prompt requests
+  // (`🔴 critical`, `🟠 high`, …), so check ALL FOUR emoji first (in severity
+  // order). Only when no emoji is on the first line fall back to word-form
+  // matching. The previous interleaved loop (🔴, critical, 🟠, high, …) let a
+  // stray higher-severity WORD override the declared emoji: '🟡 medium — not
+  // in the critical path' matched the word 'critical' first → wrong
+  // zai:critical label.
+  for (const key of ['🔴', '🟠', '🟡', '🟢']) {
+    // Emoji keys have no word boundaries; use includes. W5-7: restrict to
+    // the FIRST line (where the prompt puts the level), consistent with the
+    // word-form match below. Previously `raw.includes(key)` scanned the whole
+    // body, so a 🔴 appearing in the rationale overrode the declared level.
+    if (firstLine.includes(key)) return SEVERITY_KEYS[key];
+  }
+  for (const key of ['critical', 'high', 'medium', 'low']) {
+    // Word keys: negative lookbehind/lookahead for word chars AND hyphens,
+    // so "highlighted" → no match, "noncritical" → no match, and
+    // "high-availability" → no match (hyphen is NOT a word boundary here).
+    // Only match on the FIRST line (where the prompt puts the level).
+    const re = new RegExp(`(?<![\\w-])${key}(?![\\w-])`, 'i');
+    if (re.test(firstLine)) return SEVERITY_KEYS[key];
   }
   return null;
 }
@@ -106,20 +110,48 @@ export function parseSeverity(text) {
  *
  * @param {Array<{filename: string, patch?: string}>} files
  * @param {number} [maxChars]
+ * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
+ *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
+ *   review.js: production config always carries the default exclude list).
  * @returns {string}
  */
-export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
-  const patchable = filterPatchableFiles(files || []);
+export function buildDiffContext(
+  files,
+  maxChars = MAX_CONTEXT_CHARS,
+  excludePatterns,
+) {
+  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
+  // filter, mirroring review.js's W15-A8-8 fix (identical copy of the fix in
+  // ask.js's buildDiffContext). Previously a default-excluded
+  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
+  // and ate the ENTIRE budget — real changes were invisible to /zai impact.
+  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
+  const patchable = filterPatchableFiles(notExcluded);
   if (patchable.length === 0) return '(no textual diffs available)';
   const lines = [];
   let used = 0;
+  let skippedOversized = false;
   for (const f of patchable) {
     const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (used + entry.length > maxChars) break;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
     lines.push(entry);
     used += entry.length + 2;
   }
-  if (lines.length === 0) return '(no textual diffs available)';
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
   return lines.join('\n\n');
 }
 
@@ -127,9 +159,10 @@ export function buildDiffContext(files, maxChars = MAX_CONTEXT_CHARS) {
  * Build the impact USER prompt. Pure (exported for testing).
  *
  * @param {Array<{filename: string, patch?: string}>} files
+ * @param {string[]} [excludePatterns]  Threaded to buildDiffContext (W16-B4-4).
  * @returns {string}
  */
-export function buildImpactPrompt(files) {
+export function buildImpactPrompt(files, excludePatterns) {
   return [
     'Assess the impact and risk of the following pull-request changes.',
     'Begin your response with a severity level on its own first line, using',
@@ -139,7 +172,10 @@ export function buildImpactPrompt(files) {
     'security/auth/data-loss concerns, and anything a reviewer should verify.',
     'Be concise and concrete; cite filenames where relevant.',
     '',
-    wrapUntrusted(`## Changes under review\n${buildDiffContext(files)}`, 'pr-changes'),
+    wrapUntrusted(
+      `## Changes under review\n${buildDiffContext(files, MAX_CONTEXT_CHARS, excludePatterns)}`,
+      'pr-changes',
+    ),
   ].join('\n');
 }
 
@@ -151,15 +187,27 @@ export function buildImpactPrompt(files) {
  * This works for any label-map shape — `zai:`-prefixed maps AND flat value
  * sets like `{ critical: 'P0', high: 'P1', ... }`.
  *
+ * W18-D3-2: when `severity` is null (model output unparseable), the managed
+ * labels from a PREVIOUS run are stale — the new assessment does not confirm
+ * them. They are still removed (all of them; there is no target), and nothing
+ * is added. Previously `if (!severity) return false;` bailed before the
+ * removal loop, leaving e.g. a stale zai:high on the PR forever.
+ *
+ * W19-E2-3: that null-severity removal is now restricted to the bot's
+ * DEFAULT-managed `zai:` namespace ONLY. With a custom flat map (P0..P3) the
+ * bot cannot prove it applied a label — removing a human triager's P2 on an
+ * unparseable assessment was destructive mutation of labels the bot never
+ * owned (the documented contract says human labels are never touched). Under
+ * a custom map nothing is removed and `core.warning` explains why; under the
+ * default `zai:` scheme the W18-D3-2 cleanup is preserved byte-for-byte.
+ *
  * Injected via deps so tests never touch the GitHub API.
  *
- * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap }`
- * @returns {Promise<boolean>} true if a label was applied, false if unmappable.
+ * @param {object} args `{ octokit, owner, repo, issueNumber, severity, labelMap, core? }`
+ * @returns {Promise<boolean>} true if a label was applied, false otherwise.
  */
-async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap }) {
-  if (!severity) return false;
-  const targetLabel = labelMap?.[severity];
-  if (!targetLabel) return false;
+async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, labelMap, core }) {
+  const targetLabel = severity ? labelMap?.[severity] : null;
 
   // Fetch current labels and remove any existing managed labels (idempotent).
   // A label is "managed" if it appears as a value in the labelMap; this is
@@ -170,16 +218,33 @@ async function defaultApplyLabel({ octokit, owner, repo, issueNumber, severity, 
     issue_number: issueNumber,
   });
   const managed = new Set(Object.values(labelMap || {}));
+  // W19-E2-3: with a null severity there is no target. Only `zai:`-prefixed
+  // managed labels (the bot's default-managed namespace) are removed; a
+  // managed label under a CUSTOM map may have been applied by a human triager
+  // and is left strictly alone (declined via core.warning below).
+  let declinedUnparsedManaged = false;
   for (const label of current) {
     const name = label?.name ?? '';
-    if (managed.has(name) && name !== targetLabel) {
-      try {
-        await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
-      } catch {
-        // A label may already be gone; ignore.
-      }
+    if (!managed.has(name) || name === targetLabel) continue;
+    if (severity == null && !name.startsWith('zai:')) {
+      declinedUnparsedManaged = true;
+      continue;
+    }
+    try {
+      await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
+    } catch {
+      // A label may already be gone; ignore.
     }
   }
+  if (declinedUnparsedManaged && core?.warning) {
+    core.warning(
+      'impact: assessment unparseable; leaving labels unchanged ' +
+        '(cannot prove the bot applied non-zai: labels)',
+    );
+  }
+  // Nothing to add when the severity is null (unparseable) or unmappable —
+  // the stale-label cleanup above is the whole job.
+  if (!targetLabel) return false;
   await octokit.rest.issues.addLabels({
     owner,
     repo,
@@ -220,21 +285,38 @@ export async function handleImpactCommand(
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
         : [];
-    const prompt = buildImpactPrompt(files || []);
+    const prompt = buildImpactPrompt(files || [], config.excludePatterns);
     const assessment = await callApi(config.apiKey, config.model, prompt);
     await post(assessment);
     // OPT-IN mutation: when ZAI_IMPACT_LABELS is true, apply a scoped zai:
     // severity label (removing prior zai: labels for idempotency).
+    // W15-A4-2: the label application gets its OWN fail-soft try/catch. It
+    // previously shared the outer catch with callApi, so an addLabels
+    // failure posted a FALSE "> ⚠️ Z.ai request failed." comment AFTER the
+    // assessment was already posted. Per SECURITY.md's fail-soft
+    // write-surfaces contract, a mutation failure only core.warning's — the
+    // assessment comment stays the only comment.
     if (config.impactLabels && typeof pullNumber === 'number') {
-      const severity = parseSeverity(assessment);
-      await applyLabel({
-        octokit,
-        owner,
-        repo,
-        issueNumber: pullNumber,
-        severity,
-        labelMap: config.impactLabelMap,
-      });
+      try {
+        const severity = parseSeverity(assessment);
+        await applyLabel({
+          octokit,
+          owner,
+          repo,
+          issueNumber: pullNumber,
+          severity,
+          labelMap: config.impactLabelMap,
+          // W19-E2-3: the default applyLabel warns when an unparseable
+          // assessment declines to touch custom-map labels.
+          core,
+        });
+      } catch (mutationError) {
+        if (core?.warning) {
+          core.warning(
+            `impact label application failed: ${mutationError?.message ?? mutationError}`,
+          );
+        }
+      }
     }
   } catch (error) {
     if (core?.warning) {

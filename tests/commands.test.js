@@ -173,6 +173,39 @@ describe('parseCommand — error paths', () => {
     });
   });
 
+  // W15-A4-7: a prefix must be followed by a token boundary (whitespace or
+  // end-of-string). Without it, '/zai-botask hi' matched the '/zai-bot'
+  // prefix and parsed as command 'ask' with args 'hi' — a comment about a
+  // different tool ("zai-botask") would trigger a Z.ai command run.
+  it('W15-A4-7: returns NOT_A_COMMAND when a word runs on after the prefix', () => {
+    expect(parseCommand('/zaihelp')).toEqual({
+      command: null,
+      args: null,
+      raw: '/zaihelp',
+      error: 'NOT_A_COMMAND',
+    });
+    expect(parseCommand('/zai-botask hi')).toEqual({
+      command: null,
+      args: null,
+      raw: '/zai-botask hi',
+      error: 'NOT_A_COMMAND',
+    });
+    expect(parseCommand('@zai-botreview x')).toEqual({
+      command: null,
+      args: null,
+      raw: '@zai-botreview x',
+      error: 'NOT_A_COMMAND',
+    });
+  });
+
+  it('W15-A4-7: a bare prefix at end-of-string still parses (then MALFORMED_INPUT)', () => {
+    // The boundary accepts end-of-string, so '/zai' alone remains a
+    // recognized-but-empty invocation → MALFORMED_INPUT (help hint path),
+    // exactly as before.
+    expect(parseCommand('/zai').error).toBe('MALFORMED_INPUT');
+    expect(parseCommand('/zai-bot').error).toBe('MALFORMED_INPUT');
+  });
+
   it('returns MALFORMED_INPUT when the prefix has no command', () => {
     expect(parseCommand('/zai')).toEqual({
       command: null,

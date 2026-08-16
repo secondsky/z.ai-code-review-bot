@@ -66,7 +66,8 @@ export function buildStatusDescription({
  * Post a commit status to the PR's head SHA.
  *
  * Calls `octokit.rest.repos.createCommitStatus` with the `STATUS_CONTEXT`
- * label. Owner/repo come from `context.repo`; the SHA comes from `opts.sha`
+ * label (or `opts.reviewerName` when provided — W15-A8-7). Owner/repo come
+ * from `context.repo`; the SHA comes from `opts.sha`
  * (the caller passes `context.payload.pull_request.head.sha`).
  *
  * FAIL-SOFT: if the API call throws (e.g. missing `statuses: write` scope),
@@ -82,11 +83,23 @@ export function buildStatusDescription({
  * @param {'pending'|'success'|'failure'|'error'} opts.state  Commit-status state.
  * @param {string} opts.description Short human message (truncated to 140 chars).
  * @param {string} [opts.targetUrl] Optional link (e.g. the workflow run URL).
+ * @param {string} [opts.reviewerName] Optional custom status `context` label
+ *   (from ZAI_REVIEWER_NAME); falls back to {@link STATUS_CONTEXT} when absent
+ *   or empty so the default checks-tab label is unchanged (W15-A8-7).
  * @param {{ core?: { warning?: (m: string) => void } }} [deps]  Optional core-like logger.
  * @returns {Promise<boolean>} true on success, false on failure/no-op (fail-soft).
  */
 export async function setReviewStatus(opts, deps = {}) {
-  const { octokit, context, sha, state, description, targetUrl } = opts || {};
+  const { octokit, context, sha, state, description, targetUrl, reviewerName } =
+    opts || {};
+
+  // W15-A8-7: custom reviewer branding (ZAI_REVIEWER_NAME) must reach the
+  // checks tab. Only a non-empty string overrides the default label, so the
+  // default behavior is byte-identical.
+  const statusContext =
+    typeof reviewerName === 'string' && reviewerName.trim() !== ''
+      ? reviewerName
+      : STATUS_CONTEXT;
 
   // CFG-7: validate the state enum BEFORE any other check so an invalid state
   // short-circuits without hitting the API. GitHub only accepts these four.
@@ -108,7 +121,7 @@ export async function setReviewStatus(opts, deps = {}) {
       sha,
       state,
       description: truncateDescription(description),
-      context: STATUS_CONTEXT,
+      context: statusContext,
       target_url: targetUrl,
     });
     return true;

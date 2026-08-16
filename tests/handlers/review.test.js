@@ -9,7 +9,11 @@
  *  - callApi rejects → short error comment, no throw.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { handleReviewCommand, isUnsafePath } from '../../src/lib/handlers/review.js';
+import {
+  handleReviewCommand,
+  isUnsafePath,
+  buildFileReviewPrompt,
+} from '../../src/lib/handlers/review.js';
 
 function makeOctokit({
   files = [
@@ -116,6 +120,94 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A8-8: whole-PR branch honors EXCLUDE_PATTERNS
+ *
+ * The whole-PR `/zai review` branch applied only filterPatchableFiles and
+ * ignored config.excludePatterns — a lockfile-only PR got reviewed despite
+ * the default excludes, while the auto-review path drops those files. The
+ * handler must filter excluded files BEFORE filtering patchable ones
+ * (mirroring index.js). NOTE: .zai.yml path_filters are merged into the
+ * repoConfig locally inside index.js run() and are not reachable from the
+ * comment-handler dispatch; action-level excludePatterns are applied here.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W15-A8-8: excludes applied on whole-PR path', () => {
+  it('lockfile-only PR with default excludes → "No textual changes" note, no callApi', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+    });
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      // The default EXCLUDE_PATTERNS from config.js.
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(octokit.__calls.createComment[0].body).toContain('No textual changes');
+  });
+
+  it('a non-excluded .js file is still reviewed when excludes are set', async () => {
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+        { filename: 'src/a.js', status: 'modified', patch: '+a' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        maxDiffChars: 0,
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('src/a.js');
+    expect(prompt).not.toContain('package-lock.json');
+    expect(octokit.__calls.createComment[0].body).toContain('REVIEW');
+  });
+
+  it('no excludePatterns configured → behavior unchanged (all patchable reviewed)', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'package-lock.json', status: 'modified', patch: '+lockdata' }],
+    });
+    const callApi = vi.fn(async () => 'REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('package-lock.json');
+  });
+});
+
 describe('handleReviewCommand — specific file', () => {
   it('valid file → reviews only that file', async () => {
     const octokit = makeOctokit();
@@ -184,6 +276,102 @@ describe('handleReviewCommand — specific file', () => {
       callApi,
     });
     expect(callApi).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W16-B4-3: the single-file path caps the patch
+ *
+ * buildFileReviewPrompt interpolated file.patch raw with NO cap — a
+ * 3000-line file produced a ~104k-char prompt, unlike the whole-PR path
+ * (MAX_WHOLE_PR_DIFF_CHARS = 8000, overridable by config.maxDiffChars
+ * where 0 = unlimited). The single-file patch must be capped with the SAME
+ * resolution and marked when truncated.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W16-B4-3: single-file diff cap', () => {
+  const longPatch = () =>
+    Array.from({ length: 3000 }, (_, i) => `+line ${i + 1}`).join('\n');
+
+  it('buildFileReviewPrompt: a 3000-line patch is truncated with a marker (default 8000 cap)', () => {
+    const prompt = buildFileReviewPrompt({
+      filename: 'src/big.js',
+      status: 'modified',
+      patch: longPatch(),
+    });
+    expect(prompt).toContain('diff truncated');
+    // The tail of the raw patch is NOT present (only the capped prefix is).
+    expect(prompt).not.toContain('line 3000');
+    expect(prompt.length).toBeLessThan(10000);
+  });
+
+  it('buildFileReviewPrompt: a small patch is included unchanged (no marker)', () => {
+    const prompt = buildFileReviewPrompt({
+      filename: 'src/a.js',
+      status: 'modified',
+      patch: '+a\n+b',
+    });
+    expect(prompt).toContain('+a\n+b');
+    expect(prompt).not.toContain('diff truncated');
+  });
+
+  it('buildFileReviewPrompt: maxDiffChars 0 (unlimited sentinel) disables truncation, mirroring the whole-PR path', () => {
+    const prompt = buildFileReviewPrompt(
+      { filename: 'src/big.js', status: 'modified', patch: longPatch() },
+      { maxDiffChars: 0 },
+    );
+    expect(prompt).toContain('line 3000');
+    expect(prompt).not.toContain('diff truncated');
+  });
+
+  it('handler: explicit-file review of a huge patch is capped via the same config resolution', async () => {
+    const octokit = makeOctokit({
+      files: [{ filename: 'src/big.js', status: 'modified', patch: longPatch() }],
+    });
+    const callApi = vi.fn(async () => 'FILE-REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: 'src/big.js',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    const prompt = callApi.mock.calls[0][2];
+    expect(prompt).toContain('diff truncated');
+    expect(prompt).not.toContain('line 3000');
+  });
+
+  it('handler: explicit-file review of a default-excluded file still reviews it (intended)', async () => {
+    // Excludes only apply to the whole-PR/auto paths; an EXPLICIT
+    // `/zai review package-lock.json` must keep working.
+    const octokit = makeOctokit({
+      files: [
+        { filename: 'package-lock.json', status: 'modified', patch: '+lockdata' },
+      ],
+    });
+    const callApi = vi.fn(async () => 'FILE-REVIEW');
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: {
+        apiKey: 'k',
+        model: 'm',
+        excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+      },
+      commenter: { login: 'a' },
+      args: 'package-lock.json',
+      callApi,
+    });
+
+    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callApi.mock.calls[0][2]).toContain('package-lock.json');
+    expect(callApi.mock.calls[0][2]).toContain('+lockdata');
+    expect(octokit.__calls.createComment[0].body).toContain('FILE-REVIEW');
   });
 });
 
@@ -279,5 +467,84 @@ describe('isUnsafePath — null byte & empty input (edge cases)', () => {
     expect(isUnsafePath(undefined)).toBe(true);
     expect(isUnsafePath(null)).toBe(true);
     expect(isUnsafePath(42)).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * W17-C3-1: backtick-safe filenames in guidance comments
+ *
+ * Both guidance messages interpolate the attacker-controllable FILENAME into
+ * a backtick code span. A fork PR filename containing a backtick
+ * (a`[x](https://phish)`b.js) closes the span early, so the link renders as
+ * LIVE markdown in the bot's trusted comment (sanitizeModelOutput does not
+ * neutralize links). Fix: the W8-1 convention from findings.js — replace
+ * backticks with "'" before interpolating, at BOTH message sites.
+ * ------------------------------------------------------------------ */
+
+describe('handleReviewCommand — W17-C3-1: backtick-safe filenames in guidance comments', () => {
+  const EVIL = 'a`[x](https://phish)`b.js';
+
+  const backticksOnFileLine = (body) => {
+    const line = body.split('\n').find((l) => l.includes('https://phish'));
+    return line ? (line.match(/`/g) || []).length : -1;
+  };
+
+  it('not-part-of-PR guidance: the link payload stays inside the code span', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: EVIL,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('not part of this PR');
+    expect(body).toContain(`\`a'[x](https://phish)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('not-a-valid-file-path guidance: the link payload stays inside the code span', async () => {
+    // Traversal prefix makes isUnsafePath fire; the backtick+link tail must
+    // still not close the code span early.
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: `../${EVIL}`,
+      callApi,
+    });
+
+    expect(callApi).not.toHaveBeenCalled();
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('not a valid file path');
+    expect(body).toContain(`\`../a'[x](https://phish)'b.js\``);
+    expect(backticksOnFileLine(body)).toBe(2);
+  });
+
+  it('benign filenames render unchanged (no substitution)', async () => {
+    const octokit = makeOctokit();
+    const callApi = vi.fn();
+
+    await handleReviewCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm' },
+      commenter: { login: 'a' },
+      args: 'src/missing.js',
+      callApi,
+    });
+
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('File `src/missing.js` is not part of this PR.');
   });
 });

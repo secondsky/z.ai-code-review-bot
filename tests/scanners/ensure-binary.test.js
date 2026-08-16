@@ -355,6 +355,8 @@ describe('pickExtractor', () => {
  * @param {string} [opts.platform]
  * @param {Error|null} [opts.tarError] - if set, the first tar call rejects
  * @param {Error|null} [opts.psError] - if set, the powershell fallback rejects
+ * @param {Record<string, Error>} [opts.commandErrors] - per-command rejection
+ *   map (e.g. `{ unzip: new Error('no unzip') }`), checked on every call
  * @returns {Object}
  */
 function fakeArchiveDeps(opts = {}) {
@@ -378,12 +380,13 @@ function fakeArchiveDeps(opts = {}) {
       if (cmd === 'tar') {
         tarCallCount++;
         if (opts.tarError && tarCallCount === 1) throw opts.tarError;
-        return { stdout: '', stderr: '' };
       }
       if (cmd === 'powershell.exe' || cmd === 'pwsh') {
         psCallCount++;
         if (opts.psError) throw opts.psError;
-        return { stdout: '', stderr: '' };
+      }
+      if (opts.commandErrors && opts.commandErrors[cmd]) {
+        throw opts.commandErrors[cmd];
       }
       return { stdout: '', stderr: '' };
     },
@@ -568,19 +571,85 @@ describe('zipExtractor', () => {
     });
     await expect(
       zipExtractor(Buffer.from('x'), '/d/gitleaks', deps),
-    ).rejects.toThrow(/Expand-Archive failed/);
+    ).rejects.toThrow(/all extraction attempts failed/);
     expect(deps.calls.rename).toHaveLength(0);
   });
 
-  it('throws (no fallback) when tar fails on non-Windows', async () => {
+  it('falls back to unzip when tar fails on non-Windows (GNU tar cannot read zip) [W15-A5-4]', async () => {
+    // ubuntu-latest ships GNU tar, which rejects zip archives — the old code
+    // had NO non-Windows fallback and ast-grep extraction always failed.
     const deps = fakeArchiveDeps({
       entries: ['ast-grep'],
       platform: 'linux',
-      tarError: new Error('tar: zip not supported'),
+      tarError: new Error('tar: This does not look like a tar archive'),
+    });
+    const destPath = '/cache/ast-grep/0.34.3/ast-grep';
+    const out = await zipExtractor(Buffer.from('x'), destPath, deps);
+
+    // Extraction succeeded via the unzip fallback and finalized normally.
+    expect(out).toBe(destPath);
+    expect(deps.calls.runCommand).toHaveLength(2);
+    expect(deps.calls.runCommand[0].cmd).toBe('tar');
+    expect(deps.calls.runCommand[1].cmd).toBe('unzip');
+    expect(deps.calls.runCommand[1].args[0]).toBe('-o');
+    expect(deps.calls.runCommand[1].args).toContain('-d');
+    // The archive + dir passed to unzip are the ones we wrote/created.
+    expect(deps.calls.runCommand[1].args[1]).toBe(deps.calls.writeFile[0].path);
+    expect(deps.calls.runCommand[1].args[3]).toBe(deps.calls.mkdir[0].path);
+    expect(deps.calls.rename[0].to).toBe(destPath);
+    expect(deps.calls.chmod[0]).toEqual({ path: destPath, mode: 0o755 });
+  });
+
+  it('falls back to python3 -m zipfile when both tar and unzip fail [W15-A5-4]', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['ast-grep'],
+      platform: 'linux',
+      commandErrors: {
+        tar: new Error('tar: not a tar archive'),
+        unzip: new Error('unzip: cannot find zipfile'),
+      },
+    });
+    const destPath = '/cache/ast-grep/0.34.3/ast-grep';
+    const out = await zipExtractor(Buffer.from('x'), destPath, deps);
+
+    expect(out).toBe(destPath);
+    const cmds = deps.calls.runCommand.map((c) => c.cmd);
+    expect(cmds).toEqual(['tar', 'unzip', 'python3']);
+    const pyArgs = deps.calls.runCommand[2].args;
+    expect(pyArgs).toEqual([
+      '-m', 'zipfile', '-e',
+      deps.calls.writeFile[0].path,
+      `${deps.calls.mkdir[0].path}/`,
+    ]);
+    expect(deps.calls.rename[0].to).toBe(destPath);
+  });
+
+  it('throws an error listing every failed attempt when tar, unzip AND python3 all fail [W15-A5-4]', async () => {
+    const deps = fakeArchiveDeps({
+      entries: ['ast-grep'],
+      platform: 'linux',
+      commandErrors: {
+        tar: new Error('tar: boom'),
+        unzip: new Error('unzip: boom'),
+        python3: new Error('python3: boom'),
+      },
     });
     await expect(
       zipExtractor(Buffer.from('x'), '/d/ast-grep', deps),
-    ).rejects.toThrow(/no Expand-Archive fallback on platform=linux/);
+    ).rejects.toThrow(/all extraction attempts failed/);
+    // The message lists each attempted extractor.
+    await expect(
+      zipExtractor(Buffer.from('x'), '/d/ast-grep', deps),
+    ).rejects.toThrow(/tar:.*unzip:.*python3:/s);
+    expect(deps.calls.rename).toHaveLength(0);
+    expect(deps.calls.chmod).toHaveLength(0);
+  });
+
+  it('still uses ONLY tar (no unzip/python3) when tar succeeds on non-Windows', async () => {
+    const deps = fakeArchiveDeps({ entries: ['ast-grep'], platform: 'linux' });
+    await zipExtractor(Buffer.from('x'), '/d/ast-grep', deps);
+    expect(deps.calls.runCommand).toHaveLength(1);
+    expect(deps.calls.runCommand[0].cmd).toBe('tar');
   });
 
   it('uses -xf (NOT -xzf) — zips are not gzip-compressed', async () => {

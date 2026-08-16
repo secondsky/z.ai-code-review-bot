@@ -108,3 +108,23 @@ export function parseAddedLines(patch) {
   }
   return out;
 }
+
+/**
+ * Build the set of changed-file filenames from a GitHub PR `files` array
+ * (each entry `{ filename, patch?, status?, ... }`). Used to scope
+ * whole-repo/whole-history binary-scanner output down to the PR's diff —
+ * binary findings in files the PR never touched must not surface.
+ * Pure (no I/O).
+ *
+ * @param {Array<{filename?: string}>} files
+ * @returns {Set<string>}
+ */
+export function changedFileNames(files) {
+  const set = new Set();
+  for (const f of Array.isArray(files) ? files : []) {
+    if (f && typeof f === 'object' && typeof f.filename === 'string' && f.filename) {
+      set.add(f.filename);
+    }
+  }
+  return set;
+}

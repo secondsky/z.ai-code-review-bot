@@ -236,19 +236,63 @@ export function formatEntry(entry) {
  * Pack entries into char+file-budgeted batches.
  *
  * Returns `{ entries, batches, metadata }`. Greedy packing: an entry is added
- * to the current batch unless doing so would exceed `maxBatchChars` OR push
+ * to the current batch unless doing so would exceed the char budget OR push
  * the distinct-file count over `maxFilesPerBatch`, in which case the current
  * batch is flushed first. A single oversized entry still gets its own batch.
+ *
+ * W15-A8-1: the per-batch char budget is `min(maxBatchChars, maxDiffChars)`
+ * when `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap
+ * against cost abuse from oversized PRs, but the prompt-side truncation (W6-6
+ * in buildStructuredReviewPrompt) is intentionally skipped whenever a batch
+ * envelope is present — post-hoc truncation would silently drop entries
+ * already counted in the batch metadata. Enforcing the cap HERE, at batch
+ * construction, keeps the cap effective on the batched auto-review path
+ * without breaking batch metadata. The oversized-single-entry guarantee is
+ * preserved with the clamped budget: an entry larger than the budget still
+ * forms its own batch.
+ *
+ * W16-B3-4: the per-batch clamp alone did NOT bound the TOTAL chars — a tiny
+ * maxDiffChars with many files produced one batch per file (N API calls,
+ * strictly worse than main) and the "hard cap against cost abuse" was still
+ * unenforced. When maxDiffChars > 0, the CUMULATIVE packed chars across ALL
+ * batches are capped: once the running total would exceed maxDiffChars, the
+ * entry and every entry after it are NOT reviewed (dropping trailing entries,
+ * mirroring the unbatched MAX_DIFF_CHARS semantics). One guard keeps the
+ * oversized-entry semantics bounded: when the FIRST entry of a (fresh, empty)
+ * batch exceeds only the REMAINING cumulative budget — and the budget is not
+ * yet exhausted — it is still included as a single-entry batch, but ONLY if
+ * its size fits the effective per-batch budget; an entry larger than even
+ * that is never rescued. The total can therefore overshoot maxDiffChars by at
+ * most one per-batch-budget-sized entry. Dropped entries are recorded in
+ * metadata as `skippedEntries` / `skippedFiles` (present only when a drop
+ * happened) so callers can surface the truncation. W17-C1-3: `skippedFiles`
+ * counts only files with ZERO reviewed entries — a partially-reviewed file
+ * (some chunks packed, some dropped) is not counted as skipped.
  */
 export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
+      ? options.maxDiffChars
+      : 0;
+  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
   let currentChars = 0;
   let currentFiles = new Set();
+  // W16-B3-4: cumulative packed chars across ALL batches + the drop record.
+  let cumulativeChars = 0;
+  let stopped = false;
+  /** @type {Array<object>} */
+  const skippedEntries = [];
+  // W17-C1-3: filenames with at least one entry actually packed into a
+  // batch. skippedFiles must count only files with ZERO reviewed entries —
+  // a multi-chunk file whose first chunk was packed but whose later chunk
+  // hit the cumulative cap is PARTIALLY reviewed, not skipped.
+  const packedFiles = new Set();
 
   const flush = () => {
     if (currentEntries.length > 0) {
@@ -261,19 +305,40 @@ export function createReviewBatches(files, options = {}) {
 
   for (const entry of entries) {
     const entryLen = formatEntry(entry).length;
+    if (stopped) {
+      skippedEntries.push(entry);
+      continue;
+    }
     const nextDistinctFiles = currentFiles.has(entry.filename)
       ? currentFiles.size
       : currentFiles.size + 1;
     if (
       currentEntries.length > 0 &&
-      (currentChars + entryLen > maxBatchChars ||
+      (currentChars + entryLen > charBudget ||
         nextDistinctFiles > maxFilesPerBatch)
     ) {
       flush();
     }
+    // W16-B3-4 cumulative cap (only when maxDiffChars > 0).
+    if (maxDiffChars > 0 && cumulativeChars + entryLen > maxDiffChars) {
+      const firstOfFreshBatch = currentEntries.length === 0;
+      const fitsPerBatchBudget = entryLen <= charBudget;
+      const budgetNotExhausted = cumulativeChars < maxDiffChars;
+      if (!(firstOfFreshBatch && fitsPerBatchBudget && budgetNotExhausted)) {
+        // Beyond the total cap and not rescuable as a bounded single-entry
+        // batch: this entry and everything after it are NOT reviewed.
+        stopped = true;
+        skippedEntries.push(entry);
+        continue;
+      }
+      // Single-entry tolerance: include it even though the cumulative total
+      // overshoots (by at most one per-batch-budget-sized entry).
+    }
     currentEntries.push(entry);
     currentChars += entryLen;
     currentFiles.add(entry.filename);
+    cumulativeChars += entryLen;
+    packedFiles.add(entry.filename);
   }
   flush();
 
@@ -296,6 +361,22 @@ export function createReviewBatches(files, options = {}) {
     splitFileCount,
     totalBatches: batches.length,
   };
+  // W16-B3-4: expose the cumulative-cap drop ONLY when it happened, so the
+  // field's presence is itself the truncation signal.
+  if (skippedEntries.length > 0) {
+    metadata.skippedEntries = skippedEntries.length;
+    // W17-C1-3: count only files with ZERO reviewed entries. The old count
+    // (`distinct filenames among dropped entries`) also counted partially-
+    // reviewed files — a multi-chunk file with chunk 1 packed and chunk 2
+    // dropped has dropped entries but WAS (partially) reviewed, and must not
+    // be reported as skipped.
+    const droppedFileNames = new Set(skippedEntries.map((e) => e.filename));
+    let fullySkipped = 0;
+    for (const name of droppedFileNames) {
+      if (!packedFiles.has(name)) fullySkipped += 1;
+    }
+    metadata.skippedFiles = fullySkipped;
+  }
 
   return { entries, batches, metadata };
 }
@@ -450,6 +531,22 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
       // review. Rethrowing here would propagate through runWithConcurrency and
       // cancel every other batch; returning an empty findings array lets the
       // caller still get results for the remaining batches.
+      // W19-E1-1: the drop is no longer SILENT. Count it on the out-param
+      // counter (threaded unchanged through the halving recursion via deps —
+      // halved halves ARE retried, so only this base case drops entries
+      // permanently) and warn, so runStructuredReview can surface
+      // skippedEntries instead of posting a bare "No issues found ✅".
+      if (deps.skipCounter && typeof deps.skipCounter === 'object') {
+        deps.skipCounter.entries =
+          (typeof deps.skipCounter.entries === 'number' ? deps.skipCounter.entries : 0) + 1;
+      }
+      if (core?.warning) {
+        core.warning(
+          `Context limit hit on batch ${state.batchNumber}: skipping entry ` +
+            `'${entries[0]?.filename ?? '(unknown)'}' (single entry still overflows ` +
+            `after halving); its content goes unreviewed.`,
+        );
+      }
       return [];
     }
     const mid = Math.ceil(entries.length / 2);
@@ -517,6 +614,11 @@ export async function runStructuredReview(files, config, deps = {}) {
     maxBatchChars: config.maxBatchChars || DEFAULTS.maxBatchChars,
     maxFilesPerBatch: config.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch,
     maxPatchChars: config.maxPatchChars || DEFAULTS.maxPatchChars,
+    // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
+    // W6-6 truncation is skipped whenever batched, so the cap is enforced by
+    // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
+    // inside createReviewBatches).
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
   };
 
   const batchState = {
@@ -532,6 +634,39 @@ export async function runStructuredReview(files, config, deps = {}) {
 
   const { batches, metadata: batchMetadata } = buildBatches(files, reviewConfig);
 
+  // W16-B3-4: surface the cumulative maxDiffChars drop (if any) on the result
+  // metadata, the same way totalFindingsBeforeCap/deterministicFindingsCount
+  // are exposed — index.js assembles its reviewMetadata from result.metadata
+  // and can render the skip note later without touching this module.
+  // W18-D2-3: each key is gated INDEPENDENTLY. The old single gate
+  // (`skippedFiles > 0 ? {skippedFiles, skippedEntries} : {}`) dropped the
+  // entries count whenever no file was skipped wholesale — a file with 2/15
+  // chunks reviewed surfaced NOTHING and callers posted a bare
+  // "No issues found ✅". skippedEntries>0 alone (pure partial drops) must
+  // still reach the result metadata.
+  const skippedMeta = {};
+  if (typeof batchMetadata.skippedFiles === 'number' && batchMetadata.skippedFiles > 0) {
+    skippedMeta.skippedFiles = batchMetadata.skippedFiles;
+  }
+  if (
+    typeof batchMetadata.skippedEntries === 'number' &&
+    batchMetadata.skippedEntries > 0
+  ) {
+    skippedMeta.skippedEntries = batchMetadata.skippedEntries;
+  }
+  if (core?.info && (skippedMeta.skippedFiles || skippedMeta.skippedEntries)) {
+    core.info(
+      `Structured review: maxDiffChars cap dropped ${skippedMeta.skippedFiles ?? 0} file(s) ` +
+        `(${skippedMeta.skippedEntries ?? 0} chunk(s) unreviewed).`,
+    );
+  }
+
+  // W19-E1-1: out-param counter threaded through executeStructuredBatch's
+  // halving recursion (via deps) so single-entry context-limit drops are
+  // COUNTED, not silently discarded. The counter object is shared across all
+  // batches of this run and merged into skippedMeta below.
+  const contextSkipCounter = { entries: 0 };
+
   // Bounded concurrent fan-out (Phase 6.1). Batches run with up to
   // `batchConcurrency` calls in flight at once. runWithConcurrency returns
   // results in INPUT order, so the downstream parse/merge/dedup stays
@@ -544,9 +679,22 @@ export async function runStructuredReview(files, config, deps = {}) {
     return executeBatch(
       batch,
       { ...batchState, batchNumber: i + 1, totalBatches },
-      { callApi, core },
+      { callApi, core, skipCounter: contextSkipCounter },
     );
   });
+
+  // W19-E1-1 → W20-F1-1: surface the context-drop count in a SEPARATE
+  // metadata key (`contextSkippedEntries`) so the note renderers in
+  // index.js / schedule.js can state the CORRECT cause. The W19-E1-1
+  // version summed it into skippedMeta.skippedEntries, which made both
+  // insertSkippedFilesNote copies render the hard-coded "(MAX_DIFF_CHARS
+  // cap)" cause for context drops — with the cap disabled that was the
+  // wrong cause and the wrong implied remedy (real remedies: smaller
+  // ZAI_MAX_PATCH_CHARS chunks or a larger-context model). Batch-cap drops
+  // (skippedEntries) and context drops stay DISTINCT counts.
+  if (contextSkipCounter.entries > 0) {
+    skippedMeta.contextSkippedEntries = contextSkipCounter.entries;
+  }
 
   /** @type {Record<string, unknown>[]} */
   const allFindings = [];
@@ -608,6 +756,7 @@ export async function runStructuredReview(files, config, deps = {}) {
       deterministicFindingsCount: deterministicFindings.length,
       batchMetadata: batchMeta,
       splitFileCount: batchMetadata.splitFileCount,
+      ...skippedMeta,
     },
   };
 }

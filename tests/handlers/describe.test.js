@@ -281,6 +281,46 @@ describe('handleDescribeCommand — H1/M3 sanitization of model output', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * W15-A4-2: fail-soft opt-in mutation
+ *
+ * The body upsert used to share the outer catch with callApi, so a
+ * pulls.update failure posted a FALSE "> ⚠️ Z.ai request failed." comment
+ * AFTER the description had already been posted (two comments, the second
+ * misleading). Per SECURITY.md's fail-soft write-surfaces contract, a
+ * mutation failure must only core.warning — the description comment remains
+ * the only comment.
+ * ------------------------------------------------------------------ */
+
+describe('handleDescribeCommand — W15-A4-2: body-upsert failure is fail-soft', () => {
+  it('pulls.update rejects → exactly ONE comment (the description), no false "request failed"', async () => {
+    const octokit = makeOctokit({ pr: { body: '' } });
+    octokit.rest.pulls.update = async () => {
+      throw new Error('422 Validation Failed');
+    };
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const callApi = vi.fn(async () => '## Overview\ndescription body');
+
+    await handleDescribeCommand({
+      octokit,
+      context: makeContext(),
+      config: { apiKey: 'k', model: 'm', describeWriteBody: true },
+      commenter: { login: 'a' },
+      args: '',
+      callApi,
+      core,
+    });
+
+    // The description comment is the ONLY comment — no false error follow-up.
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('description body');
+    expect(body).not.toContain('request failed');
+    // The mutation failure was logged as a warning (fail-soft write surface).
+    expect(core.warning).toHaveBeenCalled();
+  });
+});
+
 describe('handleDescribeCommand — error path', () => {
   it('callApi rejects → short error comment, no throw', async () => {
     const octokit = makeOctokit();
@@ -476,5 +516,77 @@ describe('upsertPrDescription — CMD-8: strip model-emitted markers', () => {
     const newBody = calls.update[0].body;
     // Only one start marker (the legitimate one we add).
     expect((newBody.match(/<!-- zai-description -->/g) || []).length).toBe(1);
+  });
+});
+
+describe('upsertPrDescription — W18-D3-3: no-op guard (byte-identical body)', () => {
+  // W18-D3-3: re-running with an UNCHANGED description reconstructs a
+  // byte-identical PR body. The previous code still called pulls.update,
+  // churning the PR's edit history on every re-run. The fix returns
+  // { updated: false } WITHOUT calling update when newBody === currentBody.
+  it('W18-D3-3: identical description → updatePr NOT called, { updated: false }', async () => {
+    const calls = { get: [], update: [] };
+    const currentBody =
+      'PRE\n<!-- zai-description -->\nSAME DESC\n<!-- /zai-description -->\nPOST';
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: currentBody } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    const result = await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'SAME DESC',
+    });
+
+    expect(result).toEqual({ updated: false });
+    expect(calls.update).toHaveLength(0);
+  });
+
+  it('W18-D3-3: changed description → updatePr called once, { updated: true }', async () => {
+    const calls = { get: [], update: [] };
+    const currentBody =
+      'PRE\n<!-- zai-description -->\nOLD DESC\n<!-- /zai-description -->\nPOST';
+    const octokit = {
+      rest: {
+        pulls: {
+          async get(params) {
+            calls.get.push(params);
+            return { data: { body: currentBody } };
+          },
+          async update(params) {
+            calls.update.push(params);
+            return { data: {} };
+          },
+        },
+      },
+    };
+
+    const result = await upsertPrDescription({
+      octokit,
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 1,
+      description: 'NEW DESC',
+    });
+
+    expect(result).toEqual({ updated: true });
+    expect(calls.update).toHaveLength(1);
+    expect(calls.update[0].body).toContain('NEW DESC');
+    // Human text outside the markers is preserved.
+    expect(calls.update[0].body).toContain('PRE');
+    expect(calls.update[0].body).toContain('POST');
   });
 });

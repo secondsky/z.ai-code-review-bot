@@ -130,14 +130,28 @@ export async function handleDescribeCommand(
     await post(safeDescription);
     // OPT-IN mutation: when ZAI_DESCRIBE_WRITE_BODY is true, upsert a marked
     // description block into the PR body. Only the marked block is mutated.
+    // W15-A4-2: the upsert gets its OWN fail-soft try/catch. It previously
+    // shared the outer catch with callApi, so a pulls.update failure posted a
+    // FALSE "> ⚠️ Z.ai request failed." comment AFTER the description was
+    // already posted. Per SECURITY.md's fail-soft write-surfaces contract, a
+    // mutation failure only core.warning's — the description comment stays
+    // the only comment.
     if (config.describeWriteBody && typeof pullNumber === 'number') {
-      await upsertDescription({
-        octokit,
-        owner,
-        repo,
-        pullNumber,
-        description: safeDescription,
-      });
+      try {
+        await upsertDescription({
+          octokit,
+          owner,
+          repo,
+          pullNumber,
+          description: safeDescription,
+        });
+      } catch (mutationError) {
+        if (core?.warning) {
+          core.warning(
+            `describe body upsert failed: ${mutationError?.message ?? mutationError}`,
+          );
+        }
+      }
     }
   } catch (error) {
     if (core?.warning) {

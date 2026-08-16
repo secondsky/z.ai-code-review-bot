@@ -115,6 +115,20 @@ describe('loadConfig — numeric validation (negatives/zero clamped to safe defa
   test('ZAI_MAX_BATCH_CHARS=0 falls back to default (prevents batch degeneracy)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '0' }).maxBatchChars).toBe(120000);
   });
+  // W18-D3-4: ZAI_MAX_BATCH_CHARS=1 (or any value below the 1000 floor) used
+  // to pass clampPositive(min=1), producing a degenerate one-batch-per-entry
+  // split (30 files → 30 API calls). Below-floor values now fall back to the
+  // 120000 default — the same below-min→default semantics clampPositive
+  // already applies to ZAI_TIMEOUT_MS (min 1000).
+  test('W18-D3-4: ZAI_MAX_BATCH_CHARS below the 1000 floor falls back to default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '1' }).maxBatchChars).toBe(120000);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '500' }).maxBatchChars).toBe(120000);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '999' }).maxBatchChars).toBe(120000);
+  });
+  test('W18-D3-4: ZAI_MAX_BATCH_CHARS at/above the floor passes through', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '1000' }).maxBatchChars).toBe(1000);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_BATCH_CHARS: '5000' }).maxBatchChars).toBe(5000);
+  });
   test('ZAI_MAX_FILES_PER_BATCH=0 falls back to default', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FILES_PER_BATCH: '0' }).maxFilesPerBatch).toBe(40);
   });

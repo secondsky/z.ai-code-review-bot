@@ -17,7 +17,8 @@
  */
 
 import os from 'node:os';
-import { parseAddedLines } from './_patch.js';
+import nodePath from 'node:path';
+import { parseAddedLines, changedFileNames } from './_patch.js';
 import { selectPlatformAsset, zipExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
@@ -197,6 +198,13 @@ export function astGrepPatternToRegex(pattern) {
   const startsWithIdentifier = /^[A-Za-z_][A-Za-z0-9_]*/.test(pattern);
   if (startsWithIdentifier) {
     translated = '\\b' + translated;
+    // W15-A5-7: a BARE-identifier pattern (letters/digits/underscore only —
+    // e.g. the TODO/FIXME rules) also needs a TRAILING boundary, otherwise
+    // `TODO` prefix-matches `TODOS` (same bug class metrics.js fixed with
+    // `\bTODO\b`).
+    if (/^[A-Za-z0-9_]+$/.test(pattern)) {
+      translated = translated + '\\b';
+    }
   }
   // ReDoS guard: a regex that begins with an unanchored `.*?` (e.g. the
   // sql-concat rule `$CONN.query("$$$" + $VAR)` → `.*?\.query(".*?" \+ .*?)`)
@@ -215,6 +223,38 @@ export function astGrepPatternToRegex(pattern) {
 }
 
 /**
+ * File-extension → ast-grep language-name map (lowercased extensions).
+ * js → js/mjs/cjs, ts → ts, jsx → jsx, tsx → tsx. Shared by the regex
+ * fallback's language filter and the binary path's needed-language
+ * computation.
+ *
+ * @type {Record<string, string>}
+ */
+const EXT_TO_LANG = {
+  js: 'js',
+  mjs: 'js',
+  cjs: 'js',
+  ts: 'ts',
+  jsx: 'jsx',
+  tsx: 'tsx',
+};
+
+/**
+ * Map a filename to its ast-grep language name via its extension, or `null`
+ * when the extension is unknown/absent. Pure (no I/O).
+ *
+ * @param {string} filename
+ * @returns {string | null}
+ */
+export function filenameToLanguage(filename) {
+  if (typeof filename !== 'string') return null;
+  const base = filename.split('/').pop() || filename;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return null;
+  return EXT_TO_LANG[base.slice(dot + 1).toLowerCase()] || null;
+}
+
+/**
  * Determine whether a filename matches a rule's language set.
  *
  * - `'*'` in `languages` → matches anything
@@ -229,20 +269,7 @@ export function astGrepPatternToRegex(pattern) {
 export function fileMatchesLanguages(filename, languages) {
   if (!Array.isArray(languages) || languages.length === 0) return true;
   if (languages.includes('*')) return true;
-  if (typeof filename !== 'string') return false;
-  const base = filename.split('/').pop() || filename;
-  const dot = base.lastIndexOf('.');
-  if (dot <= 0) return false;
-  const ext = base.slice(dot + 1).toLowerCase();
-  const extToLang = {
-    js: 'js',
-    mjs: 'js',
-    cjs: 'js',
-    ts: 'ts',
-    jsx: 'jsx',
-    tsx: 'tsx',
-  };
-  const lang = extToLang[ext];
+  const lang = filenameToLanguage(filename);
   return lang ? languages.includes(lang) : false;
 }
 
@@ -362,6 +389,49 @@ export const AST_GREP_SPEC = {
 };
 
 /**
+ * Normalize an ast-grep finding's `file` to the repo-RELATIVE, posix-separator
+ * form used by GitHub filenames (W16-B3-1).
+ *
+ * Production runs `ast-grep ... <ABSOLUTE repoPath>` (repoPath is
+ * process.cwd()), so the REAL binary emits ABSOLUTE paths in its JSON, while
+ * the PR's changed-file names are repo-relative. If the path is absolute (or
+ * sits under `source`), it is converted via path.relative(source, file) with
+ * backslashes normalized to '/'; an already-relative path is returned
+ * posix-normalized as-is.
+ *
+ * Pure (no I/O). Returns '' for bad input.
+ *
+ * @param {string} file
+ * @param {string} source - the absolute repo path ast-grep was run against
+ * @returns {string}
+ */
+export function normalizeFindingFilePath(file, source) {
+  if (typeof file !== 'string' || file.length === 0) return '';
+  const posixFile = file.replace(/\\/g, '/');
+  const isAbsolute =
+    nodePath.posix.isAbsolute(posixFile) ||
+    /^[a-zA-Z]:/.test(posixFile) ||
+    (typeof source === 'string' &&
+      source.length > 0 &&
+      (posixFile === source.replace(/\\/g, '/') ||
+        posixFile.startsWith(
+          (source.endsWith('/') ? source.slice(0, -1) : source).replace(/\\/g, '/') + '/',
+        )));
+  if (!isAbsolute) return posixFile;
+  if (typeof source !== 'string' || source.length === 0) return posixFile;
+  const rel = nodePath.relative(source, file);
+  // W17-C1-5: `rel.startsWith('..')` also rejected legitimate IN-REPO paths
+  // that merely START with '..' (e.g. '/repo/..hidden/x.js' → rel
+  // '..hidden/x.js'), returning the unmatchable absolute path so the finding
+  // was dropped by the changed-files filter. Only a true parent traversal —
+  // '..' itself or a '../' (platform-separator) prefix — is outside source.
+  if (!rel || rel === '..' || rel.startsWith('..' + nodePath.sep) || nodePath.isAbsolute(rel)) {
+    return posixFile;
+  }
+  return rel.replace(/\\/g, '/');
+}
+
+/**
  * Map one ast-grep JSON match to our normalized finding schema.
  *
  * ast-grep `--json` emits an array of objects with at least:
@@ -375,6 +445,12 @@ export const AST_GREP_SPEC = {
  *     "ruleId": "eval",           // present when scanning with a rule YAML
  *   }
  *
+ * W16-B3-2: the REAL ast-grep (0.34.3) emits `lines` as a STRING (the matched
+ * text) and the 0-based start line under `range.start.line`. The line is read
+ * from `range.start.line` (+1 → 1-based) first, falling back to the legacy
+ * numeric `lines.start` shape used by older fixtures, and null when neither
+ * exists.
+ *
  * @param {object} match
  * @param {Map<string, object>} [ruleIndex] - ruleId → rule object (for title/desc lookup)
  * @returns {Record<string, unknown> | null}
@@ -385,10 +461,22 @@ export function mapAstGrepFinding(match, ruleIndex) {
   const file = typeof m.file === 'string' ? m.file : '';
   if (!file) return null;
 
-  const startLine =
-    m.lines && Number.isFinite(m.lines.start) && m.lines.start >= 1
-      ? Math.floor(m.lines.start)
+  let startLine = null;
+  const rangeStartLine =
+    m.range &&
+    typeof m.range === 'object' &&
+    m.range.start &&
+    typeof m.range.start === 'object' &&
+    Number.isFinite(m.range.start.line)
+      ? m.range.start.line
       : null;
+  if (rangeStartLine !== null && rangeStartLine >= 0) {
+    // Real ast-grep: range.start.line is 0-based.
+    startLine = Math.floor(rangeStartLine) + 1;
+  } else if (m.lines && Number.isFinite(m.lines.start) && m.lines.start >= 1) {
+    // Legacy numeric shape (1-based in fixtures).
+    startLine = Math.floor(m.lines.start);
+  }
   const text = typeof m.text === 'string' ? m.text : '';
   const ruleId = typeof m.ruleId === 'string' && m.ruleId ? m.ruleId : 'match';
   const ruleObj = ruleIndex && ruleIndex.get(ruleId);
@@ -450,6 +538,16 @@ export function parseAstGrepJson(jsonText, ruleIndex) {
  * deps.runBinary); on ANY error warns via `deps.core.warning` and falls back
  * to `scanPatternsRegex(files, rules)`. NEVER throws.
  *
+ * Binary path scoping (W15):
+ *   - A5-1: ast-grep runs over the whole repo tree, so findings are filtered
+ *     down to the PR's changed files (`opts.files` filenames).
+ *   - A5-2: each rule runs once per language it declares that is ALSO needed
+ *     by a changed file's extension (js/ts/jsx/tsx) — not just `languages[0]`.
+ *   - A5-3: `*`-language rules (TODO/FIXME) cannot run via `ast-grep run`
+ *     (it needs a concrete --lang); their diff-scoped regex findings are
+ *     appended on the success path instead of being dropped.
+ *   - Findings are deduped by `${file}:${line}:${rule}` before returning.
+ *
  * @param {{ files: Array, repoPath: string, cacheDir?: string, rules?: Array }} opts
  * @param {{
  *   ensureBinary?: Function,
@@ -485,24 +583,46 @@ export async function scanPatterns(opts, deps = {}) {
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
+
+    // W15-A5-1: ast-grep runs over the WHOLE repo tree — scope reported
+    // findings down to the PR's changed files.
+    const changedFiles = changedFileNames(files);
+
+    // W15-A5-2: compute the set of languages actually needed from the
+    // extensions present in the changed files (js/mjs/cjs→js, ts→ts,
+    // jsx→jsx, tsx→tsx). A rule then runs once per language it declares
+    // that is needed — previously `rule.languages[0]` meant a js/ts/jsx/tsx
+    // rule only ever ran as `js`, so .ts/.tsx files were never scanned.
+    const neededLangs = new Set();
+    for (const f of files) {
+      const lang = filenameToLanguage(f && typeof f === 'object' ? f.filename : undefined);
+      if (lang) neededLangs.add(lang);
+    }
+
     // Run each rule via `ast-grep run --pattern <PATTERN> --json`. We do one
     // rule at a time to keep the JSON output shape simple (and to attribute
     // findings back to a specific rule via the ruleIndex lookup).
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
     const ruleIndex = new Map(rules.map((r) => [r.id, r]));
+    // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a
+    // specific language, so they cannot go through the binary path. Collect
+    // them here; their diff-scoped regex findings are APPENDED on success
+    // (previously the success path returned only binary findings and the
+    // TODO/FIXME rules silently vanished whenever ast-grep worked).
+    /** @type {object[]} */
+    const starRules = [];
     for (const rule of rules) {
       if (!rule || !rule.id || !rule.pattern) continue;
-      // `--lang '*'` rules (TODO/FIXME) — ast-grep `run` requires a specific
-      // language; skip `*`-language rules in the ast-grep path and rely on
-      // the regex fallback to catch them.
-      if (
-        Array.isArray(rule.languages) &&
-        rule.languages.length > 0 &&
-        !rule.languages.includes('*')
-      ) {
-        // Use the first language hint (ast-grep takes a single --lang).
-        const lang = rule.languages[0];
+      const languages = Array.isArray(rule.languages) ? rule.languages : [];
+      const runnableLanguages =
+        languages.length > 0 && !languages.includes('*') ? languages : null;
+      if (!runnableLanguages) {
+        starRules.push(rule);
+        continue;
+      }
+      for (const lang of runnableLanguages) {
+        if (!neededLangs.has(lang)) continue;
         const args = [
           'run',
           '--pattern', rule.pattern,
@@ -529,10 +649,38 @@ export async function scanPatterns(opts, deps = {}) {
         for (const f of enriched) allFindings.push(f);
       }
     }
-    if (core?.info) {
-      core.info(`ast-grep: ${allFindings.length} pattern finding(s).`);
+
+    // W15-A5-3: keep `*`-rule (TODO/FIXME) findings from the diff-scoped
+    // regex fallback on the binary success path.
+    if (starRules.length > 0) {
+      for (const f of scanPatternsRegex(files, starRules)) allFindings.push(f);
     }
-    return { findings: allFindings, scanner: 'ast-grep' };
+
+    // W15-A5-1/A5-2: scope to changed files + dedup by file:line:rule.
+    // W16-B3-1: the real binary emits ABSOLUTE paths (repoPath is
+    // process.cwd()); normalize each finding's file to the repo-relative
+    // posix form before matching it against the PR's GitHub filenames, and
+    // rewrite the finding to carry the normalized name so downstream
+    // inline-comment anchoring (which matches patch filenames) still works.
+    const seen = new Set();
+    /** @type {Record<string, unknown>[]} */
+    const scoped = [];
+    for (const f of allFindings) {
+      const rawFile = typeof f.file === 'string' ? f.file : '';
+      if (!rawFile) continue;
+      const normalized = normalizeFindingFilePath(rawFile, source);
+      if (!changedFiles.has(normalized) && !changedFiles.has(rawFile)) continue;
+      f.file = normalized;
+      const key = `${f.file}:${f.line}:${f.rule}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      scoped.push(f);
+    }
+
+    if (core?.info) {
+      core.info(`ast-grep: ${scoped.length} pattern finding(s).`);
+    }
+    return { findings: scoped, scanner: 'ast-grep' };
   } catch (err) {
     if (core?.warning) {
       core.warning(

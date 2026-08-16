@@ -17,7 +17,9 @@
  */
 
 import os from 'node:os';
-import { parseAddedLines } from './_patch.js';
+import fs from 'node:fs';
+import nodePath from 'node:path';
+import { parseAddedLines, changedFileNames } from './_patch.js';
 import { selectPlatformAsset, pickExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
@@ -117,9 +119,18 @@ export const SECRET_PATTERNS = [
     // by an assignment and a quoted value of length >= 8. Capture group 1 is
     // the value, on which we run an entropy check (≥ 3.5 Shannon) to suppress
     // false positives like `password = "password"`.
-    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-.]{8,})['"]/i,
+    // W15-A5-6: the value charset now also includes `/` and `,;:=~|` — real
+    // secrets routinely contain them (JWT fragments, base64 with `/`, scoped
+    // tokens), and their omission made those values unmatchable.
+    regex: /\b(?:api[_-]?key|apikey|secret|password|passwd|token|auth[_-]?token|access[_-]?token|client[_-]?secret)\b['"\s:=+]{1,5}['"]([0-9a-zA-Z!@#$%^&*_+\-/.,;:=~|]{8,})['"]/i,
     captureGroup: 1,
     minEntropy: 3.5,
+    // W16-B3-6: URL-shaped values (`scheme://…`) matched by this pattern's
+    // broadened value charset (W15-A5-6 added `,;:=~|/`) are configuration,
+    // not secrets — `api_key = "https://api.github.com/repos/foo"` (entropy
+    // 3.95 ≥ 3.5) fired as a CRITICAL false positive. (db-connection-string
+    // deliberately does NOT set this: credential-bearing URLs are its target.)
+    skipUrlValues: true,
     title: 'Hardcoded credential assigned to a key',
     description: 'A value assigned to a credential-like key looks like a secret.',
     suggestion: 'Load credentials from environment variables or a secret manager.',
@@ -130,9 +141,63 @@ export const SECRET_PATTERNS = [
     // conservative, only flags obvious secrets. The regex captures the candidate
     // (alphanumeric + /+=); the entropy check filters out non-secret strings.
     // SCN-2: include `-` and `_` so URL-safe base64 secrets are matched.
-    regex: /\b([A-Za-z0-9+/\-_]{32,}={0,2})\b/,
+    //
+    // W17-C1-6: two zero-width assertions relocate matches off sha-prefixed
+    // SRI digests so the `sha\d{3}-` skipIfPrecededBy alternative (dead code
+    // since W15-A5-5 — the class includes `-`, so the leftmost match always
+    // ABSORBED an adjacent `sha512-` prefix and the before-text could never
+    // END with `sha###-`, leaving bare CSP digests firing as critical FPs)
+    // actually fires:
+    //   `(?!sha\d{3}-)` — a match must not START at the `sha512-` prefix
+    //     itself (rejects the absorbing leftmost match);
+    //   `(?<!sha\d{3})` — a match must not start at the orphan `-` left
+    //     between the prefix and the digest (before-text ends `sha512`).
+    // The match therefore lands on the BARE digest, whose before-text ends
+    // with `sha512-`, and the adjacency alternative suppresses it. Note: a
+    // literal `(?<!sha\d{3}-)` at the match start is a no-op here — the
+    // leftmost match starts AT `sha512`, and positions after `sha###-` are
+    // never attempted — hence the two-assertion form.
+    //
+    // W18-D1-1: compiled with the `i` flag. CSP3/SRI hash-algorithm names
+    // match ASCII case-insensitively, but these lookarounds were
+    // case-sensitive while the sha-adjacency skipIfPrecededBy alternative is
+    // /i — so valid digests like `script-src 'SHA512-<digest>'` absorbed the
+    // uppercase prefix and fired as critical FPs. With /i the assertions
+    // reject uppercase/mixed-case prefixes exactly as they do lowercase. The
+    // candidate class `[A-Za-z0-9+/\-_]` already covers both cases, so the
+    // flag changes nothing but the lookarounds.
+    regex: /\b(?!sha\d{3}-)(?<!sha\d{3})([A-Za-z0-9+/\-_]{32,}={0,2})\b/i,
     captureGroup: 1,
     minEntropy: 4.5,
+    // W15-A5-5: legitimate base64-bearing contexts that must never be flagged.
+    // Before accepting a candidate, the preceding context on the same line is
+    // tested against each regex — data URIs and subresource-integrity hashes
+    // are high-entropy BY DESIGN and flooded reviews with critical FPs.
+    // W16-B3-5: suppression now requires STRUCTURAL adjacency. The previous
+    // `/(?:integrity|sha256|sha384|sha512)["']?[=:]?\s*["']?(?:sha\d+-)?$/i`
+    // made every suffix optional, so bare prose like
+    // `"integrity <hash>"` (no `=`/`:` between the key and the hash)
+    // silently suppressed the high-entropy backstop — an attacker-controlled
+    // off switch for unknown-format secrets.
+    skipIfPrecededBy: [
+      // `data:image/png;base64,<candidate>` (data URIs)
+      /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,\s*$/i,
+      // `sha512-<candidate>` etc. — a digest prefix directly abutting the
+      // candidate (hyphen-terminated). Reachable since W17-C1-6 relocated
+      // matches onto the bare digest; suppresses bare SRI/CSP digests.
+      /(?:sha\d{3}-)$/i,
+      // W17-C1-4: ONLY the bare HTML-attribute shape suppresses — the token
+      // before `=` must BE `integrity` (preceded by start, `>`, or
+      // whitespace; NOT part of a longer identifier like `data-integrity`)
+      // with no whitespace around the `=`, optionally inside an opening
+      // quote. The previous `integrity["']?\s*[=:]\s*["']?\s*(?:sha\d{3}-)?$/i`
+      // matched ANY identifier ending in `integrity` followed by `=`/`:`
+      // (the sha group was optional), so `const integrity = "<opaque>"`
+      // blinded the backstop. Spaced assignments (`integrity = "`), colon
+      // forms (`"integrity": "`), and opaque values now scan; real
+      // sha-prefixed digests stay suppressed via the adjacency alternative.
+      /(?:^|[>\s])integrity=["']?\s*$/i,
+    ],
     title: 'High-entropy string (possible secret)',
     description:
       'A long, high-entropy string was found in the diff. This often indicates an ' +
@@ -213,9 +278,23 @@ export function scanSecretsRegex(files) {
         const match = pattern.regex.exec(text);
         if (!match) continue;
 
+        // W15-A5-5: suppress candidates that sit in a known-benign base64
+        // context (data URIs, SRI integrity hashes). Look at up to 40 chars
+        // immediately before the match on the same line.
+        if (Array.isArray(pattern.skipIfPrecededBy) && typeof match.index === 'number') {
+          const before = text.slice(Math.max(0, match.index - 40), match.index);
+          if (pattern.skipIfPrecededBy.some((re) => re.test(before))) continue;
+        }
+
         // Resolve the value used for evidence + entropy check.
         const groupIdx = typeof pattern.captureGroup === 'number' ? pattern.captureGroup : 0;
         const value = match[groupIdx] || match[0];
+
+        // W16-B3-6: URL-shaped values (`scheme://…`) matched by the broadened
+        // value charset are configuration, not secrets — scoped via
+        // `skipUrlValues` so db-connection-string (whose target IS a
+        // credential-bearing URL) is unaffected.
+        if (pattern.skipUrlValues && /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) continue;
 
         if (typeof pattern.minEntropy === 'number') {
           const ent = shannonEntropy(value);
@@ -370,6 +449,7 @@ export function parseGitleaksJson(jsonText) {
  *   runBinary?: Function,
  *   platform?: string,
  *   arch?: string,
+ *   tmpdir?: () => string,
  *   core?: { warning?: (msg: string) => void, info?: (msg: string) => void },
  * }} [deps]
  * @returns {Promise<{ findings: Array, scanner: 'gitleaks' | 'regex-fallback' }>}
@@ -406,28 +486,66 @@ export async function scanSecrets(opts, deps = {}) {
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
-    // `--no-banner` suppresses the ASCII banner; `--report-format json` emits
-    // a top-level array of findings to stdout; `--exit-code 0` (gitleaks uses
-    // exit code 1 for "leaks found") is the trick — without it, finding-leaks
-    // exits non-zero and runBinary may throw.
+    // W16-B3-3: gitleaks 8.21.2 only writes a report when `--report-path
+    // <file>` is passed — without it, stdout is EMPTY even when leaks are
+    // present (verified with the real binary), so the scanner used to report
+    // gitleaks success with 0 findings. Write the JSON report to a temp file
+    // and read it back; stdout parsing is kept as a fallback for
+    // builds/environments where the file is missing or empty. Exit-code
+    // semantics are unchanged (`--exit-code 0`).
+    const tmpdir = typeof deps.tmpdir === 'function' ? deps.tmpdir() : os.tmpdir();
+    const reportPath = nodePath.join(
+      tmpdir,
+      `gitleaks-report-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
     const args = [
       'detect',
       '--source', source,
       '--report-format', 'json',
+      '--report-path', reportPath,
       '--no-banner',
       '--exit-code', '0',
       '--redact', // gitleaks redacts the matched secret in its output
     ];
-    const result = await deps.runBinary(binaryPath, args, {
-      cwd: source,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    const stdout = typeof result === 'string' ? result : String(result?.stdout ?? '');
-    const findings = parseGitleaksJson(stdout);
-    if (core?.info) {
-      core.info(`gitleaks: ${findings.length} secret finding(s).`);
+    try {
+      const result = await deps.runBinary(binaryPath, args, {
+        cwd: source,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      // Prefer the report file (the real binary's actual output channel);
+      // fall back to stdout when the file is missing/empty.
+      let reportText = '';
+      try {
+        reportText = fs.readFileSync(reportPath, 'utf8');
+      } catch {
+        reportText = '';
+      }
+      let jsonText = reportText;
+      if (typeof jsonText !== 'string' || jsonText.trim().length === 0) {
+        jsonText = typeof result === 'string' ? result : String(result?.stdout ?? '');
+      }
+      // W15-A5-1: gitleaks scans the repo's HISTORY (`detect --source`), so
+      // its report includes leaks in files this PR never touched (with line
+      // numbers from the historical file, not the diff). Scope findings to
+      // the PR's changed files before returning.
+      const changedFiles = changedFileNames(files);
+      const findings = parseGitleaksJson(jsonText).filter((f) =>
+        changedFiles.has(typeof f.file === 'string' ? f.file : ''),
+      );
+      if (core?.info) {
+        core.info(`gitleaks: ${findings.length} secret finding(s).`);
+      }
+      return { findings, scanner: 'gitleaks' };
+    } finally {
+      // ALWAYS remove the temp report file — on success, on a runBinary
+      // error (the outer catch then serves the regex fallback), and on any
+      // read/parse failure. Never leaks a (redacted) report onto disk.
+      try {
+        fs.rmSync(reportPath, { force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
     }
-    return { findings, scanner: 'gitleaks' };
   } catch (err) {
     if (core?.warning) {
       core.warning(
