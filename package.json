@@ -14,7 +14,7 @@
     "dist-check": "ncc build src/index.js -o dist --license licenses.txt && git diff --exit-code dist"
   },
   "dependencies": {
-    "@actions/core": "^3.0.1",
+    "@actions/core": "^2.0.3",
     "@actions/github": "^9.1.1",
     "picomatch": "^4.0.1"
   },

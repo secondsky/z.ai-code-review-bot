@@ -35,8 +35,11 @@ import { promisify } from 'node:util';
 import * as fs from 'node:fs/promises';
 import * as https from 'node:https';
 
-import core from '@actions/core';
-import github from '@actions/github';
+// @actions/core@3 and @actions/github@9 are named-exports-only ESM modules
+// (no default export) — default imports would bundle as `undefined` and crash
+// the action at runtime while transformed tests stay green.
+import * as core from '@actions/core';
+import * as github from '@actions/github';
 
 import {
   eventName,
