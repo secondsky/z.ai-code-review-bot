@@ -599,12 +599,17 @@ export async function scanPatterns(opts, deps = {}) {
       if (lang) neededLangs.add(lang);
     }
 
-    // Run each rule via `ast-grep run --pattern <PATTERN> --json`. We do one
-    // rule at a time to keep the JSON output shape simple (and to attribute
-    // findings back to a specific rule via the ruleIndex lookup).
+    // Run each rule via `ast-grep run --pattern <PATTERN> --json`, one rule
+    // at a time to keep the JSON output shape simple. `ast-grep run` emits no
+    // `ruleId`, so enrichment is driver-owned: the inline map after
+    // parseAstGrepJson attaches the rule's id/title/severity/etc.
+    // (mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
+    // output that carries `ruleId` — currently test-only. Do NOT pass the
+    // per-rule map into parseAstGrepJson: `run` output has no ruleId, so
+    // lookups would miss and every title would degrade to the 'match'
+    // fallback.)
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
-    const ruleIndex = new Map(rules.map((r) => [r.id, r]));
     // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a
     // specific language, so they cannot go through the binary path. Collect
     // them here; their diff-scoped regex findings are APPENDED on success
