@@ -1266,6 +1266,87 @@ describe('createApiClient', () => {
     expect(body.messages.find((m) => m.role === 'user').content).toBe('FALLBACK_PROMPT');
   });
 
+  // F-API-CTX: the fallback spec's apiKey and model must reach the transport,
+  // not just the prompt. A fallback returning all three fields swaps ALL THREE
+  // on subsequent attempts: the user message in the body, the `model` field in
+  // the body, and the Bearer apiKey in the Authorization header.
+  test('call() fallback end-to-end: a fallback returning { prompt, apiKey, model } swaps ALL THREE at the transport', async () => {
+    // Same hand-rolled fake as the prompt-only test above: attempts 0 and 1
+    // time out (firing the fallback at attempt >= 1), attempt 2 succeeds.
+    const calls = [];
+    const request = (url, options) => {
+      const callIdx = calls.length;
+      const captured = { url, options, headers: options.headers || {}, calls };
+      calls.push(captured);
+      let responseCb = null;
+      let errorCb = null;
+      const req = {
+        on(event, cb) {
+          if (event === 'response') responseCb = cb;
+          else if (event === 'error') {
+            errorCb = cb;
+            if (callIdx < 2) {
+              queueMicrotask(() => cb(new Error('Request timed out')));
+            }
+          }
+          return req;
+        },
+        setTimeout() {
+          return req;
+        },
+        destroy(err) {
+          if (err && errorCb) errorCb(err);
+          return req;
+        },
+        write(d) {
+          captured.writes = (captured.writes || []);
+          captured.writes.push(d);
+          return req;
+        },
+        end(d) {
+          if (d) {
+            captured.writes = (captured.writes || []);
+            captured.writes.push(d);
+          }
+          captured.body = (captured.writes || []).join('');
+          if (callIdx >= 2) {
+            const res = buildFakeRes(
+              [JSON.stringify({ choices: [{ message: { content: 'recovered' } }] })],
+              { statusCode: 200 },
+            );
+            queueMicrotask(() => responseCb && responseCb(res));
+          }
+          return req;
+        },
+      };
+      captured.req = req;
+      return req;
+    };
+
+    const client = createApiClient({ maxRetries: 3, baseDelay: 2000, baseTimeout: 120000 });
+    const out = await client.call({
+      apiKey: 'K1',
+      model: 'M1',
+      systemPrompt: 's',
+      userPrompt: 'ORIGINAL_PROMPT',
+      sleep: async () => {},
+      request,
+      fallbackPrompt: () => ({ prompt: 'FALLBACK_PROMPT', apiKey: 'K2', model: 'M2' }),
+    });
+    expect(out.success).toBe(true);
+    expect(out.usedFallback).toBe(true);
+    // Pre-fallback attempts carried the ORIGINAL key/model at the transport.
+    const firstBody = JSON.parse(calls[0].body);
+    expect(firstBody.model).toBe('M1');
+    expect(calls[0].headers.Authorization).toBe('Bearer K1');
+    // The fallback attempt (3rd call) swapped ALL THREE at the transport.
+    const lastCall = calls[calls.length - 1];
+    const body = JSON.parse(lastCall.body);
+    expect(body.messages.find((m) => m.role === 'user').content).toBe('FALLBACK_PROMPT');
+    expect(body.model).toBe('M2');
+    expect(lastCall.headers.Authorization).toBe('Bearer K2');
+  });
+
   test('ZAI_API_URL is the documented endpoint', () => {
     expect(ZAI_API_URL).toBe('https://api.z.ai/api/coding/paas/v4/chat/completions');
   });
