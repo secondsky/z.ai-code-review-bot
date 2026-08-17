@@ -40,9 +40,8 @@ jobs:
       - run: npm ci
       # Rebuild the bundle. The committed dist/ must already match; any diff means
       # a src/ change wasn't accompanied by a rebuild. Fails the build.
-      - run: npm run build
       - name: Check dist/ is up to date
-        run: git diff --exit-code dist
+        run: npm run dist-check
 
   audit:
     name: npm audit (high+)
