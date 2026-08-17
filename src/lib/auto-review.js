@@ -430,54 +430,32 @@ export async function runWithConcurrency(items, concurrency, fn) {
   const results = new Array(list.length);
 
   let cursor = 0;
-  let active = 0;
   // Abort flag: once any item rejects, stop launching NEW items so we don't
   // keep consuming resources (e.g. API credits) for a review that will fail.
   // Items already in flight still settle naturally.
   let aborted = false;
 
-  return new Promise((resolve, reject) => {
-    if (list.length === 0) {
-      resolve(results);
-      return;
-    }
-
-    const launchNext = () => {
-      // Stop launching once we've hit the limit, run out of items, or aborted.
-      while (active < limit && cursor < list.length && !aborted) {
-        const i = cursor++;
-        active++;
-        let p;
-        try {
-          p = Promise.resolve(fn(list[i], i));
-        } catch (err) {
-          aborted = true;
-          reject(err);
-          return;
-        }
-        p.then(
-          (val) => {
-            results[i] = val; // slot by index → preserves input order
-            active--;
-            if (cursor < list.length) {
-              launchNext();
-            } else if (active === 0) {
-              resolve(results);
-            }
-          },
-          (err) => {
-            // First rejection wins; subsequent rejects are swallowed. Set the
-            // abort flag so success handlers from other in-flight items don't
-            // launch yet more items.
-            aborted = true;
-            reject(err);
-          },
-        );
+  // Fixed worker pool: min(limit, list.length) workers, each pulling the next
+  // index off the shared cursor. Liveness comes from Promise.all — when the
+  // last worker returns, every item has settled. Workers check `aborted`
+  // BEFORE consuming `cursor++`, so a post-abort wake starts nothing.
+  const workers = Array.from({ length: Math.min(limit, list.length) }, async () => {
+    while (!aborted) {
+      const i = cursor++;
+      if (i >= list.length) return;
+      try {
+        results[i] = await fn(list[i], i); // slot by index → preserves input order
+      } catch (err) {
+        // First rejection wins; Promise.all swallows any later ones. Set the
+        // abort flag so other workers stop pulling new items.
+        aborted = true;
+        throw err;
       }
-    };
-
-    launchNext();
+    }
   });
+
+  await Promise.all(workers);
+  return results;
 }
 
 /**
