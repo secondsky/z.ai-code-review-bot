@@ -88,6 +88,47 @@ export function buildDiffContext(
 }
 
 /**
+ * Fixed error comment posted when a command handler's body fails (no raw
+ * error leakage). F-RUNCOMMAND: previously this const (and the outer
+ * try/catch that posts it) was duplicated in every handler — past bug
+ * classes (W16-B4-2: a post() outside the try; W15-A4-2: a mutation phase
+ * sharing the outer catch) had to be fixed by hand, handler by handler.
+ * It now lives ONLY here.
+ */
+export const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
+
+/**
+ * Run a command handler body under the shared never-throw guardrail.
+ *
+ * A handler dispatched by the router must NEVER reject (the router has no
+ * catch); on any failure it core.warning's and attempts ONE fallback
+ * ERROR_COMMENT post. Even if that post itself fails, nothing escapes.
+ * This makes the guardrail structural instead of five hand-maintained
+ * copies.
+ *
+ * @param {string} name  Handler name for the warning (ask/describe/explain/impact/review).
+ * @param {object} deps
+ * @param {object} [deps.core]  @actions/core shim ({ warning }) — optional.
+ * @param {(body: string) => Promise<*>} deps.post  The handler's post()
+ *   seam (already bound to octokit/context by the handler).
+ * @param {() => Promise<*>} fn  The former handler try-body.
+ * @returns {Promise<*>}  Whatever `fn` resolves to, or `undefined` after a
+ *   swallowed failure.
+ */
+export async function runCommand(name, { core, post }, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    if (core?.warning) core.warning(`${name} handler failed: ${error?.message ?? error}`);
+    try {
+      await post(ERROR_COMMENT);
+    } catch {
+      /* last resort: never throw out of a handler */
+    }
+  }
+}
+
+/**
  * Post a command-response comment on the PR/issue.
  *
  * Uses `octokit.rest.issues.createComment` (a PLAIN create, NOT the marker

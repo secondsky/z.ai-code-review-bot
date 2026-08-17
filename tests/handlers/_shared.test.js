@@ -5,7 +5,12 @@
  * Pure injection: a fake octokit captures calls; no network.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { postComment, getPRContext } from '../../src/lib/handlers/_shared.js';
+import {
+  postComment,
+  getPRContext,
+  runCommand,
+  ERROR_COMMENT,
+} from '../../src/lib/handlers/_shared.js';
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -181,5 +186,76 @@ describe('getPRContext', () => {
     const result = await getPRContext({ octokit, context });
     expect(result).toBeNull();
     expect(octokit.__calls.pullsGet).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * runCommand — F-RUNCOMMAND: single never-throw wrapper
+ *
+ * Every command handler used to duplicate the same outer scaffold: a
+ * local ERROR_COMMENT const + a try/catch that warned and posted the
+ * error comment. Past bug classes (W16-B4-2: a post() outside the try;
+ * W15-A4-2: a mutation sharing the outer catch) had to be fixed by hand
+ * in individual handlers. runCommand makes the "a handler NEVER throws
+ * out to the router" guardrail structural: one owner, one copy.
+ * ------------------------------------------------------------------ */
+
+describe('runCommand — F-RUNCOMMAND: never-throw wrapper', () => {
+  it('fn rejects and post rejects on EVERY call → resolves without throwing, attempted the ERROR_COMMENT post', async () => {
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const attempted = [];
+    const post = async (body) => {
+      attempted.push(body);
+      throw new Error('502 bad gateway');
+    };
+
+    await expect(
+      runCommand('ask', { core, post }, async () => {
+        throw new Error('boom');
+      }),
+    ).resolves.toBeUndefined();
+
+    // The fallback post was ATTEMPTED with the exact error comment…
+    expect(attempted).toEqual([ERROR_COMMENT]);
+    // …and even though it rejected, nothing escaped.
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    expect(core.warning).toHaveBeenCalledWith('ask handler failed: boom');
+  });
+
+  it('returns the fn result untouched on success (post never called)', async () => {
+    const post = vi.fn();
+    const result = await runCommand(
+      'ask',
+      { core: null, post },
+      async () => 42,
+    );
+    expect(result).toBe(42);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('tolerates a missing core (no warning crash) and still attempts the post', async () => {
+    const attempted = [];
+    const post = async (body) => {
+      attempted.push(body);
+      throw new Error('502');
+    };
+    await expect(
+      runCommand('review', { post }, () => Promise.reject(new Error('x'))),
+    ).resolves.toBeUndefined();
+    expect(attempted).toEqual([ERROR_COMMENT]);
+  });
+
+  it('warns with the thrown value when it is not an Error', async () => {
+    const core = { warning: vi.fn() };
+    const post = vi.fn(async () => {});
+    await runCommand(
+      'describe',
+      { core, post },
+      () => Promise.reject('plain string'),
+    );
+    expect(core.warning).toHaveBeenCalledWith(
+      'describe handler failed: plain string',
+    );
+    expect(post).toHaveBeenCalledWith(ERROR_COMMENT);
   });
 });

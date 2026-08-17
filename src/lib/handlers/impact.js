@@ -17,6 +17,7 @@ import {
   postComment,
   buildDiffContext,
   MAX_CONTEXT_CHARS,
+  runCommand,
 } from './_shared.js';
 import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
@@ -25,9 +26,6 @@ import { getChangedFiles } from '../changed-files.js';
 // here and in ask.js). Re-exported to preserve this module's public surface
 // (tests import it from impact.js).
 export { buildDiffContext } from './_shared.js';
-
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
 /**
  * Emoji → severity-key map, matching the prompt's requested severity prefix
@@ -231,7 +229,9 @@ export async function handleImpactCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('impact', { core, post }, async () => {
     const files =
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
@@ -269,14 +269,5 @@ export async function handleImpactCommand(
         }
       }
     }
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`impact handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: never throw out of the handler. */
-    }
-  }
+  });
 }

@@ -17,6 +17,7 @@ import {
   getPRContext,
   buildDiffContext,
   MAX_CONTEXT_CHARS,
+  runCommand,
 } from './_shared.js';
 import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
@@ -39,9 +40,6 @@ const MAX_QUESTION_CHARS = 4000;
  * capped at 4000 and the diffs at 8000.
  */
 const MAX_BODY_CHARS = 4000;
-
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
 /** Guidance when the user issues `/zai ask` with no question. */
 const EMPTY_ARGS_COMMENT =
@@ -125,11 +123,13 @@ export async function handleAskCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('ask', { core, post }, async () => {
     // W16-B4-2: this post (like every other in the handler) must be inside
-    // the try — it previously executed OUTSIDE it, so a transient 502 on this
-    // single createComment rejected the whole handler and failed the entire
-    // action (the router dispatches with no catch).
+    // the guarded body — it previously executed OUTSIDE it, so a transient
+    // 502 on this single createComment rejected the whole handler and failed
+    // the entire action (the router dispatches with no catch).
     if (question === '') {
       await post(EMPTY_ARGS_COMMENT);
       return;
@@ -152,14 +152,5 @@ export async function handleAskCommand(
 
     const answer = await callApi(config.apiKey, config.model, prompt);
     await post(answer);
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`ask handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: nothing more we can do; never throw. */
-    }
-  }
+  });
 }
