@@ -578,6 +578,48 @@ export function selectPlatformAsset(spec, deps = {}) {
 }
 
 /**
+ * Resolve a spec + platform/arch tuple into the FLAT request object consumed
+ * by `ensureBinary`: `{ name, version, ext, url, checksumSha256, cacheDir,
+ * extractor }` — exactly those seven keys. Spec-only metadata (`urls`,
+ * `checksums`, `archiveType`, …) deliberately does NOT cross this boundary;
+ * the returned object is passed straight to `ensureBinary` without spreading.
+ *
+ * The `extractor` is the spec's embedded `extractor` when it is a function,
+ * otherwise it is derived from the selected asset's URL extension
+ * (`.tar.gz`/`.tgz` → tarGzExtractor, `.zip` → zipExtractor, raw → null).
+ *
+ * Pure (no I/O). Throws when the platform/arch tuple has no asset, so
+ * callers invoke this INSIDE their `try` — the throw then lands in their
+ * catch → warning → regex-fallback path.
+ *
+ * @param {{
+ *   name: string,
+ *   version: string,
+ *   ext?: string,
+ *   urls: Record<string, string>,
+ *   checksums: Record<string, string>,
+ *   extractor?: Function,
+ * }} spec
+ * @param {{ platform?: string, arch?: string, cacheDir?: string }} [opts]
+ * @returns {{ name: string, version: string, ext: string, url: string, checksumSha256: string, cacheDir: string, extractor: Function | null }}
+ */
+export function resolveBinaryRequest(spec, { platform = '', arch = '', cacheDir } = {}) {
+  const asset = selectPlatformAsset(spec, { platform, arch });
+  if (!asset) {
+    throw new Error(`${spec?.name}: no asset for platform=${platform || '?'} arch=${arch || '?'}`);
+  }
+  return {
+    name: spec.name,
+    version: spec.version,
+    ext: typeof spec.ext === 'string' ? spec.ext : '',
+    url: asset.url,
+    checksumSha256: asset.checksumSha256,
+    cacheDir,
+    extractor: typeof spec.extractor === 'function' ? spec.extractor : pickExtractor(asset.url),
+  };
+}
+
+/**
  * Build a unique temp path inside the OS tmpdir for a given archive name.
  * Used by tarball extractors. Pure (no I/O).
  *

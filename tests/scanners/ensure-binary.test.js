@@ -11,6 +11,7 @@ import {
   sha256Hex,
   resolveCachePath,
   selectPlatformAsset,
+  resolveBinaryRequest,
   tempPathFor,
   tarGzExtractor,
   zipExtractor,
@@ -167,6 +168,95 @@ describe('selectPlatformAsset', () => {
   it('returns null when checksum is missing even if url present', () => {
     const bad = { urls: { linux_x64: 'u' }, checksums: {} };
     expect(selectPlatformAsset(bad, { platform: 'linux', arch: 'x64' })).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * resolveBinaryRequest — spec → platform asset → flat ensureBinary request
+ * ------------------------------------------------------------------ */
+
+describe('resolveBinaryRequest', () => {
+  const spec = {
+    name: 'gitleaks',
+    version: '8.21.2',
+    ext: '',
+    urls: {
+      darwin_arm64: 'https://example.com/gitleaks_darwin_arm64.tar.gz',
+      win32_x64: 'https://example.com/gitleaks_windows_x64.zip',
+    },
+    checksums: {
+      darwin_arm64: 'a'.repeat(64),
+      win32_x64: 'b'.repeat(64),
+    },
+  };
+
+  it('selects the platform asset into the request (url + checksumSha256)', () => {
+    const req = resolveBinaryRequest(spec, {
+      platform: 'darwin',
+      arch: 'arm64',
+      cacheDir: '/cache',
+    });
+    expect(req.url).toBe('https://example.com/gitleaks_darwin_arm64.tar.gz');
+    expect(req.checksumSha256).toBe('a'.repeat(64));
+    expect(req.name).toBe('gitleaks');
+    expect(req.version).toBe('8.21.2');
+    expect(req.ext).toBe('');
+    expect(req.cacheDir).toBe('/cache');
+  });
+
+  it('defaults the extractor from the asset URL (.tar.gz → tarGzExtractor)', () => {
+    const req = resolveBinaryRequest(spec, {
+      platform: 'darwin',
+      arch: 'arm64',
+      cacheDir: '/cache',
+    });
+    expect(req.extractor).toBe(tarGzExtractor);
+  });
+
+  it('defaults the extractor from the asset URL (.zip → zipExtractor)', () => {
+    const req = resolveBinaryRequest(spec, {
+      platform: 'win32',
+      arch: 'x64',
+      cacheDir: '/cache',
+    });
+    expect(req.extractor).toBe(zipExtractor);
+  });
+
+  it('a spec-embedded function extractor wins over the URL default', () => {
+    const custom = async () => '/dest';
+    const req = resolveBinaryRequest(
+      { ...spec, extractor: custom },
+      { platform: 'darwin', arch: 'arm64', cacheDir: '/cache' },
+    );
+    expect(req.extractor).toBe(custom);
+  });
+
+  it('throws `${spec.name}: no asset for platform=? arch=?` for an unsupported tuple', () => {
+    expect(() =>
+      resolveBinaryRequest(spec, { platform: 'sunos', arch: 'sparc', cacheDir: '/c' }),
+    ).toThrow('gitleaks: no asset for platform=sunos arch=sparc');
+  });
+
+  it('throws with ? placeholders when platform/arch are empty', () => {
+    expect(() => resolveBinaryRequest(spec, {})).toThrow(
+      'gitleaks: no asset for platform=? arch=?',
+    );
+  });
+
+  it('returns ONLY the seven flat keys — no urls/checksums/archiveType leak', () => {
+    const req = resolveBinaryRequest(
+      { ...spec, archiveType: 'zip' },
+      { platform: 'darwin', arch: 'arm64', cacheDir: '/cache' },
+    );
+    expect(Object.keys(req).sort()).toEqual([
+      'cacheDir',
+      'checksumSha256',
+      'ext',
+      'extractor',
+      'name',
+      'url',
+      'version',
+    ]);
   });
 });
 

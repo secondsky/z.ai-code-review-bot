@@ -19,7 +19,7 @@
 import os from 'node:os';
 import nodePath from 'node:path';
 import { parseAddedLines, changedFileNames } from './_patch.js';
-import { selectPlatformAsset, zipExtractor } from './ensure-binary.js';
+import { resolveBinaryRequest, zipExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
  * Default curated rules
@@ -572,14 +572,12 @@ export async function scanPatterns(opts, deps = {}) {
   }
 
   try {
-    const asset = selectPlatformAsset(AST_GREP_SPEC, { platform, arch });
-    if (!asset) {
-      throw new Error(
-        `ast-grep: no asset for platform=${platform || '?'} arch=${arch || '?'}`,
-      );
-    }
+    // F-BINREQ: spec → platform asset → flat ensureBinary request in one
+    // place (the spec-embedded zipExtractor extractor wins over the URL
+    // default). resolveBinaryRequest throws on a no-asset tuple, which lands
+    // in the catch below → warning → regex fallback (unchanged coverage).
     const binaryPath = await deps.ensureBinary(
-      { ...AST_GREP_SPEC, ...asset, cacheDir: opts.cacheDir },
+      resolveBinaryRequest(AST_GREP_SPEC, { platform, arch, cacheDir: opts.cacheDir }),
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
