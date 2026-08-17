@@ -654,6 +654,45 @@ describe('learningsEnabled (Phase 8.2 — .zai/learnings.yml)', () => {
   });
 });
 
+describe('loadConfig — boolean-input conventions (F-BOOLREAD)', () => {
+  // The 14 boolean inputs follow exactly two conventions, applied via the
+  // module-private readDefaultOnBool / readOptInBool readers:
+  //  - default-on (5 advisory features): empty/whitespace means "use the
+  //    default" (true);
+  //  - opt-in (9 read-only/v1 sites): empty/invalid means false.
+  // This test pins the convention per field so a future edit cannot silently
+  // move a field from one convention to the other.
+  const conventions = [
+    // [input name, output field, emptyInputMeansTrue]
+    ['ZAI_SCANNERS_ENABLED', 'scannersEnabled', true],
+    ['ZAI_COMMIT_STATUS', 'commitStatus', true],
+    ['ZAI_WALKTHROUGH', 'walkthrough', true],
+    ['ZAI_INCREMENTAL_REVIEW', 'incrementalReview', true],
+    ['ZAI_REPO_CONFIG_ENABLED', 'repoConfigEnabled', true],
+    ['ZAI_COMMANDS_ENABLED', 'commandsEnabled', false],
+    ['ZAI_ALLOW_FORK_COMMANDS', 'allowForkCommands', false],
+    ['ZAI_SCHEDULE_ENABLED', 'scheduleEnabled', false],
+    ['ZAI_DESCRIBE_WRITE_BODY', 'describeWriteBody', false],
+    ['ZAI_IMPACT_LABELS', 'impactLabels', false],
+    // strictMode is DELIBERATELY opt-in (it blocks merges) and must never
+    // follow the advisory default-on convention.
+    ['ZAI_STRICT_MODE', 'strictMode', false],
+    ['ZAI_SUGGEST_REVIEWERS', 'suggestReviewers', false],
+    ['ZAI_AUTO_ASSIGN_REVIEWERS', 'autoAssignReviewers', false],
+    ['ZAI_LEARNINGS_ENABLED', 'learningsEnabled', false],
+  ];
+
+  test('applies the two boolean-input conventions consistently', () => {
+    for (const [name, field, emptyMeansTrue] of conventions) {
+      // shape guard: the output field exists before we assert its convention
+      expect(loadConfig({ ZAI_API_KEY: 'k' })[field]).toBeDefined();
+      // empty and whitespace-only inputs resolve to the field's convention
+      expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '' })[field]).toBe(emptyMeansTrue);
+      expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '   ' })[field]).toBe(emptyMeansTrue);
+    }
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * toInt — strict integer validation (CFG-8)
  *
