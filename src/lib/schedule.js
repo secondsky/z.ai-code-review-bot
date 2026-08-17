@@ -145,6 +145,43 @@ const defaultFindBotMarkerComments = async () => [];
  */
 const defaultListBotReviews = async () => [];
 
+/**
+ * F-SCHEDDEPS: the SINGLE source of the per-PR pipeline-collaborator defaults.
+ *
+ * Every `reviewOnePr` parameter whose default is one of the inert defaults
+ * above (or one of the real PURE helpers imported from their modules —
+ * walkthrough/status/findings) is keyed here exactly once. `reviewOnePr`
+ * destructures its defaults FROM this map, and `runScheduledReview` forwards
+ * the same collaborators as one bundle (`...pipelineDeps`): destructuring
+ * defaults fire on `undefined`, so an omitted dep behaves identically whether
+ * reviewOnePr is called directly or through the batch entry. Before this map
+ * the defaults were written twice (reviewOnePr + runScheduledReview) and the
+ * forwarding was a 37-line key-for-key transcription — a dep added to one
+ * list but not the other silently degraded to an inert no-op (the
+ * W15-A8-4/W18-D1-2 parity-loss class).
+ *
+ * Run-only deps (`listOpenPrs`, `hasReviewForSha`, `getContextStatusState`)
+ * are intentionally NOT here: runScheduledReview consumes them itself and
+ * does not forward them to reviewOnePr.
+ */
+const INERT_PIPELINE_DEPS = {
+  formatWalkthroughSummary: formatWalkthroughSummaryDefault,
+  loadRepoConfig: defaultLoadRepoConfig,
+  mergeRepoConfig: defaultMergeRepoConfig,
+  runScanners: defaultRunScanners,
+  formatScannerContext: defaultFormatScannerContext,
+  loadLearnings: defaultLoadLearnings,
+  formatLearningsForPrompt: defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings: defaultFilterFindingsByLearnings,
+  setReviewStatus: defaultSetReviewStatus,
+  buildStatusDescription: buildStatusDescriptionDefault,
+  findBotMarkerComments: defaultFindBotMarkerComments,
+  parseFindingsHashBlock: parseFindingsHashBlockDefault,
+  buildFindingsHashBlock: buildFindingsHashBlockDefault,
+  filterIncrementalFindings: filterIncrementalFindingsDefault,
+  listBotReviews: defaultListBotReviews,
+};
+
 // F-TRAILERS: buildShaBlock moved verbatim to ./findings.js — its primary
 // consumer is src/index.js, so defining it here was a reverse dependency
 // (index.js importing schedule.js just for a pure string builder). This
@@ -363,31 +400,35 @@ export async function reviewOnePr({
   // via formatWalkthroughSummary when config.walkthrough is on; the scheduled
   // path must mirror that so cron and push runs render the same PR the same
   // way. Optional dep (default: the real renderer from walkthrough.js).
-  formatWalkthroughSummary = formatWalkthroughSummaryDefault,
+  // F-SCHEDDEPS: every per-PR pipeline default below is sourced from the
+  // single INERT_PIPELINE_DEPS map (W15-A6-4/W15-A8-4/W16-B2-2/W17-C2-1/
+  // W18-D1-2) — runScheduledReview forwards these as one bundle, and these
+  // destructuring defaults fire on the undefined entries of that bundle.
+  formatWalkthroughSummary = INERT_PIPELINE_DEPS.formatWalkthroughSummary,
   // W15-A8-4 feature-parity deps (all OPTIONAL with inert defaults so existing
   // tests/hermetic callers stay green; src/index.js's schedule branch wires the
   // real functions — see run()'s schedule wiring).
   // (a) .zai.yml repo config: load (fail-soft, returns {} on any error by
   //     contract) + merge (action inputs always win; repo can only narrow).
-  loadRepoConfig = defaultLoadRepoConfig,
-  mergeRepoConfig = defaultMergeRepoConfig,
+  loadRepoConfig = INERT_PIPELINE_DEPS.loadRepoConfig,
+  mergeRepoConfig = INERT_PIPELINE_DEPS.mergeRepoConfig,
   // (b) deterministic scanners: run over the patchable files; findings flow
   //     into runStructuredReview as `deterministicFindings` and their formatted
   //     context rides the LLM prompt as `scannerContext`.
-  runScanners = defaultRunScanners,
-  formatScannerContext = defaultFormatScannerContext,
+  runScanners = INERT_PIPELINE_DEPS.runScanners,
+  formatScannerContext = INERT_PIPELINE_DEPS.formatScannerContext,
   // (c) learnings: load `.zai/learnings.yml` (fail-soft → []), format the
   //     accepted patterns as prompt context, and suppress matching findings
   //     after the review (same three seams as index.js).
-  loadLearnings = defaultLoadLearnings,
-  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
-  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  loadLearnings = INERT_PIPELINE_DEPS.loadLearnings,
+  formatLearningsForPrompt = INERT_PIPELINE_DEPS.formatLearningsForPrompt,
+  filterFindingsByLearnings = INERT_PIPELINE_DEPS.filterFindingsByLearnings,
   // (d) commit statuses: `pending` at the start of the review work and
   //     `success` computed from the FINAL kept findings (post-suppression).
   //     setReviewStatus is fail-soft by contract; buildStatusDescription is a
   //     pure helper (defaults to the real one from status.js).
-  setReviewStatus = defaultSetReviewStatus,
-  buildStatusDescription = buildStatusDescriptionDefault,
+  setReviewStatus = INERT_PIPELINE_DEPS.setReviewStatus,
+  buildStatusDescription = INERT_PIPELINE_DEPS.buildStatusDescription,
   // W16-B2-2: incremental-review hash-block preservation on the summary path.
   // (a) findBotMarkerComments enumerates the bot's existing marker comments so
   //     their `<!-- zai-hashes:... -->` blocks survive the wholesale upsert
@@ -395,19 +436,19 @@ export async function reviewOnePr({
   // (b/c) parseFindingsHashBlock/buildFindingsHashBlock are PURE helpers
   //     (default: the real ones from findings.js) used to read prior hashes
   //     and compute this run's canonical set.
-  findBotMarkerComments = defaultFindBotMarkerComments,
-  parseFindingsHashBlock = parseFindingsHashBlockDefault,
-  buildFindingsHashBlock = buildFindingsHashBlockDefault,
+  findBotMarkerComments = INERT_PIPELINE_DEPS.findBotMarkerComments,
+  parseFindingsHashBlock = INERT_PIPELINE_DEPS.parseFindingsHashBlock,
+  buildFindingsHashBlock = INERT_PIPELINE_DEPS.buildFindingsHashBlock,
   // W17-C2-1: incremental-suppression filter (pure; default: the real one
   // from findings.js). The scheduled path previously never applied it, so
   // cron ticks re-reported unchanged findings on BOTH branches.
-  filterIncrementalFindings = filterIncrementalFindingsDefault,
+  filterIncrementalFindings = INERT_PIPELINE_DEPS.filterIncrementalFindings,
   // W18-D1-2: bot-review finder (inert default; src/index.js wires the real
   // review.js listBotReviews). The scheduled INLINE path deposits its hash
   // block exclusively in the REVIEW body, so reading marker comments alone
   // left priorHashes empty on the common path and every tick after a re-push
   // re-reported unchanged findings (index.js unions reviews + comments).
-  listBotReviews = defaultListBotReviews,
+  listBotReviews = INERT_PIPELINE_DEPS.listBotReviews,
 }) {
   // W16-B2-1: whether THIS invocation successfully posted the `pending`
   // commit status. The outer catch must flip that status to a TERMINAL
@@ -1048,30 +1089,35 @@ export async function runScheduledReview({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
-  // W15-A6-4 walkthrough parity dep (optional; default: real renderer).
-  formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummaryDefault,
-  // W15-A8-4 feature-parity deps (optional; inert defaults — see reviewOnePr).
-  loadRepoConfig = defaultLoadRepoConfig,
-  mergeRepoConfig = defaultMergeRepoConfig,
-  runScanners = defaultRunScanners,
-  formatScannerContext = defaultFormatScannerContext,
-  loadLearnings = defaultLoadLearnings,
-  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
-  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
-  setReviewStatus = defaultSetReviewStatus,
-  buildStatusDescription = buildStatusDescriptionDefault,
-  // W16-B2-2 hash-block preservation deps (optional; inert/pure defaults —
-  // see reviewOnePr).
-  findBotMarkerComments = defaultFindBotMarkerComments,
-  parseFindingsHashBlock = parseFindingsHashBlockDefault,
-  buildFindingsHashBlock = buildFindingsHashBlockDefault,
-  // W17-C2-1: incremental-suppression filter (pure; default: the real one).
-  filterIncrementalFindings = filterIncrementalFindingsDefault,
-  // W18-D1-2: bot-review finder for review-side prior-hash reads (inert
-  // default; src/index.js wires the real review.js listBotReviews).
-  listBotReviews = defaultListBotReviews,
+  // F-SCHEDDEPS: the per-PR pipeline collaborators below carry NO local
+  // defaults. They are forwarded to reviewOnePr as one bundle
+  // (`...pipelineDeps`); reviewOnePr's destructuring defaults — sourced from
+  // the single INERT_PIPELINE_DEPS map — fire on the bundle's `undefined`
+  // entries, so an omitted dep behaves exactly as before. This replaces the
+  // duplicated default declarations (the parity-loss hazard: a dep defaulted
+  // here but missed in the forwarding silently degraded to an inert no-op).
+  formatWalkthroughSummary,
+  loadRepoConfig,
+  mergeRepoConfig,
+  runScanners,
+  formatScannerContext,
+  loadLearnings,
+  formatLearningsForPrompt,
+  filterFindingsByLearnings,
+  // setReviewStatus is the ONE pipeline dep this function also uses ITSELF
+  // (the W18-D2-4 skip-branch reconciliation below), so it keeps a
+  // destructuring default — sourced from the same map, never re-declared.
+  setReviewStatus = INERT_PIPELINE_DEPS.setReviewStatus,
+  buildStatusDescription,
+  findBotMarkerComments,
+  parseFindingsHashBlock,
+  buildFindingsHashBlock,
+  filterIncrementalFindings,
+  listBotReviews,
   // W19-E1-2/E2-1: commit-status context-state reader used by the skip-branch
-  // reconciliation (default: the real octokit-backed read; injectable).
+  // reconciliation (default: the real octokit-backed read; injectable). Run-
+  // only dep — consumed here, never forwarded — so it is NOT part of
+  // INERT_PIPELINE_DEPS/pipelineDeps.
   getContextStatusState = defaultGetContextStatusState,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
@@ -1092,6 +1138,30 @@ export async function runScheduledReview({
   let reviewed = 0;
   let skipped = 0;
   let failed = 0;
+
+  // F-SCHEDDEPS: the per-PR pipeline collaborators, forwarded to EVERY
+  // reviewOnePr call as one bundle. Keys are exactly reviewOnePr's parameter
+  // names, and undefined entries fall through to reviewOnePr's
+  // INERT_PIPELINE_DEPS-sourced destructuring defaults — replacing the former
+  // 37-line key-for-key transcription (and the formatWalkthroughSummaryFn
+  // rename it forced).
+  const pipelineDeps = {
+    formatWalkthroughSummary,
+    loadRepoConfig,
+    mergeRepoConfig,
+    runScanners,
+    formatScannerContext,
+    loadLearnings,
+    formatLearningsForPrompt,
+    filterFindingsByLearnings,
+    setReviewStatus,
+    buildStatusDescription,
+    findBotMarkerComments,
+    parseFindingsHashBlock,
+    buildFindingsHashBlock,
+    filterIncrementalFindings,
+    listBotReviews,
+  };
 
   for (const pr of prs) {
     if (pr.draft) {
@@ -1216,21 +1286,7 @@ export async function runScheduledReview({
       upsertReview,
       postFallbackComment,
       resolveReviewEvent,
-      formatWalkthroughSummary: formatWalkthroughSummaryFn,
-      loadRepoConfig,
-      mergeRepoConfig,
-      runScanners,
-      formatScannerContext,
-      loadLearnings,
-      formatLearningsForPrompt,
-      filterFindingsByLearnings,
-      setReviewStatus,
-      buildStatusDescription,
-      findBotMarkerComments,
-      parseFindingsHashBlock,
-      buildFindingsHashBlock,
-      filterIncrementalFindings,
-      listBotReviews,
+      ...pipelineDeps,
     });
 
     if (result.ok) {
