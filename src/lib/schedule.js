@@ -22,7 +22,7 @@
  * @module src/lib/schedule.js
  */
 
-import { MARKER, appendTrailers, isBotAuthor } from './comments.js';
+import { MARKER, appendTrailers, collectPagesSome, isBotAuthor } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
 import {
   buildStatusDescription as buildStatusDescriptionDefault,
@@ -314,33 +314,47 @@ export async function hasReviewForSha({
   // cannot stall a scheduled run (consistent with CORE-4 caps elsewhere).
   const MAX_COMMENT_PAGES = 100;
 
+  // Task-3 (deferred follow-ups): both hand-rolled pagination loops migrated
+  // to collectPagesSome — same page/short-page/cap semantics, but it returns
+  // true at the FIRST matching item instead of enumerating the full history
+  // (an existence check never needs the tail). Rejections still propagate to
+  // the caller's fail-soft boundary (W19-E2-4 in runScheduledReview).
+
   // 1. Issue comments (issues.listComments).
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: pullNumber,
-      per_page: perPage,
-      page,
-    });
-    if (comments.some(matches)) return true;
-    if (comments.length < perPage) break;
-  }
+  const inComments = await collectPagesSome(
+    (page) =>
+      octokit
+        .rest.issues.listComments({
+          owner,
+          repo,
+          issue_number: pullNumber,
+          per_page: perPage,
+          page,
+        })
+        .then((r) => r.data),
+    matches,
+    { perPage, maxPages: MAX_COMMENT_PAGES },
+  );
+  if (inComments) return true;
 
   // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
   // Guard for environments where the endpoint is absent (older mocks).
   if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
-    for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-      const { data: reviews } = await octokit.rest.pulls.listReviews({
-        owner,
-        repo,
-        pull_number: pullNumber,
-        per_page: perPage,
-        page,
-      });
-      if (reviews.some(matches)) return true;
-      if (reviews.length < perPage) break;
-    }
+    const inReviews = await collectPagesSome(
+      (page) =>
+        octokit
+          .rest.pulls.listReviews({
+            owner,
+            repo,
+            pull_number: pullNumber,
+            per_page: perPage,
+            page,
+          })
+          .then((r) => r.data),
+      matches,
+      { perPage, maxPages: MAX_COMMENT_PAGES },
+    );
+    if (inReviews) return true;
   }
 
   return false;

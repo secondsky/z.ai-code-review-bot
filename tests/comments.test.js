@@ -10,6 +10,7 @@ import {
   findBotMarkerComment,
   findBotMarkerComments,
   collectPages,
+  collectPagesSome,
   isBotAuthor,
   MARKER,
 } from '../src/lib/comments.js';
@@ -635,6 +636,121 @@ describe('collectPages', () => {
       collectPages(async () => {
         throw boom;
       }),
+    ).rejects.toBe(boom);
+  });
+});
+
+describe('collectPagesSome', () => {
+  // Task-3 (deferred follow-ups): the early-exit sibling of collectPages used
+  // by hasReviewForSha. Contract: identical page/short-page/cap semantics, but
+  // returns TRUE at the first item where `matches` is true (without fetching
+  // further pages), and FALSE when enumeration completes with no match.
+
+  test('early-exits mid-page: fetchPage called EXACTLY once when a full first page holds the match', async () => {
+    let calls = 0;
+    const fullPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1 }));
+    const result = await collectPagesSome(
+      async () => {
+        calls += 1;
+        if (calls > 1) throw new Error('early-exit test: fetched page 2 despite a page-1 match');
+        return fullPage;
+      },
+      (item) => item.id === 42,
+    );
+
+    expect(result).toBe(true);
+    expect(calls).toBe(1); // the match on page 1 must stop enumeration immediately
+  });
+
+  test('finds a match on a LATER page (full earlier pages are enumerated)', async () => {
+    const seenPages = [];
+    const result = await collectPagesSome(
+      async (page) => {
+        seenPages.push(page);
+        return page === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }];
+      },
+      (item) => item.id === 3,
+      { perPage: 2 },
+    );
+
+    expect(result).toBe(true);
+    expect(seenPages).toEqual([1, 2]); // page 1 is full → page 2 fetched → match there
+  });
+
+  test('a SHORT page with no match ends enumeration even when more pages exist (short-page stop)', async () => {
+    const seenPages = [];
+    const result = await collectPagesSome(
+      async (page) => {
+        seenPages.push(page);
+        return page === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }];
+      },
+      (item) => item.id === 3,
+      { perPage: 3 }, // page 1 (2 items < 3) is a SHORT page → stop; never fetch page 2
+    );
+
+    expect(result).toBe(false);
+    expect(seenPages).toEqual([1]);
+  });
+
+  test('no match: full enumeration stops on the first SHORT page (collectPages parity)', async () => {
+    let calls = 0;
+    const result = await collectPagesSome(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }];
+      },
+      () => false,
+      { perPage: 2 },
+    );
+
+    expect(result).toBe(false);
+    expect(calls).toBe(2); // page 1 full → page 2 fetched → short page ends the loop
+  });
+
+  test('no match: stops after exactly maxPages (default 100) when every page is full (CORE-4 cap)', async () => {
+    let calls = 0;
+    const fullPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1 }));
+    const result = await collectPagesSome(
+      async () => {
+        calls += 1;
+        if (calls > 105) throw new Error('cap test: fetched past the 100-page cap');
+        return fullPage;
+      },
+      () => false,
+    );
+
+    expect(result).toBe(false);
+    expect(calls).toBe(100); // exactly 100 fetches, then the cap stops the loop
+  });
+
+  test('empty page → false (treated as end of data)', async () => {
+    const result = await collectPagesSome(async () => [], () => true);
+    expect(result).toBe(false);
+  });
+
+  test('non-array page → false (defensive: treated as end of data)', async () => {
+    let calls = 0;
+    const result = await collectPagesSome(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }] : null;
+      },
+      () => false, // page 1 has no match → page 2 (null) is fetched → end of data
+      { perPage: 1 }, // page 1 is FULL → the loop must try page 2
+    );
+    expect(result).toBe(false);
+    expect(calls).toBe(2);
+  });
+
+  test('fetchPage rejection propagates (not swallowed)', async () => {
+    const boom = new Error('api down');
+    await expect(
+      collectPagesSome(
+        async () => {
+          throw boom;
+        },
+        () => true,
+      ),
     ).rejects.toBe(boom);
   });
 });

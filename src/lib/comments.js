@@ -69,6 +69,33 @@ export async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } 
 }
 
 /**
+ * Like {@link collectPages}, but stops at the first item where `matches`
+ * returns true and returns true; false if enumeration completes with no match.
+ * Same page/short-page/cap semantics as collectPages — an existence check
+ * (e.g. schedule.js's SHA-dedup read) never materializes the full history
+ * when the match is on an early page.
+ *
+ * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
+ * their own fail-soft boundary.
+ *
+ * @param {(page: number) => Promise<Array>} fetchPage  Resolves the batch for a page.
+ * @param {(item: *) => boolean} matches  Item predicate; first true wins.
+ * @param {object} [options]
+ * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
+ * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @returns {Promise<boolean>} true on the first matching item, else false.
+ */
+export async function collectPagesSome(fetchPage, matches, { perPage = 100, maxPages = 100 } = {}) {
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await fetchPage(page);
+    if (!Array.isArray(batch) || batch.length === 0) return false;
+    for (const item of batch) if (matches(item)) return true;
+    if (batch.length < perPage) return false;
+  }
+  return false;
+}
+
+/**
  * Build the comment body from a title and content, appending the marker. The
  * model `content` is run through the output sanitizer first so an indirect
  * prompt-injection cannot coax the bot into emitting @mention spam or forged
