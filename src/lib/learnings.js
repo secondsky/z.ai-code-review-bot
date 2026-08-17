@@ -36,6 +36,7 @@
  */
 
 import { matchesAnyPattern } from './glob.js';
+import { fetchRepoText, resolveHeadSha } from './repo-file.js';
 import { stripComment, unquote } from './yaml-lex.js';
 
 /** Hard cap on the size of a `.zai/learnings.yml` we will parse (cost/DoS guard). */
@@ -331,26 +332,13 @@ export function formatLearningsForPrompt(learnings) {
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve the PR head SHA from `opts.headSha` or
- * `context.payload.pull_request.head.sha`.
- *
- * @param {Object} opts
- * @returns {string}
- */
-function resolveHeadSha(opts) {
-  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
-  const sha = opts.context?.payload?.pull_request?.head?.sha;
-  return typeof sha === 'string' ? sha : '';
-}
-
-/**
  * Load `.zai/learnings.yml` from the PR's head SHA. Treated as UNTRUSTED.
  *
  * Flow:
  *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
- *   2. Fetch the file via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
- *   3. Base64-decode the content.
- *   4. Parse with {@link parseLearnings} (validates + drops bad entries).
+ *   2. Fetch + base64-decode the file via the shared
+ *      {@link fetchRepoText|repo-file} pipeline (dual size caps enforced there).
+ *   3. Parse with {@link parseLearnings} (validates + drops bad entries).
  *
  * On ANY error (404, parse failure, oversized, missing SHA, missing owner/repo),
  * `deps.core.warning(...)` is called and `[]` is returned. This function NEVER
@@ -385,65 +373,23 @@ export async function loadLearnings(opts = {}, deps = {}) {
     return [];
   }
 
-  let data;
-  try {
-    const resp = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path,
-      ref: headSha,
-    });
-    data = resp?.data;
-  } catch (error) {
-    const status = error?.status;
-    if (status === 404) {
-      // 404 is the common case (most repos don't have a learnings file); still
-      // surface a warning so operators can observe it.
-      warn(`learnings: no ${path} found at ${headSha.slice(0, 7)} (404).`);
-      return [];
-    }
-    warn(
-      `learnings: failed to fetch ${path} (${status ?? 'unknown'}): ` +
-        `${error?.message ?? String(error)}`,
-    );
+  // Fetch + decode via the shared repo-file pipeline (F-REPOFILE). Any
+  // not-ok outcome (404, fetch failure, oversized, decode failure, non-file)
+  // collapses to the historical inline warning + `[]`.
+  const outcome = await fetchRepoText({
+    octokit,
+    owner,
+    repo,
+    path,
+    ref: headSha,
+    maxBytes: MAX_LEARNINGS_BYTES,
+    label: 'learnings',
+  });
+  if (!outcome.ok) {
+    warn(outcome.message);
     return [];
   }
-
-  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
-  // a directory or a non-file response is treated as "no learnings".
-  let text;
-  if (data && typeof data.content === 'string') {
-    const size = typeof data.size === 'number' ? data.size : data.content.length;
-    if (size > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} is ${size} bytes (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-    try {
-      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
-    } catch {
-      warn(`learnings: ${path} could not be base64-decoded; skipping.`);
-      return [];
-    }
-    if (typeof text === 'string' && text.length > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} decodes to ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-  } else if (typeof data === 'string') {
-    text = data;
-    if (text.length > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} is ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-  } else {
-    // Not a file (directory listing or symlink) — no learnings.
-    return [];
-  }
+  const text = outcome.text;
 
   let parsed;
   try {

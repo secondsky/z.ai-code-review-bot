@@ -25,6 +25,7 @@
  */
 
 import picomatch from 'picomatch';
+import { fetchRepoText, resolveHeadSha } from './repo-file.js';
 
 /** Hard cap on the size of a CODEOWNERS file we will parse (cost/DoS guard). */
 const MAX_CODEOWNERS_BYTES = 256 * 1024; // 256 KiB
@@ -329,58 +330,6 @@ export function pickAssignableReviewers(owners) {
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve the PR head SHA from `opts.headSha` or
- * `context.payload.pull_request.head.sha`.
- *
- * @param {Object} opts
- * @returns {string}
- */
-function resolveHeadSha(opts) {
-  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
-  const sha = opts.context?.payload?.pull_request?.head?.sha;
-  return typeof sha === 'string' ? sha : '';
-}
-
-/**
- * Try to fetch a single path from the repo at `headSha`. Resolves to the
- * decoded UTF-8 text on success, or `null` if the path is absent (404) or
- * otherwise unavailable. Network/decode errors propagate to the caller (the
- * outer loop converts them into a fail-soft warning).
- *
- * @param {object} octokit
- * @param {string} owner
- * @param {string} repo
- * @param {string} path
- * @param {string} ref
- * @returns {Promise<string|null>}
- */
-async function fetchPath(octokit, owner, repo, path, ref) {
-  let data;
-  try {
-    const resp = await octokit.rest.repos.getContent({ owner, repo, path, ref });
-    data = resp?.data;
-  } catch (error) {
-    const status = error?.status;
-    if (status === 404) return null; // not at this path — try the next candidate
-    throw error; // other errors bubble to the fail-soft boundary
-  }
-  if (!data || typeof data.content !== 'string') return null;
-  const size = typeof data.size === 'number' ? data.size : data.content.length;
-  if (size > MAX_CODEOWNERS_BYTES) {
-    throw new Error(
-      `CODEOWNERS at ${path} is ${size} bytes (cap ${MAX_CODEOWNERS_BYTES})`,
-    );
-  }
-  const text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
-  if (text.length > MAX_CODEOWNERS_BYTES) {
-    throw new Error(
-      `CODEOWNERS at ${path} decodes to ${text.length} chars (cap ${MAX_CODEOWNERS_BYTES})`,
-    );
-  }
-  return text;
-}
-
-/**
  * Load + parse the CODEOWNERS file from the PR's HEAD SHA. Treated as UNTRUSTED.
  *
  * Searches `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS` in order and
@@ -418,19 +367,26 @@ export async function loadCodeowners(opts = {}, deps = {}) {
 
   let text = null;
   let foundPath = null;
-  try {
-    for (const path of CODEOWNERS_PATHS) {
-      const content = await fetchPath(octokit, owner, repo, path, headSha);
-      if (content !== null) {
-        text = content;
-        foundPath = path;
-        break;
-      }
+  for (const path of CODEOWNERS_PATHS) {
+    const outcome = await fetchRepoText({
+      octokit,
+      owner,
+      repo,
+      path,
+      ref: headSha,
+      maxBytes: MAX_CODEOWNERS_BYTES,
+      label: 'CODEOWNERS',
+    });
+    if (outcome.ok) {
+      // F-REPOFILE alignment: a raw-string payload (non-base64 `data`) now
+      // loads too — the learnings/repo-config convention, adopted everywhere.
+      text = outcome.text;
+      foundPath = path;
+      break;
     }
-  } catch (error) {
-    warn(
-      `codeowners: failed to fetch CODEOWNERS: ${error?.message ?? String(error)}`,
-    );
+    if (outcome.kind === 'missing') continue; // not at this path — try the next candidate
+    // too-large / decode / error — the historical outer-catch warn shape.
+    warn(`codeowners: failed to fetch CODEOWNERS: ${outcome.message}`);
     return [];
   }
 

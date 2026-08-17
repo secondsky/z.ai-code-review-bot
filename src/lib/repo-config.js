@@ -25,6 +25,7 @@
  * @module src/lib/repo-config.js
  */
 
+import { fetchRepoText, resolveHeadSha } from './repo-file.js';
 import { stripComment, unquote } from './yaml-lex.js';
 
 /** Hard cap on the size of a `.zai.yml` we will parse (cost/DoS guard). */
@@ -517,27 +518,14 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve the PR head SHA from `opts.headSha` or
- * `context.payload.pull_request.head.sha`.
- *
- * @param {Object} opts
- * @returns {string}
- */
-function resolveHeadSha(opts) {
-  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
-  const sha = opts.context?.payload?.pull_request?.head?.sha;
-  return typeof sha === 'string' ? sha : '';
-}
-
-/**
  * Load and validate `.zai.yml` from the PR's head SHA. Treated as UNTRUSTED.
  *
  * Flow:
  *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
- *   2. Fetch `.zai.yml` via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
- *   3. Base64-decode the content.
- *   4. Parse with {@link parseZaiYml}.
- *   5. Validate with {@link validateRepoConfig}.
+ *   2. Fetch + base64-decode `.zai.yml` via the shared
+ *      {@link fetchRepoText|repo-file} pipeline (dual size caps enforced there).
+ *   3. Parse with {@link parseZaiYml}.
+ *   4. Validate with {@link validateRepoConfig}.
  *
  * On ANY error (404, parse failure, validation drop, oversized, missing SHA),
  * `deps.core.warning(...)` is called and `{}` is returned. This function
@@ -569,69 +557,24 @@ export async function loadRepoConfig(opts = {}, deps = {}) {
     return {};
   }
 
-  let data;
-  try {
-    const resp = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path,
-      ref: headSha,
-    });
-    data = resp?.data;
-  } catch (error) {
-    const status = error?.status;
-    if (status === 404) {
-      // 404 is the common case (most repos don't have a .zai.yml), but the
-      // task brief specifies a warning on ANY error so callers can observe it.
-      warn(`repo-config: no ${path} found at ${headSha.slice(0, 7)} (404).`);
-      return {};
-    }
-    warn(
-      `repo-config: failed to fetch ${path} (${status ?? 'unknown'}): ` +
-        `${error?.message ?? String(error)}`,
-    );
+  // Fetch + decode via the shared repo-file pipeline (F-REPOFILE), keeping
+  // this module's own byte-cap constant and warning ladder: any not-ok
+  // outcome (404, fetch failure, oversized, decode failure, non-file)
+  // collapses to the historical inline warning + `{}`.
+  const outcome = await fetchRepoText({
+    octokit,
+    owner,
+    repo,
+    path,
+    ref: headSha,
+    maxBytes: MAX_REPO_CONFIG_BYTES,
+    label: 'repo-config',
+  });
+  if (!outcome.ok) {
+    warn(outcome.message);
     return {};
   }
-
-  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
-  // a directory or a non-file response is treated as "no config".
-  let text;
-  if (data && typeof data.content === 'string') {
-    // Reject oversized content before decoding (cost/DoS guard).
-    // `data.size` is the byte count GitHub reports; fall back to the
-    // base64 length when missing.
-    const size = typeof data.size === 'number' ? data.size : data.content.length;
-    if (size > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} is ${size} bytes (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-    try {
-      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
-    } catch {
-      warn(`repo-config: ${path} could not be base64-decoded; skipping.`);
-      return {};
-    }
-    // Post-decode size guard (base64 length can under-report).
-    if (typeof text === 'string' && text.length > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} decodes to ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-  } else if (typeof data === 'string') {
-    text = data;
-    if (text.length > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} is ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-  } else {
-    // Not a file (could be a directory listing or symlink) — no config.
-    return {};
-  }
+  const text = outcome.text;
 
   let parsed;
   try {
