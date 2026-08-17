@@ -82,6 +82,11 @@ import {
   // schedule paths render the identical skipped-files/portion notes (the
   // W19-E1-1→W20-F1-1 cross-copy drift can no longer happen).
   insertSkippedFilesNote,
+  // F-TRAILERS: the lenient zai-* trailer re-extractor (fallback path) and
+  // the SHA-block builder now live in findings.js with the rest of the
+  // trailer-protocol code (was a reverse dependency on schedule.js).
+  extractTrailers,
+  buildShaBlock,
 } from './lib/findings.js';
 import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
@@ -96,7 +101,7 @@ import {
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
-import { runScheduledReview, buildShaBlock } from './lib/schedule.js';
+import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 import { ensureBinary } from './lib/scanners/ensure-binary.js';
 import { scanSecrets } from './lib/scanners/secrets.js';
@@ -1030,13 +1035,13 @@ export async function run(context, deps = {}) {
         // the body (stripping any model-forged zai-* comments) and then
         // re-appends only the known trusted trailers. Extract them from the
         // reviewBody (they were appended by appendTrailers from trusted literals).
+        // F-TRAILERS: the lenient re-extraction regexes now live in
+        // findings.js (extractTrailers) — shared with schedule.js's fallback.
         const fallbackTrailers = [];
-        const markerMatch = reviewBody.match(/<!--\s*zai-code-review\s*-->/);
-        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
-        const hashMatch = reviewBody.match(/<!--\s*zai-hashes:[^>]*-->/);
-        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
-        const shaMatch = reviewBody.match(/<!--\s*zai-sha:[^>]*-->/);
-        if (shaMatch) fallbackTrailers.push(shaMatch[0]);
+        const { marker, hashBlock, shaBlock } = extractTrailers(reviewBody);
+        if (marker) fallbackTrailers.push(marker);
+        if (hashBlock) fallbackTrailers.push(hashBlock);
+        if (shaBlock) fallbackTrailers.push(shaBlock);
         await postFallbackCommentFn({
           octokit,
           context: reviewContext,

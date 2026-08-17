@@ -1334,4 +1334,55 @@ export function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, c
   return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
 }
 
+/**
+ * F-TRAILERS: the LENIENT re-extraction of the trusted zai-* trailers from a
+ * review/comment body, shared by the two fallback-comment paths (src/index.js
+ * and src/lib/schedule.js). Each regex is byte-identical to the code that was
+ * previously inlined at both call sites (W12-1 trailer re-append): `\s*` after
+ * `<!--` and `[^>]*` bodies ACCEPT no-space variants like
+ * `<!--zai-hashes:...-->`.
+ *
+ * This leniency is intentional and DIFFERENT from the canonical STRICT grammar
+ * of parseFindingsHashBlock above (`<!-- zai-hashes:(.*?) -->` — exact spaces),
+ * which stays untouched for suppression: re-extraction only re-appends
+ * trailers that appendTrailers wrote from trusted literals (post-sanitize
+ * re-append), so the wider acceptance here is safe; suppression must stay
+ * strict so a model-forged no-space variant can never register as state.
+ * First occurrence wins (oldest trailer), matching the old inline semantics.
+ *
+ * @param {string} body  the review/comment body to scan.
+ * @returns {{marker: string|null, hashBlock: string|null, shaBlock: string|null}}
+ */
+export function extractTrailers(body) {
+  if (typeof body !== 'string') return { marker: null, hashBlock: null, shaBlock: null };
+  const marker = body.match(/<!--\s*zai-code-review\s*-->/);
+  const hashBlock = body.match(/<!--\s*zai-hashes:[^>]*-->/);
+  const shaBlock = body.match(/<!--\s*zai-sha:[^>]*-->/);
+  return { marker: marker?.[0] ?? null, hashBlock: hashBlock?.[0] ?? null, shaBlock: shaBlock?.[0] ?? null };
+}
+
+/**
+ * The hidden HTML comment that embeds the PR head SHA in a posted
+ * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
+ * body contains BOTH the marker AND the head SHA; without this block the
+ * review body carries only the fixed marker literal, so the SHA match never
+ * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
+ * "only new/changed PRs" guarantee).
+ *
+ * The block is an HTML comment so it is invisible in the rendered comment.
+ * Returns '' when `sha` is empty so callers can append unconditionally.
+ *
+ * F-TRAILERS: moved verbatim from src/lib/schedule.js — its primary consumer
+ * is src/index.js (a reverse dependency); schedule.js keeps a compat
+ * re-export. The trailer-protocol constants now live with their parsers in
+ * this one module.
+ *
+ * @param {string} sha  the PR head SHA.
+ * @returns {string}
+ */
+export function buildShaBlock(sha) {
+  if (typeof sha !== 'string' || sha.length === 0) return '';
+  return `<!-- zai-sha: ${sha} -->`;
+}
+
 // Exported internals for testing (none beyond the public exports today).

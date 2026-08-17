@@ -37,6 +37,11 @@ import {
   // src/index.js (extracted verbatim into findings.js) — the W19-E1-1→
   // W20-F1-1 cross-copy drift can no longer happen.
   insertSkippedFilesNote,
+  // F-TRAILERS: the lenient zai-* trailer re-extractor (fallback parity with
+  // src/index.js) and the SHA-block builder (moved verbatim to findings.js —
+  // see the compat re-export below).
+  extractTrailers,
+  buildShaBlock,
 } from './findings.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
@@ -140,24 +145,13 @@ const defaultFindBotMarkerComments = async () => [];
  */
 const defaultListBotReviews = async () => [];
 
-/**
- * The hidden HTML comment that embeds the PR head SHA in a posted
- * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
- * body contains BOTH the marker AND the head SHA; without this block the
- * review body carries only the fixed marker literal, so the SHA match never
- * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
- * "only new/changed PRs" guarantee).
- *
- * The block is an HTML comment so it is invisible in the rendered comment.
- * Returns '' when `sha` is empty so callers can append unconditionally.
- *
- * @param {string} sha  the PR head SHA.
- * @returns {string}
- */
-export function buildShaBlock(sha) {
-  if (typeof sha !== 'string' || sha.length === 0) return '';
-  return `<!-- zai-sha: ${sha} -->`;
-}
+// F-TRAILERS: buildShaBlock moved verbatim to ./findings.js — its primary
+// consumer is src/index.js, so defining it here was a reverse dependency
+// (index.js importing schedule.js just for a pure string builder). This
+// re-export keeps the existing `import { buildShaBlock } from './schedule.js'`
+// consumers (tests/feature-bugs.test.js) working; internal call sites use the
+// findings.js import at the top of this module.
+export { buildShaBlock };
 
 /**
  * List open PRs (paginated), returning a minimal shape per PR. Stops once
@@ -830,13 +824,15 @@ export async function reviewOnePr({
         // stripped by sanitizeModelOutput (W11-11), breaking idempotent upsert
         // and SHA-level dedup on the next run.
         const fallbackTrailers = [];
-        const markerMatch = body.match(/<!--\s*zai-code-review\s*-->/);
-        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        const { marker, hashBlock: bodyHashBlock } = extractTrailers(body);
+        if (marker) fallbackTrailers.push(marker);
         // W17-C2-1: carry the hash block through the fallback too (index.js
         // parity) so suppression state survives even when the review API
         // rejects the payload.
-        const hashMatch = body.match(/<!--\s*zai-hashes:[^>]*-->/);
-        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
+        if (bodyHashBlock) fallbackTrailers.push(bodyHashBlock);
+        // The SHA trailer re-uses the locally-BUILT block (buildShaBlock
+        // above), not a body re-extract — preserved from the pre-F-TRAILERS
+        // code (index.js re-extracts all three from its reviewBody).
         if (shaBlock) fallbackTrailers.push(shaBlock);
         await postFallbackComment({
           octokit,
