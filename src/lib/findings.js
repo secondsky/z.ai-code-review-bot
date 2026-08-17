@@ -344,26 +344,9 @@ export function normalizeFinding(finding) {
     line = parseInt(f.line, 10);
   }
 
-  // Pre-coerce + pre-truncate + pre-defaulted copy for validation: validate
-  // the coerced enum values, the truncated title, and the defaulted optionals
-  // so `CRITICAL` + long titles + omitted optionals all pass after normalize.
-  const coerced = {
-    ...f,
-    file,
-    line,
-    severity,
-    confidence,
-    category,
-    title,
-    description,
-    evidence,
-    suggestion,
-    rule,
-  };
-
-  const { ok } = validateFinding(coerced);
-  if (!ok) return null;
-
+  // Validate the pre-coerced + pre-truncated + pre-defaulted object directly:
+  // validateFinding reads only the ten schema keys and ignores extras
+  // (see its JSDoc), so a spread copy carrying `...f` was redundant here.
   const normalized = {
     file,
     line,
@@ -376,6 +359,10 @@ export function normalizeFinding(finding) {
     suggestion,
     rule,
   };
+
+  const { ok } = validateFinding(normalized);
+  if (!ok) return null;
+
   // Drive output through SCHEMA_KEYS so the shape has a single source of truth
   // and any future schema field additions can't leak extras into the output.
   return Object.fromEntries(SCHEMA_KEYS.map((k) => [k, normalized[k]]));
@@ -565,25 +552,20 @@ function buildAllowedFilesSet(changedFiles) {
 }
 
 /**
- * Tolerant parser: extract findings from raw model output.
+ * Normalize each element of an ALREADY-PARSED findings array, drop anything
+ * that fails the anti-hallucination file filter (file must be in
+ * `allowedFiles`), and dedup by
+ * `${file}:${line ?? 'null'}:${title.toLowerCase()}` (first wins).
  *
- * Strategies (JSON array, fenced code block, greedy bracket scan), normalize
- * each element via {@link normalizeFinding}, drop anything that fails the
- * anti-hallucination file filter (file must be in `changedFiles`), and dedup
- * by `${file}:${line ?? 'null'}:${title.toLowerCase()}` (first wins).
+ * Module-private shared step of {@link parseFindings} (hostile raw text) and
+ * {@link parseStructuredReview} (already-parsed envelope findings — skips the
+ * JSON.stringify round-trip through parseFindings).
  *
- * Never throws. Returns `[]` on any non-parseable input.
- *
- * @param {string} rawModelOutput
- * @param {{ changedFiles?: unknown[] }} [options]
+ * @param {unknown[]} array
+ * @param {Set<string>} allowedFiles
  * @returns {Record<string, unknown>[]}
  */
-export function parseFindings(rawModelOutput, options = {}) {
-  const allowedFiles = buildAllowedFilesSet(options?.changedFiles);
-
-  const array = extractJsonArray(rawModelOutput);
-  if (!array) return [];
-
+function collectFindings(array, allowedFiles) {
   /** @type {Record<string, unknown>[]} */
   const out = [];
   const seen = new Set();
@@ -607,6 +589,29 @@ export function parseFindings(rawModelOutput, options = {}) {
   return out;
 }
 
+/**
+ * Tolerant parser: extract findings from raw model output.
+ *
+ * Strategies (JSON array, fenced code block, greedy bracket scan), then
+ * {@link collectFindings} (normalize each element via {@link normalizeFinding},
+ * anti-hallucination file filter against `changedFiles`, dedup by
+ * `${file}:${line ?? 'null'}:${title.toLowerCase()}` — first wins).
+ *
+ * Never throws. Returns `[]` on any non-parseable input.
+ *
+ * @param {string} rawModelOutput
+ * @param {{ changedFiles?: unknown[] }} [options]
+ * @returns {Record<string, unknown>[]}
+ */
+export function parseFindings(rawModelOutput, options = {}) {
+  const allowedFiles = buildAllowedFilesSet(options?.changedFiles);
+
+  const array = extractJsonArray(rawModelOutput);
+  if (!array) return [];
+
+  return collectFindings(array, allowedFiles);
+}
+
 // ---------------------------------------------------------------------------
 // parseStructuredReview
 // ---------------------------------------------------------------------------
@@ -614,7 +619,9 @@ export function parseFindings(rawModelOutput, options = {}) {
 /**
  * Tolerant parser for the v2 structured-review envelope. The model emits a
  * JSON object `{"summary": "...", "findings": [...]}`. This extracts the
- * summary string and delegates the findings array to {@link parseFindings}.
+ * summary string and runs the findings array through {@link collectFindings}
+ * (the same normalize / anti-hallucination-filter / dedup pipeline that
+ * {@link parseFindings} applies after extracting an array from raw text).
  *
  * Strategies for the envelope (tried in order):
  *   a. The entire trimmed text as JSON (if it starts with `{`).
@@ -642,7 +649,14 @@ export function parseStructuredReview(rawModelOutput, options = {}) {
     const summary =
       typeof parsed.summary === 'string' ? parsed.summary : '';
     const findingsRaw = Array.isArray(parsed.findings) ? parsed.findings : [];
-    const findings = parseFindings(JSON.stringify(findingsRaw), options);
+    // findingsRaw is already a parsed array — feed it straight to the shared
+    // collectFindings step instead of round-tripping through
+    // parseFindings(JSON.stringify(...)) (whose extraction/repair strategies
+    // are dead on JSON.parse-derived input).
+    const findings = collectFindings(
+      findingsRaw,
+      buildAllowedFilesSet(options?.changedFiles),
+    );
     return { summary, findings };
   }
 
