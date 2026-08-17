@@ -231,7 +231,8 @@ export function formatEntry(entry) {
  * batch is flushed first. A single oversized entry still gets its own batch.
  *
  * W15-A8-1: the per-batch char budget is `min(maxBatchChars, maxDiffChars)`
- * when `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap
+ * when maxDiffChars is finite (cap active; Infinity = unlimited, D-4).
+ * MAX_DIFF_CHARS is a documented hard cap
  * against cost abuse from oversized PRs, but the prompt-side truncation (W6-6
  * in buildStructuredReviewPrompt) is intentionally skipped whenever a batch
  * envelope is present — post-hoc truncation would silently drop entries
@@ -244,8 +245,9 @@ export function formatEntry(entry) {
  * W16-B3-4: the per-batch clamp alone did NOT bound the TOTAL chars — a tiny
  * maxDiffChars with many files produced one batch per file (N API calls,
  * strictly worse than main) and the "hard cap against cost abuse" was still
- * unenforced. When maxDiffChars > 0, the CUMULATIVE packed chars across ALL
- * batches are capped: once the running total would exceed maxDiffChars, the
+ * unenforced. When maxDiffChars is finite (cap active), the CUMULATIVE packed
+ * chars across ALL batches are capped: once the running total would exceed
+ * maxDiffChars, the
  * entry and every entry after it are NOT reviewed (dropping trailing entries,
  * mirroring the unbatched MAX_DIFF_CHARS semantics). One guard keeps the
  * oversized-entry semantics bounded: when the FIRST entry of a (fresh, empty)
@@ -263,11 +265,17 @@ export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  // D-4: maxDiffChars uses the post-loadConfig representation — Infinity means
+  // unlimited, a finite positive number means the cap is active. Legacy direct
+  // callers passing 0/negative (the former sentinel) still land on Infinity
+  // here, so the observable behavior is unchanged.
   const maxDiffChars =
     typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
       ? options.maxDiffChars
-      : 0;
-  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
+      : Infinity;
+  const charBudget = Number.isFinite(maxDiffChars)
+    ? Math.min(maxBatchChars, maxDiffChars)
+    : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
@@ -309,8 +317,9 @@ export function createReviewBatches(files, options = {}) {
     ) {
       flush();
     }
-    // W16-B3-4 cumulative cap (only when maxDiffChars > 0).
-    if (maxDiffChars > 0 && cumulativeChars + entryLen > maxDiffChars) {
+    // W16-B3-4 cumulative cap (only when the cap is active — Infinity means
+    // unlimited, D-4).
+    if (Number.isFinite(maxDiffChars) && cumulativeChars + entryLen > maxDiffChars) {
       const firstOfFreshBatch = currentEntries.length === 0;
       const fitsPerBatchBudget = entryLen <= charBudget;
       const budgetNotExhausted = cumulativeChars < maxDiffChars;
@@ -585,8 +594,9 @@ export async function runStructuredReview(files, config, deps = {}) {
     // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
     // W6-6 truncation is skipped whenever batched, so the cap is enforced by
     // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
-    // inside createReviewBatches).
-    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
+    // inside createReviewBatches). D-4: Infinity = unlimited; the fallback for
+    // non-number values matches the post-loadConfig representation.
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : Infinity,
   };
 
   const batchState = {

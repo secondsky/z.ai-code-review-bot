@@ -229,17 +229,21 @@ export function loadConfig(inputs = {}, options = {}) {
           .map((p) => p.trim())
           .filter((p) => p !== '');
 
-  // maxDiffChars: parseInt base 10, NaN -> default. 0 (and any negative) means
-  // "unlimited" — documented in action.yml and honored here. The DEFAULT is a
-  // sane cap; operators who want unlimited set MAX_DIFF_CHARS=0 (or a negative)
-  // explicitly. A positive integer is honored as the per-batch char cap.
+  // maxDiffChars: parseInt base 10, NaN -> default. "Unlimited" is normalized
+  // to Infinity HERE, at the boundary: action.yml documents 0 (and any
+  // negative) as unlimited, and loadConfig maps both to Infinity so consumers
+  // branch two-state (Number.isFinite = cap active; Infinity = unlimited)
+  // instead of the former three-state `> 0` checks on a 0 sentinel. The
+  // DEFAULT is a sane cap; operators who want unlimited set MAX_DIFF_CHARS=0
+  // (or a negative) explicitly. A positive integer is honored as the
+  // per-batch char cap.
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null
       ? 100000
-      : maxDiffCharsRaw <= 0
-        ? 0
-        : maxDiffCharsRaw;
+      : maxDiffCharsRaw > 0
+        ? maxDiffCharsRaw
+        : Infinity;
 
   // Numeric knobs that drive loops/batching must be positive; clamp to a safe
   // default on any non-finite/negative/zero value to prevent infinite loops

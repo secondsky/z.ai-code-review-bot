@@ -572,12 +572,14 @@ describe('createReviewBatches', () => {
     expect(packed).toBeLessThanOrEqual(1000 + 1000); // cap + one-entry tolerance
   });
 
-  test('W16-B3-4: maxDiffChars 0 → exactly today’s behavior, no skip metadata', () => {
+  test('W16-B3-4: maxDiffChars Infinity → exactly today’s behavior, no skip metadata', () => {
     const files = [];
     for (let i = 0; i < 10; i++) {
       files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(900) }));
     }
-    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: 0 });
+    // D-4: Infinity = unlimited (post-loadConfig representation of the old 0
+    // sentinel) — identical packing to an unset cap.
+    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: Infinity });
     const unset = createReviewBatches(files, { maxBatchChars: 3000 });
     expect(capped.batches).toEqual(unset.batches);
     expect(capped.metadata.skippedFiles).toBeUndefined();
@@ -643,15 +645,16 @@ describe('createReviewBatches', () => {
     expect(metadata.skippedFiles).toBe(1);
   });
 
-  test('W15-A8-1: maxDiffChars 0/unset → maxBatchChars governs (behavior unchanged)', () => {
+  test('W15-A8-1: maxDiffChars Infinity/unset → maxBatchChars governs (behavior unchanged)', () => {
     const files = [];
     for (let i = 0; i < 10; i++) {
       files.push(makeFile({ filename: `f${i}.md`, patch: 'x'.repeat(900) }));
     }
-    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: 0 });
+    // D-4: Infinity = unlimited (formerly the 0 sentinel).
+    const capped = createReviewBatches(files, { maxBatchChars: 3000, maxDiffChars: Infinity });
     const unset = createReviewBatches(files, { maxBatchChars: 3000 });
     expect(capped.batches.length).toBeGreaterThan(1);
-    expect(capped.batches.length).toBe(unset.batches.length); // 0 == unset
+    expect(capped.batches.length).toBe(unset.batches.length); // Infinity == unset
     for (const batch of capped.batches) {
       const total = batch.reduce((sum, e) => sum + formatEntry(e).length, 0);
       expect(total).toBeLessThanOrEqual(3000);
@@ -1471,10 +1474,11 @@ describe('runStructuredReview', () => {
   // model). skippedEntries reverts to counting ONLY MAX_DIFF_CHARS cap
   // drops; the context count flows to its own "(model context limit)" note
   // in index.js / schedule.js.
-  test('W19-E1-1/W20-F1-1: single file always context-overflowing (maxDiffChars 0) → contextSkippedEntries 1, skippedEntries ABSENT', async () => {
+  test('W19-E1-1/W20-F1-1: single file always context-overflowing (maxDiffChars Infinity) → contextSkippedEntries 1, skippedEntries ABSENT', async () => {
     const files = [makeFile({ filename: 'src/big.js', patch: 'x'.repeat(100) })];
     const core = { info: vi.fn(), warning: vi.fn() };
-    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: 0 }, {
+    // D-4: Infinity = unlimited (formerly the 0 sentinel) — the cap is off.
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: Infinity }, {
       callApi: async () => {
         throw new Error('maximum context length is 1024 tokens');
       },
@@ -1503,7 +1507,7 @@ describe('runStructuredReview', () => {
     for (let i = 0; i < 4; i++) {
       files.push(makeFile({ filename: `f${i}.js`, patch: 'x'.repeat(50) }));
     }
-    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: 0 }, {
+    const out = await runStructuredReview(files, { apiKey: 'k', model: 'm', maxDiffChars: Infinity }, {
       callApi: async () => {
         throw new Error('maximum context length is 1024 tokens');
       },

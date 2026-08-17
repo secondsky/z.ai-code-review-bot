@@ -439,12 +439,14 @@ describe('buildStructuredReviewPrompt', () => {
     expect(out2).not.toContain('name="b.js"');
   });
 
-  test('maxDiffChars = 0 → no truncation', () => {
+  test('maxDiffChars = Infinity → no truncation', () => {
     const files = [
       { filename: 'a.js', status: 'modified', patch: 'x'.repeat(5000) },
       { filename: 'b.js', status: 'modified', patch: 'y'.repeat(5000) },
     ];
-    const out = buildStructuredReviewPrompt(files, { maxDiffChars: 0 });
+    // D-4: Infinity is the post-loadConfig representation of "unlimited"
+    // (formerly the 0 sentinel) — same user-visible behavior: no truncation.
+    const out = buildStructuredReviewPrompt(files, { maxDiffChars: Infinity });
     expect(out).toContain('name="a.js"');
     expect(out).toContain('name="b.js"');
   });

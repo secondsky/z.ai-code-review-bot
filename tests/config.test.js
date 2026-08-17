@@ -63,18 +63,21 @@ describe('loadConfig — excludePatterns', () => {
 });
 
 describe('loadConfig — numeric fields & defaults', () => {
-  test('maxDiffChars: default 100000; 0 and negatives mean unlimited; NaN -> default', () => {
+  test('maxDiffChars: default 100000; 0 and negatives mean unlimited (Infinity); NaN -> default', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(100000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(0); // unlimited
+    // D-4: "unlimited" is normalized to Infinity at this boundary — action.yml
+    // still documents "0 or negative = unlimited"; only the internal
+    // representation changed (formerly the 0 sentinel).
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(Infinity); // unlimited
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
     // CFG-8: a non-integer numeric string (float) is now rejected by toInt's
     // strict validation and falls back to the default, rather than being
     // silently truncated to 12.
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(100000);
-    // Per action.yml + code comment, negatives mean unlimited (0), NOT the
-    // default cap. The old code returned 100000 here — a doc/code mismatch.
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(0); // negative->unlimited
+    // Per action.yml + code comment, negatives mean unlimited (Infinity), NOT
+    // the default cap. The old code returned 100000 here — a doc/code mismatch.
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(Infinity); // negative->unlimited
   });
 
   test('largePrFileThreshold default 50', () => {
