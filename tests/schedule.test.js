@@ -6,6 +6,7 @@
  * reviewed, which skipped, the dedup-by-SHA logic, per-PR failure isolation).
  */
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   runScheduledReview,
   listOpenPrs,
@@ -543,6 +544,93 @@ const makeStubs = (overrides = {}) => ({
   postFallbackComment: vi.fn(async () => ({ id: 9 })),
   ...overrides,
 });
+
+/* ---------- F-SCHEDDEPS key-parity guard (Task A1) ---------- */
+
+// Inert-compatible SENTINEL implementations for EVERY INERT_PIPELINE_DEPS key.
+// The sentinel test in runScheduledReview below pins only runScanners; this
+// table generalizes the same mechanism to all 15 keys: each sentinel is
+// injected into runScheduledReview and must be CALLED by reviewOnePr. A key
+// dropped from the `pipelineDeps` forwarding bundle (or from reviewOnePr's
+// destructuring defaults) silently degrades to the inert no-op — the exact
+// W15-A8-4/W18-D1-2 parity-loss class this guard exists to catch. Each impl is
+// a behavioral stand-in for the inert default so injecting a sentinel never
+// changes the flow under test; the assertion is purely "the batch-injected
+// function was used".
+const PIPELINE_SENTINEL_IMPLS = {
+  formatWalkthroughSummary: () => 'SENTINEL-WALKTHROUGH',
+  loadRepoConfig: async () => ({}),
+  mergeRepoConfig: (actionConfig = {}) => ({ ...actionConfig }),
+  runScanners: async () => ({ findings: [], metrics: {}, scannerNames: [] }),
+  formatScannerContext: () => 'SENTINEL-SCANNER-CTX',
+  loadLearnings: async () => [],
+  formatLearningsForPrompt: () => 'SENTINEL-LEARNINGS-CTX',
+  filterFindingsByLearnings: (findings) => ({
+    kept: Array.isArray(findings) ? findings : [],
+    suppressed: 0,
+  }),
+  setReviewStatus: async () => true,
+  buildStatusDescription: () => 'SENTINEL-STATUS-DESC',
+  findBotMarkerComments: async () => [],
+  parseFindingsHashBlock: () => [],
+  buildFindingsHashBlock: () => '',
+  filterIncrementalFindings: (findings) => ({
+    kept: Array.isArray(findings) ? findings : [],
+    suppressed: 0,
+  }),
+  listBotReviews: async () => [],
+};
+
+// One uniform harness for every sentinel case: a single reviewable PR, one
+// patchable file, and a runStructuredReview stub returning a FILE-LEVEL
+// finding (line: null → summary-only branch — the only branch that exercises
+// formatWalkthroughSummary) with ALL feature gates on so every gated dep
+// (loadRepoConfig, loadLearnings, setReviewStatus/buildStatusDescription,
+// findBotMarkerComments/listBotReviews) sits on its usage path. Each case
+// injects exactly ONE sentinel; every other dep falls through to its inert
+// default (a no-op by contract), so the only variable is the forwarded key.
+const SENTINEL_SUMMARY_FINDING = {
+  file: 'a.js',
+  line: null,
+  severity: 'low',
+  title: 'Sentinel finding',
+  description: 'd',
+};
+async function runPipelineSentinelHarness(sentinelKey) {
+  const sentinel = vi.fn(PIPELINE_SENTINEL_IMPLS[sentinelKey]);
+  const octokit = makeOctokit({ prs: [mkPr(45, 'sha45')], commentsByPr: {} });
+  const capturedReviewCfg = [];
+  const s = makeStubs({
+    getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+    runStructuredReview: vi.fn(async (files, cfg) => {
+      capturedReviewCfg.push(cfg);
+      return {
+        findings: [SENTINEL_SUMMARY_FINDING],
+        summary: 'sentinel review',
+        metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 0, batchMetadata: [] },
+      };
+    }),
+    [sentinelKey]: sentinel,
+  });
+
+  const result = await runScheduledReview({
+    octokit,
+    owner: 'o',
+    repo: 'r',
+    config: makeConfig({
+      repoConfigEnabled: true,
+      learningsEnabled: true,
+      commitStatus: true,
+      incrementalReview: true,
+      walkthrough: true,
+    }),
+    core: { info: vi.fn(), warning: vi.fn() },
+    callApi: vi.fn(),
+    ...s,
+  });
+
+  return { result, sentinel, capturedReviewCfg };
+}
 
 describe('runScheduledReview', () => {
   it('reviews PRs that have no existing review for their SHA', async () => {
@@ -1364,6 +1452,98 @@ describe('reviewOnePr — W15-A8-4 feature parity', () => {
     // ...and the sentinel's findings reached runStructuredReview's input.
     expect(capturedReviewCfg).toHaveLength(1);
     expect(capturedReviewCfg[0].deterministicFindings).toEqual([SENTINEL_FINDING]);
+  });
+
+  // F-SCHEDDEPS (Task A1) behavioral key-parity guard: EVERY map key,
+  // parameterized. Each case injects one sentinel through the batch entry and
+  // asserts reviewOnePr actually CALLED it — pinning the complete
+  // runScheduledReview → pipelineDeps bundle → reviewOnePr forwarding for that
+  // key (a dropped key fires the INERT_PIPELINE_DEPS default instead and the
+  // sentinel is never invoked).
+  it.each(Object.keys(PIPELINE_SENTINEL_IMPLS))(
+    'F-SCHEDDEPS: a sentinel %s injected into runScheduledReview is used by reviewOnePr',
+    async (key) => {
+      const { result, sentinel, capturedReviewCfg } = await runPipelineSentinelHarness(key);
+
+      // The flow must still COMPLETE — a sentinel that broke the pipeline would
+      // return {ok:false} and could mask a forwarding gap as an unrelated failure.
+      expect(result).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
+      // THE invariant: the batch-injected sentinel reached reviewOnePr's usage
+      // site for this key.
+      expect(sentinel).toHaveBeenCalled();
+      // The per-PR review ran on the same path the sentinel rode.
+      expect(capturedReviewCfg).toHaveLength(1);
+      // For deps whose OUTPUT threads into runStructuredReview's config, pin
+      // the threading too: the sentinel's marker must arrive in the captured
+      // cfg (forwarding is not just "called" but "consumed").
+      if (key === 'runScanners') {
+        expect(capturedReviewCfg[0].deterministicFindings).toEqual([]);
+      }
+      if (key === 'formatScannerContext') {
+        expect(capturedReviewCfg[0].scannerContext).toBe('SENTINEL-SCANNER-CTX');
+      }
+      if (key === 'formatLearningsForPrompt') {
+        expect(capturedReviewCfg[0].learningsContext).toBe('SENTINEL-LEARNINGS-CTX');
+      }
+    },
+  );
+});
+
+/* ---------- F-SCHEDDEPS static key-parity (source scan) ---------- */
+
+// The behavioral guard above pins forwarding per key, but its key list is
+// itself hand-maintained. This STATIC guard reads schedule.js's own source and
+// asserts the THREE hand-maintained lists agree:
+//   (1) the INERT_PIPELINE_DEPS map literal,
+//   (2) reviewOnePr's destructuring defaults (`KEY = INERT_PIPELINE_DEPS.KEY`),
+//   (3) runScheduledReview's `pipelineDeps` forwarding bundle,
+// plus (4) that the behavioral sentinel list stays in lockstep with the map.
+// A dep added to the map without updating every other list — the silent-no-op
+// hazard — fails here with the offending key named.
+describe('F-SCHEDDEPS static key-parity (source scan)', () => {
+  it('every INERT_PIPELINE_DEPS key is wired in reviewOnePr defaults, the pipelineDeps bundle, and the sentinel guard', () => {
+    const src = readFileSync(new URL('../src/lib/schedule.js', import.meta.url), 'utf8');
+
+    // Keys of a one-entry-per-line object literal (`  key: value,` / `  key,`).
+    // Both guarded literals are formatted this way; a reformat that defeats
+    // the regex fails the test loudly (empty/short key list) instead of
+    // silently skipping the guard.
+    const literalKeys = (block) =>
+      [...block.matchAll(/^ +(\w+)\s*[,:]/gm)].map((m) => m[1]);
+    const sliceLiteral = (declaration) => {
+      const start = src.indexOf(declaration);
+      expect(start, `declaration not found in schedule.js: ${declaration}`).toBeGreaterThan(-1);
+      const end = src.indexOf('};', start);
+      expect(end, `literal terminator not found for: ${declaration}`).toBeGreaterThan(start);
+      return src.slice(start, end);
+    };
+
+    // (1) The defaults map — the single source of per-PR pipeline defaults.
+    const mapKeys = literalKeys(sliceLiteral('const INERT_PIPELINE_DEPS = {'));
+    expect(mapKeys.length).toBeGreaterThan(0);
+
+    // (2) reviewOnePr's destructuring defaults: every map key must default
+    // from the map inside reviewOnePr's parameter list.
+    const reviewOnePrStart = src.indexOf('export async function reviewOnePr(');
+    const runScheduledStart = src.indexOf('export async function runScheduledReview(');
+    expect(reviewOnePrStart).toBeGreaterThan(-1);
+    expect(runScheduledStart).toBeGreaterThan(reviewOnePrStart);
+    const reviewOnePrSrc = src.slice(reviewOnePrStart, runScheduledStart);
+    for (const key of mapKeys) {
+      expect(
+        new RegExp(`\\b${key}\\s*=\\s*INERT_PIPELINE_DEPS\\.${key}\\b`).test(reviewOnePrSrc),
+        `reviewOnePr is missing the destructuring default "${key} = INERT_PIPELINE_DEPS.${key}"`,
+      ).toBe(true);
+    }
+
+    // (3) runScheduledReview's forwarding bundle: set-equal to the map keys
+    // (neither a dropped key nor a stale extra can slip through).
+    const bundleKeys = literalKeys(sliceLiteral('const pipelineDeps = {'));
+    expect([...bundleKeys].sort()).toEqual([...mapKeys].sort());
+
+    // (4) The behavioral sentinel list must cover the map exactly — a new map
+    // key without a sentinel case would silently lose behavioral coverage.
+    expect(Object.keys(PIPELINE_SENTINEL_IMPLS).sort()).toEqual([...mapKeys].sort());
   });
 });
 
