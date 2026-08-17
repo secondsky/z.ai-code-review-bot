@@ -25,7 +25,10 @@
  * @module src/lib/auto-review.js
  */
 
-import { buildStructuredReviewPrompt } from './prompt.js';
+// F-UNTRUSTTAG rider: escapeXmlAttribute is imported from prompt.js (the
+// hardened single source — it also encodes `'` as `&#39;`) instead of keeping
+// a drifted private copy here that missed the apostrophe hardening.
+import { buildStructuredReviewPrompt, escapeXmlAttribute } from './prompt.js';
 import {
   parseStructuredReview,
   rankAndCapFindings,
@@ -182,19 +185,6 @@ export function createReviewEntries(files, options = {}) {
   }
   out.sort(compareByPriority);
   return out;
-}
-
-/**
- * Escape a string for an XML attribute value (`name="…"`). Neutralizes `"`,
- * `&`, `<`, `>` so a hostile filename cannot break out of the attribute or
- * inject tag structure into the prompt.
- */
-function escapeXmlAttribute(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
 }
 
 /**
