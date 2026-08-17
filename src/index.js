@@ -421,6 +421,14 @@ export async function run(context, deps = {}) {
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
+    // D-1 (deferred-followups #13): mutable flag telling main()'s catch
+    // whether THIS run actually landed a `pending` commit status. run()
+    // flips it to true only after the pending post resolves TRUE (the
+    // W16-B2-1/W17-C2-2 boolean contract from schedule.js). The default is
+    // a fresh inert object so direct run() callers (tests, embeddings) are
+    // unaffected; main() passes its own tracker so the catch can gate the
+    // terminal `failure` post on it.
+    statusTracker = { pendingLanded: false },
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
@@ -506,7 +514,7 @@ export async function run(context, deps = {}) {
     // head SHA from the pull_request payload.
     const sha = context?.payload?.pull_request?.head?.sha ?? '';
     if (config.commitStatus) {
-      await setReviewStatusFn(
+      const pendingLanded = await setReviewStatusFn(
         {
           octokit,
           context,
@@ -517,6 +525,12 @@ export async function run(context, deps = {}) {
         },
         { core: coreDep },
       );
+      // D-1 (schedule-policy parity): set the tracker only AFTER the post
+      // resolves TRUE — setReviewStatus is fail-soft and returns FALSE on
+      // API failure (never throws), and a `pending` that never landed must
+      // not obligate main()'s catch to post a terminal `failure` for a
+      // check this run never started. Mirrors schedule.js's pendingPosted.
+      if (pendingLanded === true) statusTracker.pendingLanded = true;
     }
 
     // Build (or accept an injected) callApi adapter that wraps api.js.
@@ -1306,7 +1320,10 @@ function buildCallApi({
  * Build config from action inputs and call {@link run}. Errors propagate to
  * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
  * best-effort posts a "failure" commit status so developers aren't left
- * staring at a forever-pending status.
+ * staring at a forever-pending status — but only when a `pending` status
+ * actually landed during THIS run (D-1, schedule.js's W16-B2-1 policy):
+ * a run that died before starting its check (e.g. a getChangedFiles
+ * failure) must post nothing, instead of surfacing a failure from nowhere.
  *
  * @returns {Promise<void>}
  */
@@ -1314,19 +1331,26 @@ export async function main() {
   const inputs = readAllInputs(core);
   const config = loadConfig(inputs, { core });
   const octokit = github.getOctokit(config.githubToken);
+  // D-1: shared with run() so the pending site can report that the
+  // `pending` commit status landed (see run()'s statusTracker dep).
+  const statusTracker = { pendingLanded: false };
   try {
     return await run(github.context, {
       config,
       core,
       github,
       octokit,
+      statusTracker,
     });
   } catch (err) {
     // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
     // only — setReviewStatus swallows its own errors and never throws, so this
-    // can never mask the original failure. Only fires for pull_request events
-    // (where a head SHA exists) and when status feedback is enabled.
-    if (config.commitStatus) {
+    // can never mask the original failure. Fires for pull_request events
+    // (where a head SHA exists), when status feedback is enabled, AND only
+    // when this run's `pending` status actually landed (D-1, sanctioned
+    // behavior change #1: schedule's policy wins — posting `failure` for a
+    // check that was never started marks the commit failed from nowhere).
+    if (config.commitStatus && statusTracker.pendingLanded) {
       const sha = github.context?.payload?.pull_request?.head?.sha;
       if (sha) {
         await setReviewStatus(
