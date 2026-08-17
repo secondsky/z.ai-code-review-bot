@@ -33,6 +33,10 @@ import {
   buildFindingsHashBlock as buildFindingsHashBlockDefault,
   filterIncrementalFindings as filterIncrementalFindingsDefault,
   appendIncrementalNote,
+  // F-NOTES: the skipped-files/portion note inserter is shared with
+  // src/index.js (extracted verbatim into findings.js) — the W19-E1-1→
+  // W20-F1-1 cross-copy drift can no longer happen.
+  insertSkippedFilesNote,
 } from './findings.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
@@ -153,69 +157,6 @@ const defaultListBotReviews = async () => [];
 export function buildShaBlock(sha) {
   if (typeof sha !== 'string' || sha.length === 0) return '';
   return `<!-- zai-sha: ${sha} -->`;
-}
-
-/**
- * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
- * into a rendered body.
- *
- * Mirrors the same-named helper in src/index.js (duplicated deliberately:
- * schedule.js cannot import from index.js — the entry point imports THIS
- * module — and the helper is small). When the structured pipeline reports
- * `skippedFiles > 0`, an italic note (the `_N findings truncated to cap._`
- * style) is inserted just before the trailing marker so the posted body never
- * claims a bare "No issues found" all-clear while files were silently dropped
- * by the cumulative MAX_DIFF_CHARS cap.
- *
- * W18-D2-3: PARTIAL drops of multi-chunk files (skippedEntries) were surfaced
- * nowhere — a file with 2/15 chunks reviewed still posted the bare
- * all-clear. When `skippedEntries > 0` a matching portions note renders too
- * (both notes when both kinds fired), keeping the two inserters consistent.
- *
- * W20-F1-1: context-limit drops (contextSkippedEntries) get their OWN note
- * with the correct cause — summing them into skippedEntries (the W19-E1-1
- * approach) rendered the hard-coded "(MAX_DIFF_CHARS cap)" cause for
- * context drops even when the cap was disabled (index.js parity).
- *
- * @param {string} body   Rendered body ending in the marker (typically).
- * @param {number} skippedFiles  Count of files with zero reviewed entries.
- * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
- * @param {number} [contextSkippedEntries]  Count of entries dropped by the
- *   model context limit (NOT MAX_DIFF_CHARS).
- * @returns {string}
- */
-function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
-  const n =
-    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
-      ? Math.floor(skippedFiles)
-      : 0;
-  const e =
-    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
-      ? Math.floor(skippedEntries)
-      : 0;
-  const c =
-    typeof contextSkippedEntries === 'number' &&
-    Number.isFinite(contextSkippedEntries) &&
-    contextSkippedEntries > 0
-      ? Math.floor(contextSkippedEntries)
-      : 0;
-  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
-    return body;
-  }
-  const notes = [];
-  if (n > 0) {
-    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (e > 0) {
-    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (c > 0) {
-    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
-  }
-  const note = notes.join('\n\n');
-  const idx = body.lastIndexOf(MARKER);
-  if (idx === -1) return `${body}\n\n${note}`;
-  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
 }
 
 /**
