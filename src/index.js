@@ -58,7 +58,6 @@ import {
   upsertReviewComment,
   buildCommentBody,
   appendTrailers,
-  findBotMarkerComment,
   findBotMarkerComments,
   MARKER,
 } from './lib/comments.js';
@@ -415,7 +414,6 @@ export async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
-    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
     findBotMarkerComments: findBotMarkerCommentsFn = findBotMarkerComments,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
