@@ -738,6 +738,7 @@ export async function run(context, deps = {}) {
           octokit,
           context: reviewContext,
           marker: MARKER,
+          core: coreDep,
         });
         // The most recent prior review is the canonical hash source. Reviews
         // come back newest-first from the GitHub API; fall back to scanning
@@ -768,6 +769,7 @@ export async function run(context, deps = {}) {
           repo,
           issueNumber: pullNumber,
           marker: MARKER,
+          core: coreDep,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {

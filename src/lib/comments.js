@@ -48,6 +48,12 @@ export function isBotAuthor(item) {
  * misbehaving endpoint that never returns a short page therefore cannot trap
  * callers in an unbounded loop.
  *
+ * A non-array page is treated as end-of-data (items collected so far are
+ * returned), but is no longer SILENT: when an optional @actions/core-like
+ * `core` is supplied (Task-4 observability), ONE warning is emitted so a
+ * misbehaving/mis-shaped endpoint is greppable in the action log. No
+ * behavior change when `core` is absent (the warning channel is inert).
+ *
  * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
  * their own fail-soft boundary.
  *
@@ -55,13 +61,21 @@ export function isBotAuthor(item) {
  * @param {object} [options]
  * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
  * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @param {object} [options.core]  Optional @actions/core-like logger ({warning}).
  * @returns {Promise<Array>} every item across all fetched pages, in API order.
  */
-export async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } = {}) {
+export async function collectPages(fetchPage, { perPage = 100, maxPages = 100, core } = {}) {
   const items = [];
   for (let page = 1; page <= maxPages; page++) {
     const batch = await fetchPage(page);
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    if (!Array.isArray(batch)) {
+      // Task-4: keep the stop-on-non-array semantics but surface it — the
+      // old behavior (pre-F-BOTGATE throw) at least failed loudly; the
+      // collected-items return was silent. One warning, exact greppable text.
+      core?.warning?.('pagination: non-array page received; stopping enumeration');
+      break;
+    }
+    if (batch.length === 0) break;
     items.push(...batch);
     if (batch.length < perPage) break;
   }
@@ -75,6 +89,10 @@ export async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } 
  * (e.g. schedule.js's SHA-dedup read) never materializes the full history
  * when the match is on an early page.
  *
+ * Task-4 symmetry: the same optional `core` warning channel as collectPages —
+ * a non-array page stops enumeration (false) and emits ONE warning when a
+ * core-like logger is supplied; silent otherwise.
+ *
  * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
  * their own fail-soft boundary.
  *
@@ -83,12 +101,21 @@ export async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } 
  * @param {object} [options]
  * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
  * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @param {object} [options.core]  Optional @actions/core-like logger ({warning}).
  * @returns {Promise<boolean>} true on the first matching item, else false.
  */
-export async function collectPagesSome(fetchPage, matches, { perPage = 100, maxPages = 100 } = {}) {
+export async function collectPagesSome(
+  fetchPage,
+  matches,
+  { perPage = 100, maxPages = 100, core } = {},
+) {
   for (let page = 1; page <= maxPages; page++) {
     const batch = await fetchPage(page);
-    if (!Array.isArray(batch) || batch.length === 0) return false;
+    if (!Array.isArray(batch)) {
+      core?.warning?.('pagination: non-array page received; stopping enumeration');
+      return false;
+    }
+    if (batch.length === 0) return false;
     for (const item of batch) if (matches(item)) return true;
     if (batch.length < perPage) return false;
   }
@@ -194,6 +221,8 @@ export function appendTrailers(body, trailers = []) {
  * @param {number} args.issueNumber  PR / issue number.
  * @param {string} [args.marker]     Marker used to locate the comments (default {@link MARKER}).
  * @param {number} [args.perPage=100] Page size for listComments pagination.
+ * @param {object} [args.core]       Optional @actions/core-like logger ({warning}) forwarded
+ *                                   to {@link collectPages} (Task-4 non-array-page observability).
  * @returns {Promise<Array<{id:number, body?:string}>>} every bot marker comment (API order); [] when none.
  */
 export async function findBotMarkerComments({
@@ -203,6 +232,7 @@ export async function findBotMarkerComments({
   issueNumber,
   marker = MARKER,
   perPage = 100,
+  core,
 }) {
   // Paginate fully via the shared loop: marker comments can be anywhere in
   // the history (the original summary comment AND a later fallback comment
@@ -220,7 +250,7 @@ export async function findBotMarkerComments({
           page,
         })
         .then((r) => r.data),
-    { perPage },
+    { perPage, core },
   );
 
   return comments.filter(
@@ -277,7 +307,9 @@ export async function findBotMarkerComment(args) {
  * @param {string} args.body     Comment body (already includes marker if desired).
  * @param {string} [args.marker] Marker used to locate the existing comment.
  * @param {number} [args.perPage=100] Page size for listComments pagination.
- * @param {{info?: Function}} [args.core]  Optional @actions/core-like logger.
+ * @param {{info?: Function, warning?: Function}} [args.core]  Optional @actions/core-like
+ *                                   logger ({info} for upsert logging; {warning} forwarded to
+ *                                   {@link collectPages} via the marker lookup — Task-4).
  * @returns {Promise<{action: 'updated'|'created', commentId: number}>}
  */
 export async function upsertReviewComment({
@@ -297,6 +329,7 @@ export async function upsertReviewComment({
     issueNumber,
     marker,
     perPage,
+    core,
   });
 
   if (existing) {

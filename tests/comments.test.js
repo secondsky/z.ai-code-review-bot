@@ -638,6 +638,53 @@ describe('collectPages', () => {
       }),
     ).rejects.toBe(boom);
   });
+
+  // Task-4 (deferred follow-ups): a non-array page used to be swallowed
+  // silently. When an @actions/core-like `core` is supplied, the wrapper must
+  // emit ONE warning with the exact operator-greppable text so a misbehaving
+  // endpoint is observable in the action log.
+  test('non-array page with core: warns ONCE with the exact text and returns page-1 items', async () => {
+    const warning = vi.fn();
+    let calls = 0;
+    const items = await collectPages(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }] : { not: 'an array' };
+      },
+      { perPage: 1, core: { warning } }, // page 1 FULL → page 2 non-array → warn + stop
+    );
+    expect(calls).toBe(2);
+    expect(items).toEqual([{ id: 1 }]);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledWith('pagination: non-array page received; stopping enumeration');
+  });
+
+  test('non-array page with core: exact warning text (single assertion)', async () => {
+    const warning = vi.fn();
+    await collectPages(async () => null, { core: { warning } });
+    expect(warning.mock.calls).toEqual([
+      ['pagination: non-array page received; stopping enumeration'],
+    ]);
+  });
+
+  test('non-array page with a core lacking warning: no throw (optional channel is inert)', async () => {
+    await expect(
+      collectPages(async () => ({ bad: true }), { core: {} }),
+    ).resolves.toEqual([]);
+  });
+
+  test('non-array page WITHOUT core: no throw, same return as before (no signature break)', async () => {
+    let calls = 0;
+    const items = await collectPages(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }, { id: 2 }] : undefined;
+      },
+      { perPage: 2 },
+    );
+    expect(calls).toBe(2);
+    expect(items).toEqual([{ id: 1 }, { id: 2 }]);
+  });
 });
 
 describe('collectPagesSome', () => {
@@ -752,6 +799,33 @@ describe('collectPagesSome', () => {
         () => true,
       ),
     ).rejects.toBe(boom);
+  });
+
+  // Task-4 (deferred follow-ups): same optional warning channel as
+  // collectPages — a non-array page on the existence-check path must be
+  // observable too (same exact operator-greppable text), and false is still
+  // returned either way.
+  test('non-array page with core: warns ONCE with the exact text and returns false', async () => {
+    const warning = vi.fn();
+    let calls = 0;
+    const result = await collectPagesSome(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }] : null;
+      },
+      () => false, // page 1 has no match → page 2 (null) is fetched
+      { perPage: 1, core: { warning } },
+    );
+    expect(result).toBe(false);
+    expect(calls).toBe(2);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledWith('pagination: non-array page received; stopping enumeration');
+  });
+
+  test('non-array page WITHOUT core: silent no-throw, false returned (parity with collectPages)', async () => {
+    await expect(
+      collectPagesSome(async () => undefined, () => true),
+    ).resolves.toBe(false);
   });
 });
 

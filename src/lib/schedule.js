@@ -274,7 +274,7 @@ export async function listOpenPrs({
  * drive-by users) could post a comment containing the marker + head SHA and
  * cause the scheduled review to SKIP that PR — a trivial review-suppression.
  *
- * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker }`
+ * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker, core }`
  * @returns {Promise<boolean>}
  */
 export async function hasReviewForSha({
@@ -284,6 +284,7 @@ export async function hasReviewForSha({
   pullNumber,
   headSha,
   marker = MARKER,
+  core,
 }) {
   // INT-3: an empty head SHA cannot confirm SHA-level dedup — previously the
   // `headSha === '' ||` short-circuit matched ANY bot marker comment and
@@ -333,7 +334,7 @@ export async function hasReviewForSha({
         })
         .then((r) => r.data),
     matches,
-    { perPage, maxPages: MAX_COMMENT_PAGES },
+    { perPage, maxPages: MAX_COMMENT_PAGES, core },
   );
   if (inComments) return true;
 
@@ -352,7 +353,7 @@ export async function hasReviewForSha({
           })
           .then((r) => r.data),
       matches,
-      { perPage, maxPages: MAX_COMMENT_PAGES },
+      { perPage, maxPages: MAX_COMMENT_PAGES, core },
     );
     if (inReviews) return true;
   }
@@ -696,6 +697,7 @@ export async function reviewOnePr({
           repo,
           issueNumber: pr.number,
           marker: MARKER,
+          core,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {
@@ -724,6 +726,7 @@ export async function reviewOnePr({
           octokit,
           context: ctx,
           marker: MARKER,
+          core,
         });
         for (const priorReview of priorReviews) {
           if (typeof priorReview?.body === 'string') {
@@ -1198,6 +1201,7 @@ export async function runScheduledReview({
         repo,
         pullNumber: pr.number,
         headSha: pr.headSha,
+        core,
       });
     } catch (dedupError) {
       if (core?.warning) {
