@@ -4,16 +4,15 @@
  *
  * The module is pure (no I/O, no imports of other project modules). These
  * tests pin each contract: classifyFile cohort assignment + edge cases,
- * COHORT_ORDER ordering, buildCohorts (ordering + empty input), cohort grouping,
- * and the formatWalkthroughSummary renderer (structure, emojis, byte-exact
- * marker, empty-findings state, collapsible sections).
+ * COHORT_ORDER ordering, cohort grouping, and the formatWalkthroughSummary
+ * renderer (structure, emojis, byte-exact marker, empty-findings state,
+ * collapsible sections).
  */
 import { describe, it, expect } from 'vitest';
 
 import {
   classifyFile,
   COHORT_ORDER,
-  buildCohorts,
   groupFindingsByCohort,
   formatWalkthroughSummary,
 } from '../src/lib/walkthrough.js';
@@ -166,78 +165,6 @@ describe('COHORT_ORDER', () => {
   it('has 8 distinct cohorts', () => {
     expect(new Set(COHORT_ORDER).size).toBe(COHORT_ORDER.length);
     expect(COHORT_ORDER.length).toBe(8);
-  });
-});
-
-/* ------------------------------------------------------------------ *
- * buildCohorts
- * ------------------------------------------------------------------ */
-
-describe('buildCohorts', () => {
-  it('returns [] for empty input', () => {
-    expect(buildCohorts([])).toEqual([]);
-  });
-
-  it('returns [] for non-array input', () => {
-    expect(buildCohorts(null)).toEqual([]);
-    expect(buildCohorts(undefined)).toEqual([]);
-    expect(buildCohorts('nope')).toEqual([]);
-  });
-
-  it('groups files by cohort and orders by dependency rank', () => {
-    const files = [
-      { filename: 'src/lib/findings.js' }, // business-logic
-      { filename: 'db/schema.sql' }, // database
-      { filename: 'components/Button.tsx' }, // ui
-      { filename: 'api/users.js' }, // api
-    ];
-    const cohorts = buildCohorts(files);
-    expect(cohorts.map((c) => c.cohort)).toEqual([
-      'database',
-      'api',
-      'business-logic',
-      'ui',
-    ]);
-  });
-
-  it('only includes cohorts that have files', () => {
-    const cohorts = buildCohorts([{ filename: 'README.md' }]);
-    expect(cohorts.length).toBe(1);
-    expect(cohorts[0].cohort).toBe('docs');
-  });
-
-  it('assigns the correct dependency rank index to each cohort', () => {
-    const cohorts = buildCohorts([
-      { filename: 'README.md' }, // docs → rank 6
-      { filename: 'db/schema.sql' }, // database → rank 0
-    ]);
-    const byName = Object.fromEntries(cohorts.map((c) => [c.cohort, c.rank]));
-    expect(byName.database).toBe(0);
-    expect(byName.docs).toBe(6);
-  });
-
-  it('sorts files within each cohort alphabetically', () => {
-    const cohorts = buildCohorts([
-      { filename: 'src/lib/zzz.js' },
-      { filename: 'src/lib/aaa.js' },
-      { filename: 'src/lib/mmm.js' },
-    ]);
-    expect(cohorts[0].files.map((f) => f.filename)).toEqual([
-      'src/lib/aaa.js',
-      'src/lib/mmm.js',
-      'src/lib/zzz.js',
-    ]);
-  });
-
-  it('accepts bare string filenames too', () => {
-    const cohorts = buildCohorts(['db/a.sql', 'api/b.js']);
-    expect(cohorts.map((c) => c.cohort)).toEqual(['database', 'api']);
-  });
-
-  it('preserves original file objects in the cohort output', () => {
-    const fileObj = { filename: 'db/schema.sql', patch: 'xxx', custom: 1 };
-    const cohorts = buildCohorts([fileObj]);
-    expect(cohorts[0].files[0]).toBe(fileObj);
   });
 });
 

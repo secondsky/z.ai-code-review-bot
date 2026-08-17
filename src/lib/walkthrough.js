@@ -261,7 +261,7 @@ export function classifyFile(filename) {
 }
 
 // ---------------------------------------------------------------------------
-// buildCohorts
+// filenameOf
 // ---------------------------------------------------------------------------
 
 /**
@@ -280,47 +280,6 @@ function filenameOf(entry) {
   return '';
 }
 
-/**
- * Group files into cohorts, ordered by dependency rank.
- *
- * Only includes cohorts that have files. Cohorts are sorted by
- * {@link COHORT_ORDER} rank (foundational first). Within each cohort, files
- * are sorted alphabetically by filename.
- *
- * Each returned entry: `{ cohort, files, rank }` where `rank` is the index
- * into COHORT_ORDER.
- *
- * @param {Array<{filename?: string} | string>} files
- * @returns {Array<{cohort: string, files: Array, rank: number}>}
- */
-export function buildCohorts(files) {
-  if (!Array.isArray(files)) return [];
-  /** @type {Map<string, Array>} */
-  const byCohort = new Map();
-  for (const entry of files) {
-    const filename = filenameOf(entry);
-    if (!filename) continue;
-    const cohort = classifyFile(filename);
-    if (!byCohort.has(cohort)) byCohort.set(cohort, []);
-    byCohort.get(cohort).push(entry);
-  }
-  // Sort each cohort's files alphabetically by filename.
-  for (const list of byCohort.values()) {
-    list.sort((a, b) => {
-      const fa = filenameOf(a);
-      const fb = filenameOf(b);
-      if (fa < fb) return -1;
-      if (fa > fb) return 1;
-      return 0;
-    });
-  }
-  // Emit cohorts in dependency-rank order.
-  return COHORT_ORDER
-    .map((cohort, rank) => ({ cohort, rank, list: byCohort.get(cohort) }))
-    .filter((c) => c.list)
-    .map(({ cohort, rank, list }) => ({ cohort, files: list, rank }));
-}
-
 // ---------------------------------------------------------------------------
 // groupFindingsByCohort
 // ---------------------------------------------------------------------------
@@ -328,9 +287,9 @@ export function buildCohorts(files) {
 /**
  * Assign findings to their file's cohort.
  *
- * Builds a `Map<filename, cohort>` from {@link buildCohorts} (over `files`),
- * then assigns each finding to its file's cohort. Findings whose `file` is not
- * in the map fall back to `'other'`.
+ * Builds its own `Map<filename, cohort>` by classifying each entry of `files`
+ * via {@link classifyFile}, then buckets each finding under its file's cohort.
+ * Findings whose `file` is not among `files` fall back to `'other'`.
  *
  * @param {Array<{file?: string}>} findings
  * @param {Array<{filename?: string} | string>} files
