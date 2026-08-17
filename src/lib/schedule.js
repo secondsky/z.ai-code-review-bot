@@ -22,7 +22,7 @@
  * @module src/lib/schedule.js
  */
 
-import { MARKER, appendTrailers } from './comments.js';
+import { MARKER, appendTrailers, isBotAuthor } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
 import {
   buildStatusDescription as buildStatusDescriptionDefault,
@@ -219,25 +219,6 @@ function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextS
 }
 
 /**
- * Determine whether a comment was authored by a bot. Used to gate marker-based
- * dedup so a drive-by human commenter cannot suppress a scheduled review or
- * hijack the bot's review thread by posting a comment containing the marker.
- *
- * Accepts EITHER signal GitHub surfaces for bot accounts: an explicit
- * `user.type === 'Bot'` (set for GitHub Apps bot accounts) OR a `user.login`
- * ending in `[bot]` (the convention for actions and other bot identities).
- *
- * @param {{user?: {type?: string, login?: string}}} comment
- * @returns {boolean}
- */
-function isBotComment(comment) {
-  const user = comment?.user;
-  if (!user) return false;
-  if (typeof user.type === 'string' && user.type === 'Bot') return true;
-  return typeof user.login === 'string' && user.login.endsWith('[bot]');
-}
-
-/**
  * List open PRs (paginated), returning a minimal shape per PR. Stops once
  * `maxPrs` have been accumulated or the list is exhausted.
  *
@@ -346,7 +327,7 @@ export async function hasReviewForSha({
   // legitimate marker (which always carries it via buildShaBlock).
   const shaBlock = buildShaBlock(headSha);
   const matches = (c) =>
-    isBotComment(c) &&
+    isBotAuthor(c) &&
     typeof c?.body === 'string' &&
     c.body.includes(marker) &&
     c.body.includes(shaBlock);

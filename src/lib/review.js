@@ -23,7 +23,7 @@
  * @module src/lib/review.js
  */
 
-import { MARKER } from './comments.js';
+import { MARKER, collectPages, isBotAuthor } from './comments.js';
 import { sanitizeModelOutput, sanitizeCommentBody } from './sanitize-output.js';
 import { sanitizeTextField } from './findings.js';
 import { postComment } from './handlers/_shared.js';
@@ -305,41 +305,13 @@ export function resolveReviewEvent(findings, config) {
 }
 
 /**
- * Hard cap on pagination depth for {@link listBotReviews}. Defense-in-depth
- * (CORE-4): the loop already terminates on a short page, but a misbehaving
- * endpoint that always returns full pages would loop forever. 100 pages × 100
- * per page = 10,000 reviews — far beyond any real PR's review history.
- */
-const MAX_REVIEW_PAGES = 100;
-
-/**
- * Determine whether a review was authored by a bot. Gates marker-based
- * matching in {@link listBotReviews} so a HUMAN review carrying the marker —
- * e.g. created via GitHub's "Quote reply", which copies the invisible
- * {@link MARKER} — is never treated as the bot's own review and never
- * dismissed (W15-A3-6: dismissing a human REQUEST_CHANGES review would
- * silently unblock the PR merge). Mirrors `isBotComment` in comments.js:
- * accepts EITHER signal GitHub surfaces for bot accounts, `user.type ===
- * 'Bot'` (GitHub Apps bot accounts) OR `user.login` ending in `[bot]`
- * (actions and other bots). Reviews with a missing/absent `user` object
- * cannot prove authorship and are treated as non-bot.
- *
- * @param {{user?: {type?: string, login?: string}}} review
- * @returns {boolean}
- */
-function isBotReview(review) {
-  const user = review?.user;
-  if (!user) return false;
-  if (typeof user.type === 'string' && user.type === 'Bot') return true;
-  return typeof user.login === 'string' && user.login.endsWith('[bot]');
-}
-
-/**
  * List prior reviews posted by the bot on a PR.
  *
- * Paginates `octokit.rest.pulls.listReviews` (per_page=100, loop until a short
- * page). Filters to reviews that BOTH carry `marker` in `body` AND are
- * bot-authored ({@link isBotReview}). The marker is the canonical idempotency
+ * Pagination is owned by `collectPages` from comments.js (F-BOTGATE:
+ * per_page=100, loop until a short page, 100-page cap — CORE-4). Filters to
+ * reviews that BOTH carry `marker` in `body` AND are bot-authored
+ * ({@link isBotAuthor} — the single bot-authority predicate shared with
+ * comments.js and schedule.js). The marker is the canonical idempotency
  * signal — every review this action posts carries it — so the broad
  * `[bot]`-login fallback that previously matched ANY bot (e.g. dependabot,
  * github-actions) was removed to avoid dismissing reviews this action never
@@ -349,8 +321,7 @@ function isBotReview(review) {
  * REQUEST_CHANGES review. This mirrors the authorship gate `comments.js`
  * applies to marker comments.
  *
- * CORE-4: pagination is also capped at {@link MAX_REVIEW_PAGES} as a safety
- * net against a misbehaving endpoint that never returns a short page.
+ * `listReviews` rejections propagate (not swallowed).
  *
  * @param {{octokit:object, context:object, marker?:string}} args
  * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
@@ -361,21 +332,20 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
   const pullNumber = context?.payload?.pull_request?.number;
   if (!owner || !repo || typeof pullNumber !== 'number') return [];
 
-  /** @type {Array} */
-  const all = [];
   const perPage = 100;
-  for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
-    const { data } = await octokit.rest.pulls.listReviews({
-      owner,
-      repo,
-      pull_number: pullNumber,
-      per_page: perPage,
-      page,
-    });
-    const rows = Array.isArray(data) ? data : [];
-    all.push(...rows);
-    if (rows.length < perPage) break; // short page → done
-  }
+  const all = await collectPages(
+    (page) =>
+      octokit
+        .rest.pulls.listReviews({
+          owner,
+          repo,
+          pull_number: pullNumber,
+          per_page: perPage,
+          page,
+        })
+        .then((r) => r.data),
+    { perPage },
+  );
 
   return all.filter((r) => {
     const body = typeof r?.body === 'string' ? r.body : '';
@@ -386,7 +356,7 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
     // idempotency (every review we post carries it).
     // W15-A3-6: the marker must ALSO be paired with bot authorship — a human
     // "Quote reply" copies the marker, and that must never be dismissed.
-    return body.includes(marker) && isBotReview(r);
+    return body.includes(marker) && isBotAuthor(r);
   });
 }
 

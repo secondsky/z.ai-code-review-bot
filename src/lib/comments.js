@@ -14,30 +14,58 @@ import { sanitizeCommentBody } from './sanitize-output.js';
 export const MARKER = '<!-- zai-code-review -->';
 
 /**
- * Hard cap on pagination depth for the marker lookup in
- * {@link upsertReviewComment}. Defense-in-depth (CORE-4): the loop terminates
- * on a short page OR when the marker comment is found, but a misbehaving
- * endpoint that always returns full pages AND never contains the marker would
- * loop forever. 100 pages × 100 per page = 10,000 comments — beyond any real
- * PR's comment history.
- */
-const MAX_COMMENT_PAGES = 100;
-
-/**
- * Determine whether a comment was authored by a bot. Used to gate marker-based
- * matching so a drive-by human commenter cannot post the marker and cause the
- * bot to overwrite THEIR comment on every run (comment hijack). Accepts EITHER
- * signal GitHub surfaces for bot accounts: `user.type === 'Bot'` (GitHub Apps
- * bot accounts) OR `user.login` ending in `[bot]` (actions and other bots).
+ * Determine whether a comment or review was authored by a bot. The SINGLE
+ * bot-authority predicate (F-BOTGATE): previously duplicated as
+ * `isBotComment` (comments.js), `isBotReview` (review.js), and
+ * `isBotComment` (schedule.js) — three lockstep copies of the same
+ * audit-hardened gate. Used to gate marker-based matching so a drive-by human
+ * commenter cannot post the marker and cause the bot to overwrite THEIR
+ * comment (comment hijack) or get their review dismissed (W15-A3-6
+ * quote-reply guard). Accepts EITHER signal GitHub surfaces for bot accounts:
+ * `user.type === 'Bot'` (GitHub Apps bot accounts) OR `user.login` ending in
+ * `[bot]` (actions and other bots). A missing/absent `user` object cannot
+ * prove authorship and is treated as non-bot.
  *
- * @param {{user?: {type?: string, login?: string}}} comment
+ * @param {{user?: {type?: string, login?: string}}} item
  * @returns {boolean}
  */
-function isBotComment(comment) {
-  const user = comment?.user;
+export function isBotAuthor(item) {
+  const user = item?.user;
   if (!user) return false;
   if (typeof user.type === 'string' && user.type === 'Bot') return true;
   return typeof user.login === 'string' && user.login.endsWith('[bot]');
+}
+
+/**
+ * Shared pagination loop (CORE-4) for the bot-marker enumeration (F-BOTGATE):
+ * the single owner of the per_page-100/cap-100-pages loop that previously
+ * existed as parallel copies in `findBotMarkerComments` (comments.js) and
+ * `listBotReviews` (review.js).
+ *
+ * Calls `fetchPage(page)` with 1-based page numbers until a short page
+ * (fewer than `perPage` items), an empty page, or a non-array page is seen,
+ * or until `maxPages` pages have been fetched — whichever comes first. A
+ * misbehaving endpoint that never returns a short page therefore cannot trap
+ * callers in an unbounded loop.
+ *
+ * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
+ * their own fail-soft boundary.
+ *
+ * @param {(page: number) => Promise<Array>} fetchPage  Resolves the batch for a page.
+ * @param {object} [options]
+ * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
+ * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @returns {Promise<Array>} every item across all fetched pages, in API order.
+ */
+export async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } = {}) {
+  const items = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await fetchPage(page);
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    items.push(...batch);
+    if (batch.length < perPage) break;
+  }
+  return items;
 }
 
 /**
@@ -122,9 +150,9 @@ export function appendTrailers(body, trailers = []) {
  * data. Consumers that aggregate per-comment payloads (e.g. the
  * incremental-review hash union in src/index.js) need the FULL list.
  *
- * Pagination + bot-authority gating mirror {@link upsertReviewComment}:
- * per_page=100, loop until a short page or {@link MAX_COMMENT_PAGES} is
- * reached (CORE-4 loop guard). Bot authorship is REQUIRED (comment hijack
+ * Pagination is owned by {@link collectPages} (F-BOTGATE): per_page=100, loop
+ * until a short page or the 100-page cap is reached (CORE-4 loop guard).
+ * Bot authorship is REQUIRED via {@link isBotAuthor} (comment hijack
  * defense): only `user.type === 'Bot'` OR `user.login` ending in `[bot]` is
  * eligible — a human comment quoting the marker (and a forged hash block)
  * can never feed suppression.
@@ -149,28 +177,28 @@ export async function findBotMarkerComments({
   marker = MARKER,
   perPage = 100,
 }) {
-  // Paginate fully: marker comments can be anywhere in the history (the
-  // original summary comment AND a later fallback comment may live pages
-  // apart), and a single page would miss all but the first 100. CORE-4: cap
-  // at MAX_COMMENT_PAGES so a misbehaving endpoint cannot trap us in an
-  // unbounded loop.
-  const out = [];
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: perPage,
-      page,
-    });
-    for (const c of comments) {
-      if (isBotComment(c) && typeof c?.body === 'string' && c.body.includes(marker)) {
-        out.push(c);
-      }
-    }
-    if (comments.length < perPage) break; // last page reached
-  }
-  return out;
+  // Paginate fully via the shared loop: marker comments can be anywhere in
+  // the history (the original summary comment AND a later fallback comment
+  // may live pages apart), and a single page would miss all but the first
+  // 100. collectPages caps at 100 pages so a misbehaving endpoint cannot
+  // trap us in an unbounded loop.
+  const comments = await collectPages(
+    (page) =>
+      octokit
+        .rest.issues.listComments({
+          owner,
+          repo,
+          issue_number: issueNumber,
+          per_page: perPage,
+          page,
+        })
+        .then((r) => r.data),
+    { perPage },
+  );
+
+  return comments.filter(
+    (c) => isBotAuthor(c) && typeof c?.body === 'string' && c.body.includes(marker),
+  );
 }
 
 /**

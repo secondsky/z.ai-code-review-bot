@@ -9,6 +9,8 @@ import {
   buildCommentBody,
   findBotMarkerComment,
   findBotMarkerComments,
+  collectPages,
+  isBotAuthor,
   MARKER,
 } from '../src/lib/comments.js';
 
@@ -523,6 +525,36 @@ describe('findBotMarkerComments', () => {
     expect(all.map((c) => c.id)).toEqual([5]);
   });
 
+  test('terminates after exactly 100 pages when the endpoint never returns a short page (CORE-4 cap)', async () => {
+    // F-BOTGATE: the 100-page cap was previously UNTESTED. A misbehaving
+    // endpoint that always returns a FULL page (never short, never carrying
+    // the marker) would paginate forever without the cap. The fake throws
+    // once it is called more than 105 times, so a missing/oversized cap
+    // fails FAST with a propagated rejection instead of hanging the runner.
+    let calls = 0;
+    const fullPage = Array.from({ length: 100 }, (_, i) =>
+      makeComment(i + 1, 'plain human noise', HUMAN_USER),
+    );
+    const octokit = {
+      rest: {
+        issues: {
+          async listComments(params) {
+            calls += 1;
+            if (calls > 105) {
+              throw new Error(`cap test: fetched page ${params.page} (call #${calls}) past the 100-page cap`);
+            }
+            return { data: fullPage };
+          },
+        },
+      },
+    };
+
+    const all = await findBotMarkerComments({ ...base, octokit });
+
+    expect(calls).toBe(100); // exactly 100 pages, then the cap stops the loop
+    expect(all).toEqual([]); // none of the human noise ever matched
+  });
+
   test('listComments rejection propagates (not swallowed)', async () => {
     const boom = new Error('api down');
     const { octokit } = makeOctokit({ throwOnList: boom });
@@ -537,5 +569,96 @@ describe('findBotMarkerComments', () => {
     const found = await findBotMarkerComment({ ...base, octokit });
 
     expect(found?.id).toBe(11); // FIRST in API order, not the newest
+  });
+});
+
+describe('collectPages', () => {
+  // F-BOTGATE: the single shared pagination loop (CORE-4) that now backs
+  // findBotMarkerComments (comments.js) and listBotReviews (review.js).
+  // Contract: per_page-sized batches, 1-based page numbers passed to
+  // fetchPage, stop on a short/empty/non-array page, hard cap at maxPages,
+  // and fetchPage rejections propagate (never swallowed).
+
+  test('stops after exactly maxPages (default 100) when every page is full (CORE-4 cap)', async () => {
+    let calls = 0;
+    const fullPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1 }));
+    const items = await collectPages(async () => {
+      calls += 1;
+      if (calls > 105) throw new Error('cap test: fetched past the 100-page cap');
+      return fullPage;
+    });
+
+    expect(calls).toBe(100); // exactly 100 fetches, then the cap stops the loop
+    expect(items).toHaveLength(100 * 100);
+  });
+
+  test('passes 1-based page numbers and stops on the first short page', async () => {
+    const seenPages = [];
+    const items = await collectPages(async (page) => {
+      seenPages.push(page);
+      return page === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }];
+    }, { perPage: 2 });
+
+    expect(seenPages).toEqual([1, 2]);
+    expect(items.map((i) => i.id)).toEqual([1, 2, 3]);
+  });
+
+  test('stops on an empty page', async () => {
+    let calls = 0;
+    const items = await collectPages(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }] : [];
+      },
+      { perPage: 1 }, // page 1 is FULL → the loop must try page 2 (empty → stop)
+    );
+    expect(calls).toBe(2);
+    expect(items).toEqual([{ id: 1 }]);
+  });
+
+  test('stops on a non-array page (defensive: treated as end of data)', async () => {
+    let calls = 0;
+    const items = await collectPages(
+      async () => {
+        calls += 1;
+        return calls === 1 ? [{ id: 1 }] : null;
+      },
+      { perPage: 1 }, // page 1 is FULL → the loop must try page 2 (non-array → stop)
+    );
+    expect(calls).toBe(2);
+    expect(items).toEqual([{ id: 1 }]);
+  });
+
+  test('fetchPage rejection propagates (not swallowed)', async () => {
+    const boom = new Error('api down');
+    await expect(
+      collectPages(async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+  });
+});
+
+describe('isBotAuthor', () => {
+  // F-BOTGATE: the single bot-authority predicate (previously duplicated as
+  // isBotComment in comments.js, isBotReview in review.js, and isBotComment
+  // in schedule.js). Accepts EITHER signal GitHub surfaces for bot accounts:
+  // user.type === 'Bot' OR user.login ending in [bot]. Missing/absent user
+  // cannot prove authorship and is treated as non-bot (W15-A3-6 gate).
+  test.each([
+    ['GitHub App bot account (type Bot)', { type: 'Bot', login: 'z-ai-reviewer' }, true],
+    ['bot login suffix (type absent)', { login: 'github-actions[bot]' }, true],
+    ['both signals', { type: 'Bot', login: 'x[bot]' }, true],
+    ['human (type User)', { type: 'User', login: 'alice' }, false],
+    ['human whose login merely CONTAINS [bot]', { type: 'User', login: 'alice[bot]sworth' }, false],
+    ['empty user object', {}, false],
+  ])('%s → %s', (label, user, expected) => {
+    expect(isBotAuthor({ user })).toBe(expected);
+  });
+
+  test('missing user / nullish item → false (cannot prove authorship)', () => {
+    expect(isBotAuthor({})).toBe(false);
+    expect(isBotAuthor(null)).toBe(false);
+    expect(isBotAuthor(undefined)).toBe(false);
   });
 });
