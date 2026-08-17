@@ -430,7 +430,9 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
         return 0;
       });
       lines.push('<details>');
-      lines.push(`<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`);
+      lines.push(
+        `<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`,
+      );
       lines.push('');
       for (const f of cohortFindings) {
         const file = typeof f.file === 'string' ? f.file : '';

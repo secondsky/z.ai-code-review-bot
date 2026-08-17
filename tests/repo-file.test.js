@@ -27,7 +27,6 @@ function makeOctokit(responder) {
 /** Base args for fetchRepoText (single call site defaults). */
 function baseArgs(overrides = {}) {
   return {
-    octokit: overrides.octokit,
     owner: 'owner',
     repo: 'repo',
     path: 'CODEOWNERS',

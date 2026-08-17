@@ -1040,6 +1040,11 @@ export async function run(context, deps = {}) {
         // F-TRAILERS: the lenient re-extraction regexes now live in
         // findings.js (extractTrailers) — shared with schedule.js's fallback.
         const fallbackTrailers = [];
+        // The destructured `hashBlock`/`shaBlock` intentionally SHADOW the
+        // outer locally-built bindings of the same names: index.js re-extracts
+        // all three trailers from reviewBody (schedule.js instead renames its
+        // re-extract and re-uses the built SHA block) — the values are
+        // identical either way, since the built blocks were appended above.
         const { marker, hashBlock, shaBlock } = extractTrailers(reviewBody);
         if (marker) fallbackTrailers.push(marker);
         if (hashBlock) fallbackTrailers.push(hashBlock);

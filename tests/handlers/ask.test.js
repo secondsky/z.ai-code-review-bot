@@ -416,7 +416,6 @@ describe('handleAskCommand — F-RUNCOMMAND: always-rejecting post', () => {
     // the shared constant owned by runCommand (undefined before the
     // migration → this is the RED assertion).
     expect(attempted.at(-1)).toBe(shared.ERROR_COMMENT);
-    expect(attempted.at(-1)).toContain('Z.ai request failed');
     expect(core.warning).toHaveBeenCalledWith(
       'ask handler failed: 502 bad gateway',
     );

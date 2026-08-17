@@ -210,6 +210,21 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
 ].join('\n');
 
 /**
+ * The single predicate deciding whether the caller supplied a complete batch
+ * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
+ * options are flat mode.
+ *
+ * @param {{batchNumber?: number, totalBatches?: number}} options
+ * @returns {boolean}
+ */
+function validBatch(options) {
+  return (
+    typeof options.batchNumber === 'number' &&
+    typeof options.totalBatches === 'number'
+  );
+}
+
+/**
  * Build the user-message prompt for a structured review of a list of changed
  * files. Instructs the model to emit ONLY a JSON object with `summary` and
  * `findings` matching the schema, with quoted evidence. Reuses all existing
@@ -333,21 +348,6 @@ export function buildStructuredReviewPrompt(files, options = {}) {
     header,
     kept === entries.length ? entries : entries.slice(0, kept),
     batch,
-  );
-}
-
-/**
- * The single predicate deciding whether the caller supplied a complete batch
- * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
- * options are flat mode.
- *
- * @param {{batchNumber?: number, totalBatches?: number}} options
- * @returns {boolean}
- */
-function validBatch(options) {
-  return (
-    typeof options.batchNumber === 'number' &&
-    typeof options.totalBatches === 'number'
   );
 }
 

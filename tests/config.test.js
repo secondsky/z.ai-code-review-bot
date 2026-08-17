@@ -660,8 +660,8 @@ describe('loadConfig — boolean-input conventions (F-BOOLREAD)', () => {
   //  - default-on (5 advisory features): empty/whitespace means "use the
   //    default" (true);
   //  - opt-in (9 read-only/v1 sites): empty/invalid means false.
-  // This test pins the convention per field so a future edit cannot silently
-  // move a field from one convention to the other.
+  // test.each pins the convention per field (one case per row) so a future
+  // edit cannot silently move a field from one convention to the other.
   const conventions = [
     // [input name, output field, emptyInputMeansTrue]
     ['ZAI_SCANNERS_ENABLED', 'scannersEnabled', true],
@@ -682,15 +682,16 @@ describe('loadConfig — boolean-input conventions (F-BOOLREAD)', () => {
     ['ZAI_LEARNINGS_ENABLED', 'learningsEnabled', false],
   ];
 
-  test('applies the two boolean-input conventions consistently', () => {
-    for (const [name, field, emptyMeansTrue] of conventions) {
+  test.each(conventions)(
+    'applies the convention consistently: %s → %s (empty means %s)',
+    (name, field, emptyMeansTrue) => {
       // shape guard: the output field exists before we assert its convention
       expect(loadConfig({ ZAI_API_KEY: 'k' })[field]).toBeDefined();
       // empty and whitespace-only inputs resolve to the field's convention
       expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '' })[field]).toBe(emptyMeansTrue);
       expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '   ' })[field]).toBe(emptyMeansTrue);
-    }
-  });
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
