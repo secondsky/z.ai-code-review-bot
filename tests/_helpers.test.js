@@ -5,6 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import { validateFinding } from '../src/lib/findings.js';
 import { parseHunks } from '../src/lib/diff.js';
+import { loadConfig } from '../src/lib/config.js';
+import { makeConfig } from './integration/helpers.js';
 import {
   makeFinding,
   makePatch,
@@ -94,5 +96,14 @@ describe('makeFakeDeps', () => {
   it('accepts overrides', () => {
     const deps = makeFakeDeps({ config: { apiKey: 'x' } });
     expect(deps.config.apiKey).toBe('x');
+  });
+});
+
+describe('integration makeConfig', () => {
+  it('covers every loadConfig key', () => {
+    const cfg = makeConfig();
+    for (const key of Object.keys(loadConfig(new Map([['ZAI_API_KEY', 'k']])))) {
+      expect(cfg, `missing key: ${key}`).toHaveProperty(key);
+    }
   });
 });

@@ -9,7 +9,10 @@
  * reaction created/not, run resolved/rejected).
  *
  * Shape notes:
- *  - `makeConfig` mirrors the object `loadConfig` produces (see src/lib/config.js).
+ *  - `makeConfig` DERIVES its base from the real `loadConfig` (see
+ *    src/lib/config.js) — every key loadConfig produces is present by
+ *    construction (guarded by a key-parity test in tests/_helpers.test.js) —
+ *    and then pins the deliberate integration-only deviations listed inline.
  *  - `makeFakeOctokit` exposes every `rest.*` method the router + handlers +
  *    `upsertReviewComment` + `getChangedFiles` + `getPRContext` touch.
  *  - `makeFakeCallApi` captures `(apiKey, model, prompt)` and returns canned text.
@@ -18,55 +21,59 @@
  */
 import { vi } from 'vitest';
 import { MARKER } from '../../src/lib/comments.js';
+import { loadConfig } from '../../src/lib/config.js';
 
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
 
 /**
- * Build a valid config object matching `loadConfig`'s shape.
+ * Baseline action inputs for `makeConfig`. Everything not listed here gets
+ * loadConfig's fallback (the same defaults a production run with an empty
+ * input would get), so derived values can never drift from the real parser.
+ * ZAI_COMMANDS_ENABLED is the integration-test baseline (commands dispatch by
+ * default); authThreshold 'write' and allowForkCommands false are already
+ * loadConfig's fallbacks and need no input.
+ */
+const BASE_INPUTS = new Map([
+  ['ZAI_API_KEY', 'test-api-key'],
+  ['GITHUB_TOKEN', 'ghs-test-token'],
+  ['ZAI_COMMANDS_ENABLED', 'true'],
+]);
+
+/**
+ * Build a valid config object derived from the real `loadConfig`.
  *
- * Defaults match the brief's integration-test baseline:
- *   commandsEnabled: true, authThreshold: 'write', allowForkCommands: false.
+ * The base comes from `loadConfig(BASE_INPUTS)`, so the full key set (36 keys)
+ * is always present and future loadConfig additions flow in automatically
+ * (tests/_helpers.test.js guards the parity). Only the integration-test
+ * baseline inputs that differ from empty-string defaults are set in
+ * BASE_INPUTS; every deviation from loadConfig's derived values is pinned
+ * explicitly inside the function so it can't drift silently.
  *
- * @param {Partial<ReturnType<typeof import('../../src/lib/config.js').loadConfig>>} [overrides]
+ * @param {Partial<ReturnType<typeof loadConfig>>} [overrides]
  */
 export function makeConfig(overrides = {}) {
   return {
-    apiKey: 'test-api-key',
-    model: 'glm-5.2',
-    systemPrompt: '',
-    reviewerName: 'Z.ai Code Review',
-    excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+    ...loadConfig(BASE_INPUTS),
+    // Deliberate integration deviations from loadConfig's values:
+    // maxDiffChars 0 = unlimited: integration diffs are small and must never
+    // be truncated/capped the way production caps them at 100000.
     maxDiffChars: 0,
-    largePrFileThreshold: 50,
-    maxBatchChars: 120000,
-    maxFilesPerBatch: 40,
-    maxPatchChars: 18000,
-    commandsEnabled: true,
-    authThreshold: 'write',
-    allowForkCommands: false,
-    timeoutMs: 120000,
-    scheduleEnabled: false,
-    scheduleMaxPrs: 10,
-    describeWriteBody: false,
-    impactLabels: false,
-    impactLabelMap: { critical: 'zai:critical', high: 'zai:high', medium: 'zai:medium', low: 'zai:low' },
-    maxFindings: 8,
-    minSeverity: 'info',
-    temperature: 0.2,
-    maxTokens: 4096,
     // Phase 4: scanner layer. Integration tests DISABLE the master switch by
     // default so the real runScanners (which would attempt to download
     // gitleaks/ast-grep) is short-circuited. Tests that want to exercise
     // scanning pass { scannersEnabled: true } and (typically) a fake runScanners.
     scannersEnabled: false,
-    scannersCacheDir: '/tmp/zai-cache-scanners-test',
     // Phase 5: commit-status feedback. Default OFF in the integration helper so
     // existing end-to-end tests don't see unexpected createCommitStatus calls;
     // tests that exercise the status path opt in with { commitStatus: true }.
     commitStatus: false,
-    githubToken: 'ghs-test-token',
+    // Pinned to false to preserve today's e2e assertions; flipping to the
+    // production `true` defaults is a separate, visible decision:
+    walkthrough: false,
+    incrementalReview: false,
+    repoConfigEnabled: false,
     ...overrides,
   };
 }
