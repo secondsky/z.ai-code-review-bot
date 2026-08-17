@@ -587,6 +587,31 @@ describe('mergeRepoConfig — scanners (can only DISABLE)', () => {
   });
 });
 
+describe('scanner registry — validator and merge emit exactly SCANNER_KEYS', () => {
+  // F-SCANNERKEYS: the parser allow-list (SCANNER_KEYS), the validator's
+  // boolean copies, and mergeRepoConfig's two object literals must all agree.
+  // The W15-A1-2 bug (metrics missing from one copy) came from these sites
+  // drifting apart. Keys are compared as ARRAYS so the insertion order
+  // (gitleaks, ast_grep, metrics) is pinned too.
+  it('validateRepoConfig scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const out = validateRepoConfig({
+      scanners: { gitleaks: true, ast_grep: false, metrics: true },
+    });
+    expect(Object.keys(out.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+  });
+  it('mergeRepoConfig (enabled path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: true },
+      { scanners: { gitleaks: true, ast_grep: true, metrics: true } },
+    );
+    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+  });
+  it('mergeRepoConfig (master-off path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const merged = mergeRepoConfig({ scannersEnabled: false }, {});
+    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+  });
+});
+
 describe('mergeRepoConfig — minSeverity (action wins)', () => {
   it('action input wins on minSeverity', () => {
     const merged = mergeRepoConfig(

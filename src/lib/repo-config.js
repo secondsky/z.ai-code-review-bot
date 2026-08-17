@@ -278,6 +278,18 @@ function ensureArray(obj, key) {
   return obj[key];
 }
 
+/**
+ * Truncate a string to at most `n` chars (plain slice — no ellipsis added).
+ * Non-strings pass through unchanged; callers pre-check `typeof`.
+ *
+ * @param {unknown} s
+ * @param {number} n
+ * @returns {unknown}
+ */
+function cap(s, n) {
+  return typeof s === 'string' && s.length > n ? s.slice(0, n) : s;
+}
+
 /* ------------------------------------------------------------------ *
  * validateRepoConfig
  * ------------------------------------------------------------------ */
@@ -322,16 +334,10 @@ export function validateRepoConfig(parsed) {
       if (arr.length > 0) rv.path_filters = arr;
     }
     if (typeof r.tone_instructions === 'string') {
-      rv.tone_instructions =
-        r.tone_instructions.length > MAX_TONE_INSTRUCTIONS_CHARS
-          ? r.tone_instructions.slice(0, MAX_TONE_INSTRUCTIONS_CHARS)
-          : r.tone_instructions;
+      rv.tone_instructions = cap(r.tone_instructions, MAX_TONE_INSTRUCTIONS_CHARS);
     }
     if (typeof r.language === 'string') {
-      rv.language =
-        r.language.length > MAX_LANGUAGE_CHARS
-          ? r.language.slice(0, MAX_LANGUAGE_CHARS)
-          : r.language;
+      rv.language = cap(r.language, MAX_LANGUAGE_CHARS);
     }
     if (Object.keys(rv).length > 0) out.reviews = rv;
   }
@@ -340,11 +346,14 @@ export function validateRepoConfig(parsed) {
   const s = parsed.scanners;
   if (s && typeof s === 'object' && !Array.isArray(s)) {
     const sv = {};
-    if (typeof s.gitleaks === 'boolean') sv.gitleaks = s.gitleaks;
-    if (typeof s.ast_grep === 'boolean') sv.ast_grep = s.ast_grep;
-    // W15-A1-2: metrics was missing from the boolean set, so the documented
-    // `.zai.yml` `scanners.metrics: false` toggle was silently dropped.
-    if (typeof s.metrics === 'boolean') sv.metrics = s.metrics;
+    // Opt-in copy: only PRESENT, BOOLEAN values for known scanner keys are
+    // carried (absent keys stay absent). Key set/order derive from
+    // SCANNER_KEYS — the same registry the parser allow-lists — so the
+    // copies cannot drift (W15-A1-2: metrics was once missing from exactly
+    // this kind of literal copy).
+    for (const k of SCANNER_KEYS) {
+      if (typeof s[k] === 'boolean') sv[k] = s[k];
+    }
     if (Object.keys(sv).length > 0) out.scanners = sv;
   }
 
@@ -365,15 +374,10 @@ function normalizePathInstruction(entry) {
   if (typeof instructions !== 'string' || instructions.trim() === '') return null;
   // Cap field lengths (truncate, mirroring tone_instructions/language handling)
   // so an attacker-controlled .zai.yml cannot bloat the prompt unboundedly.
-  const cappedPath =
-    path.length > MAX_PATH_INSTRUCTION_PATH_CHARS
-      ? path.slice(0, MAX_PATH_INSTRUCTION_PATH_CHARS)
-      : path;
-  const cappedInstructions =
-    instructions.length > MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS
-      ? instructions.slice(0, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS)
-      : instructions;
-  return { path: cappedPath, instructions: cappedInstructions };
+  return {
+    path: cap(path, MAX_PATH_INSTRUCTION_PATH_CHARS),
+    instructions: cap(instructions, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS),
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -478,19 +482,18 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
   }
   // `assertive` (or unset) → action floor unchanged.
 
-  // Scanners: master switch is action-only; repo can only DISABLE.
+  // Scanners: master switch is action-only; repo can only DISABLE. Key set
+  // and order derive from SCANNER_KEYS (the parser's allow-list) so every
+  // scanner-name copy stays in lockstep — W15-A1-2 (metrics missing from
+  // one copy) came from these literals drifting apart.
   const scannersEnabled = a.scannersEnabled !== false;
-  const mergedScanners = scannersEnabled
-    ? {
-        // `false` in repo disables; otherwise the action default (enabled) applies.
-        gitleaks: scanners.gitleaks !== false,
-        ast_grep: scanners.ast_grep !== false,
-        // W15-A1-2: metrics rides the same disable-only seam so src/index.js
-        // can forward it to the scanner orchestrator (which already honors
-        // repoScanners.metrics === false).
-        metrics: scanners.metrics !== false,
-      }
-    : { gitleaks: false, ast_grep: false, metrics: false };
+  const mergedScanners = {};
+  for (const k of SCANNER_KEYS) {
+    // Enabled path: `false` in repo disables, otherwise the action default
+    // (enabled) applies. Master-off path: forced false — the repo can never
+    // enable a scanner the action's master switch turned off.
+    mergedScanners[k] = scannersEnabled ? scanners[k] !== false : false;
+  }
 
   return {
     ...a,
