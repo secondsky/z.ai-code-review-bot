@@ -34426,7 +34426,6 @@ var __webpack_exports__ = {};
 
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
-  Qh: () => (/* binding */ INPUT_NAMES),
   nm: () => (/* binding */ createScannerDeps),
   kc: () => (/* binding */ expandHome),
   Kr: () => (/* binding */ httpsGet),
@@ -39278,6 +39277,54 @@ function isBotComment(context) {
  * action.yml defaults (those are applied by GitHub before the input reaches us).
  */
 
+/**
+ * The complete list of action input names, in the order loadConfig reads them.
+ *
+ * This module owns the action-input contract: `action.yml` declares the inputs
+ * GitHub passes to the runner, `readAllInputs` (src/index.js) pulls each one
+ * via `core.getInput`, and `loadConfig` parses them below. The drift test in
+ * tests/index.test.js pins all three together, so adding an input means
+ * updating this array, the `inputs:` block in action.yml, and loadConfig.
+ */
+const INPUT_NAMES = [
+  'ZAI_API_KEY',
+  'ZAI_MODEL',
+  'ZAI_SYSTEM_PROMPT',
+  'ZAI_REVIEWER_NAME',
+  'EXCLUDE_PATTERNS',
+  'MAX_DIFF_CHARS',
+  'ZAI_LARGE_PR_FILE_THRESHOLD',
+  'ZAI_MAX_BATCH_CHARS',
+  'ZAI_MAX_FILES_PER_BATCH',
+  'ZAI_MAX_PATCH_CHARS',
+  'ZAI_TIMEOUT_MS',
+  'ZAI_COMMANDS_ENABLED',
+  'ZAI_ALLOW_FORK_COMMANDS',
+  'ZAI_AUTH_THRESHOLD',
+  'ZAI_SCHEDULE_ENABLED',
+  'ZAI_SCHEDULE_MAX_PRS',
+  'ZAI_DESCRIBE_WRITE_BODY',
+  'ZAI_IMPACT_LABELS',
+  'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
+  'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
+  'GITHUB_TOKEN',
+];
+
 const TRUTHY = new Set(['true', '1', 'yes']);
 
 function isTruthy(v) {
@@ -39449,17 +39496,21 @@ function loadConfig(inputs = {}, options = {}) {
           .map((p) => p.trim())
           .filter((p) => p !== '');
 
-  // maxDiffChars: parseInt base 10, NaN -> default. 0 (and any negative) means
-  // "unlimited" — documented in action.yml and honored here. The DEFAULT is a
-  // sane cap; operators who want unlimited set MAX_DIFF_CHARS=0 (or a negative)
-  // explicitly. A positive integer is honored as the per-batch char cap.
+  // maxDiffChars: parseInt base 10, NaN -> default. "Unlimited" is normalized
+  // to Infinity HERE, at the boundary: action.yml documents 0 (and any
+  // negative) as unlimited, and loadConfig maps both to Infinity so consumers
+  // branch two-state (Number.isFinite = cap active; Infinity = unlimited)
+  // instead of the former three-state `> 0` checks on a 0 sentinel. The
+  // DEFAULT is a sane cap; operators who want unlimited set MAX_DIFF_CHARS=0
+  // (or a negative) explicitly. A positive integer is honored as the
+  // per-batch char cap.
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null
       ? 100000
-      : maxDiffCharsRaw <= 0
-        ? 0
-        : maxDiffCharsRaw;
+      : maxDiffCharsRaw > 0
+        ? maxDiffCharsRaw
+        : Infinity;
 
   // Numeric knobs that drive loops/batching must be positive; clamp to a safe
   // default on any non-finite/negative/zero value to prevent infinite loops
@@ -40053,14 +40104,16 @@ function makeApiRequest(params, deps = {}) {
  * `call()` and represents one attempt.
  *
  * Signature note: the brief's conceptual signature is `fn(attempt,
- * currentTimeout)`. We add a third `context` argument (`{ prompt, apiKey,
- * model }`) so that, when a timeout-triggered fallback fires, this loop can
- * swap the prompt/apiKey/model used by subsequent attempts without rebuilding
- * `fn` itself. This is the documented improvement to the brief's seam; the
- * first two positional args (and the test assertions about them) are
+ * currentTimeout)`. We add a third `override` argument: `null` until a
+ * fallback fires, then a `{ prompt, apiKey?, model? }` whose PRESENT keys
+ * replace the closure's own prompt/apiKey/model on every subsequent attempt.
+ * The override is applied as one wholesale replacement (a fresh object each
+ * time the fallback fires, never mutated in place), so each attempt receives
+ * a stable snapshot. This is the documented improvement to the brief's seam;
+ * the first two positional args (and the test assertions about them) are
  * unchanged.
  *
- * @param {(attempt: number, currentTimeout: number, context: { prompt: string, apiKey?: string, model?: string }) => Promise<any>} fn
+ * @param {(attempt: number, currentTimeout: number, override: { prompt: string, apiKey?: string, model?: string } | null) => Promise<any>} fn
  * @param {{
  *   maxRetries?: number,
  *   baseDelay?: number,
@@ -40084,8 +40137,10 @@ async function callWithRetry(fn, options = {}) {
   const startTime = Date.now();
   let usedFallback = false;
   const lastIdx = PROGRESSIVE_TIMEOUT_MULTIPLIERS.length - 1;
-  // Mutable context: swapped in place when fallback fires. `fn` reads from it.
-  const context = { prompt: undefined, apiKey: undefined, model: undefined };
+  // Per-attempt fallback override: `null` until the fallback fires, then ONE
+  // wholesale replacement with the fallback spec. Each attempt gets the
+  // current snapshot by value of the binding — never a mutated shared object.
+  let override = null;
 
   let attempt = 0;
   // Loop from 0..maxRetries inclusive (≤ maxRetries+1 attempts).
@@ -40098,7 +40153,7 @@ async function callWithRetry(fn, options = {}) {
     let result;
     try {
       // eslint-disable-next-line no-await-in-loop
-      result = await fn(attempt, currentTimeout, context);
+      result = await fn(attempt, currentTimeout, override);
       return { success: true, data: result, usedFallback };
     } catch (error) {
       const { category, retryable } = categorizeError(error);
@@ -40132,11 +40187,15 @@ async function callWithRetry(fn, options = {}) {
         const fb = fallbackPrompt();
         if (fb && fb.prompt) {
           usedFallback = true;
-          // Swap the context in place so the same `fn` closure picks up the
-          // fallback prompt/apiKey/model on subsequent attempts.
-          context.prompt = fb.prompt;
-          if (fb.apiKey !== undefined) context.apiKey = fb.apiKey;
-          if (fb.model !== undefined) context.model = fb.model;
+          // One wholesale replacement: subsequent attempts merge these keys
+          // over the closure's own prompt/apiKey/model. Keys the fallback did
+          // not specify (undefined) are simply absent, so the caller's own
+          // values keep applying for those fields.
+          override = {
+            prompt: fb.prompt,
+            ...(fb.apiKey !== undefined && { apiKey: fb.apiKey }),
+            ...(fb.model !== undefined && { model: fb.model }),
+          };
           if (onFallback) {
             onFallback({ attempt, originalError: error, fallbackInfo: fb });
           }
@@ -40246,21 +40305,18 @@ function createApiClient(config = {}) {
         sleep: sleepDep,
       } = args;
 
-      // The per-attempt work. Reads the shared `context` so the retry loop can
-      // swap in the fallback prompt/apiKey/model on a timeout-triggered
-      // fallback without us rebuilding this closure.
-      const fn = (attempt, currentTimeout, context) => {
-        const currentPrompt =
-          context.prompt !== undefined ? context.prompt : userPrompt;
-        const currentApiKey =
-          context.apiKey !== undefined ? context.apiKey : apiKey;
-        const currentModel = context.model !== undefined ? context.model : model;
+      // The per-attempt work. Merges the retry loop's `override` (null until a
+      // fallback fires) over this call's own prompt/apiKey/model, so a
+      // timeout-triggered fallback swaps any or all of them on subsequent
+      // attempts without rebuilding this closure.
+      const fn = (attempt, currentTimeout, override) => {
+        const spec = { prompt: userPrompt, apiKey, model, ...(override ?? {}) };
         return makeApiRequest(
           {
-            apiKey: currentApiKey,
-            model: currentModel,
+            apiKey: spec.apiKey,
+            model: spec.model,
             systemPrompt,
-            userPrompt: currentPrompt,
+            userPrompt: spec.prompt,
             timeout: currentTimeout,
             temperature,
             maxTokens,
@@ -40822,6 +40878,12 @@ function isBotAuthor(item) {
  * misbehaving endpoint that never returns a short page therefore cannot trap
  * callers in an unbounded loop.
  *
+ * A non-array page is treated as end-of-data (items collected so far are
+ * returned), but is no longer SILENT: when an optional @actions/core-like
+ * `core` is supplied (Task-4 observability), ONE warning is emitted so a
+ * misbehaving/mis-shaped endpoint is greppable in the action log. No
+ * behavior change when `core` is absent (the warning channel is inert).
+ *
  * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
  * their own fail-soft boundary.
  *
@@ -40829,17 +40891,65 @@ function isBotAuthor(item) {
  * @param {object} [options]
  * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
  * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @param {object} [options.core]  Optional @actions/core-like logger ({warning}).
  * @returns {Promise<Array>} every item across all fetched pages, in API order.
  */
-async function collectPages(fetchPage, { perPage = 100, maxPages = 100 } = {}) {
+async function collectPages(fetchPage, { perPage = 100, maxPages = 100, core } = {}) {
   const items = [];
   for (let page = 1; page <= maxPages; page++) {
     const batch = await fetchPage(page);
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    if (!Array.isArray(batch)) {
+      // Task-4: keep the stop-on-non-array semantics but surface it — the
+      // old behavior (pre-F-BOTGATE throw) at least failed loudly; the
+      // collected-items return was silent. One warning, exact greppable text.
+      core?.warning?.('pagination: non-array page received; stopping enumeration');
+      break;
+    }
+    if (batch.length === 0) break;
     items.push(...batch);
     if (batch.length < perPage) break;
   }
   return items;
+}
+
+/**
+ * Like {@link collectPages}, but stops at the first item where `matches`
+ * returns true and returns true; false if enumeration completes with no match.
+ * Same page/short-page/cap semantics as collectPages — an existence check
+ * (e.g. schedule.js's SHA-dedup read) never materializes the full history
+ * when the match is on an early page.
+ *
+ * Task-4 symmetry: the same optional `core` warning channel as collectPages —
+ * a non-array page stops enumeration (false) and emits ONE warning when a
+ * core-like logger is supplied; silent otherwise.
+ *
+ * `fetchPage` rejections propagate (not swallowed) — callers wrap them in
+ * their own fail-soft boundary.
+ *
+ * @param {(page: number) => Promise<Array>} fetchPage  Resolves the batch for a page.
+ * @param {(item: *) => boolean} matches  Item predicate; first true wins.
+ * @param {object} [options]
+ * @param {number} [options.perPage=100]  Page size; a shorter batch ends the loop.
+ * @param {number} [options.maxPages=100] Hard cap on pages fetched (CORE-4).
+ * @param {object} [options.core]  Optional @actions/core-like logger ({warning}).
+ * @returns {Promise<boolean>} true on the first matching item, else false.
+ */
+async function collectPagesSome(
+  fetchPage,
+  matches,
+  { perPage = 100, maxPages = 100, core } = {},
+) {
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await fetchPage(page);
+    if (!Array.isArray(batch)) {
+      core?.warning?.('pagination: non-array page received; stopping enumeration');
+      return false;
+    }
+    if (batch.length === 0) return false;
+    for (const item of batch) if (matches(item)) return true;
+    if (batch.length < perPage) return false;
+  }
+  return false;
 }
 
 /**
@@ -40941,6 +41051,8 @@ function appendTrailers(body, trailers = []) {
  * @param {number} args.issueNumber  PR / issue number.
  * @param {string} [args.marker]     Marker used to locate the comments (default {@link MARKER}).
  * @param {number} [args.perPage=100] Page size for listComments pagination.
+ * @param {object} [args.core]       Optional @actions/core-like logger ({warning}) forwarded
+ *                                   to {@link collectPages} (Task-4 non-array-page observability).
  * @returns {Promise<Array<{id:number, body?:string}>>} every bot marker comment (API order); [] when none.
  */
 async function findBotMarkerComments({
@@ -40950,6 +41062,7 @@ async function findBotMarkerComments({
   issueNumber,
   marker = MARKER,
   perPage = 100,
+  core,
 }) {
   // Paginate fully via the shared loop: marker comments can be anywhere in
   // the history (the original summary comment AND a later fallback comment
@@ -40967,7 +41080,7 @@ async function findBotMarkerComments({
           page,
         })
         .then((r) => r.data),
-    { perPage },
+    { perPage, core },
   );
 
   return comments.filter(
@@ -41024,7 +41137,9 @@ async function findBotMarkerComment(args) {
  * @param {string} args.body     Comment body (already includes marker if desired).
  * @param {string} [args.marker] Marker used to locate the existing comment.
  * @param {number} [args.perPage=100] Page size for listComments pagination.
- * @param {{info?: Function}} [args.core]  Optional @actions/core-like logger.
+ * @param {{info?: Function, warning?: Function}} [args.core]  Optional @actions/core-like
+ *                                   logger ({info} for upsert logging; {warning} forwarded to
+ *                                   {@link collectPages} via the marker lookup — Task-4).
  * @returns {Promise<{action: 'updated'|'created', commentId: number}>}
  */
 async function upsertReviewComment({
@@ -41044,6 +41159,7 @@ async function upsertReviewComment({
     issueNumber,
     marker,
     perPage,
+    core,
   });
 
   if (existing) {
@@ -41490,6 +41606,21 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
 ].join('\n');
 
 /**
+ * The single predicate deciding whether the caller supplied a complete batch
+ * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
+ * options are flat mode.
+ *
+ * @param {{batchNumber?: number, totalBatches?: number}} options
+ * @returns {boolean}
+ */
+function validBatch(options) {
+  return (
+    typeof options.batchNumber === 'number' &&
+    typeof options.totalBatches === 'number'
+  );
+}
+
+/**
  * Build the user-message prompt for a structured review of a list of changed
  * files. Instructs the model to emit ONLY a JSON object with `summary` and
  * `findings` matching the schema, with quoted evidence. Reuses all existing
@@ -41500,9 +41631,10 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
  * filter first via {@link filterPatchableFiles}). Empty/undefined input
  * returns just the instruction header.
  *
- * If `options.maxDiffChars > 0` and the joined result exceeds the limit, files
- * are dropped from the END (trailing entries removed) until the body fits.
- * `maxDiffChars === 0` (the default) disables truncation.
+ * If `options.maxDiffChars` is a finite positive number and the joined result
+ * exceeds the limit, files are dropped from the END (trailing entries removed)
+ * until the body fits. `Infinity` (the post-loadConfig representation of
+ * "unlimited", D-4) disables truncation, as do legacy 0/undefined options.
  *
  * When `options.batchNumber` and `options.totalBatches` are provided, the body
  * is wrapped in a `<review_batch>` envelope (used by the batched review path).
@@ -41581,7 +41713,14 @@ function buildStructuredReviewPrompt(files, options = {}) {
     ? { batchNumber: options.batchNumber, totalBatches: options.totalBatches }
     : null;
 
-  const maxDiffChars = typeof options.maxDiffChars === 'number' ? options.maxDiffChars : 0;
+  // D-4: post-loadConfig representation — Infinity means unlimited (loadConfig
+  // maps 0/negative to Infinity); legacy direct callers passing 0, a negative,
+  // or nothing also land on Infinity here, so truncation is disabled exactly
+  // as before. A finite positive value keeps the cap active below.
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
+      ? options.maxDiffChars
+      : Infinity;
   // W6-6: in the batched path, createReviewBatches already packed entries
   // within a char budget (maxBatchChars). Applying maxDiffChars truncation on
   // top would silently drop trailing entries — they're counted in the batch
@@ -41596,7 +41735,7 @@ function buildStructuredReviewPrompt(files, options = {}) {
   // '\n\n'` byte-identically (the header survives even when it alone exceeds
   // the cap).
   let kept = entries.length;
-  if (maxDiffChars > 0 && batch === null) {
+  if (Number.isFinite(maxDiffChars) && batch === null) {
     kept = 0;
     let running = header.length + 2;
     for (const e of entries) {
@@ -41613,21 +41752,6 @@ function buildStructuredReviewPrompt(files, options = {}) {
     header,
     kept === entries.length ? entries : entries.slice(0, kept),
     batch,
-  );
-}
-
-/**
- * The single predicate deciding whether the caller supplied a complete batch
- * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
- * options are flat mode.
- *
- * @param {{batchNumber?: number, totalBatches?: number}} options
- * @returns {boolean}
- */
-function validBatch(options) {
-  return (
-    typeof options.batchNumber === 'number' &&
-    typeof options.totalBatches === 'number'
   );
 }
 
@@ -41712,6 +41836,15 @@ const SEVERITY_RANK = {
 };
 
 /**
+ * Severity display order (most severe first) — the canonical owner of the
+ * sequence every renderer walks for severity-grouped output. Aliases
+ * {@link SEVERITIES} (same values in the same order) so the schema contract
+ * and the display order can never drift apart. Imported by walkthrough.js.
+ * @type {ReadonlyArray<string>}
+ */
+const SEVERITY_ORDER = SEVERITIES;
+
+/**
  * Confidence -> numeric rank for tie-breaking. Lower rank sorts first.
  * @type {Readonly<Record<string, number>>}
  */
@@ -41748,7 +41881,12 @@ const SCHEMA_KEYS = [
 /** Idempotency marker reused from comments.js — must remain byte-exact. */
 const findings_MARKER = '<!-- zai-code-review -->';
 
-/** Per-severity emoji for the summary renderer. */
+/**
+ * Per-severity emoji for the summary renderers. The canonical severity-domain
+ * table — walkthrough.js imports it so the walkthrough Overview line and the
+ * severity-grouped summary stay visually consistent by construction.
+ * @type {Readonly<Record<string, string>>}
+ */
 const SEVERITY_EMOJI = {
   critical: '🔴',
   high: '🟠',
@@ -43280,7 +43418,8 @@ function formatEntry(entry) {
  * batch is flushed first. A single oversized entry still gets its own batch.
  *
  * W15-A8-1: the per-batch char budget is `min(maxBatchChars, maxDiffChars)`
- * when `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap
+ * when maxDiffChars is finite (cap active; Infinity = unlimited, D-4).
+ * MAX_DIFF_CHARS is a documented hard cap
  * against cost abuse from oversized PRs, but the prompt-side truncation (W6-6
  * in buildStructuredReviewPrompt) is intentionally skipped whenever a batch
  * envelope is present — post-hoc truncation would silently drop entries
@@ -43293,8 +43432,9 @@ function formatEntry(entry) {
  * W16-B3-4: the per-batch clamp alone did NOT bound the TOTAL chars — a tiny
  * maxDiffChars with many files produced one batch per file (N API calls,
  * strictly worse than main) and the "hard cap against cost abuse" was still
- * unenforced. When maxDiffChars > 0, the CUMULATIVE packed chars across ALL
- * batches are capped: once the running total would exceed maxDiffChars, the
+ * unenforced. When maxDiffChars is finite (cap active), the CUMULATIVE packed
+ * chars across ALL batches are capped: once the running total would exceed
+ * maxDiffChars, the
  * entry and every entry after it are NOT reviewed (dropping trailing entries,
  * mirroring the unbatched MAX_DIFF_CHARS semantics). One guard keeps the
  * oversized-entry semantics bounded: when the FIRST entry of a (fresh, empty)
@@ -43312,11 +43452,17 @@ function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || auto_review_DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || auto_review_DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  // D-4: maxDiffChars uses the post-loadConfig representation — Infinity means
+  // unlimited, a finite positive number means the cap is active. Legacy direct
+  // callers passing 0/negative (the former sentinel) still land on Infinity
+  // here, so the observable behavior is unchanged.
   const maxDiffChars =
     typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
       ? options.maxDiffChars
-      : 0;
-  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
+      : Infinity;
+  const charBudget = Number.isFinite(maxDiffChars)
+    ? Math.min(maxBatchChars, maxDiffChars)
+    : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
@@ -43358,8 +43504,9 @@ function createReviewBatches(files, options = {}) {
     ) {
       flush();
     }
-    // W16-B3-4 cumulative cap (only when maxDiffChars > 0).
-    if (maxDiffChars > 0 && cumulativeChars + entryLen > maxDiffChars) {
+    // W16-B3-4 cumulative cap (only when the cap is active — Infinity means
+    // unlimited, D-4).
+    if (Number.isFinite(maxDiffChars) && cumulativeChars + entryLen > maxDiffChars) {
       const firstOfFreshBatch = currentEntries.length === 0;
       const fitsPerBatchBudget = entryLen <= charBudget;
       const budgetNotExhausted = cumulativeChars < maxDiffChars;
@@ -43479,54 +43626,32 @@ async function runWithConcurrency(items, concurrency, fn) {
   const results = new Array(list.length);
 
   let cursor = 0;
-  let active = 0;
   // Abort flag: once any item rejects, stop launching NEW items so we don't
   // keep consuming resources (e.g. API credits) for a review that will fail.
   // Items already in flight still settle naturally.
   let aborted = false;
 
-  return new Promise((resolve, reject) => {
-    if (list.length === 0) {
-      resolve(results);
-      return;
-    }
-
-    const launchNext = () => {
-      // Stop launching once we've hit the limit, run out of items, or aborted.
-      while (active < limit && cursor < list.length && !aborted) {
-        const i = cursor++;
-        active++;
-        let p;
-        try {
-          p = Promise.resolve(fn(list[i], i));
-        } catch (err) {
-          aborted = true;
-          reject(err);
-          return;
-        }
-        p.then(
-          (val) => {
-            results[i] = val; // slot by index → preserves input order
-            active--;
-            if (cursor < list.length) {
-              launchNext();
-            } else if (active === 0) {
-              resolve(results);
-            }
-          },
-          (err) => {
-            // First rejection wins; subsequent rejects are swallowed. Set the
-            // abort flag so success handlers from other in-flight items don't
-            // launch yet more items.
-            aborted = true;
-            reject(err);
-          },
-        );
+  // Fixed worker pool: min(limit, list.length) workers, each pulling the next
+  // index off the shared cursor. Liveness comes from Promise.all — when the
+  // last worker returns, every item has settled. Workers check `aborted`
+  // BEFORE consuming `cursor++`, so a post-abort wake starts nothing.
+  const workers = Array.from({ length: Math.min(limit, list.length) }, async () => {
+    while (!aborted) {
+      const i = cursor++;
+      if (i >= list.length) return;
+      try {
+        results[i] = await fn(list[i], i); // slot by index → preserves input order
+      } catch (err) {
+        // First rejection wins; Promise.all swallows any later ones. Set the
+        // abort flag so other workers stop pulling new items.
+        aborted = true;
+        throw err;
       }
-    };
-
-    launchNext();
+    }
   });
+
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -43656,8 +43781,9 @@ async function runStructuredReview(files, config, deps = {}) {
     // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
     // W6-6 truncation is skipped whenever batched, so the cap is enforced by
     // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
-    // inside createReviewBatches).
-    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
+    // inside createReviewBatches). D-4: Infinity = unlimited; the fallback for
+    // non-number values matches the post-loadConfig representation.
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : Infinity,
   };
 
   const batchState = {
@@ -43811,14 +43937,16 @@ async function runStructuredReview(files, config, deps = {}) {
  * findings are rendered under their cohort as collapsible sections so the
  * summary reads like a narrative instead of a flat severity-sorted list.
  *
- * This module is PURE (no I/O). It imports the shared free-text sanitizer
- * from findings.js (W16-B1-4) so the summary prose gets exactly the same
- * treatment in both summary renderers; the renderer's trailing marker is
- * duplicated here as a literal so the module stays self-contained; it MUST
- * stay byte-exact with comments.js's MARKER.
+ * This module is PURE (no I/O). It imports the shared free-text sanitizer and
+ * the severity display tables (SEVERITY_RANK / SEVERITY_ORDER / SEVERITY_EMOJI)
+ * from findings.js — the severity-domain owner (W16-B1-4) — so the summary
+ * prose gets exactly the same treatment and the same severity presentation in
+ * both summary renderers; and the idempotency MARKER from comments.js so the
+ * renderer's trailing marker is byte-exact by construction.
  *
  * @module src/lib/walkthrough.js
  */
+
 
 
 
@@ -43989,41 +44117,6 @@ const COHORTS = [
  */
 const COHORT_ORDER = COHORTS.map((c) => c.name);
 
-/**
- * Per-severity emoji for the Overview line. Mirrors findings.js so the
- * walkthrough and the severity-grouped summary stay visually consistent.
- * @type {Record<string, string>}
- */
-const walkthrough_SEVERITY_EMOJI = {
-  critical: '🔴',
-  high: '🟠',
-  medium: '🟡',
-  low: '🔵',
-  info: '➖',
-};
-
-/**
- * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
- * sorts first. Mirrors findings.js SEVERITY_RANK.
- * @type {Record<string, number>}
- */
-const walkthrough_SEVERITY_RANK = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  info: 4,
-};
-
-/** Severity display order for the Overview line. */
-const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
-
-/**
- * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
- * as a literal so this pure module has no cross-module imports.
- */
-const walkthrough_MARKER = '<!-- zai-code-review -->';
-
 // ---------------------------------------------------------------------------
 // classifyFile
 // ---------------------------------------------------------------------------
@@ -44125,8 +44218,8 @@ function groupFindingsByCohort(findings, files) {
  * @returns {number}
  */
 function severityRank(sev) {
-  if (typeof sev === 'string' && Object.prototype.hasOwnProperty.call(walkthrough_SEVERITY_RANK, sev)) {
-    return walkthrough_SEVERITY_RANK[sev];
+  if (typeof sev === 'string' && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, sev)) {
+    return SEVERITY_RANK[sev];
   }
   return Number.MAX_SAFE_INTEGER;
 }
@@ -44214,7 +44307,7 @@ function formatWalkthroughSummary(findings, files, options = {}) {
   lines.push('### 📊 Overview');
   lines.push('');
   const sevParts = SEVERITY_ORDER.map(
-    (sev) => `${walkthrough_SEVERITY_EMOJI[sev]} ${counts[sev]} ${sev}`,
+    (sev) => `${SEVERITY_EMOJI[sev]} ${counts[sev]} ${sev}`,
   );
   lines.push(
     `${total} findings across ${cohortCount} areas · ${sevParts.join(' · ')}`,
@@ -44233,7 +44326,9 @@ function formatWalkthroughSummary(findings, files, options = {}) {
         return 0;
       });
       lines.push('<details>');
-      lines.push(`<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`);
+      lines.push(
+        `<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`,
+      );
       lines.push('');
       for (const f of cohortFindings) {
         const file = typeof f.file === 'string' ? f.file : '';
@@ -44263,7 +44358,7 @@ function formatWalkthroughSummary(findings, files, options = {}) {
     }
   }
 
-  lines.push(walkthrough_MARKER);
+  lines.push(MARKER);
   return lines.join('\n');
 }
 
@@ -44575,15 +44670,27 @@ function partitionFindings(findings, files) {
 /**
  * Shared helpers used by every `/zai` command handler.
  *
- * Two small, defensive wrappers around the injected octokit:
- *   - `postComment`     → create an issue comment (command response).
- *   - `getPRContext`    → fetch minimal PR metadata for prompt-building.
+ * This module owns:
+ *   - `postComment`                 → create an issue comment (command response),
+ *                                      with unconditional sanitize + trusted-trailer
+ *                                      re-append (SCN-15).
+ *   - `getPRContext`                → fetch minimal PR metadata for prompt-building.
+ *   - `buildDiffContext` + `MAX_CONTEXT_CHARS`
+ *                                  → the capped diff-context block (F-DIFFCTX;
+ *                                      the ONLY copy — ask/impact import it).
+ *   - `ERROR_COMMENT`               → the fixed never-leak failure comment.
+ *   - `runCommand`                  → the shared never-throw handler guardrail
+ *                                      (F-RUNCOMMAND) that posts ERROR_COMMENT
+ *                                      on failure.
+ *   - `upsertPrDescription` + `DESCRIBE_MARKER_START`/`DESCRIBE_MARKER_END`
+ *                                  → the marked-block description upsert behind
+ *                                      ZAI_DESCRIBE_WRITE_BODY.
  *
- * Both are defensive on a missing/malformed `context`: they return a sane
- * sentinel (`null`) rather than throwing, so a handler that calls them can
- * decide how to degrade (typically: post a short guidance/error comment and
- * return). Octokit is ALWAYS a parameter — never imported — so this module
- * stays pure and unit-testable.
+ * The octokit-touching helpers are defensive on a missing/malformed
+ * `context`: they return a sane sentinel (`null`) rather than throwing, so a
+ * handler that calls them can decide how to degrade (typically: post a short
+ * guidance/error comment and return). Octokit is ALWAYS a parameter — never
+ * imported — so this module stays pure and unit-testable.
  *
  * No handler imports `@actions/core` or hits the network directly.
  */
@@ -45212,10 +45319,10 @@ function resolveReviewEvent(findings, config) {
  *
  * `listReviews` rejections propagate (not swallowed).
  *
- * @param {{octokit:object, context:object, marker?:string}} args
+ * @param {{octokit:object, context:object, marker?:string, core?:object}} args
  * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
  */
-async function listBotReviews({ octokit, context, marker = MARKER }) {
+async function listBotReviews({ octokit, context, marker = MARKER, core }) {
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.pull_request?.number;
@@ -45233,7 +45340,9 @@ async function listBotReviews({ octokit, context, marker = MARKER }) {
           page,
         })
         .then((r) => r.data),
-    { perPage },
+    // Task-4: forward the optional core so a non-array page during review
+    // enumeration warns instead of silently ending the listing.
+    { perPage, core },
   );
 
   return all.filter((r) => {
@@ -45318,7 +45427,7 @@ async function upsertReview({ octokit, context, marker = MARKER, sha, body, comm
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.pull_request?.number;
 
-  const prior = await listBotReviews({ octokit, context, marker });
+  const prior = await listBotReviews({ octokit, context, marker, core });
   const reason = `Superseded by re-review at ${sha ?? ''}`.trim();
 
   const payload = buildReviewPayload({ body, comments, event });
@@ -45735,7 +45844,7 @@ function isUnsafePath(path) {
  *
  * W16-B4-3: the patch is capped using the SAME resolution as the whole-PR
  * path (MAX_WHOLE_PR_DIFF_CHARS default; `options.maxDiffChars` override
- * where 0 = the config-level "unlimited" sentinel). Previously the patch was
+ * where Infinity = the config-level "unlimited", D-4). Previously the patch was
  * interpolated raw — a 3000-line file produced a ~104k-char prompt while the
  * whole-PR path capped at 8000.
  *
@@ -45744,13 +45853,17 @@ function isUnsafePath(path) {
  * @returns {string}
  */
 function buildFileReviewPrompt(file, options = {}) {
+  // D-4 two-state resolution (post-loadConfig representation): a positive
+  // finite number caps the patch; Infinity (loadConfig's "unlimited", formerly
+  // the 0 sentinel) disables truncation. Anything else — undefined,
+  // non-number, or a legacy 0/negative — falls back to MAX_WHOLE_PR_DIFF_CHARS.
   const maxDiffChars =
-    typeof options.maxDiffChars === 'number' && options.maxDiffChars >= 0
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
       ? options.maxDiffChars
       : MAX_WHOLE_PR_DIFF_CHARS;
   let patch = file.patch || '(no textual diff available)';
-  // 0 = unlimited sentinel (config.js) — skip truncation, like the whole-PR path.
-  if (maxDiffChars > 0 && patch.length > maxDiffChars) {
+  // Infinity = unlimited — skip truncation, like the whole-PR path.
+  if (Number.isFinite(maxDiffChars) && patch.length > maxDiffChars) {
     patch = `${patch.slice(0, maxDiffChars)}\n… (diff truncated)`;
   }
   return [
@@ -45842,12 +45955,13 @@ async function handleReviewCommand(
       return;
     }
     const prompt = buildStructuredReviewPrompt(patchable, {
-      // Pass maxDiffChars through when it's a number >= 0. The `0` value is
-      // the config-level sentinel meaning "unlimited" (config.js: 0 disables
-      // truncation), so it must reach buildStructuredReviewPrompt rather than
-      // being replaced by MAX_WHOLE_PR_DIFF_CHARS.
+      // D-4: pass maxDiffChars through when it is a positive number (finite
+      // cap) or Infinity (the config-level "unlimited" — loadConfig maps
+      // 0/negative to Infinity), so it reaches buildStructuredReviewPrompt
+      // rather than being replaced by MAX_WHOLE_PR_DIFF_CHARS. Everything
+      // else falls back to the 8000 default.
       maxDiffChars:
-        typeof config.maxDiffChars === 'number' && config.maxDiffChars >= 0
+        typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
           ? config.maxDiffChars
           : MAX_WHOLE_PR_DIFF_CHARS,
     });
@@ -47050,7 +47164,7 @@ async function listOpenPrs({
  * drive-by users) could post a comment containing the marker + head SHA and
  * cause the scheduled review to SKIP that PR — a trivial review-suppression.
  *
- * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker }`
+ * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker, core }`
  * @returns {Promise<boolean>}
  */
 async function hasReviewForSha({
@@ -47060,6 +47174,7 @@ async function hasReviewForSha({
   pullNumber,
   headSha,
   marker = MARKER,
+  core,
 }) {
   // INT-3: an empty head SHA cannot confirm SHA-level dedup — previously the
   // `headSha === '' ||` short-circuit matched ANY bot marker comment and
@@ -47090,33 +47205,47 @@ async function hasReviewForSha({
   // cannot stall a scheduled run (consistent with CORE-4 caps elsewhere).
   const MAX_COMMENT_PAGES = 100;
 
+  // Task-3 (deferred follow-ups): both hand-rolled pagination loops migrated
+  // to collectPagesSome — same page/short-page/cap semantics, but it returns
+  // true at the FIRST matching item instead of enumerating the full history
+  // (an existence check never needs the tail). Rejections still propagate to
+  // the caller's fail-soft boundary (W19-E2-4 in runScheduledReview).
+
   // 1. Issue comments (issues.listComments).
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: pullNumber,
-      per_page: perPage,
-      page,
-    });
-    if (comments.some(matches)) return true;
-    if (comments.length < perPage) break;
-  }
+  const inComments = await collectPagesSome(
+    (page) =>
+      octokit
+        .rest.issues.listComments({
+          owner,
+          repo,
+          issue_number: pullNumber,
+          per_page: perPage,
+          page,
+        })
+        .then((r) => r.data),
+    matches,
+    { perPage, maxPages: MAX_COMMENT_PAGES, core },
+  );
+  if (inComments) return true;
 
   // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
   // Guard for environments where the endpoint is absent (older mocks).
   if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
-    for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-      const { data: reviews } = await octokit.rest.pulls.listReviews({
-        owner,
-        repo,
-        pull_number: pullNumber,
-        per_page: perPage,
-        page,
-      });
-      if (reviews.some(matches)) return true;
-      if (reviews.length < perPage) break;
-    }
+    const inReviews = await collectPagesSome(
+      (page) =>
+        octokit
+          .rest.pulls.listReviews({
+            owner,
+            repo,
+            pull_number: pullNumber,
+            per_page: perPage,
+            page,
+          })
+          .then((r) => r.data),
+      matches,
+      { perPage, maxPages: MAX_COMMENT_PAGES, core },
+    );
+    if (inReviews) return true;
   }
 
   return false;
@@ -47458,6 +47587,7 @@ async function reviewOnePr({
           repo,
           issueNumber: pr.number,
           marker: MARKER,
+          core,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {
@@ -47486,6 +47616,7 @@ async function reviewOnePr({
           octokit,
           context: ctx,
           marker: MARKER,
+          core,
         });
         for (const priorReview of priorReviews) {
           if (typeof priorReview?.body === 'string') {
@@ -47960,6 +48091,7 @@ async function runScheduledReview({
         repo,
         pullNumber: pr.number,
         headSha: pr.headSha,
+        core,
       });
     } catch (dedupError) {
       if (core?.warning) {
@@ -48818,9 +48950,10 @@ function selectPlatformAsset(spec, deps = {}) {
  * otherwise it is derived from the selected asset's URL extension
  * (`.tar.gz`/`.tgz` → tarGzExtractor, `.zip` → zipExtractor, raw → null).
  *
- * Pure (no I/O). Throws when the platform/arch tuple has no asset, so
- * callers invoke this INSIDE their `try` — the throw then lands in their
- * catch → warning → regex-fallback path.
+ * Pure (no I/O). Throws when `spec` is null/missing (A6) or when the
+ * platform/arch tuple has no asset, so callers invoke this INSIDE their
+ * `try` — the throw then lands in their catch → warning → regex-fallback
+ * path.
  *
  * @param {{
  *   name: string,
@@ -48834,9 +48967,15 @@ function selectPlatformAsset(spec, deps = {}) {
  * @returns {{ name: string, version: string, ext: string, url: string, checksumSha256: string, cacheDir: string, extractor: Function | null }}
  */
 function resolveBinaryRequest(spec, { platform = '', arch = '', cacheDir } = {}) {
+  // A6: guard FIRST, before any spec dereference — a null/undefined spec
+  // previously slipped into selectPlatformAsset and threw the misleading
+  // `undefined: no asset for platform=…`.
+  if (!spec || typeof spec !== 'object') {
+    throw new Error('resolveBinaryRequest: spec is required');
+  }
   const asset = selectPlatformAsset(spec, { platform, arch });
   if (!asset) {
-    throw new Error(`${spec?.name}: no asset for platform=${platform || '?'} arch=${arch || '?'}`);
+    throw new Error(`${spec.name}: no asset for platform=${platform || '?'} arch=${arch || '?'}`);
   }
   return {
     name: spec.name,
@@ -50017,11 +50156,11 @@ async function scanPatterns(opts, deps = {}) {
     // at a time to keep the JSON output shape simple. `ast-grep run` emits no
     // `ruleId`, so enrichment is driver-owned: the inline map after
     // parseAstGrepJson attaches the rule's id/title/severity/etc.
-    // (mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
+    // mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
     // output that carries `ruleId` — currently test-only. Do NOT pass the
     // per-rule map into parseAstGrepJson: `run` output has no ruleId, so
     // lookups would miss and every title would degrade to the 'match'
-    // fallback.)
+    // fallback.
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
     // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a
@@ -50572,52 +50711,23 @@ async function runScanners(opts, deps = {}) {
     scannerSharedDeps.arch = deps.arch;
   }
 
-  // Run secrets + patterns concurrently.
-  /** @type {Array<Promise<{ findings: Array, scanner: string }>>} */
-  const promises = [];
-  if (secretsEnabled) {
-    promises.push(
-      doScanSecrets(
-        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        scannerSharedDeps,
-      ).catch((err) => {
-        if (core?.warning) {
-          core.warning(`secrets scanner failed: ${err?.message ?? String(err)}`);
-        }
+  // Run secrets + patterns concurrently. Results are correlated to their
+  // scanner by index pairing with the filtered descriptor array — never by
+  // push order or positional shift().
+  const active = [
+    { name: 'secrets', run: doScanSecrets, enabled: secretsEnabled },
+    { name: 'patterns', run: doScanPatterns, enabled: patternsEnabled },
+  ].filter((s) => s.enabled);
+  const results = await Promise.all(active.map(({ name, run }) =>
+    run({ files, repoPath: opts.repoPath, cacheDir: opts.cacheDir }, scannerSharedDeps)
+      .catch((err) => {
+        core?.warning?.(`${name} scanner failed: ${err?.message ?? String(err)}`);
         return { findings: [], scanner: 'regex-fallback' };
-      }),
-    );
-  }
-  if (patternsEnabled) {
-    promises.push(
-      doScanPatterns(
-        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        scannerSharedDeps,
-      ).catch((err) => {
-        if (core?.warning) {
-          core.warning(`patterns scanner failed: ${err?.message ?? String(err)}`);
-        }
-        return { findings: [], scanner: 'regex-fallback' };
-      }),
-    );
-  }
-  const results = await Promise.all(promises);
-
-  // Track provenance.
-  if (secretsEnabled) {
-    const r = results.shift();
-    if (r) {
-      scannerNames.push(`secrets:${r.scanner}`);
-      findings = findings.concat(r.findings);
-    }
-  }
-  if (patternsEnabled) {
-    const r = results.shift();
-    if (r) {
-      scannerNames.push(`patterns:${r.scanner}`);
-      findings = findings.concat(r.findings);
-    }
-  }
+      })));
+  results.forEach((r, i) => {
+    scannerNames.push(`${active[i].name}:${r.scanner}`);
+    findings = findings.concat(r.findings);
+  });
 
   // Surface metrics-driven findings (large/generated files).
   if (metricsEnabled) {
@@ -50662,6 +50772,9 @@ async function runScanners(opts, deps = {}) {
  *
  * `label` prefixes every `message` (e.g. `learnings: …`) so callers can warn
  * with the outcome message verbatim and keep their historical warning strings.
+ * When `label` is absent/empty the message carries NO prefix (it starts with
+ * the path) — for callers that wrap the message in their own label
+ * (codeowners) and would otherwise stutter `X: X: path…` (A4).
  * Payload conventions (the learnings/repo-config superset, now adopted
  * everywhere, including codeowners):
  *   - `{ content: <base64>, encoding: 'base64' }` — decoded, whitespace stripped
@@ -50697,12 +50810,17 @@ function resolveHeadSha(opts) {
  * @param {string} args.ref       git ref (typically the PR head SHA).
  * @param {number} args.maxBytes  hard cap applied to the reported byte size
  *                                AND the decoded char length.
- * @param {string} args.label     message prefix (e.g. `learnings`).
+ * @param {string} args.label     message prefix (e.g. `learnings`); when
+ *                                absent/empty, messages carry NO prefix.
  * @returns {Promise<{ok: true, text: string} |
  *                   {ok: false, kind: 'missing'|'too-large'|'decode'|'error', message: string}>}
  */
 async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label }) {
   const shortRef = typeof ref === 'string' ? ref.slice(0, 7) : String(ref ?? '');
+  // A4: only prefix when a non-empty label was supplied — an absent label
+  // must NOT render `undefined: …` (callers that wrap the message in their
+  // own label pass none).
+  const prefix = typeof label === 'string' && label !== '' ? `${label}: ` : '';
 
   let data;
   try {
@@ -50714,13 +50832,13 @@ async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label 
       return {
         ok: false,
         kind: 'missing',
-        message: `${label}: no ${path} found at ${shortRef} (404).`,
+        message: `${prefix}no ${path} found at ${shortRef} (404).`,
       };
     }
     return {
       ok: false,
       kind: 'error',
-      message: `${label}: failed to fetch ${path} (${status ?? 'unknown'}): ${
+      message: `${prefix}failed to fetch ${path} (${status ?? 'unknown'}): ${
         error?.message ?? String(error)
       }`,
     };
@@ -50735,7 +50853,7 @@ async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label 
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} is ${size} bytes (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} is ${size} bytes (cap ${maxBytes}); skipping.`,
       };
     }
     let text;
@@ -50745,7 +50863,7 @@ async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label 
       return {
         ok: false,
         kind: 'decode',
-        message: `${label}: ${path} could not be base64-decoded; skipping.`,
+        message: `${prefix}${path} could not be base64-decoded; skipping.`,
       };
     }
     // Post-decode size guard (`data.size` can under-report).
@@ -50753,7 +50871,7 @@ async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label 
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} decodes to ${text.length} chars (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} decodes to ${text.length} chars (cap ${maxBytes}); skipping.`,
       };
     }
     return { ok: true, text };
@@ -50765,14 +50883,14 @@ async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label 
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} is ${data.length} chars (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} is ${data.length} chars (cap ${maxBytes}); skipping.`,
       };
     }
     return { ok: true, text: data };
   }
 
   // Not a file (directory listing or symlink) — treat as missing.
-  return { ok: false, kind: 'missing', message: `${label}: ${path} is not a file` };
+  return { ok: false, kind: 'missing', message: `${prefix}${path} is not a file` };
 }
 
 ;// CONCATENATED MODULE: ./src/lib/yaml-lex.js
@@ -50837,6 +50955,8 @@ function stripComment(line) {
         }
       }
     } else if (ch === '#' && !inSingle && !inDouble) {
+      // A `#` only starts a comment when it's at the start of the line or
+      // preceded by whitespace. `value#frag` is NOT a comment.
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {
         return line.slice(0, i);
@@ -51150,9 +51270,9 @@ function ensureArray(obj, key) {
  * Truncate a string to at most `n` chars (plain slice — no ellipsis added).
  * Non-strings pass through unchanged; callers pre-check `typeof`.
  *
- * @param {unknown} s
+ * @param {string} s
  * @param {number} n
- * @returns {unknown}
+ * @returns {string}
  */
 function cap(s, n) {
   return typeof s === 'string' && s.length > n ? s.slice(0, n) : s;
@@ -51845,7 +51965,9 @@ async function loadCodeowners(opts = {}, deps = {}) {
       path,
       ref: headSha,
       maxBytes: MAX_CODEOWNERS_BYTES,
-      label: 'CODEOWNERS',
+      // A4: NO label — the warn below already prefixes
+      // `failed to fetch CODEOWNERS: `; a label here would stutter
+      // `…CODEOWNERS: CODEOWNERS: .github/CODEOWNERS…`.
     });
     if (outcome.ok) {
       // F-REPOFILE alignment: a raw-string payload (non-base64 `data`) now
@@ -52562,49 +52684,6 @@ function createScannerDeps({ core: coreArg, cacheDir } = {}) {
 }
 
 /**
- * The complete list of action input names, in the order loadConfig reads them.
- * Exported so the test can assert coverage. Keep in sync with config.js.
- */
-const INPUT_NAMES = [
-  'ZAI_API_KEY',
-  'ZAI_MODEL',
-  'ZAI_SYSTEM_PROMPT',
-  'ZAI_REVIEWER_NAME',
-  'EXCLUDE_PATTERNS',
-  'MAX_DIFF_CHARS',
-  'ZAI_LARGE_PR_FILE_THRESHOLD',
-  'ZAI_MAX_BATCH_CHARS',
-  'ZAI_MAX_FILES_PER_BATCH',
-  'ZAI_MAX_PATCH_CHARS',
-  'ZAI_TIMEOUT_MS',
-  'ZAI_COMMANDS_ENABLED',
-  'ZAI_ALLOW_FORK_COMMANDS',
-  'ZAI_AUTH_THRESHOLD',
-  'ZAI_SCHEDULE_ENABLED',
-  'ZAI_SCHEDULE_MAX_PRS',
-  'ZAI_DESCRIBE_WRITE_BODY',
-  'ZAI_IMPACT_LABELS',
-  'ZAI_IMPACT_LABEL_MAP',
-  'ZAI_MAX_FINDINGS',
-  'ZAI_MIN_SEVERITY',
-  'ZAI_TEMPERATURE',
-  'ZAI_MAX_TOKENS',
-  'ZAI_BATCH_CONCURRENCY',
-  'ZAI_FALLBACK_PROMPT',
-  'ZAI_SCANNERS_ENABLED',
-  'ZAI_SCANNERS_CACHE_DIR',
-  'ZAI_COMMIT_STATUS',
-  'ZAI_WALKTHROUGH',
-  'ZAI_INCREMENTAL_REVIEW',
-  'ZAI_REPO_CONFIG_ENABLED',
-  'ZAI_STRICT_MODE',
-  'ZAI_SUGGEST_REVIEWERS',
-  'ZAI_AUTO_ASSIGN_REVIEWERS',
-  'ZAI_LEARNINGS_ENABLED',
-  'GITHUB_TOKEN',
-];
-
-/**
  * Build the fallback comment body used when inline review submission fails.
  *
  * Carries the review summary (already built, marker included) plus every
@@ -52702,7 +52781,6 @@ async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
-    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
     findBotMarkerComments: findBotMarkerCommentsFn = findBotMarkerComments,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
@@ -52710,6 +52788,14 @@ async function run(context, deps = {}) {
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
+    // D-1 (deferred-followups #13): mutable flag telling main()'s catch
+    // whether THIS run actually landed a `pending` commit status. run()
+    // flips it to true only after the pending post resolves TRUE (the
+    // W16-B2-1/W17-C2-2 boolean contract from schedule.js). The default is
+    // a fresh inert object so direct run() callers (tests, embeddings) are
+    // unaffected; main() passes its own tracker so the catch can gate the
+    // terminal `failure` post on it.
+    statusTracker = { pendingLanded: false },
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
@@ -52795,7 +52881,7 @@ async function run(context, deps = {}) {
     // head SHA from the pull_request payload.
     const sha = context?.payload?.pull_request?.head?.sha ?? '';
     if (config.commitStatus) {
-      await setReviewStatusFn(
+      const pendingLanded = await setReviewStatusFn(
         {
           octokit,
           context,
@@ -52806,6 +52892,12 @@ async function run(context, deps = {}) {
         },
         { core: coreDep },
       );
+      // D-1 (schedule-policy parity): set the tracker only AFTER the post
+      // resolves TRUE — setReviewStatus is fail-soft and returns FALSE on
+      // API failure (never throws), and a `pending` that never landed must
+      // not obligate main()'s catch to post a terminal `failure` for a
+      // check this run never started. Mirrors schedule.js's pendingPosted.
+      if (pendingLanded === true) statusTracker.pendingLanded = true;
     }
 
     // Build (or accept an injected) callApi adapter that wraps api.js.
@@ -52982,6 +53074,7 @@ async function run(context, deps = {}) {
           octokit,
           context: reviewContext,
           marker: MARKER,
+          core: coreDep,
         });
         // The most recent prior review is the canonical hash source. Reviews
         // come back newest-first from the GitHub API; fall back to scanning
@@ -53012,6 +53105,7 @@ async function run(context, deps = {}) {
           repo,
           issueNumber: pullNumber,
           marker: MARKER,
+          core: coreDep,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {
@@ -53282,6 +53376,11 @@ async function run(context, deps = {}) {
         // F-TRAILERS: the lenient re-extraction regexes now live in
         // findings.js (extractTrailers) — shared with schedule.js's fallback.
         const fallbackTrailers = [];
+        // The destructured `hashBlock`/`shaBlock` intentionally SHADOW the
+        // outer locally-built bindings of the same names: index.js re-extracts
+        // all three trailers from reviewBody (schedule.js instead renames its
+        // re-extract and re-uses the built SHA block) — the values are
+        // identical either way, since the built blocks were appended above.
         const { marker, hashBlock, shaBlock } = extractTrailers(reviewBody);
         if (marker) fallbackTrailers.push(marker);
         if (hashBlock) fallbackTrailers.push(hashBlock);
@@ -53588,7 +53687,10 @@ function buildCallApi({
  * Build config from action inputs and call {@link run}. Errors propagate to
  * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
  * best-effort posts a "failure" commit status so developers aren't left
- * staring at a forever-pending status.
+ * staring at a forever-pending status — but only when a `pending` status
+ * actually landed during THIS run (D-1, schedule.js's W16-B2-1 policy):
+ * a run that died before starting its check (e.g. a getChangedFiles
+ * failure) must post nothing, instead of surfacing a failure from nowhere.
  *
  * @returns {Promise<void>}
  */
@@ -53596,19 +53698,26 @@ async function main() {
   const inputs = readAllInputs(core_namespaceObject);
   const config = loadConfig(inputs, { core: core_namespaceObject });
   const octokit = getOctokit(config.githubToken);
+  // D-1: shared with run() so the pending site can report that the
+  // `pending` commit status landed (see run()'s statusTracker dep).
+  const statusTracker = { pendingLanded: false };
   try {
     return await run(github_context, {
       config,
       core: core_namespaceObject,
       github: github_namespaceObject,
       octokit,
+      statusTracker,
     });
   } catch (err) {
     // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
     // only — setReviewStatus swallows its own errors and never throws, so this
-    // can never mask the original failure. Only fires for pull_request events
-    // (where a head SHA exists) and when status feedback is enabled.
-    if (config.commitStatus) {
+    // can never mask the original failure. Fires for pull_request events
+    // (where a head SHA exists), when status feedback is enabled, AND only
+    // when this run's `pending` status actually landed (D-1, sanctioned
+    // behavior change #1: schedule's policy wins — posting `failure` for a
+    // check that was never started marks the commit failed from nowhere).
+    if (config.commitStatus && statusTracker.pendingLanded) {
       const sha = github_context?.payload?.pull_request?.head?.sha;
       if (sha) {
         await setReviewStatus(
@@ -53633,7 +53742,6 @@ if (isMainEntry()) {
   main().catch((err) => core.setFailed(err?.message ?? String(err)));
 }
 
-var __webpack_exports__INPUT_NAMES = __webpack_exports__.Qh;
 var __webpack_exports__createScannerDeps = __webpack_exports__.nm;
 var __webpack_exports__expandHome = __webpack_exports__.kc;
 var __webpack_exports__httpsGet = __webpack_exports__.Kr;
@@ -53641,4 +53749,4 @@ var __webpack_exports__isMainEntry = __webpack_exports__.gT;
 var __webpack_exports__main = __webpack_exports__.iW;
 var __webpack_exports__readAllInputs = __webpack_exports__.vv;
 var __webpack_exports__run = __webpack_exports__.eF;
-export { __webpack_exports__INPUT_NAMES as INPUT_NAMES, __webpack_exports__createScannerDeps as createScannerDeps, __webpack_exports__expandHome as expandHome, __webpack_exports__httpsGet as httpsGet, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };
+export { __webpack_exports__createScannerDeps as createScannerDeps, __webpack_exports__expandHome as expandHome, __webpack_exports__httpsGet as httpsGet, __webpack_exports__isMainEntry as isMainEntry, __webpack_exports__main as main, __webpack_exports__readAllInputs as readAllInputs, __webpack_exports__run as run };
