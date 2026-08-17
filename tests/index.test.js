@@ -6,12 +6,59 @@
  * network or GitHub. The module MUST be importable without triggering main().
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { hashFinding } from '../src/lib/findings.js';
+import { INPUT_NAMES } from '../src/lib/config.js';
 
 // Dynamic import so we can assert import-safety AFTER spying on core.setFailed.
 // We re-import per test group where side effects matter.
 const indexModule = await import('../src/index.js');
 const { run, readAllInputs, isMainEntry, createScannerDeps, httpsGet } = indexModule;
+
+/**
+ * The complete list of action inputs, in the order loadConfig reads them.
+ * Independent of the src/lib/config.js INPUT_NAMES export on purpose: the
+ * drift tests below pin INPUT_NAMES to this list AND to the `inputs:` block
+ * of action.yml, making the three-way sync structural.
+ */
+const EXPECTED_INPUT_NAMES = [
+  'ZAI_API_KEY',
+  'ZAI_MODEL',
+  'ZAI_SYSTEM_PROMPT',
+  'ZAI_REVIEWER_NAME',
+  'EXCLUDE_PATTERNS',
+  'MAX_DIFF_CHARS',
+  'ZAI_LARGE_PR_FILE_THRESHOLD',
+  'ZAI_MAX_BATCH_CHARS',
+  'ZAI_MAX_FILES_PER_BATCH',
+  'ZAI_MAX_PATCH_CHARS',
+  'ZAI_TIMEOUT_MS',
+  'ZAI_COMMANDS_ENABLED',
+  'ZAI_ALLOW_FORK_COMMANDS',
+  'ZAI_AUTH_THRESHOLD',
+  'ZAI_SCHEDULE_ENABLED',
+  'ZAI_SCHEDULE_MAX_PRS',
+  'ZAI_DESCRIBE_WRITE_BODY',
+  'ZAI_IMPACT_LABELS',
+  'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
+  'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
+  'GITHUB_TOKEN',
+];
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -330,54 +377,43 @@ describe('readAllInputs', () => {
     };
     const inputs = readAllInputs(core);
     // Every documented config input is read.
-    for (const name of [
-      'ZAI_API_KEY',
-      'ZAI_MODEL',
-      'ZAI_SYSTEM_PROMPT',
-      'ZAI_REVIEWER_NAME',
-      'EXCLUDE_PATTERNS',
-      'MAX_DIFF_CHARS',
-      'ZAI_LARGE_PR_FILE_THRESHOLD',
-      'ZAI_MAX_BATCH_CHARS',
-      'ZAI_MAX_FILES_PER_BATCH',
-      'ZAI_MAX_PATCH_CHARS',
-      'ZAI_TIMEOUT_MS',
-      'ZAI_COMMANDS_ENABLED',
-      'ZAI_ALLOW_FORK_COMMANDS',
-      'ZAI_AUTH_THRESHOLD',
-      'ZAI_SCHEDULE_ENABLED',
-      'ZAI_SCHEDULE_MAX_PRS',
-      'ZAI_DESCRIBE_WRITE_BODY',
-      'ZAI_IMPACT_LABELS',
-      'ZAI_IMPACT_LABEL_MAP',
-      'ZAI_MAX_FINDINGS',
-      'ZAI_MIN_SEVERITY',
-      'ZAI_TEMPERATURE',
-      'ZAI_MAX_TOKENS',
-      'ZAI_COMMIT_STATUS',
-      'ZAI_SCANNERS_ENABLED',
-      'ZAI_SCANNERS_CACHE_DIR',
-      'ZAI_BATCH_CONCURRENCY',
-      'ZAI_FALLBACK_PROMPT',
-      'GITHUB_TOKEN',
-    ]) {
+    for (const name of EXPECTED_INPUT_NAMES) {
       expect(seen[name]).toBe(true);
       expect(inputs[name]).toBe(`val-${name}`);
     }
   });
 
   it('INPUT_NAMES lists exactly the inputs readAllInputs pulls (no drift)', () => {
-    // The INPUT_NAMES export is the single source of truth for which inputs the
-    // action reads; loadConfig must accept every one. This guards against a
-    // new input being added to one but not the other.
-    expect(indexModule.INPUT_NAMES).toEqual(
-      expect.arrayContaining([
-        'ZAI_MAX_FINDINGS',
-        'ZAI_MIN_SEVERITY',
-        'ZAI_TEMPERATURE',
-        'ZAI_MAX_TOKENS',
-      ]),
+    // INPUT_NAMES (owned by src/lib/config.js) is the single source of truth
+    // for which inputs the action reads; readAllInputs iterates it directly.
+    // Full equality — not arrayContaining — so a name added to one but not the
+    // other, or a duplicate/reordering, fails here.
+    expect(INPUT_NAMES).toEqual(EXPECTED_INPUT_NAMES);
+  });
+
+  it('INPUT_NAMES matches the inputs declared in action.yml (no drift)', () => {
+    // Parse the `inputs:` block of action.yml and assert set-equality with
+    // INPUT_NAMES: every declared input is read by the action, and every
+    // input the action reads is declared (so operators can actually set it).
+    const actionYml = readFileSync(
+      new URL('../action.yml', import.meta.url),
+      'utf8',
     );
+    const lines = actionYml.split('\n');
+    const start = lines.findIndex((l) => l === 'inputs:');
+    expect(start).toBeGreaterThanOrEqual(0); // sanity: the block exists
+    const declared = [];
+    for (let i = start + 1; i < lines.length; i += 1) {
+      // The next top-level key (e.g. `runs:`) ends the inputs block.
+      if (/^[A-Za-z-]+:/.test(lines[i])) break;
+      const m = lines[i].match(/^  ([A-Za-z0-9_]+):/);
+      if (m) declared.push(m[1]);
+    }
+    const declaredSet = new Set(declared);
+    const namesSet = new Set(INPUT_NAMES);
+    expect([...namesSet].filter((n) => !declaredSet.has(n))).toEqual([]); // read but not declared
+    expect([...declaredSet].filter((n) => !namesSet.has(n))).toEqual([]); // declared but not read
+    expect(declared).toHaveLength(INPUT_NAMES.length); // no duplicates on either side
   });
 
   it('returns a plain object (not a Map)', () => {

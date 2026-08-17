@@ -51,7 +51,7 @@ import {
   isIssueCommentEvent,
   isScheduleEvent,
 } from './lib/events.js';
-import { loadConfig } from './lib/config.js';
+import { INPUT_NAMES, loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
 import { authorize } from './lib/auth.js';
 import {
@@ -316,49 +316,6 @@ export function createScannerDeps({ core: coreArg, cacheDir } = {}) {
     computeMetrics,
   };
 }
-
-/**
- * The complete list of action input names, in the order loadConfig reads them.
- * Exported so the test can assert coverage. Keep in sync with config.js.
- */
-export const INPUT_NAMES = [
-  'ZAI_API_KEY',
-  'ZAI_MODEL',
-  'ZAI_SYSTEM_PROMPT',
-  'ZAI_REVIEWER_NAME',
-  'EXCLUDE_PATTERNS',
-  'MAX_DIFF_CHARS',
-  'ZAI_LARGE_PR_FILE_THRESHOLD',
-  'ZAI_MAX_BATCH_CHARS',
-  'ZAI_MAX_FILES_PER_BATCH',
-  'ZAI_MAX_PATCH_CHARS',
-  'ZAI_TIMEOUT_MS',
-  'ZAI_COMMANDS_ENABLED',
-  'ZAI_ALLOW_FORK_COMMANDS',
-  'ZAI_AUTH_THRESHOLD',
-  'ZAI_SCHEDULE_ENABLED',
-  'ZAI_SCHEDULE_MAX_PRS',
-  'ZAI_DESCRIBE_WRITE_BODY',
-  'ZAI_IMPACT_LABELS',
-  'ZAI_IMPACT_LABEL_MAP',
-  'ZAI_MAX_FINDINGS',
-  'ZAI_MIN_SEVERITY',
-  'ZAI_TEMPERATURE',
-  'ZAI_MAX_TOKENS',
-  'ZAI_BATCH_CONCURRENCY',
-  'ZAI_FALLBACK_PROMPT',
-  'ZAI_SCANNERS_ENABLED',
-  'ZAI_SCANNERS_CACHE_DIR',
-  'ZAI_COMMIT_STATUS',
-  'ZAI_WALKTHROUGH',
-  'ZAI_INCREMENTAL_REVIEW',
-  'ZAI_REPO_CONFIG_ENABLED',
-  'ZAI_STRICT_MODE',
-  'ZAI_SUGGEST_REVIEWERS',
-  'ZAI_AUTO_ASSIGN_REVIEWERS',
-  'ZAI_LEARNINGS_ENABLED',
-  'GITHUB_TOKEN',
-];
 
 /**
  * Build the fallback comment body used when inline review submission fails.
