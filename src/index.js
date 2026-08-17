@@ -47,6 +47,9 @@ import {
   isForkPullRequest,
   getCommenter,
   isBotComment,
+  isPullRequestEvent,
+  isIssueCommentEvent,
+  isScheduleEvent,
 } from './lib/events.js';
 import { loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
@@ -559,7 +562,9 @@ export async function run(context, deps = {}) {
   // available — operators who wire `pull_request_target` are responsible for
   // ensuring their config does not leak secrets into review output (the
   // sanitizer + prompt-hardening layers remain the controls there).
-  if (event === 'pull_request' || event === 'pull_request_target') {
+  // The router below now consumes isPullRequestEvent() so events.js is the
+  // single owner of event classification.
+  if (isPullRequestEvent(context)) {
     // INT-2: only react to PR actions that warrant a fresh review. Without
     // this filter the action also fires on `closed`, `labeled`, `edited`, etc.
     // — burning API credits and posting duplicate reviews. Mirrors the
@@ -1167,7 +1172,7 @@ export async function run(context, deps = {}) {
   }
 
   // ---- issue_comment → command path ---------------------------------
-  if (event === 'issue_comment') {
+  if (isIssueCommentEvent(context)) {
     // Defense-in-depth: only react to `created` comments. The shipped example
     // workflow triggers on `types: [created]`, but a consumer who broadens it
     // to `[created, edited]` could let an authorized user re-fire commands by
@@ -1266,7 +1271,7 @@ export async function run(context, deps = {}) {
   }
 
   // ---- schedule → batch re-review of open PRs -----------------------
-  if (event === 'schedule') {
+  if (isScheduleEvent(context)) {
     if (!config.scheduleEnabled) {
       coreDep.info('Schedule disabled; nothing to do.');
       return;
