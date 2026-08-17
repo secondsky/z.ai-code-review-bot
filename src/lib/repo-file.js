@@ -17,6 +17,9 @@
  *
  * `label` prefixes every `message` (e.g. `learnings: …`) so callers can warn
  * with the outcome message verbatim and keep their historical warning strings.
+ * When `label` is absent/empty the message carries NO prefix (it starts with
+ * the path) — for callers that wrap the message in their own label
+ * (codeowners) and would otherwise stutter `X: X: path…` (A4).
  * Payload conventions (the learnings/repo-config superset, now adopted
  * everywhere, including codeowners):
  *   - `{ content: <base64>, encoding: 'base64' }` — decoded, whitespace stripped
@@ -52,12 +55,17 @@ export function resolveHeadSha(opts) {
  * @param {string} args.ref       git ref (typically the PR head SHA).
  * @param {number} args.maxBytes  hard cap applied to the reported byte size
  *                                AND the decoded char length.
- * @param {string} args.label     message prefix (e.g. `learnings`).
+ * @param {string} args.label     message prefix (e.g. `learnings`); when
+ *                                absent/empty, messages carry NO prefix.
  * @returns {Promise<{ok: true, text: string} |
  *                   {ok: false, kind: 'missing'|'too-large'|'decode'|'error', message: string}>}
  */
 export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes, label }) {
   const shortRef = typeof ref === 'string' ? ref.slice(0, 7) : String(ref ?? '');
+  // A4: only prefix when a non-empty label was supplied — an absent label
+  // must NOT render `undefined: …` (callers that wrap the message in their
+  // own label pass none).
+  const prefix = typeof label === 'string' && label !== '' ? `${label}: ` : '';
 
   let data;
   try {
@@ -69,13 +77,13 @@ export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes,
       return {
         ok: false,
         kind: 'missing',
-        message: `${label}: no ${path} found at ${shortRef} (404).`,
+        message: `${prefix}no ${path} found at ${shortRef} (404).`,
       };
     }
     return {
       ok: false,
       kind: 'error',
-      message: `${label}: failed to fetch ${path} (${status ?? 'unknown'}): ${
+      message: `${prefix}failed to fetch ${path} (${status ?? 'unknown'}): ${
         error?.message ?? String(error)
       }`,
     };
@@ -90,7 +98,7 @@ export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes,
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} is ${size} bytes (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} is ${size} bytes (cap ${maxBytes}); skipping.`,
       };
     }
     let text;
@@ -100,7 +108,7 @@ export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes,
       return {
         ok: false,
         kind: 'decode',
-        message: `${label}: ${path} could not be base64-decoded; skipping.`,
+        message: `${prefix}${path} could not be base64-decoded; skipping.`,
       };
     }
     // Post-decode size guard (`data.size` can under-report).
@@ -108,7 +116,7 @@ export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes,
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} decodes to ${text.length} chars (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} decodes to ${text.length} chars (cap ${maxBytes}); skipping.`,
       };
     }
     return { ok: true, text };
@@ -120,12 +128,12 @@ export async function fetchRepoText({ octokit, owner, repo, path, ref, maxBytes,
       return {
         ok: false,
         kind: 'too-large',
-        message: `${label}: ${path} is ${data.length} chars (cap ${maxBytes}); skipping.`,
+        message: `${prefix}${path} is ${data.length} chars (cap ${maxBytes}); skipping.`,
       };
     }
     return { ok: true, text: data };
   }
 
   // Not a file (directory listing or symlink) — treat as missing.
-  return { ok: false, kind: 'missing', message: `${label}: ${path} is not a file` };
+  return { ok: false, kind: 'missing', message: `${prefix}${path} is not a file` };
 }

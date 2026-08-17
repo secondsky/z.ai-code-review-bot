@@ -22,7 +22,7 @@
  * @module src/lib/schedule.js
  */
 
-import { MARKER, appendTrailers, isBotAuthor } from './comments.js';
+import { MARKER, appendTrailers, collectPagesSome, isBotAuthor } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
 import {
   buildStatusDescription as buildStatusDescriptionDefault,
@@ -274,7 +274,7 @@ export async function listOpenPrs({
  * drive-by users) could post a comment containing the marker + head SHA and
  * cause the scheduled review to SKIP that PR — a trivial review-suppression.
  *
- * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker }`
+ * @param {object} args `{ octokit, owner, repo, pullNumber, headSha, marker, core }`
  * @returns {Promise<boolean>}
  */
 export async function hasReviewForSha({
@@ -284,6 +284,7 @@ export async function hasReviewForSha({
   pullNumber,
   headSha,
   marker = MARKER,
+  core,
 }) {
   // INT-3: an empty head SHA cannot confirm SHA-level dedup — previously the
   // `headSha === '' ||` short-circuit matched ANY bot marker comment and
@@ -314,33 +315,47 @@ export async function hasReviewForSha({
   // cannot stall a scheduled run (consistent with CORE-4 caps elsewhere).
   const MAX_COMMENT_PAGES = 100;
 
+  // Task-3 (deferred follow-ups): both hand-rolled pagination loops migrated
+  // to collectPagesSome — same page/short-page/cap semantics, but it returns
+  // true at the FIRST matching item instead of enumerating the full history
+  // (an existence check never needs the tail). Rejections still propagate to
+  // the caller's fail-soft boundary (W19-E2-4 in runScheduledReview).
+
   // 1. Issue comments (issues.listComments).
-  for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner,
-      repo,
-      issue_number: pullNumber,
-      per_page: perPage,
-      page,
-    });
-    if (comments.some(matches)) return true;
-    if (comments.length < perPage) break;
-  }
+  const inComments = await collectPagesSome(
+    (page) =>
+      octokit
+        .rest.issues.listComments({
+          owner,
+          repo,
+          issue_number: pullNumber,
+          per_page: perPage,
+          page,
+        })
+        .then((r) => r.data),
+    matches,
+    { perPage, maxPages: MAX_COMMENT_PAGES, core },
+  );
+  if (inComments) return true;
 
   // 2. Reviews (pulls.listReviews) — where the inline-review path posts.
   // Guard for environments where the endpoint is absent (older mocks).
   if (typeof octokit?.rest?.pulls?.listReviews === 'function') {
-    for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
-      const { data: reviews } = await octokit.rest.pulls.listReviews({
-        owner,
-        repo,
-        pull_number: pullNumber,
-        per_page: perPage,
-        page,
-      });
-      if (reviews.some(matches)) return true;
-      if (reviews.length < perPage) break;
-    }
+    const inReviews = await collectPagesSome(
+      (page) =>
+        octokit
+          .rest.pulls.listReviews({
+            owner,
+            repo,
+            pull_number: pullNumber,
+            per_page: perPage,
+            page,
+          })
+          .then((r) => r.data),
+      matches,
+      { perPage, maxPages: MAX_COMMENT_PAGES, core },
+    );
+    if (inReviews) return true;
   }
 
   return false;
@@ -682,6 +697,7 @@ export async function reviewOnePr({
           repo,
           issueNumber: pr.number,
           marker: MARKER,
+          core,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {
@@ -710,6 +726,7 @@ export async function reviewOnePr({
           octokit,
           context: ctx,
           marker: MARKER,
+          core,
         });
         for (const priorReview of priorReviews) {
           if (typeof priorReview?.body === 'string') {
@@ -1184,6 +1201,7 @@ export async function runScheduledReview({
         repo,
         pullNumber: pr.number,
         headSha: pr.headSha,
+        core,
       });
     } catch (dedupError) {
       if (core?.warning) {

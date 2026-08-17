@@ -59,6 +59,8 @@ export function stripComment(line) {
         }
       }
     } else if (ch === '#' && !inSingle && !inDouble) {
+      // A `#` only starts a comment when it's at the start of the line or
+      // preceded by whitespace. `value#frag` is NOT a comment.
       const prev = i > 0 ? line[i - 1] : '';
       if (i === 0 || /\s/.test(prev)) {
         return line.slice(0, i);

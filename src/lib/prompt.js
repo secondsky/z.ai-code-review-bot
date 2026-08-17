@@ -210,6 +210,21 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
 ].join('\n');
 
 /**
+ * The single predicate deciding whether the caller supplied a complete batch
+ * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
+ * options are flat mode.
+ *
+ * @param {{batchNumber?: number, totalBatches?: number}} options
+ * @returns {boolean}
+ */
+function validBatch(options) {
+  return (
+    typeof options.batchNumber === 'number' &&
+    typeof options.totalBatches === 'number'
+  );
+}
+
+/**
  * Build the user-message prompt for a structured review of a list of changed
  * files. Instructs the model to emit ONLY a JSON object with `summary` and
  * `findings` matching the schema, with quoted evidence. Reuses all existing
@@ -220,9 +235,10 @@ const STRUCTURED_REVIEW_INSTRUCTION = [
  * filter first via {@link filterPatchableFiles}). Empty/undefined input
  * returns just the instruction header.
  *
- * If `options.maxDiffChars > 0` and the joined result exceeds the limit, files
- * are dropped from the END (trailing entries removed) until the body fits.
- * `maxDiffChars === 0` (the default) disables truncation.
+ * If `options.maxDiffChars` is a finite positive number and the joined result
+ * exceeds the limit, files are dropped from the END (trailing entries removed)
+ * until the body fits. `Infinity` (the post-loadConfig representation of
+ * "unlimited", D-4) disables truncation, as do legacy 0/undefined options.
  *
  * When `options.batchNumber` and `options.totalBatches` are provided, the body
  * is wrapped in a `<review_batch>` envelope (used by the batched review path).
@@ -301,7 +317,14 @@ export function buildStructuredReviewPrompt(files, options = {}) {
     ? { batchNumber: options.batchNumber, totalBatches: options.totalBatches }
     : null;
 
-  const maxDiffChars = typeof options.maxDiffChars === 'number' ? options.maxDiffChars : 0;
+  // D-4: post-loadConfig representation — Infinity means unlimited (loadConfig
+  // maps 0/negative to Infinity); legacy direct callers passing 0, a negative,
+  // or nothing also land on Infinity here, so truncation is disabled exactly
+  // as before. A finite positive value keeps the cap active below.
+  const maxDiffChars =
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
+      ? options.maxDiffChars
+      : Infinity;
   // W6-6: in the batched path, createReviewBatches already packed entries
   // within a char budget (maxBatchChars). Applying maxDiffChars truncation on
   // top would silently drop trailing entries — they're counted in the batch
@@ -316,7 +339,7 @@ export function buildStructuredReviewPrompt(files, options = {}) {
   // '\n\n'` byte-identically (the header survives even when it alone exceeds
   // the cap).
   let kept = entries.length;
-  if (maxDiffChars > 0 && batch === null) {
+  if (Number.isFinite(maxDiffChars) && batch === null) {
     kept = 0;
     let running = header.length + 2;
     for (const e of entries) {
@@ -333,21 +356,6 @@ export function buildStructuredReviewPrompt(files, options = {}) {
     header,
     kept === entries.length ? entries : entries.slice(0, kept),
     batch,
-  );
-}
-
-/**
- * The single predicate deciding whether the caller supplied a complete batch
- * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
- * options are flat mode.
- *
- * @param {{batchNumber?: number, totalBatches?: number}} options
- * @returns {boolean}
- */
-function validBatch(options) {
-  return (
-    typeof options.batchNumber === 'number' &&
-    typeof options.totalBatches === 'number'
   );
 }
 

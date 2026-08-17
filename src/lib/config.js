@@ -10,6 +10,54 @@
  * action.yml defaults (those are applied by GitHub before the input reaches us).
  */
 
+/**
+ * The complete list of action input names, in the order loadConfig reads them.
+ *
+ * This module owns the action-input contract: `action.yml` declares the inputs
+ * GitHub passes to the runner, `readAllInputs` (src/index.js) pulls each one
+ * via `core.getInput`, and `loadConfig` parses them below. The drift test in
+ * tests/index.test.js pins all three together, so adding an input means
+ * updating this array, the `inputs:` block in action.yml, and loadConfig.
+ */
+export const INPUT_NAMES = [
+  'ZAI_API_KEY',
+  'ZAI_MODEL',
+  'ZAI_SYSTEM_PROMPT',
+  'ZAI_REVIEWER_NAME',
+  'EXCLUDE_PATTERNS',
+  'MAX_DIFF_CHARS',
+  'ZAI_LARGE_PR_FILE_THRESHOLD',
+  'ZAI_MAX_BATCH_CHARS',
+  'ZAI_MAX_FILES_PER_BATCH',
+  'ZAI_MAX_PATCH_CHARS',
+  'ZAI_TIMEOUT_MS',
+  'ZAI_COMMANDS_ENABLED',
+  'ZAI_ALLOW_FORK_COMMANDS',
+  'ZAI_AUTH_THRESHOLD',
+  'ZAI_SCHEDULE_ENABLED',
+  'ZAI_SCHEDULE_MAX_PRS',
+  'ZAI_DESCRIBE_WRITE_BODY',
+  'ZAI_IMPACT_LABELS',
+  'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
+  'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
+  'GITHUB_TOKEN',
+];
+
 const TRUTHY = new Set(['true', '1', 'yes']);
 
 function isTruthy(v) {
@@ -181,17 +229,21 @@ export function loadConfig(inputs = {}, options = {}) {
           .map((p) => p.trim())
           .filter((p) => p !== '');
 
-  // maxDiffChars: parseInt base 10, NaN -> default. 0 (and any negative) means
-  // "unlimited" — documented in action.yml and honored here. The DEFAULT is a
-  // sane cap; operators who want unlimited set MAX_DIFF_CHARS=0 (or a negative)
-  // explicitly. A positive integer is honored as the per-batch char cap.
+  // maxDiffChars: parseInt base 10, NaN -> default. "Unlimited" is normalized
+  // to Infinity HERE, at the boundary: action.yml documents 0 (and any
+  // negative) as unlimited, and loadConfig maps both to Infinity so consumers
+  // branch two-state (Number.isFinite = cap active; Infinity = unlimited)
+  // instead of the former three-state `> 0` checks on a 0 sentinel. The
+  // DEFAULT is a sane cap; operators who want unlimited set MAX_DIFF_CHARS=0
+  // (or a negative) explicitly. A positive integer is honored as the
+  // per-batch char cap.
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null
       ? 100000
-      : maxDiffCharsRaw <= 0
-        ? 0
-        : maxDiffCharsRaw;
+      : maxDiffCharsRaw > 0
+        ? maxDiffCharsRaw
+        : Infinity;
 
   // Numeric knobs that drive loops/batching must be positive; clamp to a safe
   // default on any non-finite/negative/zero value to prevent infinite loops

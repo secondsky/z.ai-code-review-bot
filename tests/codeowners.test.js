@@ -431,6 +431,17 @@ function makeOctokitWithContent(content, opts = {}) {
             err.status = 500;
             throw err;
           }
+          if (opts.oversize) {
+            // GitHub reports a byte size over MAX_CODEOWNERS_BYTES (256 KiB)
+            // → the shared loader's pre-decode cap trips on the FIRST path.
+            return {
+              data: {
+                content: encoded,
+                encoding: 'base64',
+                size: 300000,
+              },
+            };
+          }
           if (opts.foundPath && params.path !== opts.foundPath) {
             // Simulate the real repo: only the requested path returns content;
             // all others 404.
@@ -562,6 +573,25 @@ describe('loadCodeowners — fail-soft returns []', () => {
     );
     expect(rules).toEqual([]);
     expect(core.warning).toHaveBeenCalled();
+  });
+
+  // A4: codeowners wraps the shared loader's outcome message in
+  // `codeowners: failed to fetch CODEOWNERS: ${outcome.message}`. The call
+  // passes NO label, so the message must start with the PATH — otherwise the
+  // warning stutters `… CODEOWNERS: CODEOWNERS: .github/CODEOWNERS is …`.
+  it('A4: oversize warning carries no CODEOWNERS label stutter', async () => {
+    const octokit = makeOctokitWithContent('* @alice\n', { oversize: true });
+    const { core, warnings } = makeCore();
+    const rules = await loadCodeowners(
+      { octokit, context: makeContext() },
+      { core },
+    );
+    expect(rules).toEqual([]);
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    expect(warnings[0]).toMatch(
+      /failed to fetch CODEOWNERS: \.github\/CODEOWNERS is \d+ bytes \(cap \d+\)/,
+    );
+    expect(warnings[0]).not.toContain('CODEOWNERS: CODEOWNERS');
   });
 
   it('returns [] when headSha cannot be resolved', async () => {

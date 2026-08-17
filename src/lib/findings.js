@@ -49,6 +49,15 @@ export const SEVERITY_RANK = {
 };
 
 /**
+ * Severity display order (most severe first) — the canonical owner of the
+ * sequence every renderer walks for severity-grouped output. Aliases
+ * {@link SEVERITIES} (same values in the same order) so the schema contract
+ * and the display order can never drift apart. Imported by walkthrough.js.
+ * @type {ReadonlyArray<string>}
+ */
+export const SEVERITY_ORDER = SEVERITIES;
+
+/**
  * Confidence -> numeric rank for tie-breaking. Lower rank sorts first.
  * @type {Readonly<Record<string, number>>}
  */
@@ -85,8 +94,13 @@ const SCHEMA_KEYS = [
 /** Idempotency marker reused from comments.js — must remain byte-exact. */
 const MARKER = '<!-- zai-code-review -->';
 
-/** Per-severity emoji for the summary renderer. */
-const SEVERITY_EMOJI = {
+/**
+ * Per-severity emoji for the summary renderers. The canonical severity-domain
+ * table — walkthrough.js imports it so the walkthrough Overview line and the
+ * severity-grouped summary stay visually consistent by construction.
+ * @type {Readonly<Record<string, string>>}
+ */
+export const SEVERITY_EMOJI = {
   critical: '🔴',
   high: '🟠',
   medium: '🟡',

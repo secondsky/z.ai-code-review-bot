@@ -57,7 +57,7 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
     await handleReviewCommand({
       octokit,
       context: makeContext(),
-      config: { apiKey: 'k', model: 'm', maxDiffChars: 0 },
+      config: { apiKey: 'k', model: 'm', maxDiffChars: Infinity },
       commenter: { login: 'a' },
       args: '',
       callApi,
@@ -87,10 +87,11 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
     expect(octokit.__calls.createComment[0].body).toContain('No textual changes');
   });
 
-  it('L5: passes maxDiffChars=0 (unlimited sentinel) straight through, NOT the 8000 fallback', async () => {
+  it('L5: passes maxDiffChars=Infinity (unlimited) straight through, NOT the 8000 fallback', async () => {
     // Build two files whose combined patches exceed MAX_WHOLE_PR_DIFF_CHARS
-    // (8000). With maxDiffChars=0 (unlimited) both files must appear in the
-    // prompt; with the buggy 8000 fallback, the second file would be dropped.
+    // (8000). With maxDiffChars=Infinity (unlimited, D-4's representation —
+    // formerly the 0 sentinel) both files must appear in the prompt; with the
+    // buggy 8000 fallback, the second file would be dropped.
     const big = 'x'.repeat(5000);
     const octokit = makeOctokit({
       files: [
@@ -103,8 +104,8 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
     await handleReviewCommand({
       octokit,
       context: makeContext(),
-      // maxDiffChars: 0 explicitly means "unlimited" per config.js.
-      config: { apiKey: 'k', model: 'm', maxDiffChars: 0 },
+      // maxDiffChars: Infinity explicitly means "unlimited" per config.js (D-4).
+      config: { apiKey: 'k', model: 'm', maxDiffChars: Infinity },
       commenter: { login: 'a' },
       args: '',
       callApi,
@@ -112,8 +113,8 @@ describe('handleReviewCommand — whole-PR (no args)', () => {
 
     expect(callApi).toHaveBeenCalledTimes(1);
     const prompt = callApi.mock.calls[0][2];
-    // Both large files present (no truncation) — proves the 0 sentinel was
-    // passed through rather than being replaced by the 8000 fallback.
+    // Both large files present (no truncation) — proves the unlimited value
+    // was passed through rather than being replaced by the 8000 fallback.
     expect(prompt).toContain('src/big1.js');
     expect(prompt).toContain('src/big2.js');
     expect(prompt).toContain(big);
@@ -173,7 +174,7 @@ describe('handleReviewCommand — W15-A8-8: excludes applied on whole-PR path', 
       config: {
         apiKey: 'k',
         model: 'm',
-        maxDiffChars: 0,
+        maxDiffChars: Infinity,
         excludePatterns: ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
       },
       commenter: { login: 'a' },
@@ -315,10 +316,10 @@ describe('handleReviewCommand — W16-B4-3: single-file diff cap', () => {
     expect(prompt).not.toContain('diff truncated');
   });
 
-  it('buildFileReviewPrompt: maxDiffChars 0 (unlimited sentinel) disables truncation, mirroring the whole-PR path', () => {
+  it('buildFileReviewPrompt: maxDiffChars Infinity (unlimited) disables truncation, mirroring the whole-PR path', () => {
     const prompt = buildFileReviewPrompt(
       { filename: 'src/big.js', status: 'modified', patch: longPatch() },
-      { maxDiffChars: 0 },
+      { maxDiffChars: Infinity },
     );
     expect(prompt).toContain('line 3000');
     expect(prompt).not.toContain('diff truncated');

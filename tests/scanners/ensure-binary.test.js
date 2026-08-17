@@ -243,6 +243,18 @@ describe('resolveBinaryRequest', () => {
     );
   });
 
+  // A6: a null/undefined spec previously fell into selectPlatformAsset and
+  // threw the misleading `undefined: no asset for platform=…` — while the
+  // body dereferenced bare `spec.name`. Guard at the top with a clear error.
+  it('A6: null/undefined spec throws "resolveBinaryRequest: spec is required"', () => {
+    expect(() =>
+      resolveBinaryRequest(null, { platform: 'darwin', arch: 'arm64' }),
+    ).toThrow('resolveBinaryRequest: spec is required');
+    expect(() => resolveBinaryRequest(undefined)).toThrow(
+      'resolveBinaryRequest: spec is required',
+    );
+  });
+
   it('returns ONLY the seven flat keys — no urls/checksums/archiveType leak', () => {
     const req = resolveBinaryRequest(
       { ...spec, archiveType: 'zip' },

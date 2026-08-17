@@ -323,10 +323,10 @@ export function resolveReviewEvent(findings, config) {
  *
  * `listReviews` rejections propagate (not swallowed).
  *
- * @param {{octokit:object, context:object, marker?:string}} args
+ * @param {{octokit:object, context:object, marker?:string, core?:object}} args
  * @returns {Promise<Array<{id:number, body?:string, user?:{login?:string}}>>}
  */
-export async function listBotReviews({ octokit, context, marker = MARKER }) {
+export async function listBotReviews({ octokit, context, marker = MARKER, core }) {
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.pull_request?.number;
@@ -344,7 +344,9 @@ export async function listBotReviews({ octokit, context, marker = MARKER }) {
           page,
         })
         .then((r) => r.data),
-    { perPage },
+    // Task-4: forward the optional core so a non-array page during review
+    // enumeration warns instead of silently ending the listing.
+    { perPage, core },
   );
 
   return all.filter((r) => {
@@ -429,7 +431,7 @@ export async function upsertReview({ octokit, context, marker = MARKER, sha, bod
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.pull_request?.number;
 
-  const prior = await listBotReviews({ octokit, context, marker });
+  const prior = await listBotReviews({ octokit, context, marker, core });
   const reason = `Superseded by re-review at ${sha ?? ''}`.trim();
 
   const payload = buildReviewPayload({ body, comments, event });

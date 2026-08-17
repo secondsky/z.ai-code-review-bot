@@ -168,52 +168,23 @@ export async function runScanners(opts, deps = {}) {
     scannerSharedDeps.arch = deps.arch;
   }
 
-  // Run secrets + patterns concurrently.
-  /** @type {Array<Promise<{ findings: Array, scanner: string }>>} */
-  const promises = [];
-  if (secretsEnabled) {
-    promises.push(
-      doScanSecrets(
-        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        scannerSharedDeps,
-      ).catch((err) => {
-        if (core?.warning) {
-          core.warning(`secrets scanner failed: ${err?.message ?? String(err)}`);
-        }
+  // Run secrets + patterns concurrently. Results are correlated to their
+  // scanner by index pairing with the filtered descriptor array — never by
+  // push order or positional shift().
+  const active = [
+    { name: 'secrets', run: doScanSecrets, enabled: secretsEnabled },
+    { name: 'patterns', run: doScanPatterns, enabled: patternsEnabled },
+  ].filter((s) => s.enabled);
+  const results = await Promise.all(active.map(({ name, run }) =>
+    run({ files, repoPath: opts.repoPath, cacheDir: opts.cacheDir }, scannerSharedDeps)
+      .catch((err) => {
+        core?.warning?.(`${name} scanner failed: ${err?.message ?? String(err)}`);
         return { findings: [], scanner: 'regex-fallback' };
-      }),
-    );
-  }
-  if (patternsEnabled) {
-    promises.push(
-      doScanPatterns(
-        { files, repoPath: opts.repoPath, cacheDir: opts.cacheDir },
-        scannerSharedDeps,
-      ).catch((err) => {
-        if (core?.warning) {
-          core.warning(`patterns scanner failed: ${err?.message ?? String(err)}`);
-        }
-        return { findings: [], scanner: 'regex-fallback' };
-      }),
-    );
-  }
-  const results = await Promise.all(promises);
-
-  // Track provenance.
-  if (secretsEnabled) {
-    const r = results.shift();
-    if (r) {
-      scannerNames.push(`secrets:${r.scanner}`);
-      findings = findings.concat(r.findings);
-    }
-  }
-  if (patternsEnabled) {
-    const r = results.shift();
-    if (r) {
-      scannerNames.push(`patterns:${r.scanner}`);
-      findings = findings.concat(r.findings);
-    }
-  }
+      })));
+  results.forEach((r, i) => {
+    scannerNames.push(`${active[i].name}:${r.scanner}`);
+    findings = findings.concat(r.findings);
+  });
 
   // Surface metrics-driven findings (large/generated files).
   if (metricsEnabled) {

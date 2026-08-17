@@ -6,12 +6,59 @@
  * network or GitHub. The module MUST be importable without triggering main().
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { hashFinding } from '../src/lib/findings.js';
+import { INPUT_NAMES } from '../src/lib/config.js';
 
 // Dynamic import so we can assert import-safety AFTER spying on core.setFailed.
 // We re-import per test group where side effects matter.
 const indexModule = await import('../src/index.js');
 const { run, readAllInputs, isMainEntry, createScannerDeps, httpsGet } = indexModule;
+
+/**
+ * The complete list of action inputs, in the order loadConfig reads them.
+ * Independent of the src/lib/config.js INPUT_NAMES export on purpose: the
+ * drift tests below pin INPUT_NAMES to this list AND to the `inputs:` block
+ * of action.yml, making the three-way sync structural.
+ */
+const EXPECTED_INPUT_NAMES = [
+  'ZAI_API_KEY',
+  'ZAI_MODEL',
+  'ZAI_SYSTEM_PROMPT',
+  'ZAI_REVIEWER_NAME',
+  'EXCLUDE_PATTERNS',
+  'MAX_DIFF_CHARS',
+  'ZAI_LARGE_PR_FILE_THRESHOLD',
+  'ZAI_MAX_BATCH_CHARS',
+  'ZAI_MAX_FILES_PER_BATCH',
+  'ZAI_MAX_PATCH_CHARS',
+  'ZAI_TIMEOUT_MS',
+  'ZAI_COMMANDS_ENABLED',
+  'ZAI_ALLOW_FORK_COMMANDS',
+  'ZAI_AUTH_THRESHOLD',
+  'ZAI_SCHEDULE_ENABLED',
+  'ZAI_SCHEDULE_MAX_PRS',
+  'ZAI_DESCRIBE_WRITE_BODY',
+  'ZAI_IMPACT_LABELS',
+  'ZAI_IMPACT_LABEL_MAP',
+  'ZAI_MAX_FINDINGS',
+  'ZAI_MIN_SEVERITY',
+  'ZAI_TEMPERATURE',
+  'ZAI_MAX_TOKENS',
+  'ZAI_BATCH_CONCURRENCY',
+  'ZAI_FALLBACK_PROMPT',
+  'ZAI_SCANNERS_ENABLED',
+  'ZAI_SCANNERS_CACHE_DIR',
+  'ZAI_COMMIT_STATUS',
+  'ZAI_WALKTHROUGH',
+  'ZAI_INCREMENTAL_REVIEW',
+  'ZAI_REPO_CONFIG_ENABLED',
+  'ZAI_STRICT_MODE',
+  'ZAI_SUGGEST_REVIEWERS',
+  'ZAI_AUTO_ASSIGN_REVIEWERS',
+  'ZAI_LEARNINGS_ENABLED',
+  'GITHUB_TOKEN',
+];
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -37,7 +84,7 @@ function makeConfig(overrides = {}) {
     systemPrompt: '',
     reviewerName: 'Z.ai Code Review',
     excludePatterns: ['*.lock'],
-    maxDiffChars: 0,
+    maxDiffChars: Infinity,
     largePrFileThreshold: 50,
     maxBatchChars: 120000,
     maxFilesPerBatch: 40,
@@ -330,54 +377,43 @@ describe('readAllInputs', () => {
     };
     const inputs = readAllInputs(core);
     // Every documented config input is read.
-    for (const name of [
-      'ZAI_API_KEY',
-      'ZAI_MODEL',
-      'ZAI_SYSTEM_PROMPT',
-      'ZAI_REVIEWER_NAME',
-      'EXCLUDE_PATTERNS',
-      'MAX_DIFF_CHARS',
-      'ZAI_LARGE_PR_FILE_THRESHOLD',
-      'ZAI_MAX_BATCH_CHARS',
-      'ZAI_MAX_FILES_PER_BATCH',
-      'ZAI_MAX_PATCH_CHARS',
-      'ZAI_TIMEOUT_MS',
-      'ZAI_COMMANDS_ENABLED',
-      'ZAI_ALLOW_FORK_COMMANDS',
-      'ZAI_AUTH_THRESHOLD',
-      'ZAI_SCHEDULE_ENABLED',
-      'ZAI_SCHEDULE_MAX_PRS',
-      'ZAI_DESCRIBE_WRITE_BODY',
-      'ZAI_IMPACT_LABELS',
-      'ZAI_IMPACT_LABEL_MAP',
-      'ZAI_MAX_FINDINGS',
-      'ZAI_MIN_SEVERITY',
-      'ZAI_TEMPERATURE',
-      'ZAI_MAX_TOKENS',
-      'ZAI_COMMIT_STATUS',
-      'ZAI_SCANNERS_ENABLED',
-      'ZAI_SCANNERS_CACHE_DIR',
-      'ZAI_BATCH_CONCURRENCY',
-      'ZAI_FALLBACK_PROMPT',
-      'GITHUB_TOKEN',
-    ]) {
+    for (const name of EXPECTED_INPUT_NAMES) {
       expect(seen[name]).toBe(true);
       expect(inputs[name]).toBe(`val-${name}`);
     }
   });
 
   it('INPUT_NAMES lists exactly the inputs readAllInputs pulls (no drift)', () => {
-    // The INPUT_NAMES export is the single source of truth for which inputs the
-    // action reads; loadConfig must accept every one. This guards against a
-    // new input being added to one but not the other.
-    expect(indexModule.INPUT_NAMES).toEqual(
-      expect.arrayContaining([
-        'ZAI_MAX_FINDINGS',
-        'ZAI_MIN_SEVERITY',
-        'ZAI_TEMPERATURE',
-        'ZAI_MAX_TOKENS',
-      ]),
+    // INPUT_NAMES (owned by src/lib/config.js) is the single source of truth
+    // for which inputs the action reads; readAllInputs iterates it directly.
+    // Full equality — not arrayContaining — so a name added to one but not the
+    // other, or a duplicate/reordering, fails here.
+    expect(INPUT_NAMES).toEqual(EXPECTED_INPUT_NAMES);
+  });
+
+  it('INPUT_NAMES matches the inputs declared in action.yml (no drift)', () => {
+    // Parse the `inputs:` block of action.yml and assert set-equality with
+    // INPUT_NAMES: every declared input is read by the action, and every
+    // input the action reads is declared (so operators can actually set it).
+    const actionYml = readFileSync(
+      new URL('../action.yml', import.meta.url),
+      'utf8',
     );
+    const lines = actionYml.split('\n');
+    const start = lines.findIndex((l) => l === 'inputs:');
+    expect(start).toBeGreaterThanOrEqual(0); // sanity: the block exists
+    const declared = [];
+    for (let i = start + 1; i < lines.length; i += 1) {
+      // The next top-level key (e.g. `runs:`) ends the inputs block.
+      if (/^[A-Za-z-]+:/.test(lines[i])) break;
+      const m = lines[i].match(/^  ([A-Za-z0-9_]+):/);
+      if (m) declared.push(m[1]);
+    }
+    const declaredSet = new Set(declared);
+    const namesSet = new Set(INPUT_NAMES);
+    expect([...namesSet].filter((n) => !declaredSet.has(n))).toEqual([]); // read but not declared
+    expect([...declaredSet].filter((n) => !namesSet.has(n))).toEqual([]); // declared but not read
+    expect(declared).toHaveLength(INPUT_NAMES.length); // no duplicates on either side
   });
 
   it('returns a plain object (not a Map)', () => {
@@ -3074,7 +3110,7 @@ describe('main() — failure commit-status wiring (Phase 5)', () => {
         'const callApi = async () => { throw new Error("hard boom"); };',
         'const config = {',
         '  apiKey: "k", model: "glm-5.2", systemPrompt: "", reviewerName: "Z.ai Code Review",',
-        '  excludePatterns: [], maxDiffChars: 0, largePrFileThreshold: 50, maxBatchChars: 120000,',
+        '  excludePatterns: [], maxDiffChars: Infinity, largePrFileThreshold: 50, maxBatchChars: 120000,',
         '  maxFilesPerBatch: 40, maxPatchChars: 18000, commandsEnabled: false, authThreshold: "write",',
         '  allowForkCommands: false, timeoutMs: 120000, scheduleEnabled: false, scheduleMaxPrs: 10,',
         '  describeWriteBody: false, impactLabels: false, impactLabelMap: {}, maxFindings: 8,',
@@ -3109,6 +3145,239 @@ describe('main() — failure commit-status wiring (Phase 5)', () => {
     // the error propagated — proving the run-level wiring main relies on.
     expect(out).toContain('THREW:hard boom');
     expect(out).toMatch(/STATUSCALLS:\["pending:sha-x"\]/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * main() — terminal-failure gate (D-1, deferred-followups Task 13)
+ *
+ * SANCTIONED BEHAVIOR CHANGE #1 (user-approved: schedule's policy wins):
+ * main()'s catch posts the terminal `failure` commit status ONLY when a
+ * `pending` status actually landed during THIS run — the same W16-B2-1
+ * policy src/lib/schedule.js already enforces. Previously main() posted
+ * `failure` whenever `config.commitStatus` + head SHA existed, even when
+ * run() threw BEFORE the pending ever posted (e.g. a getChangedFiles
+ * failure) — marking a commit "failed" for a check that was never started.
+ *
+ * SEAM: main() cannot be driven with injected deps in-process (it reads the
+ * module-level `github`/`core` objects and builds its own callApi from the
+ * real api.js factory), so these tests run the REAL main() in a hermetic
+ * subprocess. A registered ESM resolve hook redirects '@actions/core',
+ * '@actions/github', and (when requested) the real src/lib/api.js to mock
+ * modules written into a tmpdir; the driver then imports src/index.js and
+ * awaits main(). Everything in between — run(), the router, the pending
+ * site, the catch — is the production code under test.
+ * ------------------------------------------------------------------ */
+describe('main() — terminal failure gate (failure only when pending landed)', () => {
+  /**
+   * Mock @actions/core for the subprocess: getInput returns canned inputs
+   * (API key + token + commit status ON; everything else falls back to
+   * loadConfig defaults), logging is silenced, setFailed echoes to stdout.
+   */
+  const CORE_MOCK = [
+    "const INPUTS = { ZAI_API_KEY: 'k', GITHUB_TOKEN: 't', ZAI_COMMIT_STATUS: 'true' };",
+    'export function getInput(name) {',
+    '  return Object.prototype.hasOwnProperty.call(INPUTS, name) ? INPUTS[name] : "";',
+    '}',
+    'export function getBooleanInput(name) { return getInput(name).trim() === "true"; }',
+    'export function info() {}',
+    'export function warning() {}',
+    'export function debug() {}',
+    'export function error() {}',
+    'export function setSecret() {}',
+    'export function exportVariable() {}',
+    'export function setFailed(m) { console.log("SETFAILED:" + m); }',
+  ].join('\n');
+
+  /**
+   * Mock src/lib/api.js for the subprocess: the LLM call always rejects.
+   * Used to make run() fail AFTER the pending status landed, without any
+   * network.
+   */
+  const API_MOCK = [
+    'export function createApiClient() {',
+    '  return { async call() { throw new Error("llm down"); } };',
+    '}',
+  ].join('\n');
+
+  /**
+   * Build the mock @actions/github module source. `files` feeds
+   * pulls.listFiles; `listFilesError` makes it reject (pre-pending failure);
+   * `statusError` makes createCommitStatus reject (pending fails to land).
+   * The mock records every createCommitStatus ATTEMPT on
+   * globalThis.__STATUS_CALLS so the driver can report them.
+   */
+  function githubMockSource({ files = [], listFilesError = null, statusError = null } = {}) {
+    const listFilesBody = listFilesError
+      ? `throw new Error(${JSON.stringify(listFilesError)});`
+      : `return { data: ${JSON.stringify(files)} };`;
+    const createStatusBody = statusError
+      ? `throw new Error(${JSON.stringify(statusError)});`
+      : 'return { data: { id: 1, ...p } };';
+    return [
+      'const statusCalls = [];',
+      'globalThis.__STATUS_CALLS = statusCalls;',
+      'export const context = {',
+      '  eventName: "pull_request",',
+      '  repo: { owner: "o", repo: "r" },',
+      '  payload: {',
+      '    action: "opened",',
+      '    pull_request: {',
+      '      number: 7,',
+      '      user: { login: "dev", type: "User" },',
+      '      head: { repo: { fork: false }, sha: "sha-gate" },',
+      '    },',
+      '  },',
+      '};',
+      'export function getOctokit() {',
+      '  return {',
+      '    rest: {',
+      '      pulls: {',
+      `        async listFiles() { ${listFilesBody} },`,
+      '        async get() { return { data: { head: { ref: "r", sha: "sha-gate", repo: { fork: false } } } }; },',
+      '        async listReviews() { return { data: [] }; },',
+      '        async dismissReview() { return { data: {} }; },',
+      '        async createReview(p) { return { data: { id: 1, ...p } }; },',
+      '      },',
+      '      issues: {',
+      '        async listComments() { return { data: [] }; },',
+      '        async createComment() { return { data: { id: 1 } }; },',
+      '        async updateComment() { return { data: { id: 1 } }; },',
+      '      },',
+      '      repos: {',
+      '        async createCommitStatus(p) {',
+      '          statusCalls.push(p);',
+      `          ${createStatusBody}`,
+      '        },',
+      '      },',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+  }
+
+  /**
+   * Drive the REAL main() in a hermetic subprocess. Writes the mock modules,
+   * an ESM resolve hook (redirect map read from ZAI_MOCK_MAP env), and a
+   * driver that registers the hook, imports src/index.js, awaits main(), and
+   * prints the propagated error + every createCommitStatus attempt.
+   *
+   * @param {{ githubMock: string, apiMock?: string }} args
+   * @returns {Promise<{ stdout: string, stderr: string }>}
+   */
+  async function driveMain({ githubMock, apiMock }) {
+    const { spawnSync } = await import('node:child_process');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join, resolve: resolvePath } = await import('node:path');
+    const { pathToFileURL } = await import('node:url');
+    const repoRoot = resolvePath(process.cwd());
+    const dir = mkdtempSync(join(tmpdir(), 'zai-main-gate-'));
+    try {
+      writeFileSync(join(dir, 'core.mjs'), CORE_MOCK);
+      writeFileSync(join(dir, 'github.mjs'), githubMock);
+      if (apiMock) writeFileSync(join(dir, 'api.mjs'), apiMock);
+      writeFileSync(
+        join(dir, 'hooks.mjs'),
+        [
+          "import { readFileSync } from 'node:fs';",
+          'const map = JSON.parse(readFileSync(process.env.ZAI_MOCK_MAP, "utf8"));',
+          'export async function resolve(specifier, context, next) {',
+          '  if (map[specifier]) return { shortCircuit: true, url: map[specifier] };',
+          '  const resolved = await next(specifier, context);',
+          '  if (map[resolved.url]) return { shortCircuit: true, url: map[resolved.url] };',
+          '  return resolved;',
+          '}',
+        ].join('\n'),
+      );
+      writeFileSync(
+        join(dir, 'driver.mjs'),
+        [
+          "import { register } from 'node:module';",
+          'register(process.env.ZAI_HOOKS, import.meta.url);',
+          'const { main } = await import(process.env.ZAI_INDEX);',
+          'try {',
+          '  await main();',
+          '  console.log("MAIN:NOSTHROW");',
+          '} catch (e) {',
+          '  console.log("MAIN:THREW:" + (e && e.message));',
+          '}',
+          'console.log("STATUSCALLS:" + JSON.stringify(',
+          '  (globalThis.__STATUS_CALLS || []).map((s) => s.state + ":" + s.sha)));',
+        ].join('\n'),
+      );
+      const indexUrl = pathToFileURL(join(repoRoot, 'src', 'index.js')).href;
+      const apiUrl = pathToFileURL(join(repoRoot, 'src', 'lib', 'api.js')).href;
+      const map = {
+        '@actions/core': pathToFileURL(join(dir, 'core.mjs')).href,
+        '@actions/github': pathToFileURL(join(dir, 'github.mjs')).href,
+      };
+      if (apiMock) map[apiUrl] = pathToFileURL(join(dir, 'api.mjs')).href;
+      const mapPath = join(dir, 'mock-map.json');
+      writeFileSync(mapPath, JSON.stringify(map));
+      const result = spawnSync(process.execPath, [join(dir, 'driver.mjs')], {
+        encoding: 'utf8',
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          ZAI_MOCK_MAP: mapPath,
+          ZAI_HOOKS: pathToFileURL(join(dir, 'hooks.mjs')).href,
+          ZAI_INDEX: indexUrl,
+        },
+      });
+      if (result.status !== 0) {
+        throw new Error('main() driver failed: ' + result.stderr + result.stdout);
+      }
+      return result;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('posts NO failure status when run() rejects BEFORE the pending status lands', async () => {
+    // getChangedFiles rejects (listFiles throws) — before run() ever posts
+    // the pending status. The error must still propagate out of main(), but
+    // NO terminal `failure` may be posted: this run never started a check,
+    // so a `failure` row would appear from nowhere (schedule.js parity).
+    const result = await driveMain({
+      githubMock: githubMockSource({ listFilesError: 'boom-list-files' }),
+    });
+    expect(result.stdout).toContain('MAIN:THREW:boom-list-files');
+    expect(result.stdout).toContain('STATUSCALLS:[]');
+  });
+
+  it('posts the failure status when run() rejects AFTER the pending status landed', async () => {
+    // Pending posts successfully; the LLM call then rejects. The catch MUST
+    // flip the landed pending to terminal `failure` (a spinning pending
+    // blocks merges on required-check repos). Pins the kept half.
+    const result = await driveMain({
+      githubMock: githubMockSource({
+        files: [{ filename: 'a.js', status: 'modified', patch: '@@ -1 +1 @@\n-old\n+new' }],
+      }),
+      apiMock: API_MOCK,
+    });
+    expect(result.stdout).toContain('MAIN:THREW:llm down');
+    expect(result.stdout).toContain(
+      'STATUSCALLS:["pending:sha-gate","failure:sha-gate"]',
+    );
+  });
+
+  it('posts NO failure status when the pending status FAILED to land (403)', async () => {
+    // setReviewStatus is fail-soft and returns FALSE when the API rejects
+    // (e.g. missing statuses:write). A pending that never landed must not
+    // obligate the catch to post a doomed terminal failure — the boolean
+    // contract from schedule.js W17-C2-2, now mirrored in main().
+    const result = await driveMain({
+      githubMock: githubMockSource({
+        files: [{ filename: 'a.js', status: 'modified', patch: '@@ -1 +1 @@\n-old\n+new' }],
+        statusError: 'statuses:write missing',
+      }),
+      apiMock: API_MOCK,
+    });
+    expect(result.stdout).toContain('MAIN:THREW:llm down');
+    // The pending ATTEMPT happened (recorded) but nothing terminal followed.
+    expect(result.stdout).toContain('STATUSCALLS:["pending:sha-gate"]');
+    expect(result.stdout).not.toContain('"failure:');
   });
 });
 

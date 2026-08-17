@@ -134,7 +134,7 @@ describe('classifyFile', () => {
   // 'config' after 'ui', and a reconciliation loop masked it. A path that
   // matches BOTH config and ui cohorts must resolve to config because the
   // canonical order ranks config as more foundational.
-  it('CMD-6: classifyFile follows COHORT_ORDER — config beats ui (pages/settings.json → config)', () => {
+  it('CMD-6: classifyFile follows the canonical registry order — config beats ui (pages/settings.json → config)', () => {
     // pages/ matches ui; .json matches config. COHORT_ORDER has config (rank 3)
     // before ui (rank 4), so config wins.
     expect(classifyFile('pages/settings.json')).toBe('config');

@@ -283,9 +283,9 @@ function ensureArray(obj, key) {
  * Truncate a string to at most `n` chars (plain slice — no ellipsis added).
  * Non-strings pass through unchanged; callers pre-check `typeof`.
  *
- * @param {unknown} s
+ * @param {string} s
  * @param {number} n
- * @returns {unknown}
+ * @returns {string}
  */
 function cap(s, n) {
   return typeof s === 'string' && s.length > n ? s.slice(0, n) : s;

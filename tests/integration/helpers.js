@@ -57,9 +57,10 @@ export function makeConfig(overrides = {}) {
   return {
     ...loadConfig(BASE_INPUTS),
     // Deliberate integration deviations from loadConfig's values:
-    // maxDiffChars 0 = unlimited: integration diffs are small and must never
-    // be truncated/capped the way production caps them at 100000.
-    maxDiffChars: 0,
+    // maxDiffChars Infinity = unlimited (D-4's representation, formerly the 0
+    // sentinel): integration diffs are small and must never be truncated/capped
+    // the way production caps them at 100000 — same e2e behavior.
+    maxDiffChars: Infinity,
     // Phase 4: scanner layer. Integration tests DISABLE the master switch by
     // default so the real runScanners (which would attempt to download
     // gitleaks/ast-grep) is short-circuited. Tests that want to exercise

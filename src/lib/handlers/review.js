@@ -55,7 +55,7 @@ export function isUnsafePath(path) {
  *
  * W16-B4-3: the patch is capped using the SAME resolution as the whole-PR
  * path (MAX_WHOLE_PR_DIFF_CHARS default; `options.maxDiffChars` override
- * where 0 = the config-level "unlimited" sentinel). Previously the patch was
+ * where Infinity = the config-level "unlimited", D-4). Previously the patch was
  * interpolated raw — a 3000-line file produced a ~104k-char prompt while the
  * whole-PR path capped at 8000.
  *
@@ -64,13 +64,17 @@ export function isUnsafePath(path) {
  * @returns {string}
  */
 export function buildFileReviewPrompt(file, options = {}) {
+  // D-4 two-state resolution (post-loadConfig representation): a positive
+  // finite number caps the patch; Infinity (loadConfig's "unlimited", formerly
+  // the 0 sentinel) disables truncation. Anything else — undefined,
+  // non-number, or a legacy 0/negative — falls back to MAX_WHOLE_PR_DIFF_CHARS.
   const maxDiffChars =
-    typeof options.maxDiffChars === 'number' && options.maxDiffChars >= 0
+    typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
       ? options.maxDiffChars
       : MAX_WHOLE_PR_DIFF_CHARS;
   let patch = file.patch || '(no textual diff available)';
-  // 0 = unlimited sentinel (config.js) — skip truncation, like the whole-PR path.
-  if (maxDiffChars > 0 && patch.length > maxDiffChars) {
+  // Infinity = unlimited — skip truncation, like the whole-PR path.
+  if (Number.isFinite(maxDiffChars) && patch.length > maxDiffChars) {
     patch = `${patch.slice(0, maxDiffChars)}\n… (diff truncated)`;
   }
   return [
@@ -162,12 +166,13 @@ export async function handleReviewCommand(
       return;
     }
     const prompt = buildStructuredReviewPrompt(patchable, {
-      // Pass maxDiffChars through when it's a number >= 0. The `0` value is
-      // the config-level sentinel meaning "unlimited" (config.js: 0 disables
-      // truncation), so it must reach buildStructuredReviewPrompt rather than
-      // being replaced by MAX_WHOLE_PR_DIFF_CHARS.
+      // D-4: pass maxDiffChars through when it is a positive number (finite
+      // cap) or Infinity (the config-level "unlimited" — loadConfig maps
+      // 0/negative to Infinity), so it reaches buildStructuredReviewPrompt
+      // rather than being replaced by MAX_WHOLE_PR_DIFF_CHARS. Everything
+      // else falls back to the 8000 default.
       maxDiffChars:
-        typeof config.maxDiffChars === 'number' && config.maxDiffChars >= 0
+        typeof config.maxDiffChars === 'number' && config.maxDiffChars > 0
           ? config.maxDiffChars
           : MAX_WHOLE_PR_DIFF_CHARS,
     });

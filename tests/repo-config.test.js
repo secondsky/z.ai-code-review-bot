@@ -15,6 +15,11 @@ import {
 } from '../src/lib/repo-config.js';
 import { filterExcludedFiles } from '../src/lib/changed-files.js';
 
+// F-SCANNERKEYS: the exact scanner key set (and insertion order) every
+// emission site must agree on — hoisted so the assertions pin against ONE
+// literal instead of three copies that could drift.
+const SCANNER_KEYS_ORDER = ['gitleaks', 'ast_grep', 'metrics'];
+
 /* ------------------------------------------------------------------ *
  * parseZaiYml
  * ------------------------------------------------------------------ */
@@ -597,18 +602,18 @@ describe('scanner registry — validator and merge emit exactly SCANNER_KEYS', (
     const out = validateRepoConfig({
       scanners: { gitleaks: true, ast_grep: false, metrics: true },
     });
-    expect(Object.keys(out.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+    expect(Object.keys(out.scanners)).toEqual(SCANNER_KEYS_ORDER);
   });
   it('mergeRepoConfig (enabled path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
     const merged = mergeRepoConfig(
       { scannersEnabled: true },
       { scanners: { gitleaks: true, ast_grep: true, metrics: true } },
     );
-    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+    expect(Object.keys(merged.scanners)).toEqual(SCANNER_KEYS_ORDER);
   });
   it('mergeRepoConfig (master-off path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
     const merged = mergeRepoConfig({ scannersEnabled: false }, {});
-    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+    expect(Object.keys(merged.scanners)).toEqual(SCANNER_KEYS_ORDER);
   });
 });
 

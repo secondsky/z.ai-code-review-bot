@@ -33,15 +33,16 @@ import { makeFinding } from './_helpers.js';
 describe('US-036: MAX_DIFF_CHARS negative value handling', () => {
   it('treats 0 as unlimited (documented behavior)', () => {
     const cfg = loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' });
-    expect(cfg.maxDiffChars).toBe(0);
+    // D-4: unlimited is represented as Infinity after loadConfig.
+    expect(cfg.maxDiffChars).toBe(Infinity);
   });
 
   it('treats a negative value as unlimited (regression: previously returned 100000)', () => {
-    // Per action.yml + the code comment, negatives mean unlimited (0).
-    // Previously the code returned 100000 for negatives (a doc/code mismatch);
-    // this guards against that regression.
+    // Per action.yml + the code comment, negatives mean unlimited (Infinity,
+    // D-4's representation). Previously the code returned 100000 for negatives
+    // (a doc/code mismatch); this guards against that regression.
     const cfg = loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-1' });
-    expect(cfg.maxDiffChars).toBe(0);
+    expect(cfg.maxDiffChars).toBe(Infinity);
   });
 });
 

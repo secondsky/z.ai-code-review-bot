@@ -8,16 +8,23 @@
  * findings are rendered under their cohort as collapsible sections so the
  * summary reads like a narrative instead of a flat severity-sorted list.
  *
- * This module is PURE (no I/O). It imports the shared free-text sanitizer
- * from findings.js (W16-B1-4) so the summary prose gets exactly the same
- * treatment in both summary renderers; the renderer's trailing marker is
- * duplicated here as a literal so the module stays self-contained; it MUST
- * stay byte-exact with comments.js's MARKER.
+ * This module is PURE (no I/O). It imports the shared free-text sanitizer and
+ * the severity display tables (SEVERITY_RANK / SEVERITY_ORDER / SEVERITY_EMOJI)
+ * from findings.js — the severity-domain owner (W16-B1-4) — so the summary
+ * prose gets exactly the same treatment and the same severity presentation in
+ * both summary renderers; and the idempotency MARKER from comments.js so the
+ * renderer's trailing marker is byte-exact by construction.
  *
  * @module src/lib/walkthrough.js
  */
 
-import { sanitizeTextField } from './findings.js';
+import { MARKER } from './comments.js';
+import {
+  sanitizeTextField,
+  SEVERITY_EMOJI,
+  SEVERITY_ORDER,
+  SEVERITY_RANK,
+} from './findings.js';
 
 // ---------------------------------------------------------------------------
 // Cohort registry
@@ -185,41 +192,6 @@ const COHORTS = [
  * @type {string[]}
  */
 export const COHORT_ORDER = COHORTS.map((c) => c.name);
-
-/**
- * Per-severity emoji for the Overview line. Mirrors findings.js so the
- * walkthrough and the severity-grouped summary stay visually consistent.
- * @type {Record<string, string>}
- */
-const SEVERITY_EMOJI = {
-  critical: '🔴',
-  high: '🟠',
-  medium: '🟡',
-  low: '🔵',
-  info: '➖',
-};
-
-/**
- * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
- * sorts first. Mirrors findings.js SEVERITY_RANK.
- * @type {Record<string, number>}
- */
-const SEVERITY_RANK = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  info: 4,
-};
-
-/** Severity display order for the Overview line. */
-const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
-
-/**
- * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
- * as a literal so this pure module has no cross-module imports.
- */
-const MARKER = '<!-- zai-code-review -->';
 
 // ---------------------------------------------------------------------------
 // classifyFile
@@ -430,7 +402,9 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
         return 0;
       });
       lines.push('<details>');
-      lines.push(`<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`);
+      lines.push(
+        `<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`,
+      );
       lines.push('');
       for (const f of cohortFindings) {
         const file = typeof f.file === 'string' ? f.file : '';

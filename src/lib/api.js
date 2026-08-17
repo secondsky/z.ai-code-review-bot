@@ -376,14 +376,16 @@ export function makeApiRequest(params, deps = {}) {
  * `call()` and represents one attempt.
  *
  * Signature note: the brief's conceptual signature is `fn(attempt,
- * currentTimeout)`. We add a third `context` argument (`{ prompt, apiKey,
- * model }`) so that, when a timeout-triggered fallback fires, this loop can
- * swap the prompt/apiKey/model used by subsequent attempts without rebuilding
- * `fn` itself. This is the documented improvement to the brief's seam; the
- * first two positional args (and the test assertions about them) are
+ * currentTimeout)`. We add a third `override` argument: `null` until a
+ * fallback fires, then a `{ prompt, apiKey?, model? }` whose PRESENT keys
+ * replace the closure's own prompt/apiKey/model on every subsequent attempt.
+ * The override is applied as one wholesale replacement (a fresh object each
+ * time the fallback fires, never mutated in place), so each attempt receives
+ * a stable snapshot. This is the documented improvement to the brief's seam;
+ * the first two positional args (and the test assertions about them) are
  * unchanged.
  *
- * @param {(attempt: number, currentTimeout: number, context: { prompt: string, apiKey?: string, model?: string }) => Promise<any>} fn
+ * @param {(attempt: number, currentTimeout: number, override: { prompt: string, apiKey?: string, model?: string } | null) => Promise<any>} fn
  * @param {{
  *   maxRetries?: number,
  *   baseDelay?: number,
@@ -407,8 +409,10 @@ export async function callWithRetry(fn, options = {}) {
   const startTime = Date.now();
   let usedFallback = false;
   const lastIdx = PROGRESSIVE_TIMEOUT_MULTIPLIERS.length - 1;
-  // Mutable context: swapped in place when fallback fires. `fn` reads from it.
-  const context = { prompt: undefined, apiKey: undefined, model: undefined };
+  // Per-attempt fallback override: `null` until the fallback fires, then ONE
+  // wholesale replacement with the fallback spec. Each attempt gets the
+  // current snapshot by value of the binding — never a mutated shared object.
+  let override = null;
 
   let attempt = 0;
   // Loop from 0..maxRetries inclusive (≤ maxRetries+1 attempts).
@@ -421,7 +425,7 @@ export async function callWithRetry(fn, options = {}) {
     let result;
     try {
       // eslint-disable-next-line no-await-in-loop
-      result = await fn(attempt, currentTimeout, context);
+      result = await fn(attempt, currentTimeout, override);
       return { success: true, data: result, usedFallback };
     } catch (error) {
       const { category, retryable } = categorizeError(error);
@@ -455,11 +459,15 @@ export async function callWithRetry(fn, options = {}) {
         const fb = fallbackPrompt();
         if (fb && fb.prompt) {
           usedFallback = true;
-          // Swap the context in place so the same `fn` closure picks up the
-          // fallback prompt/apiKey/model on subsequent attempts.
-          context.prompt = fb.prompt;
-          if (fb.apiKey !== undefined) context.apiKey = fb.apiKey;
-          if (fb.model !== undefined) context.model = fb.model;
+          // One wholesale replacement: subsequent attempts merge these keys
+          // over the closure's own prompt/apiKey/model. Keys the fallback did
+          // not specify (undefined) are simply absent, so the caller's own
+          // values keep applying for those fields.
+          override = {
+            prompt: fb.prompt,
+            ...(fb.apiKey !== undefined && { apiKey: fb.apiKey }),
+            ...(fb.model !== undefined && { model: fb.model }),
+          };
           if (onFallback) {
             onFallback({ attempt, originalError: error, fallbackInfo: fb });
           }
@@ -569,21 +577,18 @@ export function createApiClient(config = {}) {
         sleep: sleepDep,
       } = args;
 
-      // The per-attempt work. Reads the shared `context` so the retry loop can
-      // swap in the fallback prompt/apiKey/model on a timeout-triggered
-      // fallback without us rebuilding this closure.
-      const fn = (attempt, currentTimeout, context) => {
-        const currentPrompt =
-          context.prompt !== undefined ? context.prompt : userPrompt;
-        const currentApiKey =
-          context.apiKey !== undefined ? context.apiKey : apiKey;
-        const currentModel = context.model !== undefined ? context.model : model;
+      // The per-attempt work. Merges the retry loop's `override` (null until a
+      // fallback fires) over this call's own prompt/apiKey/model, so a
+      // timeout-triggered fallback swaps any or all of them on subsequent
+      // attempts without rebuilding this closure.
+      const fn = (attempt, currentTimeout, override) => {
+        const spec = { prompt: userPrompt, apiKey, model, ...(override ?? {}) };
         return makeApiRequest(
           {
-            apiKey: currentApiKey,
-            model: currentModel,
+            apiKey: spec.apiKey,
+            model: spec.model,
             systemPrompt,
-            userPrompt: currentPrompt,
+            userPrompt: spec.prompt,
             timeout: currentTimeout,
             temperature,
             maxTokens,

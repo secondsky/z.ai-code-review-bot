@@ -601,11 +601,11 @@ export async function scanPatterns(opts, deps = {}) {
     // at a time to keep the JSON output shape simple. `ast-grep run` emits no
     // `ruleId`, so enrichment is driver-owned: the inline map after
     // parseAstGrepJson attaches the rule's id/title/severity/etc.
-    // (mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
+    // mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
     // output that carries `ruleId` — currently test-only. Do NOT pass the
     // per-rule map into parseAstGrepJson: `run` output has no ruleId, so
     // lookups would miss and every title would degrade to the 'match'
-    // fallback.)
+    // fallback.
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
     // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a

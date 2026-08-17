@@ -51,14 +51,13 @@ import {
   isIssueCommentEvent,
   isScheduleEvent,
 } from './lib/events.js';
-import { loadConfig } from './lib/config.js';
+import { INPUT_NAMES, loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
 import { authorize } from './lib/auth.js';
 import {
   upsertReviewComment,
   buildCommentBody,
   appendTrailers,
-  findBotMarkerComment,
   findBotMarkerComments,
   MARKER,
 } from './lib/comments.js';
@@ -318,49 +317,6 @@ export function createScannerDeps({ core: coreArg, cacheDir } = {}) {
 }
 
 /**
- * The complete list of action input names, in the order loadConfig reads them.
- * Exported so the test can assert coverage. Keep in sync with config.js.
- */
-export const INPUT_NAMES = [
-  'ZAI_API_KEY',
-  'ZAI_MODEL',
-  'ZAI_SYSTEM_PROMPT',
-  'ZAI_REVIEWER_NAME',
-  'EXCLUDE_PATTERNS',
-  'MAX_DIFF_CHARS',
-  'ZAI_LARGE_PR_FILE_THRESHOLD',
-  'ZAI_MAX_BATCH_CHARS',
-  'ZAI_MAX_FILES_PER_BATCH',
-  'ZAI_MAX_PATCH_CHARS',
-  'ZAI_TIMEOUT_MS',
-  'ZAI_COMMANDS_ENABLED',
-  'ZAI_ALLOW_FORK_COMMANDS',
-  'ZAI_AUTH_THRESHOLD',
-  'ZAI_SCHEDULE_ENABLED',
-  'ZAI_SCHEDULE_MAX_PRS',
-  'ZAI_DESCRIBE_WRITE_BODY',
-  'ZAI_IMPACT_LABELS',
-  'ZAI_IMPACT_LABEL_MAP',
-  'ZAI_MAX_FINDINGS',
-  'ZAI_MIN_SEVERITY',
-  'ZAI_TEMPERATURE',
-  'ZAI_MAX_TOKENS',
-  'ZAI_BATCH_CONCURRENCY',
-  'ZAI_FALLBACK_PROMPT',
-  'ZAI_SCANNERS_ENABLED',
-  'ZAI_SCANNERS_CACHE_DIR',
-  'ZAI_COMMIT_STATUS',
-  'ZAI_WALKTHROUGH',
-  'ZAI_INCREMENTAL_REVIEW',
-  'ZAI_REPO_CONFIG_ENABLED',
-  'ZAI_STRICT_MODE',
-  'ZAI_SUGGEST_REVIEWERS',
-  'ZAI_AUTO_ASSIGN_REVIEWERS',
-  'ZAI_LEARNINGS_ENABLED',
-  'GITHUB_TOKEN',
-];
-
-/**
  * Build the fallback comment body used when inline review submission fails.
  *
  * Carries the review summary (already built, marker included) plus every
@@ -458,7 +414,6 @@ export async function run(context, deps = {}) {
     formatScannerContext: formatScannerContextFn = formatScannerContext,
     buildCommentBody: buildCommentBodyFn = buildCommentBody,
     upsertReviewComment: upsertReviewCommentFn = upsertReviewComment,
-    findBotMarkerComment: findBotMarkerCommentFn = findBotMarkerComment,
     findBotMarkerComments: findBotMarkerCommentsFn = findBotMarkerComments,
     parseCommand: parseCommandFn = parseCommand,
     authorize: authorizeFn = authorize,
@@ -466,6 +421,14 @@ export async function run(context, deps = {}) {
     getPRContext: getPRContextFn = getPRContext,
     runScheduledReview: runScheduledReviewFn = runScheduledReview,
     setReviewStatus: setReviewStatusFn = setReviewStatus,
+    // D-1 (deferred-followups #13): mutable flag telling main()'s catch
+    // whether THIS run actually landed a `pending` commit status. run()
+    // flips it to true only after the pending post resolves TRUE (the
+    // W16-B2-1/W17-C2-2 boolean contract from schedule.js). The default is
+    // a fresh inert object so direct run() callers (tests, embeddings) are
+    // unaffected; main() passes its own tracker so the catch can gate the
+    // terminal `failure` post on it.
+    statusTracker = { pendingLanded: false },
     buildStatusDescription: buildStatusDescriptionFn = buildStatusDescription,
     loadRepoConfig: loadRepoConfigFn = loadRepoConfig,
     mergeRepoConfig: mergeRepoConfigFn = mergeRepoConfig,
@@ -551,7 +514,7 @@ export async function run(context, deps = {}) {
     // head SHA from the pull_request payload.
     const sha = context?.payload?.pull_request?.head?.sha ?? '';
     if (config.commitStatus) {
-      await setReviewStatusFn(
+      const pendingLanded = await setReviewStatusFn(
         {
           octokit,
           context,
@@ -562,6 +525,12 @@ export async function run(context, deps = {}) {
         },
         { core: coreDep },
       );
+      // D-1 (schedule-policy parity): set the tracker only AFTER the post
+      // resolves TRUE — setReviewStatus is fail-soft and returns FALSE on
+      // API failure (never throws), and a `pending` that never landed must
+      // not obligate main()'s catch to post a terminal `failure` for a
+      // check this run never started. Mirrors schedule.js's pendingPosted.
+      if (pendingLanded === true) statusTracker.pendingLanded = true;
     }
 
     // Build (or accept an injected) callApi adapter that wraps api.js.
@@ -738,6 +707,7 @@ export async function run(context, deps = {}) {
           octokit,
           context: reviewContext,
           marker: MARKER,
+          core: coreDep,
         });
         // The most recent prior review is the canonical hash source. Reviews
         // come back newest-first from the GitHub API; fall back to scanning
@@ -768,6 +738,7 @@ export async function run(context, deps = {}) {
           repo,
           issueNumber: pullNumber,
           marker: MARKER,
+          core: coreDep,
         });
         for (const priorComment of priorMarkerComments) {
           if (typeof priorComment?.body === 'string') {
@@ -1038,6 +1009,11 @@ export async function run(context, deps = {}) {
         // F-TRAILERS: the lenient re-extraction regexes now live in
         // findings.js (extractTrailers) — shared with schedule.js's fallback.
         const fallbackTrailers = [];
+        // The destructured `hashBlock`/`shaBlock` intentionally SHADOW the
+        // outer locally-built bindings of the same names: index.js re-extracts
+        // all three trailers from reviewBody (schedule.js instead renames its
+        // re-extract and re-uses the built SHA block) — the values are
+        // identical either way, since the built blocks were appended above.
         const { marker, hashBlock, shaBlock } = extractTrailers(reviewBody);
         if (marker) fallbackTrailers.push(marker);
         if (hashBlock) fallbackTrailers.push(hashBlock);
@@ -1344,7 +1320,10 @@ function buildCallApi({
  * Build config from action inputs and call {@link run}. Errors propagate to
  * the top-level `.catch`, which calls `core.setFailed`. On a hard failure,
  * best-effort posts a "failure" commit status so developers aren't left
- * staring at a forever-pending status.
+ * staring at a forever-pending status — but only when a `pending` status
+ * actually landed during THIS run (D-1, schedule.js's W16-B2-1 policy):
+ * a run that died before starting its check (e.g. a getChangedFiles
+ * failure) must post nothing, instead of surfacing a failure from nowhere.
  *
  * @returns {Promise<void>}
  */
@@ -1352,19 +1331,26 @@ export async function main() {
   const inputs = readAllInputs(core);
   const config = loadConfig(inputs, { core });
   const octokit = github.getOctokit(config.githubToken);
+  // D-1: shared with run() so the pending site can report that the
+  // `pending` commit status landed (see run()'s statusTracker dep).
+  const statusTracker = { pendingLanded: false };
   try {
     return await run(github.context, {
       config,
       core,
       github,
       octokit,
+      statusTracker,
     });
   } catch (err) {
     // Phase 5: flip the commit status to "failure" on a hard error. Best-effort
     // only — setReviewStatus swallows its own errors and never throws, so this
-    // can never mask the original failure. Only fires for pull_request events
-    // (where a head SHA exists) and when status feedback is enabled.
-    if (config.commitStatus) {
+    // can never mask the original failure. Fires for pull_request events
+    // (where a head SHA exists), when status feedback is enabled, AND only
+    // when this run's `pending` status actually landed (D-1, sanctioned
+    // behavior change #1: schedule's policy wins — posting `failure` for a
+    // check that was never started marks the commit failed from nowhere).
+    if (config.commitStatus && statusTracker.pendingLanded) {
       const sha = github.context?.payload?.pull_request?.head?.sha;
       if (sha) {
         await setReviewStatus(

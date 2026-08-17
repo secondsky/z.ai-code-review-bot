@@ -27,7 +27,6 @@ function makeOctokit(responder) {
 /** Base args for fetchRepoText (single call site defaults). */
 function baseArgs(overrides = {}) {
   return {
-    octokit: overrides.octokit,
     owner: 'owner',
     repo: 'repo',
     path: 'CODEOWNERS',
@@ -144,6 +143,21 @@ describe('fetchRepoText — outcome kinds', () => {
     });
     const out = await fetchRepoText(baseArgs({ octokit, label: 'learnings' }));
     expect(out.message.startsWith('learnings: ')).toBe(true);
+  });
+
+  // A4: an absent/empty label must NOT produce a `undefined: ` (or empty)
+  // prefix — the message starts with the path so a caller that wraps it in
+  // its own label (codeowners) does not stutter `X: X: path…`.
+  it('no label → message has NO prefix (starts with the path, never "undefined: ")', async () => {
+    const octokit = makeOctokit(() => fileResponse('hello', 4096));
+    const out = await fetchRepoText({
+      ...baseArgs({ octokit, path: '.github/CODEOWNERS' }),
+      label: undefined,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.kind).toBe('too-large');
+    expect(out.message.startsWith('.github/CODEOWNERS is 4096 bytes')).toBe(true);
+    expect(out.message).not.toContain('undefined');
   });
 
   it('fetches via octokit.rest.repos.getContent with the given owner/repo/path/ref', async () => {

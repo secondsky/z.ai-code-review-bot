@@ -63,18 +63,21 @@ describe('loadConfig — excludePatterns', () => {
 });
 
 describe('loadConfig — numeric fields & defaults', () => {
-  test('maxDiffChars: default 100000; 0 and negatives mean unlimited; NaN -> default', () => {
+  test('maxDiffChars: default 100000; 0 and negatives mean unlimited (Infinity); NaN -> default', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(100000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(0); // unlimited
+    // D-4: "unlimited" is normalized to Infinity at this boundary — action.yml
+    // still documents "0 or negative = unlimited"; only the internal
+    // representation changed (formerly the 0 sentinel).
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(Infinity); // unlimited
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
     // CFG-8: a non-integer numeric string (float) is now rejected by toInt's
     // strict validation and falls back to the default, rather than being
     // silently truncated to 12.
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(100000);
-    // Per action.yml + code comment, negatives mean unlimited (0), NOT the
-    // default cap. The old code returned 100000 here — a doc/code mismatch.
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(0); // negative->unlimited
+    // Per action.yml + code comment, negatives mean unlimited (Infinity), NOT
+    // the default cap. The old code returned 100000 here — a doc/code mismatch.
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(Infinity); // negative->unlimited
   });
 
   test('largePrFileThreshold default 50', () => {
@@ -660,8 +663,8 @@ describe('loadConfig — boolean-input conventions (F-BOOLREAD)', () => {
   //  - default-on (5 advisory features): empty/whitespace means "use the
   //    default" (true);
   //  - opt-in (9 read-only/v1 sites): empty/invalid means false.
-  // This test pins the convention per field so a future edit cannot silently
-  // move a field from one convention to the other.
+  // test.each pins the convention per field (one case per row) so a future
+  // edit cannot silently move a field from one convention to the other.
   const conventions = [
     // [input name, output field, emptyInputMeansTrue]
     ['ZAI_SCANNERS_ENABLED', 'scannersEnabled', true],
@@ -682,15 +685,16 @@ describe('loadConfig — boolean-input conventions (F-BOOLREAD)', () => {
     ['ZAI_LEARNINGS_ENABLED', 'learningsEnabled', false],
   ];
 
-  test('applies the two boolean-input conventions consistently', () => {
-    for (const [name, field, emptyMeansTrue] of conventions) {
+  test.each(conventions)(
+    'applies the convention consistently: %s → %s (empty means %s)',
+    (name, field, emptyMeansTrue) => {
       // shape guard: the output field exists before we assert its convention
       expect(loadConfig({ ZAI_API_KEY: 'k' })[field]).toBeDefined();
       // empty and whitespace-only inputs resolve to the field's convention
       expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '' })[field]).toBe(emptyMeansTrue);
       expect(loadConfig({ ZAI_API_KEY: 'k', [name]: '   ' })[field]).toBe(emptyMeansTrue);
-    }
-  });
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *

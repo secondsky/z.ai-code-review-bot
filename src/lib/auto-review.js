@@ -231,7 +231,8 @@ export function formatEntry(entry) {
  * batch is flushed first. A single oversized entry still gets its own batch.
  *
  * W15-A8-1: the per-batch char budget is `min(maxBatchChars, maxDiffChars)`
- * when `options.maxDiffChars > 0`. MAX_DIFF_CHARS is a documented hard cap
+ * when maxDiffChars is finite (cap active; Infinity = unlimited, D-4).
+ * MAX_DIFF_CHARS is a documented hard cap
  * against cost abuse from oversized PRs, but the prompt-side truncation (W6-6
  * in buildStructuredReviewPrompt) is intentionally skipped whenever a batch
  * envelope is present — post-hoc truncation would silently drop entries
@@ -244,8 +245,9 @@ export function formatEntry(entry) {
  * W16-B3-4: the per-batch clamp alone did NOT bound the TOTAL chars — a tiny
  * maxDiffChars with many files produced one batch per file (N API calls,
  * strictly worse than main) and the "hard cap against cost abuse" was still
- * unenforced. When maxDiffChars > 0, the CUMULATIVE packed chars across ALL
- * batches are capped: once the running total would exceed maxDiffChars, the
+ * unenforced. When maxDiffChars is finite (cap active), the CUMULATIVE packed
+ * chars across ALL batches are capped: once the running total would exceed
+ * maxDiffChars, the
  * entry and every entry after it are NOT reviewed (dropping trailing entries,
  * mirroring the unbatched MAX_DIFF_CHARS semantics). One guard keeps the
  * oversized-entry semantics bounded: when the FIRST entry of a (fresh, empty)
@@ -263,11 +265,17 @@ export function createReviewBatches(files, options = {}) {
   const maxBatchChars = options.maxBatchChars || DEFAULTS.maxBatchChars;
   const maxFilesPerBatch = options.maxFilesPerBatch || DEFAULTS.maxFilesPerBatch;
   const entries = createReviewEntries(files, options);
+  // D-4: maxDiffChars uses the post-loadConfig representation — Infinity means
+  // unlimited, a finite positive number means the cap is active. Legacy direct
+  // callers passing 0/negative (the former sentinel) still land on Infinity
+  // here, so the observable behavior is unchanged.
   const maxDiffChars =
     typeof options.maxDiffChars === 'number' && options.maxDiffChars > 0
       ? options.maxDiffChars
-      : 0;
-  const charBudget = maxDiffChars > 0 ? Math.min(maxBatchChars, maxDiffChars) : maxBatchChars;
+      : Infinity;
+  const charBudget = Number.isFinite(maxDiffChars)
+    ? Math.min(maxBatchChars, maxDiffChars)
+    : maxBatchChars;
 
   const batches = [];
   let currentEntries = [];
@@ -309,8 +317,9 @@ export function createReviewBatches(files, options = {}) {
     ) {
       flush();
     }
-    // W16-B3-4 cumulative cap (only when maxDiffChars > 0).
-    if (maxDiffChars > 0 && cumulativeChars + entryLen > maxDiffChars) {
+    // W16-B3-4 cumulative cap (only when the cap is active — Infinity means
+    // unlimited, D-4).
+    if (Number.isFinite(maxDiffChars) && cumulativeChars + entryLen > maxDiffChars) {
       const firstOfFreshBatch = currentEntries.length === 0;
       const fitsPerBatchBudget = entryLen <= charBudget;
       const budgetNotExhausted = cumulativeChars < maxDiffChars;
@@ -430,54 +439,32 @@ export async function runWithConcurrency(items, concurrency, fn) {
   const results = new Array(list.length);
 
   let cursor = 0;
-  let active = 0;
   // Abort flag: once any item rejects, stop launching NEW items so we don't
   // keep consuming resources (e.g. API credits) for a review that will fail.
   // Items already in flight still settle naturally.
   let aborted = false;
 
-  return new Promise((resolve, reject) => {
-    if (list.length === 0) {
-      resolve(results);
-      return;
-    }
-
-    const launchNext = () => {
-      // Stop launching once we've hit the limit, run out of items, or aborted.
-      while (active < limit && cursor < list.length && !aborted) {
-        const i = cursor++;
-        active++;
-        let p;
-        try {
-          p = Promise.resolve(fn(list[i], i));
-        } catch (err) {
-          aborted = true;
-          reject(err);
-          return;
-        }
-        p.then(
-          (val) => {
-            results[i] = val; // slot by index → preserves input order
-            active--;
-            if (cursor < list.length) {
-              launchNext();
-            } else if (active === 0) {
-              resolve(results);
-            }
-          },
-          (err) => {
-            // First rejection wins; subsequent rejects are swallowed. Set the
-            // abort flag so success handlers from other in-flight items don't
-            // launch yet more items.
-            aborted = true;
-            reject(err);
-          },
-        );
+  // Fixed worker pool: min(limit, list.length) workers, each pulling the next
+  // index off the shared cursor. Liveness comes from Promise.all — when the
+  // last worker returns, every item has settled. Workers check `aborted`
+  // BEFORE consuming `cursor++`, so a post-abort wake starts nothing.
+  const workers = Array.from({ length: Math.min(limit, list.length) }, async () => {
+    while (!aborted) {
+      const i = cursor++;
+      if (i >= list.length) return;
+      try {
+        results[i] = await fn(list[i], i); // slot by index → preserves input order
+      } catch (err) {
+        // First rejection wins; Promise.all swallows any later ones. Set the
+        // abort flag so other workers stop pulling new items.
+        aborted = true;
+        throw err;
       }
-    };
-
-    launchNext();
+    }
   });
+
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -607,8 +594,9 @@ export async function runStructuredReview(files, config, deps = {}) {
     // W15-A8-1: MAX_DIFF_CHARS must bind at batch construction (the prompt-side
     // W6-6 truncation is skipped whenever batched, so the cap is enforced by
     // clamping each batch's char budget to min(maxBatchChars, maxDiffChars)
-    // inside createReviewBatches).
-    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : 0,
+    // inside createReviewBatches). D-4: Infinity = unlimited; the fallback for
+    // non-number values matches the post-loadConfig representation.
+    maxDiffChars: typeof config.maxDiffChars === 'number' ? config.maxDiffChars : Infinity,
   };
 
   const batchState = {
