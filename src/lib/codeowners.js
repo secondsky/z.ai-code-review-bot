@@ -375,7 +375,9 @@ export async function loadCodeowners(opts = {}, deps = {}) {
       path,
       ref: headSha,
       maxBytes: MAX_CODEOWNERS_BYTES,
-      label: 'CODEOWNERS',
+      // A4: NO label — the warn below already prefixes
+      // `failed to fetch CODEOWNERS: `; a label here would stutter
+      // `…CODEOWNERS: CODEOWNERS: .github/CODEOWNERS…`.
     });
     if (outcome.ok) {
       // F-REPOFILE alignment: a raw-string payload (non-base64 `data`) now

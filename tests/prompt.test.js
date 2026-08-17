@@ -284,6 +284,17 @@ describe('buildStructuredReviewPrompt', () => {
     expect(out).not.toContain('status="modified">');
   });
 
+  // A7 pin: a file entry with NO `status` field renders status="" in the open
+  // tag — openUntrustedTag passes every value through escapeXmlAttribute,
+  // which coerces undefined → ''. Documented micro-delta (a missing status is
+  // NOT skipped or defaulted to a real word). Pin-only: passes today.
+  test('A7 pin: a file lacking status renders status="" in the open tag', () => {
+    const out = buildStructuredReviewPrompt([
+      { filename: 'a.js', patch: '@@ a @@' },
+    ]);
+    expect(out).toContain('<untrusted_input source="file" name="a.js" status="">');
+  });
+
   test('empty files → header instruction only (no file entries)', () => {
     const out = buildStructuredReviewPrompt([]);
     expect(out.startsWith(UNTRUSTED_PREAMBLE)).toBe(true);

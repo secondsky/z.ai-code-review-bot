@@ -1,15 +1,27 @@
 /**
  * Shared helpers used by every `/zai` command handler.
  *
- * Two small, defensive wrappers around the injected octokit:
- *   - `postComment`     → create an issue comment (command response).
- *   - `getPRContext`    → fetch minimal PR metadata for prompt-building.
+ * This module owns:
+ *   - `postComment`                 → create an issue comment (command response),
+ *                                      with unconditional sanitize + trusted-trailer
+ *                                      re-append (SCN-15).
+ *   - `getPRContext`                → fetch minimal PR metadata for prompt-building.
+ *   - `buildDiffContext` + `MAX_CONTEXT_CHARS`
+ *                                  → the capped diff-context block (F-DIFFCTX;
+ *                                      the ONLY copy — ask/impact import it).
+ *   - `ERROR_COMMENT`               → the fixed never-leak failure comment.
+ *   - `runCommand`                  → the shared never-throw handler guardrail
+ *                                      (F-RUNCOMMAND) that posts ERROR_COMMENT
+ *                                      on failure.
+ *   - `upsertPrDescription` + `DESCRIBE_MARKER_START`/`DESCRIBE_MARKER_END`
+ *                                  → the marked-block description upsert behind
+ *                                      ZAI_DESCRIBE_WRITE_BODY.
  *
- * Both are defensive on a missing/malformed `context`: they return a sane
- * sentinel (`null`) rather than throwing, so a handler that calls them can
- * decide how to degrade (typically: post a short guidance/error comment and
- * return). Octokit is ALWAYS a parameter — never imported — so this module
- * stays pure and unit-testable.
+ * The octokit-touching helpers are defensive on a missing/malformed
+ * `context`: they return a sane sentinel (`null`) rather than throwing, so a
+ * handler that calls them can decide how to degrade (typically: post a short
+ * guidance/error comment and return). Octokit is ALWAYS a parameter — never
+ * imported — so this module stays pure and unit-testable.
  *
  * No handler imports `@actions/core` or hits the network directly.
  */

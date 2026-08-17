@@ -588,9 +588,10 @@ export function selectPlatformAsset(spec, deps = {}) {
  * otherwise it is derived from the selected asset's URL extension
  * (`.tar.gz`/`.tgz` → tarGzExtractor, `.zip` → zipExtractor, raw → null).
  *
- * Pure (no I/O). Throws when the platform/arch tuple has no asset, so
- * callers invoke this INSIDE their `try` — the throw then lands in their
- * catch → warning → regex-fallback path.
+ * Pure (no I/O). Throws when `spec` is null/missing (A6) or when the
+ * platform/arch tuple has no asset, so callers invoke this INSIDE their
+ * `try` — the throw then lands in their catch → warning → regex-fallback
+ * path.
  *
  * @param {{
  *   name: string,
@@ -604,9 +605,15 @@ export function selectPlatformAsset(spec, deps = {}) {
  * @returns {{ name: string, version: string, ext: string, url: string, checksumSha256: string, cacheDir: string, extractor: Function | null }}
  */
 export function resolveBinaryRequest(spec, { platform = '', arch = '', cacheDir } = {}) {
+  // A6: guard FIRST, before any spec dereference — a null/undefined spec
+  // previously slipped into selectPlatformAsset and threw the misleading
+  // `undefined: no asset for platform=…`.
+  if (!spec || typeof spec !== 'object') {
+    throw new Error('resolveBinaryRequest: spec is required');
+  }
   const asset = selectPlatformAsset(spec, { platform, arch });
   if (!asset) {
-    throw new Error(`${spec?.name}: no asset for platform=${platform || '?'} arch=${arch || '?'}`);
+    throw new Error(`${spec.name}: no asset for platform=${platform || '?'} arch=${arch || '?'}`);
   }
   return {
     name: spec.name,
