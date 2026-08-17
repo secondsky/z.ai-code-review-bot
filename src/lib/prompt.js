@@ -285,7 +285,7 @@ export function buildStructuredReviewPrompt(files, options = {}) {
     return header;
   }
 
-  let entries = files
+  const entries = files
     .filter((f) => f && typeof f.patch === 'string' && f.patch.length > 0)
     .map(formatFileEntry);
 
@@ -293,48 +293,81 @@ export function buildStructuredReviewPrompt(files, options = {}) {
     return header;
   }
 
+  // F-PROMPTMODE: resolve the batch mode ONCE. Both the truncation bypass
+  // below and joinBody's envelope choice branch on this descriptor instead of
+  // re-deriving it from raw options (the duplicated predicates had already
+  // drifted once — see W6-6).
+  const batch = validBatch(options)
+    ? { batchNumber: options.batchNumber, totalBatches: options.totalBatches }
+    : null;
+
   const maxDiffChars = typeof options.maxDiffChars === 'number' ? options.maxDiffChars : 0;
   // W6-6: in the batched path, createReviewBatches already packed entries
   // within a char budget (maxBatchChars). Applying maxDiffChars truncation on
   // top would silently drop trailing entries — they're counted in the batch
   // metadata but never sent to the model. Skip truncation when batched.
-  const isBatched =
-    typeof options.batchNumber === 'number' && typeof options.totalBatches === 'number';
-
-  if (maxDiffChars > 0 && !isBatched) {
-    // Truncate from the END: drop trailing entries until the joined body fits
-    // within maxDiffChars.
-    while (entries.length > 0) {
-      const body = joinBody(header, entries, options);
-      if (body.length <= maxDiffChars) {
+  //
+  // Single-pass accounting (flat mode only): the flat body is
+  // `header + '\n\n' + entries.join('\n\n')`, so its length is
+  // `header.length + 2 + Σ kept entries + 2*(kept-1)`. Keep the longest
+  // prefix whose body fits maxDiffChars — exactly the set of entries the old
+  // pop-and-re-render loop retained, without re-rendering per drop. When even
+  // the first entry does not fit, kept === 0 and joinBody emits `header +
+  // '\n\n'` byte-identically (the header survives even when it alone exceeds
+  // the cap).
+  let kept = entries.length;
+  if (maxDiffChars > 0 && batch === null) {
+    kept = 0;
+    let running = header.length + 2;
+    for (const e of entries) {
+      const cost = (kept > 0 ? 2 : 0) + e.length;
+      if (running + cost > maxDiffChars) {
         break;
       }
-      entries.pop();
+      running += cost;
+      kept += 1;
     }
   }
 
-  return joinBody(header, entries, options);
+  return joinBody(
+    header,
+    kept === entries.length ? entries : entries.slice(0, kept),
+    batch,
+  );
+}
+
+/**
+ * The single predicate deciding whether the caller supplied a complete batch
+ * descriptor (`batchNumber` AND `totalBatches`, both numbers). Half-supplied
+ * options are flat mode.
+ *
+ * @param {{batchNumber?: number, totalBatches?: number}} options
+ * @returns {boolean}
+ */
+function validBatch(options) {
+  return (
+    typeof options.batchNumber === 'number' &&
+    typeof options.totalBatches === 'number'
+  );
 }
 
 /**
  * Join the header + file entries, optionally wrapping in the `<review_batch>`
- * envelope when `options.batchNumber` / `options.totalBatches` are present.
+ * envelope when a batch descriptor is supplied. F-PROMPTMODE: the mode is
+ * resolved once by the caller ({@link validBatch}); this function only
+ * renders it.
  *
  * @param {string} header
  * @param {string[]} entries
- * @param {{batchNumber?: number, totalBatches?: number}} options
+ * @param {{batchNumber: number, totalBatches: number} | null} batch
  * @returns {string}
  */
-function joinBody(header, entries, options) {
-  const batchNumber = options.batchNumber;
-  const totalBatches = options.totalBatches;
-  const hasBatch =
-    typeof batchNumber === 'number' && typeof totalBatches === 'number';
-
-  if (!hasBatch) {
+function joinBody(header, entries, batch) {
+  if (!batch) {
     return `${header}\n\n${entries.join('\n\n')}`;
   }
 
+  const { batchNumber, totalBatches } = batch;
   return (
     `${header}\n\n` +
     `This is batch ${batchNumber} of ${totalBatches}. Review all files in this batch thoroughly, ` +

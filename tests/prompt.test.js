@@ -716,3 +716,101 @@ describe('buildStructuredReviewPrompt — truncation edge cases', () => {
     expect(out).toContain('name="c.js"');
   });
 });
+
+// ---------------------------------------------------------------------------
+// F-PROMPTMODE pins (Task 16): byte-exact truncation output + half-supplied
+// batch options. Both pin the CURRENT behavior so the refactor that resolves
+// batch mode once (single-pass truncation accounting) cannot change it.
+// ---------------------------------------------------------------------------
+
+// Hand-written transcription of the full flat-mode header, derived ONLY from
+// the documented format (UNTRUSTED_PREAMBLE + the instruction block + the
+// maxFindings sentence). NOT produced by calling buildStructuredReviewPrompt.
+const HAND_WRITTEN_HEADER = [
+  UNTRUSTED_PREAMBLE,
+  '',
+  'You are reviewing a pull request. Produce a STRICTLY structured review.',
+  '',
+  'Output ONLY a valid JSON object (no prose, no markdown fences, no commentary before or after).',
+  'The object MUST have this exact shape:',
+  '{',
+  '  "summary": "2-3 sentence high-level overview of the change quality and risk.",',
+  '  "findings": [',
+  '    {',
+  '      "file": "<changed file path>",',
+  '      "line": <positive integer line number, or null>,',
+  '      "severity": "<critical | high | medium | low | info>",',
+  '      "confidence": "<high | medium | low>",',
+  '      "category": "<bug | security | performance | maintainability | style | test | docs>",',
+  '      "title": "<short one-line summary, <= 120 chars>",',
+  '      "description": "<what is wrong and why it matters>",',
+  '      "evidence": "<the exact diff line(s) that justify this finding, quoted verbatim>",',
+  '      "suggestion": "<how to fix it, or null>",',
+  '      "rule": "<short rule id, e.g. \'llm\' or a scanner id>"',
+  '    }',
+  '  ]',
+  '}',
+  '',
+  'Mandates:',
+  '- Every finding MUST include an `evidence` field quoting the exact diff line(s) that justify it. If you cannot quote evidence, do not emit the finding.',
+  '- Output ONLY a valid JSON object. No prose, no markdown fences, no commentary before or after.',
+  '- `file` MUST be one of the file paths shown in the diff below; never invent a path.',
+  '- If there are no issues, emit `{"summary": "...", "findings": []}`.',
+  '',
+  'Emit at most 8 findings, prioritizing the highest-severity issues.',
+].join('\n');
+
+describe('buildStructuredReviewPrompt — F-PROMPTMODE pins', () => {
+  test('truncation dropping exactly one entry yields the hand-written byte-exact string', () => {
+    const patch = 'x'.repeat(100);
+    const files = [
+      { filename: 'a.js', status: 'modified', patch },
+      { filename: 'b.js', status: 'modified', patch },
+      { filename: 'c.js', status: 'modified', patch },
+    ];
+
+    // Expected output derived BY HAND from the documented format: the header,
+    // a blank line, then the KEPT entries joined by blank lines. The dropped
+    // entry leaves NO remnant — no separator, no entry text.
+    const expected =
+      HAND_WRITTEN_HEADER +
+      '\n\n' +
+      entry('a.js', 'modified', patch) +
+      '\n\n' +
+      entry('b.js', 'modified', patch);
+
+    // Cap choice is hand-derived too: expected.length is exactly the size of
+    // the 2-entry flat body, and admitting a third entry costs one more '\n\n'
+    // separator plus the entry itself (far more than 5 chars), so
+    // cap = expected.length + 5 keeps exactly two entries — exactly one drop.
+    const cap = expected.length + 5;
+
+    const out = buildStructuredReviewPrompt(files, { maxDiffChars: cap });
+
+    expect(out).toBe(expected);
+    expect(out).not.toContain('name="c.js"');
+    expect(out.length).toBeLessThanOrEqual(cap);
+  });
+
+  test('batchNumber WITHOUT totalBatches → no batch envelope AND truncation still applies (flat)', () => {
+    const patch = 'x'.repeat(100);
+    const files = [
+      { filename: 'a.js', status: 'modified', patch },
+      { filename: 'b.js', status: 'modified', patch },
+      { filename: 'c.js', status: 'modified', patch },
+    ];
+    const oneFile = buildStructuredReviewPrompt([files[0]]);
+    const cap = oneFile.length + 50;
+
+    const out = buildStructuredReviewPrompt(files, { maxDiffChars: cap, batchNumber: 1 });
+
+    // Half-supplied batch options are NOT batch mode: flat body...
+    expect(out).not.toContain('<review_batch');
+    expect(out).not.toContain('This is batch');
+    // ...and truncation still applies in flat mode (trailing entries dropped).
+    expect(out).toContain('name="a.js"');
+    expect(out).not.toContain('name="b.js"');
+    expect(out).not.toContain('name="c.js"');
+    expect(out.length).toBeLessThanOrEqual(cap);
+  });
+});
