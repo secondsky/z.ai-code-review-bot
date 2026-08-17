@@ -15,6 +15,10 @@
  */
 
 import { sanitizeModelOutput } from '../sanitize-output.js';
+import {
+  filterExcludedFiles,
+  filterPatchableFiles,
+} from '../changed-files.js';
 
 /**
  * Markers delimiting the upserted PR-description block. The block is the ONLY
@@ -23,6 +27,65 @@ import { sanitizeModelOutput } from '../sanitize-output.js';
  */
 export const DESCRIBE_MARKER_START = '<!-- zai-description -->';
 export const DESCRIBE_MARKER_END = '<!-- /zai-description -->';
+
+/** Soft cap on the diff context bundled into the prompt. */
+export const MAX_CONTEXT_CHARS = 8000;
+
+/**
+ * Build the diff context block from patchable files, capped to a char budget.
+ *
+ * Pure (exported for testing). F-DIFFCTX: previously a byte-identical copy
+ * lived in BOTH ask.js and impact.js — past fixes (W15-A4-4, W16-B4-4) had
+ * to be applied to both. It now lives ONLY here; both handlers import it
+ * (and re-export it to preserve their public surface). A drift-guard test
+ * in tests/handlers/ask.test.js pins the two exports to the same binding.
+ *
+ * @param {Array<{filename: string, patch?: string}>} files
+ * @param {number} [maxChars]
+ * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
+ *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
+ *   review.js: production config always carries the default exclude list).
+ * @returns {string}
+ */
+export function buildDiffContext(
+  files,
+  maxChars = MAX_CONTEXT_CHARS,
+  excludePatterns,
+) {
+  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
+  // filter, mirroring review.js's W15-A8-8 fix. Previously a default-excluded
+  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
+  // and ate the ENTIRE budget — the model saw only the lockfile and real
+  // changes (e.g. src/auth.js) were invisible to /zai ask.
+  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
+  const patchable = filterPatchableFiles(notExcluded);
+  if (patchable.length === 0) return '(no textual diffs available)';
+  const lines = [];
+  let used = 0;
+  let skippedOversized = false;
+  for (const f of patchable) {
+    const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
+    // `break` stopped at the first oversized diff, so a huge file FIRST in
+    // the list caused '(no textual diffs available)' even though later,
+    // smaller entries fit the budget.
+    if (used + entry.length > maxChars) {
+      skippedOversized = true;
+      continue;
+    }
+    lines.push(entry);
+    used += entry.length + 2; // +2 for the '\n\n' joiner
+  }
+  if (lines.length === 0) {
+    // Every entry was oversized (there WAS textual diff content; it just
+    // didn't fit). Say the budget was exceeded rather than falsely claiming
+    // no textual diffs exist.
+    return skippedOversized
+      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
+      : '(no textual diffs available)';
+  }
+  return lines.join('\n\n');
+}
 
 /**
  * Post a command-response comment on the PR/issue.
