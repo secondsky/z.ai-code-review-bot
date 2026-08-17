@@ -129,10 +129,11 @@ describe('classifyFile', () => {
     expect(classifyFile('foo.spec.js')).toBe('tests');
   });
 
-  // CMD-6: classifyFile must iterate COHORT_ORDER (where 'config' is at index 3,
-  // BEFORE 'ui' at index 4), NOT the COHORT_RULES array (where 'config' sits at
-  // index 5, AFTER 'ui'). A path that matches BOTH config and ui cohorts must
-  // resolve to config because COHORT_ORDER ranks config as more foundational.
+  // CMD-6: classifyFile must follow the canonical dependency order (where
+  // 'config' ranks BEFORE 'ui') — historically the matcher table listed
+  // 'config' after 'ui', and a reconciliation loop masked it. A path that
+  // matches BOTH config and ui cohorts must resolve to config because the
+  // canonical order ranks config as more foundational.
   it('CMD-6: classifyFile follows COHORT_ORDER — config beats ui (pages/settings.json → config)', () => {
     // pages/ matches ui; .json matches config. COHORT_ORDER has config (rank 3)
     // before ui (rank 4), so config wins.
@@ -165,6 +166,52 @@ describe('COHORT_ORDER', () => {
   it('has 8 distinct cohorts', () => {
     expect(new Set(COHORT_ORDER).size).toBe(COHORT_ORDER.length);
     expect(COHORT_ORDER.length).toBe(8);
+  });
+
+  // F-COHORTS registry-completeness pin: every COHORT_ORDER entry must be a
+  // REAL cohort — reachable through classifyFile and renderable with a full
+  // descriptor (non-empty emoji + label). Written against the public export
+  // and renderer only, so it holds before AND after the one-registry refactor:
+  // no cohort may exist in the export without matchers/emoji/label, and no
+  // classifyFile return value may fall outside the export.
+  it('every COHORT_ORDER entry is reachable via classifyFile and nothing else is returned', () => {
+    // One fixture file per cohort, each hitting that cohort's matchers.
+    const fixtures = [
+      'db/schema.sql', // database
+      'api/users.js', // api
+      'src/lib/a.js', // business-logic
+      'config.yml', // config
+      'components/B.tsx', // ui
+      'a.test.js', // tests
+      'README.md', // docs
+      'Makefile', // other
+    ];
+    const returned = new Set(fixtures.map((f) => classifyFile(f)));
+    expect(returned.size).toBe(COHORT_ORDER.length);
+    expect([...returned].sort()).toEqual([...COHORT_ORDER].sort());
+  });
+
+  it('renders a fully-populated section header for every COHORT_ORDER entry', () => {
+    const findings = [
+      { file: 'db/schema.sql', severity: 'info', title: '1' },
+      { file: 'api/users.js', severity: 'info', title: '2' },
+      { file: 'src/lib/a.js', severity: 'info', title: '3' },
+      { file: 'config.yml', severity: 'info', title: '4' },
+      { file: 'components/B.tsx', severity: 'info', title: '5' },
+      { file: 'a.test.js', severity: 'info', title: '6' },
+      { file: 'README.md', severity: 'info', title: '7' },
+      { file: 'Makefile', severity: 'info', title: '8' },
+    ];
+    const files = findings.map((f) => ({ filename: f.file }));
+    const out = formatWalkthroughSummary(findings, files, {});
+    const summaryLines = out.split('\n').filter((l) => l.startsWith('<summary>'));
+    // One section per cohort — the export can never name a cohort the
+    // renderer cannot render.
+    expect(summaryLines).toHaveLength(COHORT_ORDER.length);
+    // Every header carries a non-empty emoji and a non-empty label.
+    for (const line of summaryLines) {
+      expect(line).toMatch(/^<summary>\S+ \S[^\n]* \(\d+\)<\/summary>$/);
+    }
   });
 });
 
