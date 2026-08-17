@@ -100,6 +100,16 @@ describe('parseZaiYml — comments', () => {
     const text = 'reviews:\n  tone_instructions: "use # for headers"\n';
     expect(parseZaiYml(text).reviews.tone_instructions).toBe('use # for headers');
   });
+
+  // W15-A6-6 parity with learnings.js: a `"` glued to a word character (the
+  // inches mark in `5" floppy`) must not toggle the in-double-quote state.
+  // Before this fix, repo-config's `"` branch was a bare toggle, so the
+  // trailing `# legacy note` looked quoted and survived into the parsed value.
+  it('strips trailing comments after a glued unpaired double quote (W15-A6-6 parity)', () => {
+    const yml = 'reviews:\n  tone_instructions: use 5" floppy # legacy note\n';
+    const out = parseZaiYml(yml);
+    expect(out.reviews.tone_instructions).toBe('use 5" floppy');
+  });
 });
 
 describe('parseZaiYml — arrays', () => {

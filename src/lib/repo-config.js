@@ -25,6 +25,8 @@
  * @module src/lib/repo-config.js
  */
 
+import { stripComment, unquote } from './yaml-lex.js';
+
 /** Hard cap on the size of a `.zai.yml` we will parse (cost/DoS guard). */
 const MAX_REPO_CONFIG_BYTES = 64 * 1024; // 64 KiB
 
@@ -47,68 +49,6 @@ const MAX_PATH_INSTRUCTION_ENTRIES = 50;
  * Mirrors the `MAX_PATH_INSTRUCTION_ENTRIES` guard on `path_instructions`.
  */
 const MAX_PATH_FILTER_ENTRIES = 100;
-
-/**
- * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
- * single- or double-quoted string. A `#` preceded by whitespace (or at the
- * start of the line) starts a comment; a `#` glued to a value (`url#anchor`)
- * does not — mirroring YAML 1.2. The quote-tracking is deliberately simple:
- * it toggles on the first quote char encountered and toggles back on the
- * matching one.
- *
- * @param {string} line
- * @returns {string}
- */
-function stripComment(line) {
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "'" && !inDouble) {
-      // W12-4b: the contraction guard (don't treat `'` as a delimiter when
-      // preceded by alphanumeric, to handle `it's`) must NOT apply when we are
-      // ALREADY inside a single-quoted string — a `'` inside a single-quoted
-      // value is always the closing delimiter regardless of the preceding char.
-      // Without this, `'see ref5'   # note` keeps inSingle=true after the
-      // closing quote, so quotes aren't stripped and the comment leaks.
-      if (inSingle) {
-        inSingle = false;
-      } else {
-        const prev = i > 0 ? line[i - 1] : '';
-        if (!/[A-Za-z0-9]/.test(prev)) {
-          inSingle = !inSingle;
-        }
-      }
-    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === '#' && !inSingle && !inDouble) {
-      // A `#` only starts a comment when it's at the start of the line or
-      // preceded by whitespace. `value#frag` is NOT a comment.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (i === 0 || /\s/.test(prev)) {
-        return line.slice(0, i);
-      }
-    }
-  }
-  return line;
-}
-
-/**
- * Unquote a YAML scalar value: strips matching surrounding single or double
- * quotes. Returns the input unchanged when not quoted.
- *
- * @param {string} v
- * @returns {string}
- */
-function unquote(v) {
-  if (typeof v !== 'string' || v.length < 2) return v;
-  if (
-    (v[0] === '"' && v[v.length - 1] === '"') ||
-    (v[0] === "'" && v[v.length - 1] === "'")
-  ) {
-    return v.slice(1, -1);
-  }
-  return v;
-}
 
 /**
  * Coerce a raw YAML scalar string into a JS value. Recognizes the literals
