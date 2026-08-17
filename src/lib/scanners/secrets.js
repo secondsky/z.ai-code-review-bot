@@ -20,7 +20,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import nodePath from 'node:path';
 import { parseAddedLines, changedFileNames } from './_patch.js';
-import { selectPlatformAsset, pickExtractor } from './ensure-binary.js';
+import { resolveBinaryRequest } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
  * Shannon entropy helper (used to suppress low-entropy false positives)
@@ -325,8 +325,9 @@ export function scanSecretsRegex(files) {
  * against `gitleaks_8.21.2_checksums.txt` from the v8.21.2 GitHub release.
  *
  * gitleaks ships as a .tar.gz on macOS/Linux and a .zip on Windows. The
- * extractor is selected per-asset via `pickExtractor(url)` (see
- * `scanSecrets`); the dispatch handles both archive types with one spec.
+ * extractor is selected per-asset by `resolveBinaryRequest` (via
+ * `pickExtractor(url)`) when building the ensureBinary request in
+ * `scanSecrets`; the dispatch handles both archive types with one spec.
  *
  * @type {Object}
  */
@@ -469,20 +470,11 @@ export async function scanSecrets(opts, deps = {}) {
   }
 
   try {
-    const asset = selectPlatformAsset(GITLEAKS_SPEC, { platform, arch });
-    if (!asset) {
-      throw new Error(
-        `gitleaks: no asset for platform=${platform || '?'} arch=${arch || '?'}`,
-      );
-    }
+    // F-BINREQ: spec → platform asset → flat ensureBinary request in one
+    // place. resolveBinaryRequest throws on a no-asset tuple, which lands in
+    // the catch below → warning → regex fallback (unchanged coverage).
     const binaryPath = await deps.ensureBinary(
-      {
-        ...GITLEAKS_SPEC,
-        ...asset,
-        cacheDir: opts.cacheDir,
-        // gitleaks ships .tar.gz (mac/linux) and .zip (windows); pick by URL.
-        extractor: pickExtractor(asset.url),
-      },
+      resolveBinaryRequest(GITLEAKS_SPEC, { platform, arch, cacheDir: opts.cacheDir }),
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();

@@ -11,16 +11,13 @@
  * throws (errors → short comment + return); no `@actions/core` import; no
  * direct network.
  */
-import { postComment } from './_shared.js';
+import { postComment, runCommand } from './_shared.js';
 import {
   getChangedFiles,
   filterExcludedFiles,
   filterPatchableFiles,
 } from '../changed-files.js';
 import { buildStructuredReviewPrompt, wrapUntrusted } from '../prompt.js';
-
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
 /** Cap on whole-PR diff size passed to callApi. */
 const MAX_WHOLE_PR_DIFF_CHARS = 8000;
@@ -113,7 +110,9 @@ export async function handleReviewCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('review', { core, post }, async () => {
     const files =
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
@@ -174,14 +173,5 @@ export async function handleReviewCommand(
     });
     const review = await callApi(config.apiKey, config.model, prompt);
     await post(review);
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`review handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: never throw out of the handler. */
-    }
-  }
+  });
 }

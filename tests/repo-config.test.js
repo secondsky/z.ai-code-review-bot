@@ -100,6 +100,16 @@ describe('parseZaiYml — comments', () => {
     const text = 'reviews:\n  tone_instructions: "use # for headers"\n';
     expect(parseZaiYml(text).reviews.tone_instructions).toBe('use # for headers');
   });
+
+  // W15-A6-6 parity with learnings.js: a `"` glued to a word character (the
+  // inches mark in `5" floppy`) must not toggle the in-double-quote state.
+  // Before this fix, repo-config's `"` branch was a bare toggle, so the
+  // trailing `# legacy note` looked quoted and survived into the parsed value.
+  it('strips trailing comments after a glued unpaired double quote (W15-A6-6 parity)', () => {
+    const yml = 'reviews:\n  tone_instructions: use 5" floppy # legacy note\n';
+    const out = parseZaiYml(yml);
+    expect(out.reviews.tone_instructions).toBe('use 5" floppy');
+  });
 });
 
 describe('parseZaiYml — arrays', () => {
@@ -574,6 +584,31 @@ describe('mergeRepoConfig — scanners (can only DISABLE)', () => {
     );
     expect(merged.scannersEnabled).toBe(false);
     expect(merged.scanners.metrics).toBe(false);
+  });
+});
+
+describe('scanner registry — validator and merge emit exactly SCANNER_KEYS', () => {
+  // F-SCANNERKEYS: the parser allow-list (SCANNER_KEYS), the validator's
+  // boolean copies, and mergeRepoConfig's two object literals must all agree.
+  // The W15-A1-2 bug (metrics missing from one copy) came from these sites
+  // drifting apart. Keys are compared as ARRAYS so the insertion order
+  // (gitleaks, ast_grep, metrics) is pinned too.
+  it('validateRepoConfig scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const out = validateRepoConfig({
+      scanners: { gitleaks: true, ast_grep: false, metrics: true },
+    });
+    expect(Object.keys(out.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+  });
+  it('mergeRepoConfig (enabled path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const merged = mergeRepoConfig(
+      { scannersEnabled: true },
+      { scanners: { gitleaks: true, ast_grep: true, metrics: true } },
+    );
+    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
+  });
+  it('mergeRepoConfig (master-off path) scanners keys are exactly [gitleaks, ast_grep, metrics]', () => {
+    const merged = mergeRepoConfig({ scannersEnabled: false }, {});
+    expect(Object.keys(merged.scanners)).toEqual(['gitleaks', 'ast_grep', 'metrics']);
   });
 });
 

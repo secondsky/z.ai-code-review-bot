@@ -11,7 +11,7 @@
     "test:unit": "vitest run --exclude tests/integration/**",
     "test:integration": "vitest run tests/integration",
     "test:coverage": "vitest run --coverage",
-    "dist-check": "ncc build src/index.js -o dist --license licenses.txt && git diff --exit-code dist"
+    "dist-check": "npm run build && git diff --exit-code dist"
   },
   "dependencies": {
     "@actions/core": "^2.0.3",

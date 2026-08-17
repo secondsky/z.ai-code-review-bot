@@ -630,7 +630,7 @@ describe('listBotReviews', () => {
 
   it('accepts a bot-suffixed login even when user.type is absent (W15-A3-6)', async () => {
     // Some payloads surface bot identity only via the `[bot]` login suffix
-    // (mirrors isBotComment in comments.js — either signal suffices).
+    // (mirrors isBotAuthor in comments.js — either signal suffices).
     const reviews = [
       { id: 4, body: `b\n\n${MARKER}`, user: { login: 'zai-code-review[bot]' } },
       { id: 5, body: `h\n\n${MARKER}`, user: { login: 'alice' } },

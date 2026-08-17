@@ -20,92 +20,7 @@
 import { sanitizeTextField } from './findings.js';
 
 // ---------------------------------------------------------------------------
-// Cohort metadata
-// ---------------------------------------------------------------------------
-
-/**
- * The canonical cohort ordering (dependency rank — foundational first).
- * Lower index = more foundational = rendered earlier.
- * @type {string[]}
- */
-export const COHORT_ORDER = [
-  'database',
-  'api',
-  'business-logic',
-  'config',
-  'ui',
-  'tests',
-  'docs',
-  'other',
-];
-
-/**
- * Per-cohort emoji for the walkthrough section headers.
- * @type {Record<string, string>}
- */
-const COHORT_EMOJI = {
-  database: '🗄️',
-  api: '🔌',
-  'business-logic': '⚙️',
-  config: '🔧',
-  ui: '🎨',
-  tests: '🧪',
-  docs: '📚',
-  other: '📦',
-};
-
-/**
- * Per-cohort human-readable display label (Title Case).
- * @type {Record<string, string>}
- */
-const COHORT_LABEL = {
-  database: 'Database',
-  api: 'API',
-  'business-logic': 'Business Logic',
-  config: 'Config',
-  ui: 'UI',
-  tests: 'Tests',
-  docs: 'Docs',
-  other: 'Other',
-};
-
-/**
- * Per-severity emoji for the Overview line. Mirrors findings.js so the
- * walkthrough and the severity-grouped summary stay visually consistent.
- * @type {Record<string, string>}
- */
-const SEVERITY_EMOJI = {
-  critical: '🔴',
-  high: '🟠',
-  medium: '🟡',
-  low: '🔵',
-  info: '➖',
-};
-
-/**
- * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
- * sorts first. Mirrors findings.js SEVERITY_RANK.
- * @type {Record<string, number>}
- */
-const SEVERITY_RANK = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  info: 4,
-};
-
-/** Severity display order for the Overview line. */
-const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
-
-/**
- * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
- * as a literal so this pure module has no cross-module imports.
- */
-const MARKER = '<!-- zai-code-review -->';
-
-// ---------------------------------------------------------------------------
-// classifyFile
+// Cohort registry
 // ---------------------------------------------------------------------------
 
 /**
@@ -147,15 +62,24 @@ function basenameKeyword(name) {
 }
 
 /**
- * Each cohort's matchers, checked in array order. The cohort list itself is
- * iterated in {@link COHORT_ORDER} order so "first match wins" is enforced by
- * the classifyFile loop. A filename matches a cohort if ANY matcher hits.
+ * The single ordered cohort registry — ONE entry per cohort carrying its
+ * name, header emoji, display label, and path matchers. The array order IS
+ * the canonical dependency order (foundational first: database → api →
+ * business-logic → config → ui → tests → docs → other); classifyFile and the
+ * renderer both walk it in this order, so "first match wins" and the rendered
+ * section order are enforced by construction. CMD-6: 'config' ranks BEFORE
+ * 'ui' here, so a path matching both (e.g. pages/settings.json) resolves to
+ * config. A filename matches a cohort if ANY of its matchers hits. The
+ * trailing 'other' cohort is the fallback — it has no matchers; files that
+ * match nothing (or that fail the string guard) land there.
  *
- * @type {Array<{ cohort: string, matchers: RegExp[] }>}
+ * @type {Array<{ name: string, emoji: string, label: string, matchers: RegExp[] }>}
  */
-const COHORT_RULES = [
+const COHORTS = [
   {
-    cohort: 'database',
+    name: 'database',
+    emoji: '🗄️',
+    label: 'Database',
     matchers: [
       dirSegment('db'),
       dirSegment('migrations'),
@@ -166,7 +90,9 @@ const COHORT_RULES = [
     ],
   },
   {
-    cohort: 'api',
+    name: 'api',
+    emoji: '🔌',
+    label: 'API',
     matchers: [
       dirSegment('api'),
       dirSegment('server'),
@@ -177,7 +103,9 @@ const COHORT_RULES = [
     ],
   },
   {
-    cohort: 'business-logic',
+    name: 'business-logic',
+    emoji: '⚙️',
+    label: 'Business Logic',
     matchers: [
       dirSegment('src/lib'),
       dirSegment('src/services'),
@@ -188,7 +116,24 @@ const COHORT_RULES = [
     ],
   },
   {
-    cohort: 'ui',
+    name: 'config',
+    emoji: '🔧',
+    label: 'Config',
+    matchers: [
+      extRe('yml'),
+      extRe('yaml'),
+      extRe('json'),
+      extRe('toml'),
+      dirSegment('.github'),
+      basenameKeyword('Dockerfile'),
+      basenameKeyword('docker-compose'),
+      basenameKeyword('.env'),
+    ],
+  },
+  {
+    name: 'ui',
+    emoji: '🎨',
+    label: 'UI',
     matchers: [
       dirSegment('components'),
       dirSegment('pages'),
@@ -202,7 +147,9 @@ const COHORT_RULES = [
     ],
   },
   {
-    cohort: 'tests',
+    name: 'tests',
+    emoji: '🧪',
+    label: 'Tests',
     matchers: [
       /\.test\./i,
       /\.spec\./i,
@@ -212,20 +159,9 @@ const COHORT_RULES = [
     ],
   },
   {
-    cohort: 'config',
-    matchers: [
-      extRe('yml'),
-      extRe('yaml'),
-      extRe('json'),
-      extRe('toml'),
-      dirSegment('.github'),
-      basenameKeyword('Dockerfile'),
-      basenameKeyword('docker-compose'),
-      basenameKeyword('.env'),
-    ],
-  },
-  {
-    cohort: 'docs',
+    name: 'docs',
+    emoji: '📚',
+    label: 'Docs',
     matchers: [
       extRe('md'),
       extRe('rst'),
@@ -234,34 +170,83 @@ const COHORT_RULES = [
       basenameKeyword('README'),
     ],
   },
+  {
+    name: 'other',
+    emoji: '📦',
+    label: 'Other',
+    matchers: [],
+  },
 ];
+
+/**
+ * The canonical cohort ordering (dependency rank — foundational first).
+ * Lower index = more foundational = rendered earlier. Derived from the
+ * registry so the export can never drift from it.
+ * @type {string[]}
+ */
+export const COHORT_ORDER = COHORTS.map((c) => c.name);
+
+/**
+ * Per-severity emoji for the Overview line. Mirrors findings.js so the
+ * walkthrough and the severity-grouped summary stay visually consistent.
+ * @type {Record<string, string>}
+ */
+const SEVERITY_EMOJI = {
+  critical: '🔴',
+  high: '🟠',
+  medium: '🟡',
+  low: '🔵',
+  info: '➖',
+};
+
+/**
+ * Severity -> numeric rank for ordering findings WITHIN a cohort. Lower rank
+ * sorts first. Mirrors findings.js SEVERITY_RANK.
+ * @type {Record<string, number>}
+ */
+const SEVERITY_RANK = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4,
+};
+
+/** Severity display order for the Overview line. */
+const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+
+/**
+ * Idempotency marker — MUST be byte-exact with comments.js MARKER. Duplicated
+ * as a literal so this pure module has no cross-module imports.
+ */
+const MARKER = '<!-- zai-code-review -->';
+
+// ---------------------------------------------------------------------------
+// classifyFile
+// ---------------------------------------------------------------------------
 
 /**
  * Classify a changed file into a cohort by its path.
  *
- * Rules are checked in {@link COHORT_ORDER} order; the FIRST matching cohort
- * wins (so a test file under `src/lib/` classifies as business-logic, because
- * business-logic is checked before tests). Files matching no rule fall back to
- * `'other'`.
+ * The registry is walked in order; the FIRST matching cohort wins (so a test
+ * file under `src/lib/` classifies as business-logic, because business-logic
+ * ranks before tests — and, per CMD-6, a path matching both config and ui,
+ * e.g. pages/settings.json, resolves to config because config ranks first).
+ * Files matching no matcher fall back to `'other'`.
  *
  * @param {string} filename
- * @returns {string} cohort name: 'database'|'api'|'business-logic'|'ui'|'tests'|'config'|'docs'|'other'
+ * @returns {string} cohort name: 'database'|'api'|'business-logic'|'config'|'ui'|'tests'|'docs'|'other'
  */
 export function classifyFile(filename) {
   if (typeof filename !== 'string' || filename.length === 0) return 'other';
-  // Iterate in COHORT_ORDER (the canonical dependency rank), looking up each
-  // cohort's rule, so the documented "first-match-wins by dependency rank"
-  // holds — NOT the COHORT_RULES array order (which differs: e.g. 'config'
-  // sits AFTER 'ui' in the array but BEFORE it in COHORT_ORDER).
-  for (const cohort of COHORT_ORDER) {
-    const rule = COHORT_RULES.find((r) => r.cohort === cohort);
-    if (rule && rule.matchers.some((re) => re.test(filename))) return cohort;
+  for (const cohort of COHORTS) {
+    if (cohort.matchers.some((re) => re.test(filename))) return cohort.name;
   }
   return 'other';
 }
 
 // ---------------------------------------------------------------------------
-// buildCohorts
+// filenameOf
 // ---------------------------------------------------------------------------
 
 /**
@@ -280,47 +265,6 @@ function filenameOf(entry) {
   return '';
 }
 
-/**
- * Group files into cohorts, ordered by dependency rank.
- *
- * Only includes cohorts that have files. Cohorts are sorted by
- * {@link COHORT_ORDER} rank (foundational first). Within each cohort, files
- * are sorted alphabetically by filename.
- *
- * Each returned entry: `{ cohort, files, rank }` where `rank` is the index
- * into COHORT_ORDER.
- *
- * @param {Array<{filename?: string} | string>} files
- * @returns {Array<{cohort: string, files: Array, rank: number}>}
- */
-export function buildCohorts(files) {
-  if (!Array.isArray(files)) return [];
-  /** @type {Map<string, Array>} */
-  const byCohort = new Map();
-  for (const entry of files) {
-    const filename = filenameOf(entry);
-    if (!filename) continue;
-    const cohort = classifyFile(filename);
-    if (!byCohort.has(cohort)) byCohort.set(cohort, []);
-    byCohort.get(cohort).push(entry);
-  }
-  // Sort each cohort's files alphabetically by filename.
-  for (const list of byCohort.values()) {
-    list.sort((a, b) => {
-      const fa = filenameOf(a);
-      const fb = filenameOf(b);
-      if (fa < fb) return -1;
-      if (fa > fb) return 1;
-      return 0;
-    });
-  }
-  // Emit cohorts in dependency-rank order.
-  return COHORT_ORDER
-    .map((cohort, rank) => ({ cohort, rank, list: byCohort.get(cohort) }))
-    .filter((c) => c.list)
-    .map(({ cohort, rank, list }) => ({ cohort, files: list, rank }));
-}
-
 // ---------------------------------------------------------------------------
 // groupFindingsByCohort
 // ---------------------------------------------------------------------------
@@ -328,9 +272,9 @@ export function buildCohorts(files) {
 /**
  * Assign findings to their file's cohort.
  *
- * Builds a `Map<filename, cohort>` from {@link buildCohorts} (over `files`),
- * then assigns each finding to its file's cohort. Findings whose `file` is not
- * in the map fall back to `'other'`.
+ * Builds its own `Map<filename, cohort>` by classifying each entry of `files`
+ * via {@link classifyFile}, then buckets each finding under its file's cohort.
+ * Findings whose `file` is not among `files` fall back to `'other'`.
  *
  * @param {Array<{file?: string}>} findings
  * @param {Array<{filename?: string} | string>} files
@@ -452,9 +396,15 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
   }
   const total = list.length;
 
-  // Cohort buckets (ordered by dependency rank).
+  // Cohort buckets (ordered by dependency rank). Registry order IS the
+  // canonical order (COHORT_ORDER derives from it), so filtering the registry
+  // yields the ordered cohort list carrying full descriptors. Map keys come
+  // only from classifyFile or the 'other' fallback — both registry names — so
+  // the descriptor reads below cannot miss.
   const grouped = groupFindingsByCohort(list, files);
-  const orderedCohorts = COHORT_ORDER.filter((c) => grouped.has(c) && grouped.get(c).length > 0);
+  const orderedCohorts = COHORTS.filter(
+    (c) => grouped.has(c.name) && grouped.get(c.name).length > 0,
+  );
   const cohortCount = orderedCohorts.length;
 
   // Overview line.
@@ -473,16 +423,14 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
     lines.push('');
   } else {
     for (const cohort of orderedCohorts) {
-      const cohortFindings = grouped.get(cohort).slice().sort((a, b) => {
+      const cohortFindings = grouped.get(cohort.name).slice().sort((a, b) => {
         const sa = severityRank(typeof a.severity === 'string' ? a.severity : '');
         const sb = severityRank(typeof b.severity === 'string' ? b.severity : '');
         if (sa !== sb) return sa - sb;
         return 0;
       });
-      const emoji = COHORT_EMOJI[cohort] ?? '📦';
-      const label = COHORT_LABEL[cohort] ?? 'Other';
       lines.push('<details>');
-      lines.push(`<summary>${emoji} ${label} (${cohortFindings.length})</summary>`);
+      lines.push(`<summary>${cohort.emoji} ${cohort.label} (${cohortFindings.length})</summary>`);
       lines.push('');
       for (const f of cohortFindings) {
         const file = typeof f.file === 'string' ? f.file : '';

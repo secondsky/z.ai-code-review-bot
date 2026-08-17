@@ -1314,6 +1314,57 @@ describe('reviewOnePr — W15-A8-4 feature parity', () => {
     const comments = s.upsertReview.mock.calls[0][0].comments;
     expect(comments.some((c) => c.body.includes('Hardcoded AWS key'))).toBe(true);
   });
+
+  // F-SCHEDDEPS (pin, passes against pre-refactor code): a SENTINEL runScanners
+  // injected into runScheduledReview must reach runStructuredReview's
+  // `deterministicFindings` input — i.e. reviewOnePr must actually CALL the
+  // batch-injected collaborator, not its own inert default. This pins the
+  // batch→per-PR forwarding property the INERT_PIPELINE_DEPS bundle refactor
+  // must preserve: a dep dropped from the handoff would silently degrade to an
+  // inert no-op (the W15-A8-4/W18-D1-2 parity-loss class) and fail here.
+  it('F-SCHEDDEPS: a sentinel runScanners injected into runScheduledReview reaches runStructuredReview', async () => {
+    const octokit = makeOctokit({ prs: [mkPr(44, 'sha44')], commentsByPr: {} });
+    const SENTINEL_FINDING = {
+      file: 'a.js',
+      line: 2,
+      severity: 'critical',
+      title: 'Sentinel scanner finding',
+      description: 'sentinel detected',
+      rule: 'sentinel:probe',
+    };
+    const sentinelRunScanners = vi.fn(async () => ({
+      findings: [SENTINEL_FINDING],
+      metrics: {},
+      scannerNames: ['sentinel'],
+    }));
+    const capturedReviewCfg = [];
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async (files, cfg) => {
+        capturedReviewCfg.push(cfg);
+        return {
+          findings: Array.isArray(cfg.deterministicFindings) ? cfg.deterministicFindings : [],
+          summary: 'sentinel review',
+          metadata: { totalBatches: 1, totalFindingsBeforeCap: 1, deterministicFindingsCount: 1, batchMetadata: [] },
+        };
+      }),
+      runScanners: sentinelRunScanners,
+    });
+
+    const result = await runScheduledReview({
+      octokit, owner: 'o', repo: 'r',
+      config: makeConfig(), // no repoConfig/learnings toggles needed: runScanners is unconditional
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ reviewed: 1, skipped: 0, failed: 0 });
+    // reviewOnePr called the batch-injected SENTINEL (not the inert default).
+    expect(sentinelRunScanners).toHaveBeenCalledTimes(1);
+    expect(sentinelRunScanners.mock.calls[0][0].files).toEqual([INLINE_FILE]);
+    // ...and the sentinel's findings reached runStructuredReview's input.
+    expect(capturedReviewCfg).toHaveLength(1);
+    expect(capturedReviewCfg[0].deterministicFindings).toEqual([SENTINEL_FINDING]);
+  });
 });
 
 /* ---------- reviewOnePr — W16-B2-1 terminal failure status ---------- */

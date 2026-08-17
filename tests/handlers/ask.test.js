@@ -378,6 +378,52 @@ describe('handleAskCommand — W16-B4-2: guarded first post', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * F-RUNCOMMAND: the never-throw guardrail is structural.
+ *
+ * The outer try/catch and ERROR_COMMENT now live in ONE place —
+ * runCommand in handlers/_shared.js — not in each handler. With a post
+ * that rejects on EVERY call (including the ERROR_COMMENT fallback
+ * itself), the handler must still resolve, and the fallback attempt
+ * must carry the SHARED ERROR_COMMENT constant byte-for-byte.
+ * ------------------------------------------------------------------ */
+
+describe('handleAskCommand — F-RUNCOMMAND: always-rejecting post', () => {
+  it('post rejects on every call (incl. the fallback) → handler resolves; fallback body is the shared ERROR_COMMENT', async () => {
+    const shared = await import('../../src/lib/handlers/_shared.js');
+    const core = { info: vi.fn(), warning: vi.fn() };
+    const attempted = [];
+    const post = async (body) => {
+      attempted.push(body);
+      throw new Error('502 bad gateway');
+    };
+
+    await expect(
+      handleAskCommand(
+        {
+          octokit: makeOctokit(),
+          context: makeContext(),
+          config: { apiKey: 'k', model: 'm' },
+          commenter: { login: 'alice' },
+          args: 'why?',
+          callApi: vi.fn(async () => 'ans'),
+          core,
+        },
+        { post },
+      ),
+    ).resolves.toBeUndefined();
+
+    // The last attempted post was the fallback error comment, and it is
+    // the shared constant owned by runCommand (undefined before the
+    // migration → this is the RED assertion).
+    expect(attempted.at(-1)).toBe(shared.ERROR_COMMENT);
+    expect(attempted.at(-1)).toContain('Z.ai request failed');
+    expect(core.warning).toHaveBeenCalledWith(
+      'ask handler failed: 502 bad gateway',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * W16-B4-4: excluded files dropped BEFORE the diff budget
  *
  * buildDiffContext applied only filterPatchableFiles, so a default-excluded
@@ -428,6 +474,23 @@ describe('buildDiffContext — W16-B4-4: excluded files dropped before the budge
       DEFAULT_EXCLUDES,
     );
     expect(context).toBe('(no textual diffs available)');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * F-DIFFCTX drift guard: ONE buildDiffContext, not two.
+ *
+ * buildDiffContext was byte-identical in ask.js and impact.js, and past
+ * fixes (W15-A4-4, W16-B4-4) had to be applied to BOTH copies. The function
+ * now lives in handlers/_shared.js and both handlers re-export the SAME
+ * binding; this test fails if either handler ever grows a private copy
+ * again (identity check, not a behavior check).
+ * ------------------------------------------------------------------ */
+
+describe('buildDiffContext — F-DIFFCTX: shared single implementation', () => {
+  it('shares one buildDiffContext with impact', async () => {
+    const impact = await import('../../src/lib/handlers/impact.js');
+    expect(buildDiffContext).toBe(impact.buildDiffContext);
   });
 });
 

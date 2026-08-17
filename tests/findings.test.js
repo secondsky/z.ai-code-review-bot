@@ -29,6 +29,7 @@ import {
   buildFindingsHashBlock,
   parseFindingsHashBlock,
   filterIncrementalFindings,
+  extractTrailers,
 } from '../src/lib/findings.js';
 
 /** A fully valid finding used as the base for mutations in tests. */
@@ -1968,5 +1969,70 @@ describe('mergeFindings — deterministic-supersedes-LLM edge cases', () => {
 
   it('returns an empty array when both inputs are empty', () => {
     expect(mergeFindings([], [])).toEqual([]);
+  });
+});
+
+describe('extractTrailers — lenient re-extraction of zai-* trailers (F-TRAILERS)', () => {
+  // F-TRAILERS: index.js and schedule.js both re-extract the trusted trailers
+  // from a review body before posting a fallback comment (W12-1). The regexes
+  // are deliberately LENIENT (\s* after `<!--`, [^>]* bodies): they must accept
+  // no-space variants the canonical STRICT parser (parseFindingsHashBlock,
+  // used for suppression) rejects. Different job, different grammar — both
+  // grammars now live in this one module so they cannot drift silently.
+
+  it('returns all three matched trailer strings when all are present', () => {
+    const body = [
+      'Some review prose.',
+      '',
+      '<!-- zai-code-review -->',
+      '<!-- zai-hashes:abc123,def456 -->',
+      '<!-- zai-sha: 9f8e7d6c -->',
+    ].join('\n');
+    expect(extractTrailers(body)).toEqual({
+      marker: '<!-- zai-code-review -->',
+      hashBlock: '<!-- zai-hashes:abc123,def456 -->',
+      shaBlock: '<!-- zai-sha: 9f8e7d6c -->',
+    });
+  });
+
+  it('returns null for every absent trailer', () => {
+    const out = extractTrailers('A body with no trailers at all.');
+    expect(out).toEqual({ marker: null, hashBlock: null, shaBlock: null });
+  });
+
+  it('returns null for the absent one and strings for the present ones (partial)', () => {
+    const out = extractTrailers('prose\n<!-- zai-code-review -->\n<!-- zai-sha: aa -->');
+    expect(out).toEqual({
+      marker: '<!-- zai-code-review -->',
+      hashBlock: null,
+      shaBlock: '<!-- zai-sha: aa -->',
+    });
+  });
+
+  it('ACCEPTS no-space variants (lenient — unlike the strict suppression parser)', () => {
+    // `<!--zai-hashes:...-->` (no space after `<!--`) is NOT matched by the
+    // canonical strict parseFindingsHashBlock grammar, but the lenient
+    // re-extraction regexes must accept it: re-extraction only re-appends
+    // trailers appendTrailers itself wrote (trusted literals), so widening
+    // the grammar is safe and intentional parity with the old inline code.
+    const out = extractTrailers('x\n<!--zai-code-review-->\n<!--zai-hashes:h1,h2-->\n<!--zai-sha:ff-->');
+    expect(out).toEqual({
+      marker: '<!--zai-code-review-->',
+      hashBlock: '<!--zai-hashes:h1,h2-->',
+      shaBlock: '<!--zai-sha:ff-->',
+    });
+    // Sanity for the contrast claim above: the strict parser rejects it.
+    expect(parseFindingsHashBlock('<!--zai-hashes:h1,h2-->').size).toBe(0);
+  });
+
+  it('returns all nulls for a non-string body', () => {
+    expect(extractTrailers(undefined)).toEqual({ marker: null, hashBlock: null, shaBlock: null });
+    expect(extractTrailers(null)).toEqual({ marker: null, hashBlock: null, shaBlock: null });
+    expect(extractTrailers(42)).toEqual({ marker: null, hashBlock: null, shaBlock: null });
+  });
+
+  it('matches the FIRST occurrence of each trailer (oldest wins)', () => {
+    const body = '<!-- zai-hashes:first -->\nprose\n<!-- zai-hashes:second -->';
+    expect(extractTrailers(body).hashBlock).toBe('<!-- zai-hashes:first -->');
   });
 });

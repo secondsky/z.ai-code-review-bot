@@ -12,12 +12,9 @@
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
-import { postComment, getPRContext } from './_shared.js';
+import { postComment, getPRContext, runCommand } from './_shared.js';
 import { wrapUntrusted, escapeDiffFence } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
-
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
 /** Usage guidance. */
 const USAGE_COMMENT =
@@ -231,11 +228,13 @@ export async function handleExplainCommand(
 
   const { range, file } = parseExplainArgs(args);
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('explain', { core, post }, async () => {
     // W16-B4-2: this post (like every other in the handler) must be inside
-    // the try — it previously executed OUTSIDE it, so a transient 502 on this
-    // single createComment rejected the whole handler and failed the entire
-    // action (the router dispatches with no catch).
+    // the guarded body — it previously executed OUTSIDE it, so a transient
+    // 502 on this single createComment rejected the whole handler and failed
+    // the entire action (the router dispatches with no catch).
     if (!range) {
       await post(USAGE_COMMENT);
       return;
@@ -326,14 +325,5 @@ export async function handleExplainCommand(
     });
     const explanation = await callApi(config.apiKey, config.model, prompt);
     await post(explanation);
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`explain handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: never throw out of the handler. */
-    }
-  }
+  });
 }

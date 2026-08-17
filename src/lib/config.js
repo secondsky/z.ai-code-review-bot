@@ -17,6 +17,24 @@ function isTruthy(v) {
 }
 
 /**
+ * Opt-in boolean input: empty/invalid means false (v1 read-only convention).
+ * Used by the nine features that must NEVER be auto-enabled.
+ */
+function readOptInBool(inputs, name) {
+  return isTruthy(read(inputs, name));
+}
+
+/**
+ * Default-on boolean input: empty means "use the default" (true); advisory
+ * features only. A non-empty value is parsed normally, so an explicit
+ * "false"/"0"/"no" still disables the feature.
+ */
+function readDefaultOnBool(inputs, name) {
+  const raw = read(inputs, name).trim();
+  return raw === '' ? true : isTruthy(raw);
+}
+
+/**
  * Read a single input from either a Map or a plain object.
  * Always returns a string (possibly empty); never throws.
  */
@@ -193,15 +211,15 @@ export function loadConfig(inputs = {}, options = {}) {
   const maxPatchChars = clampPositive(read(inputs, 'ZAI_MAX_PATCH_CHARS'), 18000);
   const timeoutMs = clampPositive(read(inputs, 'ZAI_TIMEOUT_MS'), 120000, 1000);
 
-  const commandsEnabled = isTruthy(read(inputs, 'ZAI_COMMANDS_ENABLED'));
-  const allowForkCommands = isTruthy(read(inputs, 'ZAI_ALLOW_FORK_COMMANDS'));
+  const commandsEnabled = readOptInBool(inputs, 'ZAI_COMMANDS_ENABLED');
+  const allowForkCommands = readOptInBool(inputs, 'ZAI_ALLOW_FORK_COMMANDS');
 
   const authThreshold =
     read(inputs, 'ZAI_AUTH_THRESHOLD').trim() || 'write';
   validateEnum(authThreshold, AUTH_LEVELS, AUTH_ERROR);
 
   // Schedule feature (opt-in, off by default).
-  const scheduleEnabled = isTruthy(read(inputs, 'ZAI_SCHEDULE_ENABLED'));
+  const scheduleEnabled = readOptInBool(inputs, 'ZAI_SCHEDULE_ENABLED');
   // scheduleMaxPrs: capped at an absolute maximum (100) so a runaway value
   // cannot trigger unbounded sequential work on a schedule tick. The default
   // remains 10; values up to 100 pass through; above 100 is clamped to 100.
@@ -209,8 +227,8 @@ export function loadConfig(inputs = {}, options = {}) {
 
   // describe/impact opt-in mutation features (off by default — v1 stays
   // read-only unless the operator explicitly enables them).
-  const describeWriteBody = isTruthy(read(inputs, 'ZAI_DESCRIBE_WRITE_BODY'));
-  const impactLabels = isTruthy(read(inputs, 'ZAI_IMPACT_LABELS'));
+  const describeWriteBody = readOptInBool(inputs, 'ZAI_DESCRIBE_WRITE_BODY');
+  const impactLabels = readOptInBool(inputs, 'ZAI_IMPACT_LABELS');
   const impactLabelMap = parseImpactLabelMap(read(inputs, 'ZAI_IMPACT_LABEL_MAP'));
 
   // v2 structured-review knobs.
@@ -262,9 +280,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // users) get the same behavior. The master switch is an action input (only
   // the action can turn scanning ON); per-scanner DISABLE toggles live in
   // repo-level .zai.yml (Phase 3) and can only turn a scanner OFF.
-  const scannersEnabledRaw = read(inputs, 'ZAI_SCANNERS_ENABLED').trim().toLowerCase();
-  const scannersEnabled =
-    scannersEnabledRaw === '' ? true : isTruthy(scannersEnabledRaw);
+  const scannersEnabled = readDefaultOnBool(inputs, 'ZAI_SCANNERS_ENABLED');
   const scannersCacheDir =
     read(inputs, 'ZAI_SCANNERS_CACHE_DIR').trim() || '~/.zai-cache/scanners';
 
@@ -277,9 +293,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // switch follows the same empty=default convention as scannersEnabled: an
   // empty input means "use the default" (true), so direct callers (tests,
   // programmatic users) get the feature without setting the input.
-  const commitStatusRaw = read(inputs, 'ZAI_COMMIT_STATUS').trim().toLowerCase();
-  const commitStatus =
-    commitStatusRaw === '' ? true : isTruthy(commitStatusRaw);
+  const commitStatus = readDefaultOnBool(inputs, 'ZAI_COMMIT_STATUS');
 
   // Phase 7: walkthrough / cohort-ordered summary rendering. When true
   // (default), the summary findings are reorganized into dependency-ordered
@@ -288,9 +302,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // and are unaffected; only the SUMMARY rendering changes. Empty input means
   // "use the default" (true), matching the scannersEnabled/commitStatus
   // convention so direct callers get the feature without setting the input.
-  const walkthroughRaw = read(inputs, 'ZAI_WALKTHROUGH').trim().toLowerCase();
-  const walkthrough =
-    walkthroughRaw === '' ? true : isTruthy(walkthroughRaw);
+  const walkthrough = readDefaultOnBool(inputs, 'ZAI_WALKTHROUGH');
 
   // Phase 6.3: incremental review. When true (default), the PR review path
   // stores a content hash of every finding inside a hidden HTML comment in the
@@ -300,9 +312,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // surface. Empty input means "use the default" (true), matching the
   // scannersEnabled/commitStatus/walkthrough convention so direct callers get
   // the feature without setting the input.
-  const incrementalReviewRaw = read(inputs, 'ZAI_INCREMENTAL_REVIEW').trim().toLowerCase();
-  const incrementalReview =
-    incrementalReviewRaw === '' ? true : isTruthy(incrementalReviewRaw);
+  const incrementalReview = readDefaultOnBool(inputs, 'ZAI_INCREMENTAL_REVIEW');
 
   // Phase 3: in-repo config file (`.zai.yml`). The master switch defaults to
   // TRUE — repos can commit a `.zai.yml` to tailor review behavior (path
@@ -312,9 +322,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // NARROW behavior (lower a cap, add excludes, disable a scanner), never
   // widen it. Operators who don't want repo-config loading at all can set
   // ZAI_REPO_CONFIG_ENABLED=false.
-  const repoConfigEnabledRaw = read(inputs, 'ZAI_REPO_CONFIG_ENABLED').trim().toLowerCase();
-  const repoConfigEnabled =
-    repoConfigEnabledRaw === '' ? true : isTruthy(repoConfigEnabledRaw);
+  const repoConfigEnabled = readDefaultOnBool(inputs, 'ZAI_REPO_CONFIG_ENABLED');
 
   // Phase 8.3: strict review mode. When true, the PR auto-review is submitted
   // with event=REQUEST_CHANGES (instead of COMMENT) whenever there are
@@ -323,7 +331,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // auto-enabled. Only fires when explicitly turned on AND a critical/high
   // finding exists (resolveReviewEvent enforces both conditions). Requires
   // `pull-requests: write` (already needed to post reviews).
-  const strictMode = isTruthy(read(inputs, 'ZAI_STRICT_MODE'));
+  const strictMode = readOptInBool(inputs, 'ZAI_STRICT_MODE');
 
   // Phase 8.1: CODEOWNERS-aware reviewer suggestions. Read-only by default —
   // when `ZAI_SUGGEST_REVIEWERS=true`, the bot parses the PR's CODEOWNERS,
@@ -335,8 +343,8 @@ export function loadConfig(inputs = {}, options = {}) {
   // fetched from the head SHA and treated as UNTRUSTED (attacker-controllable
   // in fork PRs); only `@user` handles (no `@org/team`) are forwarded to
   // requestReviewers (teams require extra perms and are summary-only).
-  const suggestReviewers = isTruthy(read(inputs, 'ZAI_SUGGEST_REVIEWERS'));
-  const autoAssignReviewers = isTruthy(read(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS'));
+  const suggestReviewers = readOptInBool(inputs, 'ZAI_SUGGEST_REVIEWERS');
+  const autoAssignReviewers = readOptInBool(inputs, 'ZAI_AUTO_ASSIGN_REVIEWERS');
 
   // Phase 8.2: learnings / memory (`.zai/learnings.yml`). The master switch
   // defaults to FALSE — opt-in — because the learnings file is a NEW trust
@@ -347,7 +355,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // clearly match a recorded "previously-reviewed / won't-fix" pattern. The
   // suppression is conservative (glob + case-insensitive substring on BOTH
   // axes); the prompt also carries the accepted patterns as additive context.
-  const learningsEnabled = isTruthy(read(inputs, 'ZAI_LEARNINGS_ENABLED'));
+  const learningsEnabled = readOptInBool(inputs, 'ZAI_LEARNINGS_ENABLED');
 
   const config = {
     apiKey,

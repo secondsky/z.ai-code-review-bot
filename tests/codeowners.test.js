@@ -438,6 +438,11 @@ function makeOctokitWithContent(content, opts = {}) {
             err.status = 404;
             throw err;
           }
+          if (opts.returnRawString) {
+            // Non-base64 response: the raw string IS the file content (the
+            // learnings/repo-config convention, now shared via repo-file.js).
+            return { data: content };
+          }
           return {
             data: {
               content: encoded,
@@ -516,6 +521,22 @@ describe('loadCodeowners — happy path', () => {
     const paths = octokit.__calls.getContent.map((c) => c.path);
     expect(paths).toEqual(['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']);
     expect(rules).toEqual([{ pattern: 'docs/**', owners: ['@docs'] }]);
+  });
+
+  it('F-REPOFILE: loads a raw-string payload (non-base64 data) — alignment with the shared loader', async () => {
+    // The old fetchPath only accepted `{content, encoding}` responses; the
+    // shared repo-file loader also accepts a raw-string `data` payload (the
+    // learnings/repo-config convention). Pin the alignment fix.
+    const octokit = makeOctokitWithContent('src/** @fe\n', {
+      foundPath: 'CODEOWNERS',
+      returnRawString: true,
+    });
+    const { core } = makeCore();
+    const rules = await loadCodeowners(
+      { octokit, context: makeContext('sha-4') },
+      { core },
+    );
+    expect(rules).toEqual([{ pattern: 'src/**', owners: ['@fe'] }]);
   });
 });
 

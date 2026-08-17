@@ -25,8 +25,10 @@
  * `reviews` and `scanners` top-level keys, so it would silently drop a
  * `learnings:` key. Rather than widen that shared parser's surface (and risk a
  * regression for repo-config), this module ships a tiny subset parser that only
- * understands the learnings shape. It reuses the same comment-strip + unquote
- * idioms so the dialect matches `.zai.yml`.
+ * understands the learnings shape. The lexical idioms (comment-strip +
+ * unquote) are shared via `./yaml-lex.js` — the single hardened home, so the
+ * dialect matches `.zai.yml` — while the learnings parser itself remains
+ * learnings-only.
  *
  * No `@actions/core` import; `core` is injected via `deps`.
  *
@@ -34,6 +36,8 @@
  */
 
 import { matchesAnyPattern } from './glob.js';
+import { fetchRepoText, resolveHeadSha } from './repo-file.js';
+import { stripComment, unquote } from './yaml-lex.js';
 
 /** Hard cap on the size of a `.zai/learnings.yml` we will parse (cost/DoS guard). */
 const MAX_LEARNINGS_BYTES = 64 * 1024; // 64 KiB
@@ -47,80 +51,6 @@ const MAX_FIELD_CHARS = 1000;
 /* ------------------------------------------------------------------ *
  * Minimal YAML subset parser (learnings-only)
  * ------------------------------------------------------------------ */
-
-/**
- * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
- * single- or double-quoted string. Mirrors `stripComment` in repo-config.js so
- * the dialect matches.
- *
- * @param {string} line
- * @returns {string}
- */
-function stripComment(line) {
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "'" && !inDouble) {
-      // W8-4: only treat `'` as a quote toggle when NOT embedded in a word.
-      // An apostrophe glued to a letter/digit (like in `don't` or `it's`)
-      // is not a delimiter; treating it as one flips inSingle permanently and
-      // disables comment stripping for the rest of the line. Mirrors the guard
-      // in repo-config.js stripComment.
-      // W12-4b: the guard must NOT apply when already inside a single-quoted
-      // string — a `'` inside is always the closing delimiter.
-      if (inSingle) {
-        inSingle = false;
-      } else {
-        const prev = i > 0 ? line[i - 1] : '';
-        if (!/[A-Za-z0-9]/.test(prev)) {
-          inSingle = !inSingle;
-        }
-      }
-    } else if (ch === '"' && !inSingle) {
-      // W15-A6-6: mirror the W8-4 apostrophe guard for `"` — a double quote
-      // glued to a word character (like the inches mark in `5" floppy`) is
-      // not a delimiter; treating it as one flips inDouble permanently and
-      // disables comment stripping for the rest of the line (the trailing
-      // `# comment` then survives into the parsed value). As with W8-4, the
-      // guard must NOT apply when already inside a double-quoted string — a
-      // `"` inside is always the closing delimiter (values legitimately end
-      // in word characters, e.g. `"x # not comment"`).
-      if (inDouble) {
-        inDouble = false;
-      } else {
-        const prev = i > 0 ? line[i - 1] : '';
-        if (!/[A-Za-z0-9]/.test(prev)) {
-          inDouble = !inDouble;
-        }
-      }
-    } else if (ch === '#' && !inSingle && !inDouble) {
-      const prev = i > 0 ? line[i - 1] : '';
-      if (i === 0 || /\s/.test(prev)) {
-        return line.slice(0, i);
-      }
-    }
-  }
-  return line;
-}
-
-/**
- * Unquote a YAML scalar value: strips matching surrounding single or double
- * quotes. Returns the input unchanged when not quoted.
- *
- * @param {string} v
- * @returns {string}
- */
-function unquote(v) {
-  if (typeof v !== 'string' || v.length < 2) return v;
-  if (
-    (v[0] === '"' && v[v.length - 1] === '"') ||
-    (v[0] === "'" && v[v.length - 1] === "'")
-  ) {
-    return v.slice(1, -1);
-  }
-  return v;
-}
 
 /**
  * Parse a minimal YAML subset into `{ learnings: Array<{file, pattern, reason?}> }`.
@@ -402,26 +332,13 @@ export function formatLearningsForPrompt(learnings) {
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve the PR head SHA from `opts.headSha` or
- * `context.payload.pull_request.head.sha`.
- *
- * @param {Object} opts
- * @returns {string}
- */
-function resolveHeadSha(opts) {
-  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
-  const sha = opts.context?.payload?.pull_request?.head?.sha;
-  return typeof sha === 'string' ? sha : '';
-}
-
-/**
  * Load `.zai/learnings.yml` from the PR's head SHA. Treated as UNTRUSTED.
  *
  * Flow:
  *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
- *   2. Fetch the file via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
- *   3. Base64-decode the content.
- *   4. Parse with {@link parseLearnings} (validates + drops bad entries).
+ *   2. Fetch + base64-decode the file via the shared
+ *      {@link fetchRepoText|repo-file} pipeline (dual size caps enforced there).
+ *   3. Parse with {@link parseLearnings} (validates + drops bad entries).
  *
  * On ANY error (404, parse failure, oversized, missing SHA, missing owner/repo),
  * `deps.core.warning(...)` is called and `[]` is returned. This function NEVER
@@ -456,65 +373,23 @@ export async function loadLearnings(opts = {}, deps = {}) {
     return [];
   }
 
-  let data;
-  try {
-    const resp = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path,
-      ref: headSha,
-    });
-    data = resp?.data;
-  } catch (error) {
-    const status = error?.status;
-    if (status === 404) {
-      // 404 is the common case (most repos don't have a learnings file); still
-      // surface a warning so operators can observe it.
-      warn(`learnings: no ${path} found at ${headSha.slice(0, 7)} (404).`);
-      return [];
-    }
-    warn(
-      `learnings: failed to fetch ${path} (${status ?? 'unknown'}): ` +
-        `${error?.message ?? String(error)}`,
-    );
+  // Fetch + decode via the shared repo-file pipeline (F-REPOFILE). Any
+  // not-ok outcome (404, fetch failure, oversized, decode failure, non-file)
+  // collapses to the historical inline warning + `[]`.
+  const outcome = await fetchRepoText({
+    octokit,
+    owner,
+    repo,
+    path,
+    ref: headSha,
+    maxBytes: MAX_LEARNINGS_BYTES,
+    label: 'learnings',
+  });
+  if (!outcome.ok) {
+    warn(outcome.message);
     return [];
   }
-
-  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
-  // a directory or a non-file response is treated as "no learnings".
-  let text;
-  if (data && typeof data.content === 'string') {
-    const size = typeof data.size === 'number' ? data.size : data.content.length;
-    if (size > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} is ${size} bytes (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-    try {
-      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
-    } catch {
-      warn(`learnings: ${path} could not be base64-decoded; skipping.`);
-      return [];
-    }
-    if (typeof text === 'string' && text.length > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} decodes to ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-  } else if (typeof data === 'string') {
-    text = data;
-    if (text.length > MAX_LEARNINGS_BYTES) {
-      warn(
-        `learnings: ${path} is ${text.length} chars (cap ${MAX_LEARNINGS_BYTES}); skipping.`,
-      );
-      return [];
-    }
-  } else {
-    // Not a file (directory listing or symlink) — no learnings.
-    return [];
-  }
+  const text = outcome.text;
 
   let parsed;
   try {

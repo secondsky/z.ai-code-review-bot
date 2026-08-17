@@ -12,16 +12,20 @@
  *   - No `@actions/core` import; no direct network (callApi + injected octokit).
  *   - callApi rejection → a fixed short error comment (NOT the raw error).
  */
-import { postComment, getPRContext } from './_shared.js';
-import { wrapUntrusted } from '../prompt.js';
 import {
-  getChangedFiles,
-  filterExcludedFiles,
-  filterPatchableFiles,
-} from '../changed-files.js';
+  postComment,
+  getPRContext,
+  buildDiffContext,
+  MAX_CONTEXT_CHARS,
+  runCommand,
+} from './_shared.js';
+import { wrapUntrusted } from '../prompt.js';
+import { getChangedFiles } from '../changed-files.js';
 
-/** Soft cap on the diff context bundled into the prompt. */
-const MAX_CONTEXT_CHARS = 8000;
+// F-DIFFCTX: buildDiffContext is owned by _shared.js (it was byte-identical
+// here and in impact.js). Re-exported to preserve this module's public
+// surface (tests import it from ask.js).
+export { buildDiffContext } from './_shared.js';
 
 /**
  * CMD-9: hard cap on the user-supplied question length. Prevents a
@@ -37,64 +41,9 @@ const MAX_QUESTION_CHARS = 4000;
  */
 const MAX_BODY_CHARS = 4000;
 
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
-
 /** Guidance when the user issues `/zai ask` with no question. */
 const EMPTY_ARGS_COMMENT =
   '> Please provide a question: `/zai ask <question>`';
-
-/**
- * Build the diff context block from patchable files, capped to a char budget.
- *
- * Pure (exported for testing).
- *
- * @param {Array<{filename: string, patch?: string}>} files
- * @param {number} [maxChars]
- * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
- *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
- *   review.js: production config always carries the default exclude list).
- * @returns {string}
- */
-export function buildDiffContext(
-  files,
-  maxChars = MAX_CONTEXT_CHARS,
-  excludePatterns,
-) {
-  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
-  // filter, mirroring review.js's W15-A8-8 fix. Previously a default-excluded
-  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
-  // and ate the ENTIRE budget — the model saw only the lockfile and real
-  // changes (e.g. src/auth.js) were invisible to /zai ask.
-  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
-  const patchable = filterPatchableFiles(notExcluded);
-  if (patchable.length === 0) return '(no textual diffs available)';
-  const lines = [];
-  let used = 0;
-  let skippedOversized = false;
-  for (const f of patchable) {
-    const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
-    // `break` stopped at the first oversized diff, so a huge file FIRST in
-    // the list caused '(no textual diffs available)' even though later,
-    // smaller entries fit the budget.
-    if (used + entry.length > maxChars) {
-      skippedOversized = true;
-      continue;
-    }
-    lines.push(entry);
-    used += entry.length + 2; // +2 for the '\n\n' joiner
-  }
-  if (lines.length === 0) {
-    // Every entry was oversized (there WAS textual diff content; it just
-    // didn't fit). Say the budget was exceeded rather than falsely claiming
-    // no textual diffs exist.
-    return skippedOversized
-      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
-      : '(no textual diffs available)';
-  }
-  return lines.join('\n\n');
-}
 
 /**
  * Build the ask USER prompt. Pure (exported for testing).
@@ -174,11 +123,13 @@ export async function handleAskCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('ask', { core, post }, async () => {
     // W16-B4-2: this post (like every other in the handler) must be inside
-    // the try — it previously executed OUTSIDE it, so a transient 502 on this
-    // single createComment rejected the whole handler and failed the entire
-    // action (the router dispatches with no catch).
+    // the guarded body — it previously executed OUTSIDE it, so a transient
+    // 502 on this single createComment rejected the whole handler and failed
+    // the entire action (the router dispatches with no catch).
     if (question === '') {
       await post(EMPTY_ARGS_COMMENT);
       return;
@@ -201,14 +152,5 @@ export async function handleAskCommand(
 
     const answer = await callApi(config.apiKey, config.model, prompt);
     await post(answer);
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`ask handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: nothing more we can do; never throw. */
-    }
-  }
+  });
 }

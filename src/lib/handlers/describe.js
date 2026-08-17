@@ -13,13 +13,10 @@
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
-import { postComment, upsertPrDescription } from './_shared.js';
+import { postComment, upsertPrDescription, runCommand } from './_shared.js';
 import { sanitizeModelOutput } from '../sanitize-output.js';
 import { wrapUntrusted } from '../prompt.js';
 import { getChangedFiles } from '../changed-files.js';
-
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
 
 /** Cap on the number of commits fetched for the prompt. */
 const MAX_COMMITS = 30;
@@ -107,7 +104,9 @@ export async function handleDescribeCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('describe', { core, post }, async () => {
     const [commits, files] =
       typeof pullNumber === 'number'
         ? await Promise.all([
@@ -153,14 +152,5 @@ export async function handleDescribeCommand(
         }
       }
     }
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`describe handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: never throw out of the handler. */
-    }
-  }
+  });
 }

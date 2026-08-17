@@ -735,6 +735,12 @@ describe('scanPatterns — ast-grep path (fake runBinary)', () => {
       line: 7,
       rule: 'astgrep:eval',
     });
+    // F-RULEINDEX pin: `ast-grep run` output carries no ruleId, so severity
+    // and title must come from the driver-owned inline enrichment (the custom
+    // rule), NOT from mapAstGrepFinding's 'match' fallback ('medium' /
+    // 'ast-grep rule "match" matched').
+    expect(result.findings[0].severity).toBe('high');
+    expect(result.findings[0].title).toBe('Use of eval()');
   });
 
   it('runs ONLY the languages present in the changed files (js-only diff) [W15-A5-2]', async () => {

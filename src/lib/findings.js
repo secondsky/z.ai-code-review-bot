@@ -344,26 +344,9 @@ export function normalizeFinding(finding) {
     line = parseInt(f.line, 10);
   }
 
-  // Pre-coerce + pre-truncate + pre-defaulted copy for validation: validate
-  // the coerced enum values, the truncated title, and the defaulted optionals
-  // so `CRITICAL` + long titles + omitted optionals all pass after normalize.
-  const coerced = {
-    ...f,
-    file,
-    line,
-    severity,
-    confidence,
-    category,
-    title,
-    description,
-    evidence,
-    suggestion,
-    rule,
-  };
-
-  const { ok } = validateFinding(coerced);
-  if (!ok) return null;
-
+  // Validate the pre-coerced + pre-truncated + pre-defaulted object directly:
+  // validateFinding reads only the ten schema keys and ignores extras
+  // (see its JSDoc), so a spread copy carrying `...f` was redundant here.
   const normalized = {
     file,
     line,
@@ -376,6 +359,10 @@ export function normalizeFinding(finding) {
     suggestion,
     rule,
   };
+
+  const { ok } = validateFinding(normalized);
+  if (!ok) return null;
+
   // Drive output through SCHEMA_KEYS so the shape has a single source of truth
   // and any future schema field additions can't leak extras into the output.
   return Object.fromEntries(SCHEMA_KEYS.map((k) => [k, normalized[k]]));
@@ -565,25 +552,20 @@ function buildAllowedFilesSet(changedFiles) {
 }
 
 /**
- * Tolerant parser: extract findings from raw model output.
+ * Normalize each element of an ALREADY-PARSED findings array, drop anything
+ * that fails the anti-hallucination file filter (file must be in
+ * `allowedFiles`), and dedup by
+ * `${file}:${line ?? 'null'}:${title.toLowerCase()}` (first wins).
  *
- * Strategies (JSON array, fenced code block, greedy bracket scan), normalize
- * each element via {@link normalizeFinding}, drop anything that fails the
- * anti-hallucination file filter (file must be in `changedFiles`), and dedup
- * by `${file}:${line ?? 'null'}:${title.toLowerCase()}` (first wins).
+ * Module-private shared step of {@link parseFindings} (hostile raw text) and
+ * {@link parseStructuredReview} (already-parsed envelope findings — skips the
+ * JSON.stringify round-trip through parseFindings).
  *
- * Never throws. Returns `[]` on any non-parseable input.
- *
- * @param {string} rawModelOutput
- * @param {{ changedFiles?: unknown[] }} [options]
+ * @param {unknown[]} array
+ * @param {Set<string>} allowedFiles
  * @returns {Record<string, unknown>[]}
  */
-export function parseFindings(rawModelOutput, options = {}) {
-  const allowedFiles = buildAllowedFilesSet(options?.changedFiles);
-
-  const array = extractJsonArray(rawModelOutput);
-  if (!array) return [];
-
+function collectFindings(array, allowedFiles) {
   /** @type {Record<string, unknown>[]} */
   const out = [];
   const seen = new Set();
@@ -607,6 +589,29 @@ export function parseFindings(rawModelOutput, options = {}) {
   return out;
 }
 
+/**
+ * Tolerant parser: extract findings from raw model output.
+ *
+ * Strategies (JSON array, fenced code block, greedy bracket scan), then
+ * {@link collectFindings} (normalize each element via {@link normalizeFinding},
+ * anti-hallucination file filter against `changedFiles`, dedup by
+ * `${file}:${line ?? 'null'}:${title.toLowerCase()}` — first wins).
+ *
+ * Never throws. Returns `[]` on any non-parseable input.
+ *
+ * @param {string} rawModelOutput
+ * @param {{ changedFiles?: unknown[] }} [options]
+ * @returns {Record<string, unknown>[]}
+ */
+export function parseFindings(rawModelOutput, options = {}) {
+  const allowedFiles = buildAllowedFilesSet(options?.changedFiles);
+
+  const array = extractJsonArray(rawModelOutput);
+  if (!array) return [];
+
+  return collectFindings(array, allowedFiles);
+}
+
 // ---------------------------------------------------------------------------
 // parseStructuredReview
 // ---------------------------------------------------------------------------
@@ -614,7 +619,9 @@ export function parseFindings(rawModelOutput, options = {}) {
 /**
  * Tolerant parser for the v2 structured-review envelope. The model emits a
  * JSON object `{"summary": "...", "findings": [...]}`. This extracts the
- * summary string and delegates the findings array to {@link parseFindings}.
+ * summary string and runs the findings array through {@link collectFindings}
+ * (the same normalize / anti-hallucination-filter / dedup pipeline that
+ * {@link parseFindings} applies after extracting an array from raw text).
  *
  * Strategies for the envelope (tried in order):
  *   a. The entire trimmed text as JSON (if it starts with `{`).
@@ -642,7 +649,14 @@ export function parseStructuredReview(rawModelOutput, options = {}) {
     const summary =
       typeof parsed.summary === 'string' ? parsed.summary : '';
     const findingsRaw = Array.isArray(parsed.findings) ? parsed.findings : [];
-    const findings = parseFindings(JSON.stringify(findingsRaw), options);
+    // findingsRaw is already a parsed array — feed it straight to the shared
+    // collectFindings step instead of round-tripping through
+    // parseFindings(JSON.stringify(...)) (whose extraction/repair strategies
+    // are dead on JSON.parse-derived input).
+    const findings = collectFindings(
+      findingsRaw,
+      buildAllowedFilesSet(options?.changedFiles),
+    );
     return { summary, findings };
   }
 
@@ -1238,6 +1252,137 @@ export function appendIncrementalNote(summary, suppressedCount, learningsSuppres
   const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
   const note = `_${what} suppressed (incremental review)._`;
   return base.length === 0 ? note : `${base}\n\n${note}`;
+}
+
+// ---------------------------------------------------------------------------
+// Skipped-files/portion note (shared by index.js and schedule.js)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
+ * into a rendered body.
+ *
+ * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
+ * review, but nothing surfaced that to the reviewer — a run that skipped
+ * files still posted a bare "No issues found. The changes look good. ✅".
+ * When the structured pipeline reports `skippedFiles > 0`, an italic note
+ * (mirroring the `_N findings truncated to cap._` style the summary
+ * renderers use) is inserted just before the trailing marker so it lands in
+ * the posted body of BOTH delivery paths (inline review body and summary
+ * comment). Rendering happens AFTER the renderer returns — because the note
+ * must appear on every path without touching each renderer.
+ *
+ * W18-D2-3: skippedFiles counts only zero-entry files; PARTIAL drops of
+ * multi-chunk files (skippedEntries) were surfaced nowhere — a file with
+ * 2/15 chunks reviewed still posted the bare all-clear. When
+ * `skippedEntries > 0` a matching portions note is rendered too (when both
+ * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
+ * "N file(s) (M chunk(s) unreviewed)" style).
+ *
+ * W20-F1-1: context-limit drops (contextSkippedEntries — single-entry
+ * batches skipped by executeStructuredBatch when even one entry overflows
+ * the model context) get their OWN note with the correct cause. Summing
+ * them into skippedEntries (the W19-E1-1 approach) rendered the hard-coded
+ * "(MAX_DIFF_CHARS cap)" cause for context drops — with the cap disabled
+ * that was the wrong cause and the wrong implied remedy (real remedies:
+ * smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context model).
+ *
+ * F-NOTES: extracted verbatim from src/index.js (and its byte-identical twin
+ * in src/lib/schedule.js) so both delivery paths share ONE copy — the two
+ * copies had already drifted once (W19-E1-1 vs W20-F1-1) via cross-copy
+ * bug-fixes. Behavior is byte-identical. The MARKER it searches for is the
+ * module-local literal above (byte-equal to comments.js's export).
+ *
+ * @param {string} body   Rendered body ending in the marker (typically).
+ * @param {number} skippedFiles  Count of files with zero reviewed entries.
+ * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
+ * @param {number} [contextSkippedEntries]  Count of entries dropped by the
+ *   model context limit (NOT MAX_DIFF_CHARS).
+ * @returns {string}
+ */
+export function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
+  const n =
+    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
+      ? Math.floor(skippedFiles)
+      : 0;
+  const e =
+    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
+      ? Math.floor(skippedEntries)
+      : 0;
+  const c =
+    typeof contextSkippedEntries === 'number' &&
+    Number.isFinite(contextSkippedEntries) &&
+    contextSkippedEntries > 0
+      ? Math.floor(contextSkippedEntries)
+      : 0;
+  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
+    return body;
+  }
+  const notes = [];
+  if (n > 0) {
+    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (e > 0) {
+    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
+  }
+  if (c > 0) {
+    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
+  }
+  const note = notes.join('\n\n');
+  const idx = body.lastIndexOf(MARKER);
+  if (idx === -1) return `${body}\n\n${note}`;
+  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
+}
+
+/**
+ * F-TRAILERS: the LENIENT re-extraction of the trusted zai-* trailers from a
+ * review/comment body, shared by the two fallback-comment paths (src/index.js
+ * and src/lib/schedule.js). Each regex is byte-identical to the code that was
+ * previously inlined at both call sites (W12-1 trailer re-append): `\s*` after
+ * `<!--` and `[^>]*` bodies ACCEPT no-space variants like
+ * `<!--zai-hashes:...-->`.
+ *
+ * This leniency is intentional and DIFFERENT from the canonical STRICT grammar
+ * of parseFindingsHashBlock above (`<!-- zai-hashes:(.*?) -->` — exact spaces),
+ * which stays untouched for suppression: re-extraction only re-appends
+ * trailers that appendTrailers wrote from trusted literals (post-sanitize
+ * re-append), so the wider acceptance here is safe; suppression must stay
+ * strict so a model-forged no-space variant can never register as state.
+ * First occurrence wins (oldest trailer), matching the old inline semantics.
+ *
+ * @param {string} body  the review/comment body to scan.
+ * @returns {{marker: string|null, hashBlock: string|null, shaBlock: string|null}}
+ */
+export function extractTrailers(body) {
+  if (typeof body !== 'string') return { marker: null, hashBlock: null, shaBlock: null };
+  const marker = body.match(/<!--\s*zai-code-review\s*-->/);
+  const hashBlock = body.match(/<!--\s*zai-hashes:[^>]*-->/);
+  const shaBlock = body.match(/<!--\s*zai-sha:[^>]*-->/);
+  return { marker: marker?.[0] ?? null, hashBlock: hashBlock?.[0] ?? null, shaBlock: shaBlock?.[0] ?? null };
+}
+
+/**
+ * The hidden HTML comment that embeds the PR head SHA in a posted
+ * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
+ * body contains BOTH the marker AND the head SHA; without this block the
+ * review body carries only the fixed marker literal, so the SHA match never
+ * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
+ * "only new/changed PRs" guarantee).
+ *
+ * The block is an HTML comment so it is invisible in the rendered comment.
+ * Returns '' when `sha` is empty so callers can append unconditionally.
+ *
+ * F-TRAILERS: moved verbatim from src/lib/schedule.js — its primary consumer
+ * is src/index.js (a reverse dependency); schedule.js keeps a compat
+ * re-export. The trailer-protocol constants now live with their parsers in
+ * this one module.
+ *
+ * @param {string} sha  the PR head SHA.
+ * @returns {string}
+ */
+export function buildShaBlock(sha) {
+  if (typeof sha !== 'string' || sha.length === 0) return '';
+  return `<!-- zai-sha: ${sha} -->`;
 }
 
 // Exported internals for testing (none beyond the public exports today).

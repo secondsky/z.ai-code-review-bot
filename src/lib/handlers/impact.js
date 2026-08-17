@@ -13,19 +13,19 @@
  * Contract invariants: same `deps = {}` seam; same injected `callApi`; NEVER
  * throws; no `@actions/core` import; no direct network.
  */
-import { postComment } from './_shared.js';
-import { wrapUntrusted } from '../prompt.js';
 import {
-  getChangedFiles,
-  filterExcludedFiles,
-  filterPatchableFiles,
-} from '../changed-files.js';
+  postComment,
+  buildDiffContext,
+  MAX_CONTEXT_CHARS,
+  runCommand,
+} from './_shared.js';
+import { wrapUntrusted } from '../prompt.js';
+import { getChangedFiles } from '../changed-files.js';
 
-/** Fixed error comment (no raw error leakage). */
-const ERROR_COMMENT = '> ⚠️ Z.ai request failed. Please try again.';
-
-/** Cap on the diff context bundled into the prompt. */
-const MAX_CONTEXT_CHARS = 8000;
+// F-DIFFCTX: buildDiffContext is owned by _shared.js (it was byte-identical
+// here and in ask.js). Re-exported to preserve this module's public surface
+// (tests import it from impact.js).
+export { buildDiffContext } from './_shared.js';
 
 /**
  * Emoji → severity-key map, matching the prompt's requested severity prefix
@@ -102,57 +102,6 @@ export function parseSeverity(text) {
     if (re.test(firstLine)) return SEVERITY_KEYS[key];
   }
   return null;
-}
-
-/**
- * Build the diff context block from patchable files, capped to a char budget.
- * Pure (exported for testing).
- *
- * @param {Array<{filename: string, patch?: string}>} files
- * @param {number} [maxChars]
- * @param {string[]} [excludePatterns]  Globs to drop BEFORE the patchable
- *   filter (W16-B4-4). `undefined`/non-array → nothing is excluded (mirrors
- *   review.js: production config always carries the default exclude list).
- * @returns {string}
- */
-export function buildDiffContext(
-  files,
-  maxChars = MAX_CONTEXT_CHARS,
-  excludePatterns,
-) {
-  // W16-B4-4: drop excluded files (lockfiles etc.) BEFORE the patchable
-  // filter, mirroring review.js's W15-A8-8 fix (identical copy of the fix in
-  // ask.js's buildDiffContext). Previously a default-excluded
-  // package-lock.json (typically FIRST and huge) passed filterPatchableFiles
-  // and ate the ENTIRE budget — real changes were invisible to /zai impact.
-  const notExcluded = filterExcludedFiles(files || [], excludePatterns);
-  const patchable = filterPatchableFiles(notExcluded);
-  if (patchable.length === 0) return '(no textual diffs available)';
-  const lines = [];
-  let used = 0;
-  let skippedOversized = false;
-  for (const f of patchable) {
-    const entry = `### ${f.filename}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    // W15-A4-4: SKIP an over-budget entry and keep scanning — the previous
-    // `break` stopped at the first oversized diff, so a huge file FIRST in
-    // the list caused '(no textual diffs available)' even though later,
-    // smaller entries fit the budget.
-    if (used + entry.length > maxChars) {
-      skippedOversized = true;
-      continue;
-    }
-    lines.push(entry);
-    used += entry.length + 2;
-  }
-  if (lines.length === 0) {
-    // Every entry was oversized (there WAS textual diff content; it just
-    // didn't fit). Say the budget was exceeded rather than falsely claiming
-    // no textual diffs exist.
-    return skippedOversized
-      ? `(diffs omitted: exceeded ${maxChars}-char budget)`
-      : '(no textual diffs available)';
-  }
-  return lines.join('\n\n');
 }
 
 /**
@@ -280,7 +229,9 @@ export async function handleImpactCommand(
   const repo = context?.repo?.repo;
   const pullNumber = context?.payload?.issue?.number;
 
-  try {
+  // F-RUNCOMMAND: the outer never-throw scaffold (warning + ERROR_COMMENT
+  // fallback post) is owned by runCommand in _shared.js.
+  return runCommand('impact', { core, post }, async () => {
     const files =
       typeof pullNumber === 'number'
         ? await getFiles({ octokit, owner, repo, pullNumber })
@@ -318,14 +269,5 @@ export async function handleImpactCommand(
         }
       }
     }
-  } catch (error) {
-    if (core?.warning) {
-      core.warning(`impact handler failed: ${error?.message ?? error}`);
-    }
-    try {
-      await post(ERROR_COMMENT);
-    } catch {
-      /* last-resort: never throw out of the handler. */
-    }
-  }
+  });
 }

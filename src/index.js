@@ -47,6 +47,9 @@ import {
   isForkPullRequest,
   getCommenter,
   isBotComment,
+  isPullRequestEvent,
+  isIssueCommentEvent,
+  isScheduleEvent,
 } from './lib/events.js';
 import { loadConfig } from './lib/config.js';
 import { createApiClient } from './lib/api.js';
@@ -75,6 +78,15 @@ import {
   // W18-D1-3: extracted verbatim into the shared pure module so schedule.js
   // can render the identical suppression note (index.js behavior unchanged).
   appendIncrementalNote,
+  // F-NOTES: extracted verbatim into the shared pure module so the index and
+  // schedule paths render the identical skipped-files/portion notes (the
+  // W19-E1-1→W20-F1-1 cross-copy drift can no longer happen).
+  insertSkippedFilesNote,
+  // F-TRAILERS: the lenient zai-* trailer re-extractor (fallback path) and
+  // the SHA-block builder now live in findings.js with the rest of the
+  // trailer-protocol code (was a reverse dependency on schedule.js).
+  extractTrailers,
+  buildShaBlock,
 } from './lib/findings.js';
 import { formatWalkthroughSummary } from './lib/walkthrough.js';
 import { partitionFindings } from './lib/diff.js';
@@ -89,7 +101,7 @@ import {
 import { parseCommand } from './lib/commands.js';
 import { HANDLERS } from './lib/handlers/index.js';
 import { getPRContext } from './lib/handlers/_shared.js';
-import { runScheduledReview, buildShaBlock } from './lib/schedule.js';
+import { runScheduledReview } from './lib/schedule.js';
 import { runScanners, formatScannerContext } from './lib/scanners/index.js';
 import { ensureBinary } from './lib/scanners/ensure-binary.js';
 import { scanSecrets } from './lib/scanners/secrets.js';
@@ -383,76 +395,6 @@ function buildFallbackBody(reviewBody, findings, reviewerName) {
 }
 
 /**
- * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
- * into a rendered body.
- *
- * The cumulative MAX_DIFF_CHARS cap (W16-B3-4) can drop whole files from the
- * review, but nothing surfaced that to the reviewer — a run that skipped
- * files still posted a bare "No issues found. The changes look good. ✅".
- * When the structured pipeline reports `skippedFiles > 0`, an italic note
- * (mirroring the `_N findings truncated to cap._` style the summary
- * renderers use) is inserted just before the trailing marker so it lands in
- * the posted body of BOTH delivery paths (inline review body and summary
- * comment). Rendering happens here — after the renderer returns — because
- * the note must appear on every path without touching each renderer.
- *
- * W18-D2-3: skippedFiles counts only zero-entry files; PARTIAL drops of
- * multi-chunk files (skippedEntries) were surfaced nowhere — a file with
- * 2/15 chunks reviewed still posted the bare all-clear. When
- * `skippedEntries > 0` a matching portions note is rendered too (when both
- * kinds fired, BOTH notes render, mirroring the structured-pipeline log's
- * "N file(s) (M chunk(s) unreviewed)" style).
- *
- * W20-F1-1: context-limit drops (contextSkippedEntries — single-entry
- * batches skipped by executeStructuredBatch when even one entry overflows
- * the model context) get their OWN note with the correct cause. Summing
- * them into skippedEntries (the W19-E1-1 approach) rendered the hard-coded
- * "(MAX_DIFF_CHARS cap)" cause for context drops — with the cap disabled
- * that was the wrong cause and the wrong implied remedy (real remedies:
- * smaller ZAI_MAX_PATCH_CHARS chunks or a larger-context model).
- *
- * @param {string} body   Rendered body ending in the marker (typically).
- * @param {number} skippedFiles  Count of files with zero reviewed entries.
- * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
- * @param {number} [contextSkippedEntries]  Count of entries dropped by the
- *   model context limit (NOT MAX_DIFF_CHARS).
- * @returns {string}
- */
-function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
-  const n =
-    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
-      ? Math.floor(skippedFiles)
-      : 0;
-  const e =
-    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
-      ? Math.floor(skippedEntries)
-      : 0;
-  const c =
-    typeof contextSkippedEntries === 'number' &&
-    Number.isFinite(contextSkippedEntries) &&
-    contextSkippedEntries > 0
-      ? Math.floor(contextSkippedEntries)
-      : 0;
-  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
-    return body;
-  }
-  const notes = [];
-  if (n > 0) {
-    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (e > 0) {
-    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (c > 0) {
-    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
-  }
-  const note = notes.join('\n\n');
-  const idx = body.lastIndexOf(MARKER);
-  if (idx === -1) return `${body}\n\n${note}`;
-  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
-}
-
-/**
  * Pull every ZAI_* + GITHUB_TOKEN input into a plain object via core.getInput.
  * `core.getInput` returns '' for unset inputs, which loadConfig handles.
  *
@@ -559,7 +501,9 @@ export async function run(context, deps = {}) {
   // available — operators who wire `pull_request_target` are responsible for
   // ensuring their config does not leak secrets into review output (the
   // sanitizer + prompt-hardening layers remain the controls there).
-  if (event === 'pull_request' || event === 'pull_request_target') {
+  // The router below now consumes isPullRequestEvent() so events.js is the
+  // single owner of event classification.
+  if (isPullRequestEvent(context)) {
     // INT-2: only react to PR actions that warrant a fresh review. Without
     // this filter the action also fires on `closed`, `labeled`, `edited`, etc.
     // — burning API credits and posting duplicate reviews. Mirrors the
@@ -990,10 +934,12 @@ export async function run(context, deps = {}) {
       0,
       (result.metadata.totalFindingsBeforeCap || 0) - result.findings.length,
     );
-    // W17-C1-3: the cumulative-cap drop count, threaded into BOTH metadata
-    // objects below and rendered as an italic note in the posted body —
-    // previously nothing consumed it, so a run that skipped files posted a
-    // bare "No issues found" all-clear.
+    // W17-C1-3: the cumulative-cap drop count, rendered as an italic note in
+    // the posted body — previously nothing consumed it, so a run that skipped
+    // files posted a bare "No issues found" all-clear.
+    // F-NOTES: the renderers never read `skippedFiles` from their metadata
+    // (the note inserter consumes the counts directly), so the unread
+    // output-side metadata keys were removed.
     const skippedFileCount =
       typeof result.metadata.skippedFiles === 'number' && result.metadata.skippedFiles > 0
         ? result.metadata.skippedFiles
@@ -1016,7 +962,6 @@ export async function run(context, deps = {}) {
       reviewerName: config.reviewerName,
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
-      skippedFiles: skippedFileCount,
       // Phase 7: walkthrough context for the summary-only section of the
       // review body. When config.walkthrough is true, buildReviewBody renders
       // the summary-only findings as dependency-ordered cohort sections
@@ -1090,13 +1035,13 @@ export async function run(context, deps = {}) {
         // the body (stripping any model-forged zai-* comments) and then
         // re-appends only the known trusted trailers. Extract them from the
         // reviewBody (they were appended by appendTrailers from trusted literals).
+        // F-TRAILERS: the lenient re-extraction regexes now live in
+        // findings.js (extractTrailers) — shared with schedule.js's fallback.
         const fallbackTrailers = [];
-        const markerMatch = reviewBody.match(/<!--\s*zai-code-review\s*-->/);
-        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
-        const hashMatch = reviewBody.match(/<!--\s*zai-hashes:[^>]*-->/);
-        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
-        const shaMatch = reviewBody.match(/<!--\s*zai-sha:[^>]*-->/);
-        if (shaMatch) fallbackTrailers.push(shaMatch[0]);
+        const { marker, hashBlock, shaBlock } = extractTrailers(reviewBody);
+        if (marker) fallbackTrailers.push(marker);
+        if (hashBlock) fallbackTrailers.push(hashBlock);
+        if (shaBlock) fallbackTrailers.push(shaBlock);
         await postFallbackCommentFn({
           octokit,
           context: reviewContext,
@@ -1121,7 +1066,6 @@ export async function run(context, deps = {}) {
     const summaryMetadata = {
       deterministicFindingsCount: result.metadata.deterministicFindingsCount,
       truncated: truncatedCount,
-      skippedFiles: skippedFileCount,
       summary: finalSummary,
       // Phase 8.1: pre-rendered "Suggested reviewers" line.
       suggestedReviewersLine,
@@ -1167,7 +1111,7 @@ export async function run(context, deps = {}) {
   }
 
   // ---- issue_comment → command path ---------------------------------
-  if (event === 'issue_comment') {
+  if (isIssueCommentEvent(context)) {
     // Defense-in-depth: only react to `created` comments. The shipped example
     // workflow triggers on `types: [created]`, but a consumer who broadens it
     // to `[created, edited]` could let an authorized user re-fire commands by
@@ -1266,7 +1210,7 @@ export async function run(context, deps = {}) {
   }
 
   // ---- schedule → batch re-review of open PRs -----------------------
-  if (event === 'schedule') {
+  if (isScheduleEvent(context)) {
     if (!config.scheduleEnabled) {
       coreDep.info('Schedule disabled; nothing to do.');
       return;

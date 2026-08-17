@@ -22,7 +22,7 @@
  * @module src/lib/schedule.js
  */
 
-import { MARKER, appendTrailers } from './comments.js';
+import { MARKER, appendTrailers, isBotAuthor } from './comments.js';
 import { formatWalkthroughSummary as formatWalkthroughSummaryDefault } from './walkthrough.js';
 import {
   buildStatusDescription as buildStatusDescriptionDefault,
@@ -33,6 +33,15 @@ import {
   buildFindingsHashBlock as buildFindingsHashBlockDefault,
   filterIncrementalFindings as filterIncrementalFindingsDefault,
   appendIncrementalNote,
+  // F-NOTES: the skipped-files/portion note inserter is shared with
+  // src/index.js (extracted verbatim into findings.js) — the W19-E1-1→
+  // W20-F1-1 cross-copy drift can no longer happen.
+  insertSkippedFilesNote,
+  // F-TRAILERS: the lenient zai-* trailer re-extractor (fallback parity with
+  // src/index.js) and the SHA-block builder (moved verbatim to findings.js —
+  // see the compat re-export below).
+  extractTrailers,
+  buildShaBlock,
 } from './findings.js';
 
 /** Default cap on the number of PRs reviewed per scheduled run. */
@@ -137,105 +146,49 @@ const defaultFindBotMarkerComments = async () => [];
 const defaultListBotReviews = async () => [];
 
 /**
- * The hidden HTML comment that embeds the PR head SHA in a posted
- * review/comment body. `hasReviewForSha` matches a bot-authored comment whose
- * body contains BOTH the marker AND the head SHA; without this block the
- * review body carries only the fixed marker literal, so the SHA match never
- * succeeds and a stable PR is re-reviewed on EVERY cron tick (defeating the
- * "only new/changed PRs" guarantee).
+ * F-SCHEDDEPS: the SINGLE source of the per-PR pipeline-collaborator defaults.
  *
- * The block is an HTML comment so it is invisible in the rendered comment.
- * Returns '' when `sha` is empty so callers can append unconditionally.
+ * Every `reviewOnePr` parameter whose default is one of the inert defaults
+ * above (or one of the real PURE helpers imported from their modules —
+ * walkthrough/status/findings) is keyed here exactly once. `reviewOnePr`
+ * destructures its defaults FROM this map, and `runScheduledReview` forwards
+ * the same collaborators as one bundle (`...pipelineDeps`): destructuring
+ * defaults fire on `undefined`, so an omitted dep behaves identically whether
+ * reviewOnePr is called directly or through the batch entry. Before this map
+ * the defaults were written twice (reviewOnePr + runScheduledReview) and the
+ * forwarding was a 37-line key-for-key transcription — a dep added to one
+ * list but not the other silently degraded to an inert no-op (the
+ * W15-A8-4/W18-D1-2 parity-loss class).
  *
- * @param {string} sha  the PR head SHA.
- * @returns {string}
+ * Run-only deps (`listOpenPrs`, `hasReviewForSha`, `getContextStatusState`)
+ * are intentionally NOT here: runScheduledReview consumes them itself and
+ * does not forward them to reviewOnePr.
  */
-export function buildShaBlock(sha) {
-  if (typeof sha !== 'string' || sha.length === 0) return '';
-  return `<!-- zai-sha: ${sha} -->`;
-}
+const INERT_PIPELINE_DEPS = {
+  formatWalkthroughSummary: formatWalkthroughSummaryDefault,
+  loadRepoConfig: defaultLoadRepoConfig,
+  mergeRepoConfig: defaultMergeRepoConfig,
+  runScanners: defaultRunScanners,
+  formatScannerContext: defaultFormatScannerContext,
+  loadLearnings: defaultLoadLearnings,
+  formatLearningsForPrompt: defaultFormatLearningsForPrompt,
+  filterFindingsByLearnings: defaultFilterFindingsByLearnings,
+  setReviewStatus: defaultSetReviewStatus,
+  buildStatusDescription: buildStatusDescriptionDefault,
+  findBotMarkerComments: defaultFindBotMarkerComments,
+  parseFindingsHashBlock: parseFindingsHashBlockDefault,
+  buildFindingsHashBlock: buildFindingsHashBlockDefault,
+  filterIncrementalFindings: filterIncrementalFindingsDefault,
+  listBotReviews: defaultListBotReviews,
+};
 
-/**
- * Insert the W17-C1-3 skipped-files note (and the W18-D2-3 portions note)
- * into a rendered body.
- *
- * Mirrors the same-named helper in src/index.js (duplicated deliberately:
- * schedule.js cannot import from index.js — the entry point imports THIS
- * module — and the helper is small). When the structured pipeline reports
- * `skippedFiles > 0`, an italic note (the `_N findings truncated to cap._`
- * style) is inserted just before the trailing marker so the posted body never
- * claims a bare "No issues found" all-clear while files were silently dropped
- * by the cumulative MAX_DIFF_CHARS cap.
- *
- * W18-D2-3: PARTIAL drops of multi-chunk files (skippedEntries) were surfaced
- * nowhere — a file with 2/15 chunks reviewed still posted the bare
- * all-clear. When `skippedEntries > 0` a matching portions note renders too
- * (both notes when both kinds fired), keeping the two inserters consistent.
- *
- * W20-F1-1: context-limit drops (contextSkippedEntries) get their OWN note
- * with the correct cause — summing them into skippedEntries (the W19-E1-1
- * approach) rendered the hard-coded "(MAX_DIFF_CHARS cap)" cause for
- * context drops even when the cap was disabled (index.js parity).
- *
- * @param {string} body   Rendered body ending in the marker (typically).
- * @param {number} skippedFiles  Count of files with zero reviewed entries.
- * @param {number} [skippedEntries]  Count of dropped entries (partial drops).
- * @param {number} [contextSkippedEntries]  Count of entries dropped by the
- *   model context limit (NOT MAX_DIFF_CHARS).
- * @returns {string}
- */
-function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextSkippedEntries = 0) {
-  const n =
-    typeof skippedFiles === 'number' && Number.isFinite(skippedFiles) && skippedFiles > 0
-      ? Math.floor(skippedFiles)
-      : 0;
-  const e =
-    typeof skippedEntries === 'number' && Number.isFinite(skippedEntries) && skippedEntries > 0
-      ? Math.floor(skippedEntries)
-      : 0;
-  const c =
-    typeof contextSkippedEntries === 'number' &&
-    Number.isFinite(contextSkippedEntries) &&
-    contextSkippedEntries > 0
-      ? Math.floor(contextSkippedEntries)
-      : 0;
-  if ((n === 0 && e === 0 && c === 0) || typeof body !== 'string' || body.length === 0) {
-    return body;
-  }
-  const notes = [];
-  if (n > 0) {
-    notes.push(`_${n} file${n === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (e > 0) {
-    notes.push(`_${e} portion${e === 1 ? '' : 's'} not reviewed (MAX_DIFF_CHARS cap)._`);
-  }
-  if (c > 0) {
-    notes.push(`_${c} portion${c === 1 ? '' : 's'} not reviewed (model context limit)._`);
-  }
-  const note = notes.join('\n\n');
-  const idx = body.lastIndexOf(MARKER);
-  if (idx === -1) return `${body}\n\n${note}`;
-  return `${body.slice(0, idx)}${note}\n\n${body.slice(idx)}`;
-}
-
-/**
- * Determine whether a comment was authored by a bot. Used to gate marker-based
- * dedup so a drive-by human commenter cannot suppress a scheduled review or
- * hijack the bot's review thread by posting a comment containing the marker.
- *
- * Accepts EITHER signal GitHub surfaces for bot accounts: an explicit
- * `user.type === 'Bot'` (set for GitHub Apps bot accounts) OR a `user.login`
- * ending in `[bot]` (the convention for actions and other bot identities).
- *
- * @param {{user?: {type?: string, login?: string}}} comment
- * @returns {boolean}
- */
-function isBotComment(comment) {
-  const user = comment?.user;
-  if (!user) return false;
-  if (typeof user.type === 'string' && user.type === 'Bot') return true;
-  return typeof user.login === 'string' && user.login.endsWith('[bot]');
-}
+// F-TRAILERS: buildShaBlock moved verbatim to ./findings.js — its primary
+// consumer is src/index.js, so defining it here was a reverse dependency
+// (index.js importing schedule.js just for a pure string builder). This
+// re-export keeps the existing `import { buildShaBlock } from './schedule.js'`
+// consumers (tests/feature-bugs.test.js) working; internal call sites use the
+// findings.js import at the top of this module.
+export { buildShaBlock };
 
 /**
  * List open PRs (paginated), returning a minimal shape per PR. Stops once
@@ -346,7 +299,7 @@ export async function hasReviewForSha({
   // legitimate marker (which always carries it via buildShaBlock).
   const shaBlock = buildShaBlock(headSha);
   const matches = (c) =>
-    isBotComment(c) &&
+    isBotAuthor(c) &&
     typeof c?.body === 'string' &&
     c.body.includes(marker) &&
     c.body.includes(shaBlock);
@@ -447,31 +400,35 @@ export async function reviewOnePr({
   // via formatWalkthroughSummary when config.walkthrough is on; the scheduled
   // path must mirror that so cron and push runs render the same PR the same
   // way. Optional dep (default: the real renderer from walkthrough.js).
-  formatWalkthroughSummary = formatWalkthroughSummaryDefault,
+  // F-SCHEDDEPS: every per-PR pipeline default below is sourced from the
+  // single INERT_PIPELINE_DEPS map (W15-A6-4/W15-A8-4/W16-B2-2/W17-C2-1/
+  // W18-D1-2) — runScheduledReview forwards these as one bundle, and these
+  // destructuring defaults fire on the undefined entries of that bundle.
+  formatWalkthroughSummary = INERT_PIPELINE_DEPS.formatWalkthroughSummary,
   // W15-A8-4 feature-parity deps (all OPTIONAL with inert defaults so existing
   // tests/hermetic callers stay green; src/index.js's schedule branch wires the
   // real functions — see run()'s schedule wiring).
   // (a) .zai.yml repo config: load (fail-soft, returns {} on any error by
   //     contract) + merge (action inputs always win; repo can only narrow).
-  loadRepoConfig = defaultLoadRepoConfig,
-  mergeRepoConfig = defaultMergeRepoConfig,
+  loadRepoConfig = INERT_PIPELINE_DEPS.loadRepoConfig,
+  mergeRepoConfig = INERT_PIPELINE_DEPS.mergeRepoConfig,
   // (b) deterministic scanners: run over the patchable files; findings flow
   //     into runStructuredReview as `deterministicFindings` and their formatted
   //     context rides the LLM prompt as `scannerContext`.
-  runScanners = defaultRunScanners,
-  formatScannerContext = defaultFormatScannerContext,
+  runScanners = INERT_PIPELINE_DEPS.runScanners,
+  formatScannerContext = INERT_PIPELINE_DEPS.formatScannerContext,
   // (c) learnings: load `.zai/learnings.yml` (fail-soft → []), format the
   //     accepted patterns as prompt context, and suppress matching findings
   //     after the review (same three seams as index.js).
-  loadLearnings = defaultLoadLearnings,
-  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
-  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
+  loadLearnings = INERT_PIPELINE_DEPS.loadLearnings,
+  formatLearningsForPrompt = INERT_PIPELINE_DEPS.formatLearningsForPrompt,
+  filterFindingsByLearnings = INERT_PIPELINE_DEPS.filterFindingsByLearnings,
   // (d) commit statuses: `pending` at the start of the review work and
   //     `success` computed from the FINAL kept findings (post-suppression).
   //     setReviewStatus is fail-soft by contract; buildStatusDescription is a
   //     pure helper (defaults to the real one from status.js).
-  setReviewStatus = defaultSetReviewStatus,
-  buildStatusDescription = buildStatusDescriptionDefault,
+  setReviewStatus = INERT_PIPELINE_DEPS.setReviewStatus,
+  buildStatusDescription = INERT_PIPELINE_DEPS.buildStatusDescription,
   // W16-B2-2: incremental-review hash-block preservation on the summary path.
   // (a) findBotMarkerComments enumerates the bot's existing marker comments so
   //     their `<!-- zai-hashes:... -->` blocks survive the wholesale upsert
@@ -479,19 +436,19 @@ export async function reviewOnePr({
   // (b/c) parseFindingsHashBlock/buildFindingsHashBlock are PURE helpers
   //     (default: the real ones from findings.js) used to read prior hashes
   //     and compute this run's canonical set.
-  findBotMarkerComments = defaultFindBotMarkerComments,
-  parseFindingsHashBlock = parseFindingsHashBlockDefault,
-  buildFindingsHashBlock = buildFindingsHashBlockDefault,
+  findBotMarkerComments = INERT_PIPELINE_DEPS.findBotMarkerComments,
+  parseFindingsHashBlock = INERT_PIPELINE_DEPS.parseFindingsHashBlock,
+  buildFindingsHashBlock = INERT_PIPELINE_DEPS.buildFindingsHashBlock,
   // W17-C2-1: incremental-suppression filter (pure; default: the real one
   // from findings.js). The scheduled path previously never applied it, so
   // cron ticks re-reported unchanged findings on BOTH branches.
-  filterIncrementalFindings = filterIncrementalFindingsDefault,
+  filterIncrementalFindings = INERT_PIPELINE_DEPS.filterIncrementalFindings,
   // W18-D1-2: bot-review finder (inert default; src/index.js wires the real
   // review.js listBotReviews). The scheduled INLINE path deposits its hash
   // block exclusively in the REVIEW body, so reading marker comments alone
   // left priorHashes empty on the common path and every tick after a re-push
   // re-reported unchanged findings (index.js unions reviews + comments).
-  listBotReviews = defaultListBotReviews,
+  listBotReviews = INERT_PIPELINE_DEPS.listBotReviews,
 }) {
   // W16-B2-1: whether THIS invocation successfully posted the `pending`
   // commit status. The outer catch must flip that status to a TERMINAL
@@ -908,13 +865,15 @@ export async function reviewOnePr({
         // stripped by sanitizeModelOutput (W11-11), breaking idempotent upsert
         // and SHA-level dedup on the next run.
         const fallbackTrailers = [];
-        const markerMatch = body.match(/<!--\s*zai-code-review\s*-->/);
-        if (markerMatch) fallbackTrailers.push(markerMatch[0]);
+        const { marker, hashBlock: bodyHashBlock } = extractTrailers(body);
+        if (marker) fallbackTrailers.push(marker);
         // W17-C2-1: carry the hash block through the fallback too (index.js
         // parity) so suppression state survives even when the review API
         // rejects the payload.
-        const hashMatch = body.match(/<!--\s*zai-hashes:[^>]*-->/);
-        if (hashMatch) fallbackTrailers.push(hashMatch[0]);
+        if (bodyHashBlock) fallbackTrailers.push(bodyHashBlock);
+        // The SHA trailer re-uses the locally-BUILT block (buildShaBlock
+        // above), not a body re-extract — preserved from the pre-F-TRAILERS
+        // code (index.js re-extracts all three from its reviewBody).
         if (shaBlock) fallbackTrailers.push(shaBlock);
         await postFallbackComment({
           octokit,
@@ -1130,30 +1089,35 @@ export async function runScheduledReview({
   upsertReview,
   postFallbackComment,
   resolveReviewEvent,
-  // W15-A6-4 walkthrough parity dep (optional; default: real renderer).
-  formatWalkthroughSummary: formatWalkthroughSummaryFn = formatWalkthroughSummaryDefault,
-  // W15-A8-4 feature-parity deps (optional; inert defaults — see reviewOnePr).
-  loadRepoConfig = defaultLoadRepoConfig,
-  mergeRepoConfig = defaultMergeRepoConfig,
-  runScanners = defaultRunScanners,
-  formatScannerContext = defaultFormatScannerContext,
-  loadLearnings = defaultLoadLearnings,
-  formatLearningsForPrompt = defaultFormatLearningsForPrompt,
-  filterFindingsByLearnings = defaultFilterFindingsByLearnings,
-  setReviewStatus = defaultSetReviewStatus,
-  buildStatusDescription = buildStatusDescriptionDefault,
-  // W16-B2-2 hash-block preservation deps (optional; inert/pure defaults —
-  // see reviewOnePr).
-  findBotMarkerComments = defaultFindBotMarkerComments,
-  parseFindingsHashBlock = parseFindingsHashBlockDefault,
-  buildFindingsHashBlock = buildFindingsHashBlockDefault,
-  // W17-C2-1: incremental-suppression filter (pure; default: the real one).
-  filterIncrementalFindings = filterIncrementalFindingsDefault,
-  // W18-D1-2: bot-review finder for review-side prior-hash reads (inert
-  // default; src/index.js wires the real review.js listBotReviews).
-  listBotReviews = defaultListBotReviews,
+  // F-SCHEDDEPS: the per-PR pipeline collaborators below carry NO local
+  // defaults. They are forwarded to reviewOnePr as one bundle
+  // (`...pipelineDeps`); reviewOnePr's destructuring defaults — sourced from
+  // the single INERT_PIPELINE_DEPS map — fire on the bundle's `undefined`
+  // entries, so an omitted dep behaves exactly as before. This replaces the
+  // duplicated default declarations (the parity-loss hazard: a dep defaulted
+  // here but missed in the forwarding silently degraded to an inert no-op).
+  formatWalkthroughSummary,
+  loadRepoConfig,
+  mergeRepoConfig,
+  runScanners,
+  formatScannerContext,
+  loadLearnings,
+  formatLearningsForPrompt,
+  filterFindingsByLearnings,
+  // setReviewStatus is the ONE pipeline dep this function also uses ITSELF
+  // (the W18-D2-4 skip-branch reconciliation below), so it keeps a
+  // destructuring default — sourced from the same map, never re-declared.
+  setReviewStatus = INERT_PIPELINE_DEPS.setReviewStatus,
+  buildStatusDescription,
+  findBotMarkerComments,
+  parseFindingsHashBlock,
+  buildFindingsHashBlock,
+  filterIncrementalFindings,
+  listBotReviews,
   // W19-E1-2/E2-1: commit-status context-state reader used by the skip-branch
-  // reconciliation (default: the real octokit-backed read; injectable).
+  // reconciliation (default: the real octokit-backed read; injectable). Run-
+  // only dep — consumed here, never forwarded — so it is NOT part of
+  // INERT_PIPELINE_DEPS/pipelineDeps.
   getContextStatusState = defaultGetContextStatusState,
 }) {
   // Effective cap resolution. `config.scheduleMaxPrs` (from
@@ -1174,6 +1138,30 @@ export async function runScheduledReview({
   let reviewed = 0;
   let skipped = 0;
   let failed = 0;
+
+  // F-SCHEDDEPS: the per-PR pipeline collaborators, forwarded to EVERY
+  // reviewOnePr call as one bundle. Keys are exactly reviewOnePr's parameter
+  // names, and undefined entries fall through to reviewOnePr's
+  // INERT_PIPELINE_DEPS-sourced destructuring defaults — replacing the former
+  // 37-line key-for-key transcription (and the formatWalkthroughSummaryFn
+  // rename it forced).
+  const pipelineDeps = {
+    formatWalkthroughSummary,
+    loadRepoConfig,
+    mergeRepoConfig,
+    runScanners,
+    formatScannerContext,
+    loadLearnings,
+    formatLearningsForPrompt,
+    filterFindingsByLearnings,
+    setReviewStatus,
+    buildStatusDescription,
+    findBotMarkerComments,
+    parseFindingsHashBlock,
+    buildFindingsHashBlock,
+    filterIncrementalFindings,
+    listBotReviews,
+  };
 
   for (const pr of prs) {
     if (pr.draft) {
@@ -1298,21 +1286,7 @@ export async function runScheduledReview({
       upsertReview,
       postFallbackComment,
       resolveReviewEvent,
-      formatWalkthroughSummary: formatWalkthroughSummaryFn,
-      loadRepoConfig,
-      mergeRepoConfig,
-      runScanners,
-      formatScannerContext,
-      loadLearnings,
-      formatLearningsForPrompt,
-      filterFindingsByLearnings,
-      setReviewStatus,
-      buildStatusDescription,
-      findBotMarkerComments,
-      parseFindingsHashBlock,
-      buildFindingsHashBlock,
-      filterIncrementalFindings,
-      listBotReviews,
+      ...pipelineDeps,
     });
 
     if (result.ok) {

@@ -19,7 +19,7 @@
 import os from 'node:os';
 import nodePath from 'node:path';
 import { parseAddedLines, changedFileNames } from './_patch.js';
-import { selectPlatformAsset, zipExtractor } from './ensure-binary.js';
+import { resolveBinaryRequest, zipExtractor } from './ensure-binary.js';
 
 /* ------------------------------------------------------------------ *
  * Default curated rules
@@ -572,14 +572,12 @@ export async function scanPatterns(opts, deps = {}) {
   }
 
   try {
-    const asset = selectPlatformAsset(AST_GREP_SPEC, { platform, arch });
-    if (!asset) {
-      throw new Error(
-        `ast-grep: no asset for platform=${platform || '?'} arch=${arch || '?'}`,
-      );
-    }
+    // F-BINREQ: spec → platform asset → flat ensureBinary request in one
+    // place (the spec-embedded zipExtractor extractor wins over the URL
+    // default). resolveBinaryRequest throws on a no-asset tuple, which lands
+    // in the catch below → warning → regex fallback (unchanged coverage).
     const binaryPath = await deps.ensureBinary(
-      { ...AST_GREP_SPEC, ...asset, cacheDir: opts.cacheDir },
+      resolveBinaryRequest(AST_GREP_SPEC, { platform, arch, cacheDir: opts.cacheDir }),
       { platform, arch },
     );
     const source = opts.repoPath || process.cwd();
@@ -599,12 +597,17 @@ export async function scanPatterns(opts, deps = {}) {
       if (lang) neededLangs.add(lang);
     }
 
-    // Run each rule via `ast-grep run --pattern <PATTERN> --json`. We do one
-    // rule at a time to keep the JSON output shape simple (and to attribute
-    // findings back to a specific rule via the ruleIndex lookup).
+    // Run each rule via `ast-grep run --pattern <PATTERN> --json`, one rule
+    // at a time to keep the JSON output shape simple. `ast-grep run` emits no
+    // `ruleId`, so enrichment is driver-owned: the inline map after
+    // parseAstGrepJson attaches the rule's id/title/severity/etc.
+    // (mapAstGrepFinding's `ruleIndex` parameter exists for `scan`-style
+    // output that carries `ruleId` — currently test-only. Do NOT pass the
+    // per-rule map into parseAstGrepJson: `run` output has no ruleId, so
+    // lookups would miss and every title would degrade to the 'match'
+    // fallback.)
     /** @type {Record<string, unknown>[]} */
     const allFindings = [];
-    const ruleIndex = new Map(rules.map((r) => [r.id, r]));
     // W15-A5-3: `*`-language rules (TODO/FIXME) — ast-grep `run` requires a
     // specific language, so they cannot go through the binary path. Collect
     // them here; their diff-scoped regex findings are APPENDED on success

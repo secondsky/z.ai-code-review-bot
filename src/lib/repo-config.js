@@ -25,6 +25,9 @@
  * @module src/lib/repo-config.js
  */
 
+import { fetchRepoText, resolveHeadSha } from './repo-file.js';
+import { stripComment, unquote } from './yaml-lex.js';
+
 /** Hard cap on the size of a `.zai.yml` we will parse (cost/DoS guard). */
 const MAX_REPO_CONFIG_BYTES = 64 * 1024; // 64 KiB
 
@@ -47,68 +50,6 @@ const MAX_PATH_INSTRUCTION_ENTRIES = 50;
  * Mirrors the `MAX_PATH_INSTRUCTION_ENTRIES` guard on `path_instructions`.
  */
 const MAX_PATH_FILTER_ENTRIES = 100;
-
-/**
- * Strip a YAML `# ...` comment from a line, UNLESS the `#` is inside a
- * single- or double-quoted string. A `#` preceded by whitespace (or at the
- * start of the line) starts a comment; a `#` glued to a value (`url#anchor`)
- * does not — mirroring YAML 1.2. The quote-tracking is deliberately simple:
- * it toggles on the first quote char encountered and toggles back on the
- * matching one.
- *
- * @param {string} line
- * @returns {string}
- */
-function stripComment(line) {
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "'" && !inDouble) {
-      // W12-4b: the contraction guard (don't treat `'` as a delimiter when
-      // preceded by alphanumeric, to handle `it's`) must NOT apply when we are
-      // ALREADY inside a single-quoted string — a `'` inside a single-quoted
-      // value is always the closing delimiter regardless of the preceding char.
-      // Without this, `'see ref5'   # note` keeps inSingle=true after the
-      // closing quote, so quotes aren't stripped and the comment leaks.
-      if (inSingle) {
-        inSingle = false;
-      } else {
-        const prev = i > 0 ? line[i - 1] : '';
-        if (!/[A-Za-z0-9]/.test(prev)) {
-          inSingle = !inSingle;
-        }
-      }
-    } else if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === '#' && !inSingle && !inDouble) {
-      // A `#` only starts a comment when it's at the start of the line or
-      // preceded by whitespace. `value#frag` is NOT a comment.
-      const prev = i > 0 ? line[i - 1] : '';
-      if (i === 0 || /\s/.test(prev)) {
-        return line.slice(0, i);
-      }
-    }
-  }
-  return line;
-}
-
-/**
- * Unquote a YAML scalar value: strips matching surrounding single or double
- * quotes. Returns the input unchanged when not quoted.
- *
- * @param {string} v
- * @returns {string}
- */
-function unquote(v) {
-  if (typeof v !== 'string' || v.length < 2) return v;
-  if (
-    (v[0] === '"' && v[v.length - 1] === '"') ||
-    (v[0] === "'" && v[v.length - 1] === "'")
-  ) {
-    return v.slice(1, -1);
-  }
-  return v;
-}
 
 /**
  * Coerce a raw YAML scalar string into a JS value. Recognizes the literals
@@ -338,6 +279,18 @@ function ensureArray(obj, key) {
   return obj[key];
 }
 
+/**
+ * Truncate a string to at most `n` chars (plain slice — no ellipsis added).
+ * Non-strings pass through unchanged; callers pre-check `typeof`.
+ *
+ * @param {unknown} s
+ * @param {number} n
+ * @returns {unknown}
+ */
+function cap(s, n) {
+  return typeof s === 'string' && s.length > n ? s.slice(0, n) : s;
+}
+
 /* ------------------------------------------------------------------ *
  * validateRepoConfig
  * ------------------------------------------------------------------ */
@@ -382,16 +335,10 @@ export function validateRepoConfig(parsed) {
       if (arr.length > 0) rv.path_filters = arr;
     }
     if (typeof r.tone_instructions === 'string') {
-      rv.tone_instructions =
-        r.tone_instructions.length > MAX_TONE_INSTRUCTIONS_CHARS
-          ? r.tone_instructions.slice(0, MAX_TONE_INSTRUCTIONS_CHARS)
-          : r.tone_instructions;
+      rv.tone_instructions = cap(r.tone_instructions, MAX_TONE_INSTRUCTIONS_CHARS);
     }
     if (typeof r.language === 'string') {
-      rv.language =
-        r.language.length > MAX_LANGUAGE_CHARS
-          ? r.language.slice(0, MAX_LANGUAGE_CHARS)
-          : r.language;
+      rv.language = cap(r.language, MAX_LANGUAGE_CHARS);
     }
     if (Object.keys(rv).length > 0) out.reviews = rv;
   }
@@ -400,11 +347,14 @@ export function validateRepoConfig(parsed) {
   const s = parsed.scanners;
   if (s && typeof s === 'object' && !Array.isArray(s)) {
     const sv = {};
-    if (typeof s.gitleaks === 'boolean') sv.gitleaks = s.gitleaks;
-    if (typeof s.ast_grep === 'boolean') sv.ast_grep = s.ast_grep;
-    // W15-A1-2: metrics was missing from the boolean set, so the documented
-    // `.zai.yml` `scanners.metrics: false` toggle was silently dropped.
-    if (typeof s.metrics === 'boolean') sv.metrics = s.metrics;
+    // Opt-in copy: only PRESENT, BOOLEAN values for known scanner keys are
+    // carried (absent keys stay absent). Key set/order derive from
+    // SCANNER_KEYS — the same registry the parser allow-lists — so the
+    // copies cannot drift (W15-A1-2: metrics was once missing from exactly
+    // this kind of literal copy).
+    for (const k of SCANNER_KEYS) {
+      if (typeof s[k] === 'boolean') sv[k] = s[k];
+    }
     if (Object.keys(sv).length > 0) out.scanners = sv;
   }
 
@@ -425,15 +375,10 @@ function normalizePathInstruction(entry) {
   if (typeof instructions !== 'string' || instructions.trim() === '') return null;
   // Cap field lengths (truncate, mirroring tone_instructions/language handling)
   // so an attacker-controlled .zai.yml cannot bloat the prompt unboundedly.
-  const cappedPath =
-    path.length > MAX_PATH_INSTRUCTION_PATH_CHARS
-      ? path.slice(0, MAX_PATH_INSTRUCTION_PATH_CHARS)
-      : path;
-  const cappedInstructions =
-    instructions.length > MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS
-      ? instructions.slice(0, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS)
-      : instructions;
-  return { path: cappedPath, instructions: cappedInstructions };
+  return {
+    path: cap(path, MAX_PATH_INSTRUCTION_PATH_CHARS),
+    instructions: cap(instructions, MAX_PATH_INSTRUCTION_INSTRUCTIONS_CHARS),
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -538,19 +483,18 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
   }
   // `assertive` (or unset) → action floor unchanged.
 
-  // Scanners: master switch is action-only; repo can only DISABLE.
+  // Scanners: master switch is action-only; repo can only DISABLE. Key set
+  // and order derive from SCANNER_KEYS (the parser's allow-list) so every
+  // scanner-name copy stays in lockstep — W15-A1-2 (metrics missing from
+  // one copy) came from these literals drifting apart.
   const scannersEnabled = a.scannersEnabled !== false;
-  const mergedScanners = scannersEnabled
-    ? {
-        // `false` in repo disables; otherwise the action default (enabled) applies.
-        gitleaks: scanners.gitleaks !== false,
-        ast_grep: scanners.ast_grep !== false,
-        // W15-A1-2: metrics rides the same disable-only seam so src/index.js
-        // can forward it to the scanner orchestrator (which already honors
-        // repoScanners.metrics === false).
-        metrics: scanners.metrics !== false,
-      }
-    : { gitleaks: false, ast_grep: false, metrics: false };
+  const mergedScanners = {};
+  for (const k of SCANNER_KEYS) {
+    // Enabled path: `false` in repo disables, otherwise the action default
+    // (enabled) applies. Master-off path: forced false — the repo can never
+    // enable a scanner the action's master switch turned off.
+    mergedScanners[k] = scannersEnabled ? scanners[k] !== false : false;
+  }
 
   return {
     ...a,
@@ -574,27 +518,14 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve the PR head SHA from `opts.headSha` or
- * `context.payload.pull_request.head.sha`.
- *
- * @param {Object} opts
- * @returns {string}
- */
-function resolveHeadSha(opts) {
-  if (typeof opts.headSha === 'string' && opts.headSha !== '') return opts.headSha;
-  const sha = opts.context?.payload?.pull_request?.head?.sha;
-  return typeof sha === 'string' ? sha : '';
-}
-
-/**
  * Load and validate `.zai.yml` from the PR's head SHA. Treated as UNTRUSTED.
  *
  * Flow:
  *   1. Resolve the head SHA (from `opts.headSha` or the PR payload).
- *   2. Fetch `.zai.yml` via `octokit.rest.repos.getContent({owner, repo, path, ref})`.
- *   3. Base64-decode the content.
- *   4. Parse with {@link parseZaiYml}.
- *   5. Validate with {@link validateRepoConfig}.
+ *   2. Fetch + base64-decode `.zai.yml` via the shared
+ *      {@link fetchRepoText|repo-file} pipeline (dual size caps enforced there).
+ *   3. Parse with {@link parseZaiYml}.
+ *   4. Validate with {@link validateRepoConfig}.
  *
  * On ANY error (404, parse failure, validation drop, oversized, missing SHA),
  * `deps.core.warning(...)` is called and `{}` is returned. This function
@@ -626,69 +557,24 @@ export async function loadRepoConfig(opts = {}, deps = {}) {
     return {};
   }
 
-  let data;
-  try {
-    const resp = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path,
-      ref: headSha,
-    });
-    data = resp?.data;
-  } catch (error) {
-    const status = error?.status;
-    if (status === 404) {
-      // 404 is the common case (most repos don't have a .zai.yml), but the
-      // task brief specifies a warning on ANY error so callers can observe it.
-      warn(`repo-config: no ${path} found at ${headSha.slice(0, 7)} (404).`);
-      return {};
-    }
-    warn(
-      `repo-config: failed to fetch ${path} (${status ?? 'unknown'}): ` +
-        `${error?.message ?? String(error)}`,
-    );
+  // Fetch + decode via the shared repo-file pipeline (F-REPOFILE), keeping
+  // this module's own byte-cap constant and warning ladder: any not-ok
+  // outcome (404, fetch failure, oversized, decode failure, non-file)
+  // collapses to the historical inline warning + `{}`.
+  const outcome = await fetchRepoText({
+    octokit,
+    owner,
+    repo,
+    path,
+    ref: headSha,
+    maxBytes: MAX_REPO_CONFIG_BYTES,
+    label: 'repo-config',
+  });
+  if (!outcome.ok) {
+    warn(outcome.message);
     return {};
   }
-
-  // Decode the base64 content. GitHub returns `{content, encoding}` for files;
-  // a directory or a non-file response is treated as "no config".
-  let text;
-  if (data && typeof data.content === 'string') {
-    // Reject oversized content before decoding (cost/DoS guard).
-    // `data.size` is the byte count GitHub reports; fall back to the
-    // base64 length when missing.
-    const size = typeof data.size === 'number' ? data.size : data.content.length;
-    if (size > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} is ${size} bytes (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-    try {
-      text = Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
-    } catch {
-      warn(`repo-config: ${path} could not be base64-decoded; skipping.`);
-      return {};
-    }
-    // Post-decode size guard (base64 length can under-report).
-    if (typeof text === 'string' && text.length > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} decodes to ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-  } else if (typeof data === 'string') {
-    text = data;
-    if (text.length > MAX_REPO_CONFIG_BYTES) {
-      warn(
-        `repo-config: ${path} is ${text.length} chars (cap ${MAX_REPO_CONFIG_BYTES}); skipping.`,
-      );
-      return {};
-    }
-  } else {
-    // Not a file (could be a directory listing or symlink) — no config.
-    return {};
-  }
+  const text = outcome.text;
 
   let parsed;
   try {
