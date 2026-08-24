@@ -14,7 +14,7 @@
     "dist-check": "npm run build && git diff --exit-code dist"
   },
   "dependencies": {
-    "@actions/core": "^2.0.3",
+    "@actions/core": "^3.0.1",
     "@actions/github": "^9.1.1",
     "picomatch": "^4.0.1"
   },
