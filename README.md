@@ -1,6 +1,6 @@
-# Z.ai Code Review
+# Z-AI GLM Code Review Bot
 
-[![GitHub Marketplace](https://img.shields.io/badge/GitHub_Marketplace-v2-2088FF?logo=githubactions&logoColor=white)](https://github.com/marketplace/actions/z-ai-code-review)
+[![GitHub Marketplace](https://img.shields.io/badge/GitHub_Marketplace-v2-2088FF?logo=githubactions&logoColor=white)](https://github.com/marketplace/actions/z-ai-glm-code-review-bot)
 
 An AI-powered GitHub Action that reviews pull requests with [Z.ai](https://z.ai)
 GLM models — with **inline line-level review comments**, **deterministic
