@@ -122,8 +122,8 @@ src/index.js  run(context, deps)   ← entry; routes by eventName
 ## Build & test
 
 - Source is ESM. `npm run build` produces the committed `dist/index.js` via
-  `@vercel/ncc`; runtime is `node20`.
-- CI runs vitest on Node 20/22, gates on `dist/` drift, and runs
+  `@vercel/ncc`; runtime is `node24`.
+- CI runs vitest on Node 22/24, gates on `dist/` drift, and runs
   `npm audit --audit-level=high`.
 - Dependabot watches npm + github-actions ecosystems (weekly).
-- 1337 tests across 37 files. `dist/` is committed intentionally.
+- 2338 tests across the suite. `dist/` is committed intentionally.
