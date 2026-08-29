@@ -1,5 +1,7 @@
 # Z.ai Code Review
 
+[![GitHub Marketplace](https://img.shields.io/badge/GitHub_Marketplace-v2-2088FF?logo=githubactions&logoColor=white)](https://github.com/marketplace/actions/z-ai-code-review)
+
 An AI-powered GitHub Action that reviews pull requests with [Z.ai](https://z.ai)
 GLM models — with **inline line-level review comments**, **deterministic
 scanners**, a **walkthrough summary**, and (optionally) interactive `/zai`
@@ -53,7 +55,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: <your-org>/z.ai-code-review-bot@v2.0.0
+      - uses: secondsky/z.ai-code-review-bot@v2
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -199,13 +201,13 @@ pull_request event
 | **Inline comments** | ✅ | ✅ | ✅ |
 | **Repo config file** | ✅ `.zai.yml` | ✅ `.coderabbit.yaml` | ❌ |
 | **Cost** | your Z.ai API cost only | subscription | subscription |
-| **Auditable core** | ✅ ~11k LOC, 3 deps, 1794 tests | black box | black box |
+| **Auditable core** | ✅ ~11k LOC, 3 deps, 2338 tests | black box | black box |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (1794 tests)
+npm test            # vitest suite (2338 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 npm audit           # 0 vulnerabilities
@@ -217,4 +219,4 @@ the module map and [`SECURITY.md`](./SECURITY.md) for the authorization model.
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](./LICENSE).
