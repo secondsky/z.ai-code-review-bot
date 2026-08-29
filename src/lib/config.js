@@ -216,7 +216,7 @@ export function loadConfig(inputs = {}, options = {}) {
     throw new Error('ZAI_API_KEY is required');
   }
 
-  const model = read(inputs, 'ZAI_MODEL').trim() || 'glm-5.2';
+  const model = read(inputs, 'ZAI_MODEL').trim() || 'glm-5.3';
   const systemPrompt = read(inputs, 'ZAI_SYSTEM_PROMPT');
   const reviewerName = read(inputs, 'ZAI_REVIEWER_NAME').trim() || 'Z.ai Code Review';
 
@@ -286,7 +286,7 @@ export function loadConfig(inputs = {}, options = {}) {
   // v2 structured-review knobs.
   const maxFindings = clampPositiveCapped(
     read(inputs, 'ZAI_MAX_FINDINGS'),
-    8,
+    25,
     50,
   );
 

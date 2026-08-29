@@ -17,8 +17,8 @@ describe('loadConfig — apiKey (required)', () => {
 });
 
 describe('loadConfig — string fields & defaults', () => {
-  test('model defaults to glm-5.2', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).model).toBe('glm-5.2');
+  test('model defaults to glm-5.3', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).model).toBe('glm-5.3');
   });
   test('model uses provided value', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MODEL: 'glm-4.6' }).model).toBe('glm-4.6');
@@ -280,33 +280,33 @@ describe('loadConfig — works with Map inputs', () => {
   test('treats null input values as empty (defensive)', () => {
     const cfg = loadConfig({ ZAI_API_KEY: 'k', ZAI_MODEL: null });
     expect(cfg.apiKey).toBe('k');
-    expect(cfg.model).toBe('glm-5.2');
+    expect(cfg.model).toBe('glm-5.3');
   });
 });
 
 describe('loadConfig — v2 structured-review knobs', () => {
-  test('maxFindings defaults to 8', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(8);
+  test('maxFindings defaults to 25', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(25);
   });
 
   test('maxFindings uses a provided positive value', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '5' }).maxFindings).toBe(5);
   });
 
-  test('maxFindings clamps to min 1 (0 → default 8)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(8);
+  test('maxFindings clamps to min 1 (0 → default 25)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(25);
   });
 
-  test('maxFindings clamps to min 1 (negative → default 8)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(8);
+  test('maxFindings clamps to min 1 (negative → default 25)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(25);
   });
 
   test('maxFindings caps at 50 (runaway noise guard)', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '999' }).maxFindings).toBe(50);
   });
 
-  test('maxFindings NaN → default 8', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(8);
+  test('maxFindings NaN → default 25', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(25);
   });
 
   test('minSeverity defaults to "info"', () => {

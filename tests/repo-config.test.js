@@ -976,9 +976,9 @@ describe('mergeRepoConfig — maxFindings security boundary', () => {
   });
 
   it('falls back to the default cap when action has no maxFindings and repo is silent', () => {
-    // No action cap and no repo value → the built-in default of 8 applies.
+    // No action cap and no repo value → the built-in default of 25 applies.
     const merged = mergeRepoConfig({}, {});
-    expect(merged.maxFindings).toBe(8);
+    expect(merged.maxFindings).toBe(25);
   });
 });
 

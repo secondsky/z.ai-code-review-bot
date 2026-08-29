@@ -80,7 +80,7 @@ function makeCore() {
 function makeConfig(overrides = {}) {
   return {
     apiKey: 'test-api-key',
-    model: 'glm-5.2',
+    model: 'glm-5.3',
     systemPrompt: '',
     reviewerName: 'Z.ai Code Review',
     excludePatterns: ['*.lock'],
@@ -456,7 +456,7 @@ describe('run — pull_request auto-review', () => {
     expect(callApi).toHaveBeenCalledTimes(1);
     const [apiKey, model, prompt] = callApi.mock.calls[0];
     expect(apiKey).toBe('test-api-key');
-    expect(model).toBe('glm-5.2');
+    expect(model).toBe('glm-5.3');
     // The prompt is the structured-review prompt (no free-form header).
     expect(prompt).toContain('Output ONLY a valid JSON');
     expect(prompt).toContain('src/a.js');
@@ -2684,7 +2684,7 @@ describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
     expect(arg.maxTokens).toBe(2048);
     // And the baseline fields are still there.
     expect(arg.apiKey).toBe('test-api-key');
-    expect(arg.model).toBe('glm-5.2');
+    expect(arg.model).toBe('glm-5.3');
     expect(typeof arg.userPrompt).toBe('string');
   });
 
@@ -3109,7 +3109,7 @@ describe('main() — failure commit-status wiring (Phase 5)', () => {
         'const core = { info(){}, warning(){}, setSecret(){}, setFailed(m){ console.log("SETFAILED:"+m); }, getInput(){ return ""; } };',
         'const callApi = async () => { throw new Error("hard boom"); };',
         'const config = {',
-        '  apiKey: "k", model: "glm-5.2", systemPrompt: "", reviewerName: "Z.ai Code Review",',
+        '  apiKey: "k", model: "glm-5.3", systemPrompt: "", reviewerName: "Z.ai Code Review",',
         '  excludePatterns: [], maxDiffChars: Infinity, largePrFileThreshold: 50, maxBatchChars: 120000,',
         '  maxFilesPerBatch: 40, maxPatchChars: 18000, commandsEnabled: false, authThreshold: "write",',
         '  allowForkCommands: false, timeoutMs: 120000, scheduleEnabled: false, scheduleMaxPrs: 10,',
