@@ -2,8 +2,8 @@ name: 'Z-AI GLM Code Review Bot'
 description: 'AI-powered pull-request code review and interactive /zai assistant using Z.ai GLM models.'
 author: 'z.ai-code-review-bot contributors'
 branding:
-  icon: 'check-circle'
-  color: 'gray-dark'
+  icon: 'eye'
+  color: 'blue'
 
 inputs:
   ZAI_API_KEY:
