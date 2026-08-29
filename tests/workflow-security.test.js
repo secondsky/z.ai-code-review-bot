@@ -7,8 +7,9 @@ import { parse } from 'yaml';
 /* ------------------------------------------------------------------ *
  * Workflow security policy — regression lock on our own GitHub Actions
  *
- * These tests parse every ACTIVE workflow in .github/workflows/*.yml and
- * enforce the supply-chain hardening policy, so a future edit that regresses
+ * These tests parse every ACTIVE workflow in .github/workflows/ (*.yml or
+ * *.yaml) and enforce the supply-chain hardening policy, so a future edit
+ * that regresses
  * any invariant fails CI instead of silently re-opening an attack surface:
  *
  *   - SHA-pinned `uses:` refs (tj-actions/Trivy-style mutable-tag retagging)
@@ -32,15 +33,19 @@ const WORKFLOW_DIR = fileURLToPath(new URL('../.github/workflows/', import.meta.
 // if a new active workflow appears, this list must grow with it.
 const ACTIVE_FILES = ['ci.yml', 'codeql.yml', 'scorecard.yml'];
 
-// `owner/repo[/path]@<ref>` where <ref> must be a full commit SHA. The
-// leading `@` in the pattern tolerates `docker://@sha256:...`-style values.
-const SHA_REF = /^@?[0-9a-f]{40}$/;
+// `owner/repo[/path]@<ref>` where <ref> is sliced past the last `@` and must
+// be a full 40-hex commit SHA (action refs) or a `sha256:`-prefixed 64-hex
+// digest (container image refs, e.g. `docker://image@sha256:...`). Mutable
+// refs (tags, branch names, short SHAs) are always rejected.
+const SHA_REF = /^(?:sha256:[0-9a-f]{64}|[0-9a-f]{40})$/;
 const REQUIRED_RUNNER = 'ubuntu-24.04';
 const FORBIDDEN_TRIGGERS = ['pull_request_target', 'workflow_run'];
 
-const discovered = readdirSync(WORKFLOW_DIR)
-  .filter((f) => f.endsWith('.yml'))
-  .sort();
+// GitHub Actions registers both *.yml and *.yaml, so discovery must match
+// both — a `*.yml`-only filter would let a rogue `evil.yaml` bypass every
+// policy invariant below while the exact-set assertion still passed.
+const allEntries = readdirSync(WORKFLOW_DIR).sort();
+const discovered = allEntries.filter((f) => /\.(yml|yaml)$/.test(f));
 
 const workflows = discovered.map((name) => ({
   name,
@@ -85,6 +90,17 @@ describe('active workflow discovery', () => {
     expect(discovered).toEqual(ACTIVE_FILES);
   });
 
+  // Composition guard: every file in .github/workflows/ must be either a
+  // discovered workflow (*.yml/*.yaml — covered by the policy tests below)
+  // or an inert *.yml.example template. A surprise file fails here by name
+  // instead of silently escaping every invariant.
+  it('contains only workflows or *.yml.example templates', () => {
+    const strays = allEntries.filter(
+      (f) => !discovered.includes(f) && !f.endsWith('.yml.example')
+    );
+    expect(strays).toEqual([]);
+  });
+
   // Vacuity guard: the policy tests below must never pass because they
   // scanned nothing. Today the pinned 3 files carry exactly 7 checkout
   // steps (5 in ci.yml, 1 in codeql.yml, 1 in scorecard.yml); if this
@@ -98,7 +114,7 @@ describe('active workflow discovery', () => {
 });
 
 describe('supply-chain hardening policy', () => {
-  it('pins every uses: ref to a full 40-hex commit SHA', () => {
+  it('pins every uses: ref to a full 40-hex commit SHA or sha256: digest', () => {
     const violations = [];
     for (const { name, doc } of workflows) {
       for (const step of collectSteps(doc)) {

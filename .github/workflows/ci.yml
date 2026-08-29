@@ -45,6 +45,7 @@ jobs:
           # Plain gate: no SARIF upload (that would need security-events: write).
           advanced-security: false
           # Keep parity with the local gate invocation.
+          version: 1.29.0 # pin zizmor itself; the input defaults to floating `latest`
           min-severity: medium
           min-confidence: medium
 

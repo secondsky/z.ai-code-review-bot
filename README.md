@@ -55,7 +55,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: secondsky/z.ai-code-review-bot@v2
+      - uses: secondsky/z.ai-code-review-bot@e906b1c8edb0f4f1695352ebd49e2bb265d00435 # v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -201,13 +201,13 @@ pull_request event
 | **Inline comments** | ✅ | ✅ | ✅ |
 | **Repo config file** | ✅ `.zai.yml` | ✅ `.coderabbit.yaml` | ❌ |
 | **Cost** | your Z.ai API cost only | subscription | subscription |
-| **Auditable core** | ✅ ~11k LOC, 3 deps, 2338 tests | black box | black box |
+| **Auditable core** | ✅ ~11k LOC, 3 deps, 2349 tests | black box | black box |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (2338 tests)
+npm test            # vitest suite (2349 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 npm audit           # 0 vulnerabilities
