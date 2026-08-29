@@ -51,7 +51,7 @@ export const DEFAULTS = {
   maxBatchChars: 120000,
   maxFilesPerBatch: 40,
   maxPatchChars: 18000,
-  maxFindings: 8,
+  maxFindings: 25,
   minSeverity: 'info',
 };
 

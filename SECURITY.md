@@ -95,7 +95,7 @@ for a file not in the diff is dropped). Scanner findings carry provenance
 (`rule: '<scanner>:<id>'`).
 
 ### 4. Cost controls
-`MAX_DIFF_CHARS` (default 100000), `ZAI_MAX_FINDINGS` (default 8), and
+`MAX_DIFF_CHARS` (default 100000), `ZAI_MAX_FINDINGS` (default 25), and
 `ZAI_BATCH_CONCURRENCY` (default 3) bound prompt size, output volume, and API
 fan-out.
 

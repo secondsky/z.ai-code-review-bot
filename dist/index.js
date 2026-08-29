@@ -39483,7 +39483,7 @@ function loadConfig(inputs = {}, options = {}) {
     throw new Error('ZAI_API_KEY is required');
   }
 
-  const model = read(inputs, 'ZAI_MODEL').trim() || 'glm-5.2';
+  const model = read(inputs, 'ZAI_MODEL').trim() || 'glm-5.3';
   const systemPrompt = read(inputs, 'ZAI_SYSTEM_PROMPT');
   const reviewerName = read(inputs, 'ZAI_REVIEWER_NAME').trim() || 'Z.ai Code Review';
 
@@ -39553,7 +39553,7 @@ function loadConfig(inputs = {}, options = {}) {
   // v2 structured-review knobs.
   const maxFindings = clampPositiveCapped(
     read(inputs, 'ZAI_MAX_FINDINGS'),
-    8,
+    25,
     50,
   );
 
@@ -41648,7 +41648,7 @@ function buildStructuredReviewPrompt(files, options = {}) {
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings > 0
       ? Math.floor(options.maxFindings)
-      : 8;
+      : 25;
 
   // The instruction varies only by the maxFindings cap (interpolated) —
   // everything else is constant.
@@ -42598,7 +42598,7 @@ function rankAndCapFindings(findings, options = {}) {
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings >= 0
       ? Math.floor(options.maxFindings)
-      : 8;
+      : 25;
   const minSeverity =
     typeof options.minSeverity === 'string' && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, options.minSeverity)
       ? options.minSeverity
@@ -43238,7 +43238,7 @@ const auto_review_DEFAULTS = {
   maxBatchChars: 120000,
   maxFilesPerBatch: 40,
   maxPatchChars: 18000,
-  maxFindings: 8,
+  maxFindings: 25,
   minSeverity: 'info',
 };
 
@@ -51405,7 +51405,7 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
 
   // maxFindings: repo can only LOWER the cap.
   const actionMaxFindings =
-    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 8;
+    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 25;
   const repoMaxFindings =
     Number.isInteger(reviews.max_findings) && reviews.max_findings > 0
       ? reviews.max_findings

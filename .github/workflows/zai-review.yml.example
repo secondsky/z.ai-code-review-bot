@@ -45,7 +45,7 @@ jobs:
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           # Optional knobs — these are shown with their action.yml defaults:
-          # ZAI_MODEL: ${{ vars.ZAI_MODEL }}           # glm-5.2
+          # ZAI_MODEL: ${{ vars.ZAI_MODEL }}           # glm-5.3
           # ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
           # ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
           # EXCLUDE_PATTERNS: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'

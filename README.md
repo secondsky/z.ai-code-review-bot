@@ -15,7 +15,7 @@ commands.
 - **Deterministic scanners beneath the LLM** — secret detection (gitleaks +
   regex fallback) and code-pattern analysis (ast-grep + regex fallback) run
   BEFORE the model, catching what LLMs miss and suppressing hallucinations.
-- **Structured findings** with a noise cap (default 8/PR), severity ranking,
+- **Structured findings** with a noise cap (default 25/PR), severity ranking,
   and anti-hallucination file validation.
 - **Walkthrough summary** — findings grouped into dependency-ordered cohorts
   (database → API → logic → UI → tests) in collapsible sections.
@@ -111,7 +111,7 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 | Input | Default | Description |
 |---|---|---|
 | `ZAI_API_KEY` | *(required)* | Z.ai API key. Use a **secret**. |
-| `ZAI_MODEL` | `glm-5.2` | Z.ai model name. |
+| `ZAI_MODEL` | `glm-5.3` | Z.ai model name. Use `glm-5.3-flash` for faster/cheaper runs. |
 | `ZAI_SYSTEM_PROMPT` | *(built-in)* | System prompt; empty uses the built-in default. |
 | `ZAI_REVIEWER_NAME` | `Z.ai Code Review` | Header label on the review. |
 | `ZAI_TEMPERATURE` | `0.2` | Sampling temperature, clamped [0, 2]. Low = deterministic. |
@@ -122,7 +122,7 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 ### Findings & noise control
 | Input | Default | Description |
 |---|---|---|
-| `ZAI_MAX_FINDINGS` | `8` | Max findings after rank+cap (clamped [1, 50]). |
+| `ZAI_MAX_FINDINGS` | `25` | Max findings after rank+cap (clamped [1, 50]). |
 | `ZAI_MIN_SEVERITY` | `info` | Lowest severity to include. |
 | `ZAI_WALKTHROUGH` | `true` | Group findings into dependency-ordered cohort sections. |
 | `ZAI_INCREMENTAL_REVIEW` | `true` | Suppress previously-reported findings on re-push. |

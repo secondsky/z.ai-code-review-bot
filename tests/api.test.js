@@ -565,12 +565,12 @@ describe('makeApiRequest', () => {
       }),
     }));
     await makeApiRequest(
-      { apiKey: 'secret-key', model: 'glm-5.2', systemPrompt: 'SYS', userPrompt: 'USR', timeout: 1000 },
+      { apiKey: 'secret-key', model: 'glm-5.3', systemPrompt: 'SYS', userPrompt: 'USR', timeout: 1000 },
       { request },
     );
     const captured = request.calls[0];
     const body = JSON.parse(captured.body);
-    expect(body.model).toBe('glm-5.2');
+    expect(body.model).toBe('glm-5.3');
     expect(body.messages).toEqual([
       { role: 'system', content: 'SYS' },
       { role: 'user', content: 'USR' },

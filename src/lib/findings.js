@@ -811,7 +811,7 @@ export function rankAndCapFindings(findings, options = {}) {
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings >= 0
       ? Math.floor(options.maxFindings)
-      : 8;
+      : 25;
   const minSeverity =
     typeof options.minSeverity === 'string' && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, options.minSeverity)
       ? options.minSeverity

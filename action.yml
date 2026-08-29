@@ -11,9 +11,9 @@ inputs:
     required: true
 
   ZAI_MODEL:
-    description: 'Z.ai model name (e.g. glm-5.2, glm-4.7).'
+    description: 'Z.ai model name (e.g. glm-5.3, or glm-5.3-flash for faster/cheaper runs).'
     required: false
-    default: 'glm-5.2'
+    default: 'glm-5.3'
 
   ZAI_SYSTEM_PROMPT:
     description: 'System prompt for the review model. Falls back to a built-in default when empty.'
@@ -138,7 +138,7 @@ inputs:
       Findings above this cap are dropped (highest-severity first). Clamped to
       [1, 50] — values outside that range fall back to the default.
     required: false
-    default: '8'
+    default: '25'
 
   ZAI_MIN_SEVERITY:
     description: |-

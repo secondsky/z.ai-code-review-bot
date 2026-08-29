@@ -89,7 +89,7 @@ describe('integration: pull_request structured review — small PR', () => {
     expect(callApi).toHaveBeenCalledTimes(1);
     const [apiKey, model, prompt] = callApi.mock.calls[0];
     expect(apiKey).toBe('test-api-key');
-    expect(model).toBe('glm-5.2');
+    expect(model).toBe('glm-5.3');
     // The structured prompt contains BOTH files' diffs.
     expect(prompt).toContain('src/a.js');
     expect(prompt).toContain('src/b.js');

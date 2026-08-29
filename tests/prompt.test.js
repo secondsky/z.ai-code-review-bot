@@ -232,11 +232,11 @@ describe('buildStructuredReviewPrompt', () => {
     expect(out.toLowerCase()).toContain('no prose');
   });
 
-  test('contains the maxFindings limit (default 8)', () => {
+  test('contains the maxFindings limit (default 25)', () => {
     const out = buildStructuredReviewPrompt([
       { filename: 'a.js', status: 'modified', patch: '@@ a @@' },
     ]);
-    expect(out).toMatch(/at most 8 findings/i);
+    expect(out).toMatch(/at most 25 findings/i);
   });
 
   test('contains a custom maxFindings when provided', () => {
@@ -774,7 +774,7 @@ const HAND_WRITTEN_HEADER = [
   '- `file` MUST be one of the file paths shown in the diff below; never invent a path.',
   '- If there are no issues, emit `{"summary": "...", "findings": []}`.',
   '',
-  'Emit at most 8 findings, prioritizing the highest-severity issues.',
+  'Emit at most 25 findings, prioritizing the highest-severity issues.',
 ].join('\n');
 
 describe('buildStructuredReviewPrompt — F-PROMPTMODE pins', () => {
