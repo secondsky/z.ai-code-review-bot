@@ -5,8 +5,8 @@
 # used to call Z.ai server-side and is never exposed to the PR author.
 #
 # Copy this into .github/workflows/ in the consuming repo and adjust the `uses:`
-# line (point it at a version tag once you publish one, e.g.
-# <your-org>/z.ai-code-review-bot@v2.0.0).
+# line once you publish a release (pin it to the release's full commit SHA —
+# see the security note next to the step).
 
 name: Z.ai Review
 
@@ -39,7 +39,20 @@ jobs:
     # re-triggers this workflow once they are).
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      # SECURITY: pin the action to the FULL commit SHA of the release tag —
+      # not the mutable tag. Force-pushed tags were the propagation vector of
+      # the 2025-2026 tj-actions/changed-files (CVE-2025-30066) and aqua Trivy
+      # action supply-chain compromises:
+      #   uses: <your-org>/z.ai-code-review-bot@<full-commit-sha> # v2.0.0
+      # Keep the pin current with Dependabot's `github-actions` ecosystem
+      # (.github/dependabot.yml):
+      #   version: 2
+      #   updates:
+      #     - package-ecosystem: github-actions
+      #       directory: /
+      #       schedule: { interval: weekly }
       - name: Review with Z.ai
         uses: <your-org>/z.ai-code-review-bot@v2.0.0
         with:

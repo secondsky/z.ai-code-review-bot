@@ -22,7 +22,8 @@
 # (ZAI_AUTH_THRESHOLD, default 'write') so a misconfigured workflow cannot let an
 # untrusted user through. Both layers must agree for a command to run.
 #
-# Copy into .github/workflows/ and set the `uses:` line to a published version.
+# Copy into .github/workflows/ and pin the `uses:` line to a published release
+# (full commit SHA — see the security note next to the step).
 
 name: Z.ai Commands
 
@@ -57,7 +58,20 @@ jobs:
           && contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'),
                        github.event.comment.author_association) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      # SECURITY: pin the action to the FULL commit SHA of the release tag —
+      # not the mutable tag. Force-pushed tags were the propagation vector of
+      # the 2025-2026 tj-actions/changed-files (CVE-2025-30066) and aqua Trivy
+      # action supply-chain compromises:
+      #   uses: <your-org>/z.ai-code-review-bot@<full-commit-sha> # v2.0.0
+      # Keep the pin current with Dependabot's `github-actions` ecosystem
+      # (.github/dependabot.yml):
+      #   version: 2
+      #   updates:
+      #     - package-ecosystem: github-actions
+      #       directory: /
+      #       schedule: { interval: weekly }
       - name: Run /zai command
         uses: <your-org>/z.ai-code-review-bot@v2.0.0
         with:

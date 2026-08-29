@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Explicit cooldown (zizmor dependabot-cooldown): 7 days beats GitHub's
+    # implicit 3-day default — compromised releases are usually pulled fast.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       actions-deps:
@@ -26,6 +30,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: chore(ci-deps)

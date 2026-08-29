@@ -55,7 +55,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: secondsky/z.ai-code-review-bot@v2
+      - uses: secondsky/z.ai-code-review-bot@e906b1c8edb0f4f1695352ebd49e2bb265d00435 # v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -201,13 +201,13 @@ pull_request event
 | **Inline comments** | ✅ | ✅ | ✅ |
 | **Repo config file** | ✅ `.zai.yml` | ✅ `.coderabbit.yaml` | ❌ |
 | **Cost** | your Z.ai API cost only | subscription | subscription |
-| **Auditable core** | ✅ ~11k LOC, 3 deps, 2338 tests | black box | black box |
+| **Auditable core** | ✅ ~11k LOC, 3 deps, 2349 tests | black box | black box |
 
 ## Development
 
 ```bash
 npm install
-npm test            # vitest suite (2338 tests)
+npm test            # vitest suite (2349 tests)
 npm run test:coverage
 npm run build       # @vercel/ncc -> dist/index.js (commit the bundle)
 npm audit           # 0 vulnerabilities
@@ -216,6 +216,28 @@ npm audit           # 0 vulnerabilities
 `dist/index.js` is committed on purpose — it is what the runner executes. CI
 fails if it drifts from `src/`. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for
 the module map and [`SECURITY.md`](./SECURITY.md) for the authorization model.
+
+## Security
+
+- **Pin the action to a full commit SHA.** Tags are mutable, and force-pushed
+  tags were the propagation vector of the 2025–2026 GitHub Action supply-chain
+  compromises (tj-actions/changed-files, aqua Trivy). Reference the action as
+  `<your-org>/z.ai-code-review-bot@<full-commit-sha>` — not a floating tag —
+  and enable Dependabot's `github-actions` package ecosystem so it keeps the
+  pin current. The example workflows in
+  [`.github/workflows/`](./.github/workflows/) document the exact setup.
+- **Keep the least-privilege `permissions:` blocks.** The example workflows
+  grant each job only the scopes it needs (`pull-requests: write`,
+  `contents: read`, and optionally `statuses: write`); widening them is never
+  required.
+- **Keep first-time contributor approvals on.** By default, GitHub requires
+  maintainer approval before workflow runs from first-time fork contributors
+  execute — leave that default in place.
+- **This repo dogfoods its own hardening.** Every action reference is
+  SHA-pinned, and CI runs the zizmor + actionlint
+  ([`ci.yml`](./.github/workflows/ci.yml)), CodeQL
+  ([`codeql.yml`](./.github/workflows/codeql.yml)), and OpenSSF Scorecard
+  ([`scorecard.yml`](./.github/workflows/scorecard.yml)) gates on every change.
 
 ## License
 
