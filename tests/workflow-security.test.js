@@ -86,14 +86,14 @@ describe('active workflow discovery', () => {
   });
 
   // Vacuity guard: the policy tests below must never pass because they
-  // scanned nothing. Today the pinned 3 files carry exactly 6 checkout
-  // steps (4 in ci.yml, 1 in codeql.yml, 1 in scorecard.yml); if this
+  // scanned nothing. Today the pinned 3 files carry exactly 7 checkout
+  // steps (5 in ci.yml, 1 in codeql.yml, 1 in scorecard.yml); if this
   // count changes, update it deliberately.
   it('actually scans the expected number of checkout steps', () => {
     const checkouts = workflows.flatMap(({ doc }) =>
       collectSteps(doc).filter((s) => s.uses.startsWith('actions/checkout@'))
     );
-    expect(checkouts).toHaveLength(6);
+    expect(checkouts).toHaveLength(7);
   });
 });
 
