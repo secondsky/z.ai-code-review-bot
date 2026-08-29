@@ -1,4 +1,4 @@
-name: 'Z.ai Code Review'
+name: 'Z-AI GLM Code Review Bot'
 description: 'AI-powered pull-request code review and interactive /zai assistant using Z.ai GLM models.'
 author: 'z.ai-code-review-bot contributors'
 branding:
