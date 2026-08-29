@@ -22,7 +22,8 @@
   "devDependencies": {
     "@vercel/ncc": "^0.45.0",
     "@vitest/coverage-v8": "^4.1.10",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "yaml": "^2.9.0"
   },
   "engines": {
     "node": ">=20"
