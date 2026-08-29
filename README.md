@@ -55,7 +55,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: secondsky/z.ai-code-review-bot@e906b1c8edb0f4f1695352ebd49e2bb265d00435 # v2.0.0
+      - uses: secondsky/z.ai-code-review-bot@755511b788750a30ab0fb7b98649e8ab5b3d64eb # v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
