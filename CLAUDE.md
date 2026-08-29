@@ -2,6 +2,7 @@
 
 ## Communication
 
+- THE ABSOLUTE MOST IMPORTANT RULE: when talking to me, use clear, easy, short, everyday end-user language. No jargon — explain things the way you would to someone who is not a technical person. This rule outranks every other rule in this file.
 - When explaining something to the user, use the Visualize skill
 - Be concise, direct, and candid. Challenge weak assumptions and distinguish verified facts from uncertainty
 - Ground research in authoritative, current sources and link important evidence
