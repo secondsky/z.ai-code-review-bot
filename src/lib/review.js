@@ -25,7 +25,7 @@
 
 import { MARKER, collectPages, isBotAuthor } from './comments.js';
 import { sanitizeModelOutput, sanitizeCommentBody } from './sanitize-output.js';
-import { sanitizeTextField } from './findings.js';
+import { sanitizeTextField, renderOverflowSection } from './findings.js';
 import { postComment } from './handlers/_shared.js';
 import { formatWalkthroughSummary } from './walkthrough.js';
 
@@ -60,6 +60,9 @@ const SEVERITY_EMOJI = {
  *   - **file** — title           (one per summary-only finding)
  *     <endif>
  *   <endif>
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
+ *   <endif>
  *   <!-- zai-code-review -->     (byte-exact marker — REQUIRED for idempotency)
  *
  * The walkthrough path reuses formatWalkthroughSummary but strips its header +
@@ -70,7 +73,7 @@ const SEVERITY_EMOJI = {
  *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string, overflowFindings?:Array}} [metadata]
  * @returns {string}
  */
 export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -158,6 +161,19 @@ export function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
       }
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail (set
+  // by runStructuredReview). Rendered AFTER the summary-only content and BEFORE
+  // the marker via the shared findings.js helper — additive: renders nothing
+  // (byte-identical output) when the key is absent or empty. The literal
+  // <details> tags survive sanitizeCommentBody below exactly like the
+  // walkthrough's cohort blocks, and the fields inside are escaped by the
+  // helper itself.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   lines.push(MARKER);

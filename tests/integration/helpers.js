@@ -59,7 +59,7 @@ export function makeConfig(overrides = {}) {
     // Deliberate integration deviations from loadConfig's values:
     // maxDiffChars Infinity = unlimited (D-4's representation, formerly the 0
     // sentinel): integration diffs are small and must never be truncated/capped
-    // the way production caps them at 100000 — same e2e behavior.
+    // the way production caps them at 500000 — same e2e behavior.
     maxDiffChars: Infinity,
     // Phase 4: scanner layer. Integration tests DISABLE the master switch by
     // default so the real runScanners (which would attempt to download

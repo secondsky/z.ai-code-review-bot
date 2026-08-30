@@ -7,7 +7,9 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { hashFinding } from '../src/lib/findings.js';
+import { hashFinding, formatFindingsAsSummary } from '../src/lib/findings.js';
+import { formatWalkthroughSummary } from '../src/lib/walkthrough.js';
+import { buildReviewBody } from '../src/lib/review.js';
 import { INPUT_NAMES } from '../src/lib/config.js';
 
 // Dynamic import so we can assert import-safety AFTER spying on core.setFailed.
@@ -101,7 +103,7 @@ function makeConfig(overrides = {}) {
     maxFindings: 8,
     minSeverity: 'info',
     temperature: 0.2,
-    maxTokens: 4096,
+    maxTokens: 8192,
     batchConcurrency: 3,
     fallbackPrompt: '',
     // Phase 4: scanner master switch OFF in tests by default so the real
@@ -2041,6 +2043,128 @@ describe('run — pull_request skipped-files note (W17-C1-3)', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Task 4 — beyond-cap (overflow) findings threading
+ *
+ * runStructuredReview exposes the ranked beyond-cap tail as
+ * metadata.overflowFindings. run() must thread it into BOTH delivery
+ * branches — the inline-review branch's buildReviewBody metadata AND the
+ * summary-only branch's renderer metadata (walkthrough AND flat renderer) —
+ * so all three renderers can show the collapsed "more findings" section.
+ * The value is passed RAW (possibly undefined); the renderers gate on a
+ * non-empty array themselves, so no extra gating lives here.
+ * ------------------------------------------------------------------ */
+
+describe('run — overflow findings threading (Task 4)', () => {
+  const overflowTail = [
+    { file: 'src/a.js', line: 3, severity: 'low', title: 'Tail', description: 'd' },
+  ];
+  const reviewResult = (findings) => ({
+    findings,
+    summary: 's',
+    metadata: {
+      totalBatches: 1,
+      totalFindingsBeforeCap: 2,
+      deterministicFindingsCount: 0,
+      batchMetadata: [],
+      overflowFindings: overflowTail,
+    },
+  });
+
+  it('Task 4: inline branch threads result.metadata.overflowFindings into buildReviewBody metadata', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    // Spy wrapper around the REAL renderer so the threading is observable
+    // while the posted body still reflects production output.
+    const buildReviewBodySpy = vi.fn(buildReviewBody);
+
+    await run(prContext(), {
+      config: makeConfig(),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: vi.fn(async () =>
+        reviewResult([
+          { file: 'src/a.js', line: 2, severity: 'high', title: 'T', description: 'd' },
+        ]),
+      ),
+      buildReviewBody: buildReviewBodySpy,
+    });
+
+    expect(octokit.__calls.createReview).toHaveLength(1);
+    // overflowFindings rides the metadata object by reference, ungated.
+    const meta = buildReviewBodySpy.mock.calls[0][2];
+    expect(meta.overflowFindings).toBe(overflowTail);
+    // The real renderer turns it into the collapsed section in the body.
+    const body = octokit.__calls.createReview[0].body;
+    expect(body).toContain('➕ 1 more findings (below the display cap)');
+  });
+
+  it('Task 4: summary-only branch threads overflowFindings into the walkthrough renderer metadata (default)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    const formatWalkthroughSummarySpy = vi.fn(formatWalkthroughSummary);
+    const formatFindingsAsSummarySpy = vi.fn(formatFindingsAsSummary);
+
+    await run(prContext(), {
+      config: makeConfig(), // walkthrough: true by default
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      // line: null → file-level → summary-only branch.
+      runStructuredReview: vi.fn(async () =>
+        reviewResult([
+          { file: 'src/a.js', line: null, severity: 'low', title: 'X', description: 'd' },
+        ]),
+      ),
+      formatWalkthroughSummary: formatWalkthroughSummarySpy,
+      formatFindingsAsSummary: formatFindingsAsSummarySpy,
+    });
+
+    expect(octokit.__calls.createComment).toHaveLength(1);
+    expect(formatWalkthroughSummarySpy).toHaveBeenCalledTimes(1);
+    expect(formatFindingsAsSummarySpy).not.toHaveBeenCalled();
+    // Same summaryMetadata object reaches the walkthrough renderer's options.
+    const opts = formatWalkthroughSummarySpy.mock.calls[0][2];
+    expect(opts.metadata.overflowFindings).toBe(overflowTail);
+    // The rendered walkthrough carries the collapsed section before the marker.
+    const body = octokit.__calls.createComment[0].body;
+    expect(body).toContain('➕ 1 more findings (below the display cap)');
+  });
+
+  it('Task 4: summary-only branch threads overflowFindings into the flat renderer metadata too (walkthrough off)', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit({
+      files: [file('src/a.js', '@@ -1,0 +2 @@\n+const x = 1;\n')],
+    });
+    const formatFindingsAsSummarySpy = vi.fn(formatFindingsAsSummary);
+
+    await run(prContext(), {
+      config: makeConfig({ walkthrough: false }),
+      core,
+      octokit,
+      callApi: vi.fn(),
+      apiClient: { call: vi.fn() },
+      runStructuredReview: vi.fn(async () =>
+        reviewResult([
+          { file: 'src/a.js', line: null, severity: 'low', title: 'X', description: 'd' },
+        ]),
+      ),
+      formatFindingsAsSummary: formatFindingsAsSummarySpy,
+    });
+
+    expect(formatFindingsAsSummarySpy).toHaveBeenCalledTimes(1);
+    const opts = formatFindingsAsSummarySpy.mock.calls[0][1];
+    expect(opts.metadata.overflowFindings).toBe(overflowTail);
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * W18-D2-3 — partial-drop portion note (skippedEntries)
  *
  * skippedFiles counts only zero-entry files, but skippedEntries (partial
@@ -2688,10 +2812,10 @@ describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
     expect(typeof arg.userPrompt).toBe('string');
   });
 
-  it('forwards default temperature (0.2) and maxTokens (4096) to client.call in the stock config', async () => {
-    // loadConfig ALWAYS produces numbers for these (default 0.2 / 4096). The
+  it('forwards default temperature (0.2) and maxTokens (8192) to client.call in the stock config', async () => {
+    // loadConfig ALWAYS produces numbers for these (default 0.2 / 8192). The
     // adapter forwards them whenever non-null, which is always for a real
-    // config — so a stock run actually sends temperature=0.2 & max_tokens=4096.
+    // config — so a stock run actually sends temperature=0.2 & max_tokens=8192.
     const core = makeCore();
     const octokit = makeOctokit({ files: [file('src/a.js')] });
     const callSpy = vi.fn(async () => ({
@@ -2700,14 +2824,14 @@ describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
       usedFallback: false,
     }));
     await run(prContext(), {
-      config: makeConfig(), // default temperature 0.2, maxTokens 4096
+      config: makeConfig(), // default temperature 0.2, maxTokens 8192
       core,
       octokit,
       apiClient: { call: callSpy },
     });
     const arg = callSpy.mock.calls[0][0];
     expect(arg.temperature).toBe(0.2);
-    expect(arg.maxTokens).toBe(4096);
+    expect(arg.maxTokens).toBe(8192);
   });
 
   it('passes fallbackPrompt to createApiClient when config.fallbackPrompt is a non-empty string', async () => {

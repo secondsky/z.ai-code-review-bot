@@ -418,7 +418,7 @@ export function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
 
   // maxFindings: repo can only LOWER the cap.
   const actionMaxFindings =
-    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 25;
+    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 40;
   const repoMaxFindings =
     Number.isInteger(reviews.max_findings) && reviews.max_findings > 0
       ? reviews.max_findings

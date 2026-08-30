@@ -256,4 +256,43 @@ describe('matchesAnyPattern', () => {
     expect(matchesAnyPattern('[!a]', ['\\[!a\\]'])).toBe(true);
     expect(matchesAnyPattern('a', ['\\[!a\\]'])).toBe(false);
   });
+
+  // ------------------------------------------------------------------
+  // Defaults batch: the four NEW default EXCLUDE_PATTERNS entries
+  // ('*.min.js', '*.min.css', '*.map', '*.snap') must match NESTED
+  // basenames. Like '*.lock', each pattern has no slash, so it matches via
+  // the basename leg of matchesAnyPattern even when the file sits deep in
+  // a directory tree — that is how generated/vendored artifacts
+  // (dist/bundle.min.js, assets/site.min.css, src/app.js.map,
+  // test/__snapshots__/x.test.js.snap) get excluded by the default list.
+  // ------------------------------------------------------------------
+
+  test('defaults: *.min.js matches a nested minified JS basename', () => {
+    expect(matchesAnyPattern('dist/bundle.min.js', ['*.min.js'])).toBe(true);
+    expect(matchesAnyPattern('a/b/c/vendor.min.js', ['*.min.js'])).toBe(true);
+  });
+
+  test('defaults: *.min.css matches a nested minified CSS basename', () => {
+    expect(matchesAnyPattern('assets/site.min.css', ['*.min.css'])).toBe(true);
+    expect(matchesAnyPattern('build/css/main.min.css', ['*.min.css'])).toBe(true);
+  });
+
+  test('defaults: *.map matches a nested sourcemap basename', () => {
+    expect(matchesAnyPattern('src/app.js.map', ['*.map'])).toBe(true);
+    expect(matchesAnyPattern('dist/assets/bundle.css.map', ['*.map'])).toBe(true);
+  });
+
+  test('defaults: *.snap matches a nested snapshot basename', () => {
+    expect(matchesAnyPattern('test/__snapshots__/x.test.js.snap', ['*.snap'])).toBe(true);
+    expect(matchesAnyPattern('__snapshots__/a.b.snap', ['*.snap'])).toBe(true);
+  });
+
+  test('defaults: the new patterns do NOT match files whose basename merely contains them', () => {
+    // '*.min.js' must not swallow hand-written sources whose basename only
+    // embeds the substring (e.g. 'min.js' alone, or '.mins.js').
+    expect(matchesAnyPattern('src/min.js', ['*.min.js'])).toBe(false);
+    expect(matchesAnyPattern('src/app.mins.js', ['*.min.js'])).toBe(false);
+    expect(matchesAnyPattern('src/mapper.js', ['*.map'])).toBe(false);
+    expect(matchesAnyPattern('src/snappy.js', ['*.snap'])).toBe(false);
+  });
 });

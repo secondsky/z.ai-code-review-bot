@@ -132,7 +132,7 @@ function makeConfig(overrides = {}) {
     model: 'm',
     reviewerName: 'Z.ai Code Review',
     excludePatterns: [],
-    maxDiffChars: 100000,
+    maxDiffChars: 500000,
     largePrFileThreshold: 50,
     ...overrides,
   };
@@ -1848,6 +1848,90 @@ describe('reviewOnePr — W17-C1-3 skipped-files note', () => {
     expect(typeof meta.truncated).toBe('number');
     const body = s.upsertReview.mock.calls[0][0].body;
     expect(body).toContain('1 file not reviewed (MAX_DIFF_CHARS cap).');
+  });
+
+  // Task 4 (defaults-and-overflow): PR/schedule parity — reviewOnePr must
+  // thread result.metadata.overflowFindings into BOTH branches exactly like
+  // index.js (inline buildReviewBody metadata + summary renderer metadata).
+  // The value is passed RAW (possibly undefined); the renderers gate on a
+  // non-empty array themselves.
+  it('Task 4: inline path threads result.metadata.overflowFindings into buildReviewBody metadata', async () => {
+    const overflowTail = [
+      { file: 'a.js', line: 3, severity: 'low', title: 'Tail', description: 'd' },
+    ];
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [INLINE_FINDING],
+        summary: 'inline',
+        metadata: {
+          totalBatches: 1,
+          totalFindingsBeforeCap: 2,
+          deterministicFindingsCount: 0,
+          batchMetadata: [],
+          overflowFindings: overflowTail,
+        },
+      })),
+      // Spy wrapper around the REAL renderer (same harness as the
+      // skippedFiles contract test above).
+      buildReviewBody: vi.fn(buildReviewBody),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(63, 'sha63'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig(), core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    // overflowFindings rides the metadata object by reference, ungated.
+    const meta = s.buildReviewBody.mock.calls[0][2];
+    expect(meta.overflowFindings).toBe(overflowTail);
+    // The real renderer turns it into the collapsed section in the body.
+    const body = s.upsertReview.mock.calls[0][0].body;
+    expect(body).toContain('➕ 1 more findings (below the display cap)');
+  });
+
+  it('Task 4: summary branch threads result.metadata.overflowFindings into the walkthrough renderer metadata', async () => {
+    const overflowTail = [
+      { file: 'a.js', line: null, severity: 'info', title: 'Tail', description: 'd' },
+    ];
+    // line: null → file-level → summary-only branch.
+    const fileLevelFinding = { file: 'a.js', line: null, severity: 'low', title: 'X', description: 'd' };
+    const s = makeStubs({
+      getChangedFiles: vi.fn(async () => [INLINE_FILE]),
+      runStructuredReview: vi.fn(async () => ({
+        findings: [fileLevelFinding],
+        summary: 'summary only',
+        metadata: {
+          totalBatches: 1,
+          totalFindingsBeforeCap: 2,
+          deterministicFindingsCount: 0,
+          batchMetadata: [],
+          overflowFindings: overflowTail,
+        },
+      })),
+      // Real renderers so the posted body reflects production output.
+      formatWalkthroughSummary: vi.fn(formatWalkthroughSummary),
+      formatFindingsAsSummary: vi.fn(formatFindingsAsSummary),
+    });
+
+    const result = await reviewOnePr({
+      pr: mkPr(64, 'sha64'),
+      octokit: makeOctokit(), owner: 'o', repo: 'r',
+      config: makeConfig({ walkthrough: true }),
+      core: { info: vi.fn(), warning: vi.fn() }, callApi: vi.fn(), ...s,
+    });
+
+    expect(result).toEqual({ ok: true, action: 'reviewed' });
+    expect(s.formatWalkthroughSummary).toHaveBeenCalledTimes(1);
+    expect(s.formatFindingsAsSummary).not.toHaveBeenCalled();
+    // Same summaryMetadata object reaches the renderer's options.
+    const opts = s.formatWalkthroughSummary.mock.calls[0][2];
+    expect(opts.metadata.overflowFindings).toBe(overflowTail);
+    // The rendered walkthrough carries the collapsed section before the marker.
+    const body = s.upsertReviewComment.mock.calls[0][0].body;
+    expect(body).toContain('➕ 1 more findings (below the display cap)');
   });
 
   it('W17-C1-3: zero skipped files → no skip note in the posted body', async () => {

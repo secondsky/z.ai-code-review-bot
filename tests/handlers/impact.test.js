@@ -629,6 +629,10 @@ const DEFAULT_EXCLUDES = [
   'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
+  '*.min.js',
+  '*.min.css',
+  '*.map',
+  '*.snap',
 ];
 
 describe('buildDiffContext — W16-B4-4 (impact): excluded files dropped before the budget', () => {

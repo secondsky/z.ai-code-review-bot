@@ -163,6 +163,71 @@ describe('buildReviewBody', () => {
     expect(body).not.toContain('\n# H');
     expect(body).not.toMatch(/^# H$/m);
   });
+
+  it('appends the collapsed overflow section after summary-only findings, before the marker', () => {
+    const body = buildReviewBody(
+      'Summary.',
+      [{ file: 'src/a.js', title: 'Inline-unmappable', severity: 'high' }],
+      {
+        overflowFindings: [
+          { file: 'src/b.js', line: 7, severity: 'low', title: 'Beyond cap' },
+        ],
+      },
+    );
+    expect(body).toContain('➕ 1 more findings (below the display cap)');
+    expect(body).toContain('- 🔵 `src/b.js`:L7 — Beyond cap');
+    const addlIdx = body.indexOf('Additional findings');
+    const sectionIdx = body.indexOf('<details>');
+    const markerIdx = body.lastIndexOf(MARKER);
+    expect(addlIdx).toBeGreaterThan(-1);
+    expect(sectionIdx).toBeGreaterThan(addlIdx);
+    expect(markerIdx).toBeGreaterThan(sectionIdx);
+    // The marker stays the last thing in the body (idempotency detection).
+    expect(body.endsWith(MARKER)).toBe(true);
+  });
+
+  it('is unchanged when overflowFindings is absent or empty', () => {
+    const base = buildReviewBody(
+      'Summary.',
+      [{ file: 'src/a.js', title: 'Bug', severity: 'high' }],
+      {},
+    );
+    expect(
+      buildReviewBody('Summary.', [{ file: 'src/a.js', title: 'Bug', severity: 'high' }], {
+        overflowFindings: [],
+      }),
+    ).toBe(base);
+    expect(base).not.toContain('<details>');
+  });
+
+  // Parity with the W17-C1-1 summary test: the overflow section's <details> /
+  // <summary> tags are TRUSTED LITERALS — hostile finding fields must never
+  // emit a raw structural tag that could break out of the collapsible section.
+  it('overflow section parity — hostile title/filename never emit raw structural tags', () => {
+    const body = buildReviewBody('Summary.', [], {
+      overflowFindings: [
+        {
+          file: 'evil`</details><script>alert(1)</script>.js',
+          line: 3,
+          severity: 'critical',
+          title: '</details><script>alert(1)</script>',
+        },
+      ],
+    });
+    // The only structural tags in the body are the helper's literals.
+    expect((body.match(/<details>/g) || []).length).toBe(1);
+    expect((body.match(/<\/details>/g) || []).length).toBe(1);
+    expect((body.match(/<summary>/g) || []).length).toBe(1);
+    expect((body.match(/<\/summary>/g) || []).length).toBe(1);
+    expect(body).not.toContain('<script');
+    expect(body).not.toContain('</script');
+    // The hostile payloads survive, escaped and visible.
+    expect(body).toContain('&lt;/details&gt;');
+    expect(body).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    // And the section survived sanitizeCommentBody intact (closing tag last,
+    // marker still the final line).
+    expect(body.endsWith(MARKER)).toBe(true);
+  });
 });
 
 describe('buildReviewComments', () => {

@@ -1122,6 +1122,54 @@ describe('runStructuredReview', () => {
     expect(out.metadata.totalFindingsBeforeCap).toBe(5);
   });
 
+  test('exposes beyond-cap findings as metadata.overflowFindings in ranked order', async () => {
+    const files = [makeFile({ filename: 'a.js', patch: 'short' })];
+    // 5 findings, distinct severities, so the ranked order is fixed:
+    // critical, high, medium, low, info. Cap at 2.
+    const callApi = async () =>
+      structuredPayload('s', [
+        finding('a.js', { title: 'low issue', severity: 'low' }),
+        finding('a.js', { title: 'critical issue', severity: 'critical' }),
+        finding('a.js', { title: 'info issue', severity: 'info' }),
+        finding('a.js', { title: 'high issue', severity: 'high' }),
+        finding('a.js', { title: 'medium issue', severity: 'medium' }),
+      ]);
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxFindings: 2 },
+      { callApi },
+    );
+    expect(out.findings.map((f) => f.title)).toEqual([
+      'critical issue',
+      'high issue',
+    ]);
+    // Overflow carries the beyond-cap tail in the same ranked order —
+    // content checked, not just length.
+    expect(Array.isArray(out.metadata.overflowFindings)).toBe(true);
+    expect(out.metadata.overflowFindings.map((f) => f.title)).toEqual([
+      'medium issue',
+      'low issue',
+      'info issue',
+    ]);
+    expect(out.metadata.totalFindingsBeforeCap).toBe(5);
+  });
+
+  test('metadata has no overflowFindings key when merged findings fit the cap', async () => {
+    const files = [makeFile({ filename: 'a.js', patch: 'short' })];
+    const callApi = async () =>
+      structuredPayload('s', [
+        finding('a.js', { title: 'one' }),
+        finding('a.js', { title: 'two' }),
+      ]);
+    const out = await runStructuredReview(
+      files,
+      { apiKey: 'k', model: 'm', maxFindings: 5 },
+      { callApi },
+    );
+    expect(out.findings).toHaveLength(2);
+    expect(out.metadata).not.toHaveProperty('overflowFindings');
+  });
+
   test('mergeFindings merges deterministic (config.deterministicFindings) over LLM', async () => {
     const files = [makeFile({ filename: 'a.js', patch: 'short' })];
     const deterministic = [

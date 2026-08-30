@@ -28,17 +28,19 @@ inputs:
   EXCLUDE_PATTERNS:
     description: 'Comma-separated glob patterns to exclude from review.'
     required: false
-    default: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'
+    default: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml,*.min.js,*.min.css,*.map,*.snap'
 
   MAX_DIFF_CHARS:
     description: |-
-      Hard cap on total diff chars sent to the model per review batch. 0 (or any
-      negative value) = unlimited (NOT recommended — a large PR can produce a
-      huge prompt and exhaust your Z.ai quota; the cap defends against cost
-      abuse from fork PRs). The structured-review pipeline batches large PRs
-      regardless; this cap limits each batch's prompt size.
+      Hard cap on TOTAL diff chars across ALL batches of one review (not a
+      per-batch limit). Files that would push the review past this cap are
+      skipped and noted in the review. Per-batch prompt size is capped
+      separately by ZAI_MAX_BATCH_CHARS. 0 (or any negative value) =
+      unlimited (NOT recommended — a large PR can produce a huge prompt and
+      exhaust your Z.ai quota; the cap defends against cost abuse from fork
+      PRs).
     required: false
-    default: '100000'
+    default: '500000'
 
   # --- Large-PR batching knobs ---
   ZAI_LARGE_PR_FILE_THRESHOLD:
@@ -135,10 +137,10 @@ inputs:
   ZAI_MAX_FINDINGS:
     description: |-
       Maximum number of findings the review will emit (after ranking + capping).
-      Findings above this cap are dropped (highest-severity first). Clamped to
-      [1, 50] — values outside that range fall back to the default.
+      Findings above this cap are listed in a collapsed 'more findings' section (highest-severity first). Clamped to
+      [1, 100] — values outside that range fall back to the default.
     required: false
-    default: '25'
+    default: '40'
 
   ZAI_MIN_SEVERITY:
     description: |-
@@ -159,10 +161,10 @@ inputs:
   ZAI_MAX_TOKENS:
     description: |-
       Maximum tokens to generate per model call. Clamped to a minimum of 1;
-      invalid values fall back to 4096. Wired into the Z.ai request body as
+      invalid values fall back to 8192. Wired into the Z.ai request body as
       max_tokens.
     required: false
-    default: '4096'
+    default: '8192'
 
   ZAI_BATCH_CONCURRENCY:
     description: |-

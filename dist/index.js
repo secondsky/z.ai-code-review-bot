@@ -39456,7 +39456,7 @@ function clampFloat(raw, fallback, min, max) {
 
 /**
  * Parse and clamp a positive-integer input, then cap at `cap`. Returns the
- * fallback on NaN/non-finite/below-min. Used for `ZAI_MAX_FINDINGS` (cap 50)
+ * fallback on NaN/non-finite/below-min. Used for `ZAI_MAX_FINDINGS` (cap 100)
  * and `ZAI_MAX_TOKENS` (no cap — pass Infinity).
  *
  * @param {string} raw
@@ -39490,7 +39490,7 @@ function loadConfig(inputs = {}, options = {}) {
   const excludeRaw = read(inputs, 'EXCLUDE_PATTERNS');
   const excludePatterns =
     excludeRaw.trim() === ''
-      ? ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']
+      ? ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '*.min.js', '*.min.css', '*.map', '*.snap']
       : excludeRaw
           .split(',')
           .map((p) => p.trim())
@@ -39502,12 +39502,13 @@ function loadConfig(inputs = {}, options = {}) {
   // branch two-state (Number.isFinite = cap active; Infinity = unlimited)
   // instead of the former three-state `> 0` checks on a 0 sentinel. The
   // DEFAULT is a sane cap; operators who want unlimited set MAX_DIFF_CHARS=0
-  // (or a negative) explicitly. A positive integer is honored as the
-  // per-batch char cap.
+  // (or a negative) explicitly. A positive integer is honored as the TOTAL
+  // char cap across ALL batches; the per-batch budget is
+  // min(ZAI_MAX_BATCH_CHARS, MAX_DIFF_CHARS).
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null
-      ? 100000
+      ? 500000
       : maxDiffCharsRaw > 0
         ? maxDiffCharsRaw
         : Infinity;
@@ -39553,8 +39554,8 @@ function loadConfig(inputs = {}, options = {}) {
   // v2 structured-review knobs.
   const maxFindings = clampPositiveCapped(
     read(inputs, 'ZAI_MAX_FINDINGS'),
-    25,
-    50,
+    40,
+    100,
   );
 
   // minSeverity: validate against the allowed set; invalid → 'info' + warning.
@@ -39575,7 +39576,7 @@ function loadConfig(inputs = {}, options = {}) {
   }
 
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
-  const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
+  const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 8192);
 
   // Phase 6.1: bounded batch concurrency. Default 3, clamped to [1, 8].
   // Below-1 values are treated as invalid (defensive: a future caller cannot
@@ -41648,7 +41649,7 @@ function buildStructuredReviewPrompt(files, options = {}) {
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings > 0
       ? Math.floor(options.maxFindings)
-      : 25;
+      : 40;
 
   // The instruction varies only by the maxFindings cap (interpolated) —
   // everything else is constant.
@@ -41903,6 +41904,16 @@ const SEVERITY_LABEL = {
   low: 'Low',
   info: 'Info',
 };
+
+/**
+ * Maximum number of overflow finding LINES rendered inside the collapsed
+ * "more findings" section ({@link renderOverflowSection}). Beyond-cap findings
+ * exist to be visible at a glance, not to re-create the wall of text the cap
+ * exists to prevent; the section always reports the FULL count in its summary
+ * line and appends `_+N more not shown_` for the tail beyond this cap.
+ * @type {number}
+ */
+const OVERFLOW_DISPLAY_CAP = 100;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -42583,22 +42594,25 @@ function findingComparator(a, b) {
 }
 
 /**
- * Filter, sort, and cap findings.
+ * Filter, sort, and split findings into kept and overflow buckets.
  *
  * Drops findings whose severity rank is GREATER than `SEVERITY_RANK[minSeverity]`,
- * sorts by (severity, confidence, file, line), and caps at `maxFindings`.
+ * sorts by (severity, confidence, file, line), then splits at `maxFindings`:
+ * `kept` is the first `maxFindings` entries and `overflow` is the remaining
+ * tail, both in the same ranked order. `overflow` is empty when nothing
+ * exceeds the cap. Non-array input yields `{ kept: [], overflow: [] }`.
  *
  * @param {Record<string, unknown>[]} findings
  * @param {{ maxFindings?: number, minSeverity?: string }} [options]
- * @returns {Record<string, unknown>[]}
+ * @returns {{ kept: Record<string, unknown>[], overflow: Record<string, unknown>[] }}
  */
-function rankAndCapFindings(findings, options = {}) {
-  if (!Array.isArray(findings)) return [];
+function rankAndSplitFindings(findings, options = {}) {
+  if (!Array.isArray(findings)) return { kept: [], overflow: [] };
 
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings >= 0
       ? Math.floor(options.maxFindings)
-      : 25;
+      : 40;
   const minSeverity =
     typeof options.minSeverity === 'string' && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, options.minSeverity)
       ? options.minSeverity
@@ -42614,7 +42628,26 @@ function rankAndCapFindings(findings, options = {}) {
   // Copy before sort so we never mutate caller input.
   const sorted = [...filtered].sort(findingComparator);
 
-  return sorted.slice(0, maxFindings);
+  return {
+    kept: sorted.slice(0, maxFindings),
+    overflow: sorted.slice(maxFindings),
+  };
+}
+
+/**
+ * Filter, sort, and cap findings.
+ *
+ * Drops findings whose severity rank is GREATER than `SEVERITY_RANK[minSeverity]`,
+ * sorts by (severity, confidence, file, line), and caps at `maxFindings`.
+ * Thin wrapper over {@link rankAndSplitFindings}; the beyond-cap tail is
+ * discarded here — use the split directly when callers need it.
+ *
+ * @param {Record<string, unknown>[]} findings
+ * @param {{ maxFindings?: number, minSeverity?: string }} [options]
+ * @returns {Record<string, unknown>[]}
+ */
+function rankAndCapFindings(findings, options = {}) {
+  return rankAndSplitFindings(findings, options).kept;
 }
 
 // ---------------------------------------------------------------------------
@@ -42694,6 +42727,76 @@ function mergeFindings(llmFindings, deterministicFindings) {
 }
 
 // ---------------------------------------------------------------------------
+// renderOverflowSection
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the beyond-cap (overflow) findings as a collapsed markdown section.
+ *
+ * Structure (mirrors how walkthrough.js emits its cohort blocks — blank line
+ * after the `<summary>` line and before the closing tag):
+ *   <details>
+ *   <summary>➕ N more findings (below the display cap)</summary>
+ *
+ *   - <emoji> `file`:L42 — title        (one line per DISPLAYED finding)
+ *   _+N more not shown_                  (only past OVERFLOW_DISPLAY_CAP)
+ *
+ *   </details>
+ *
+ * N in the summary line is the FULL `overflowFindings.length` even when the
+ * display is capped, so the count reviewers see is always the true one. The
+ * `<details>`/`<summary>` tags are TRUSTED LITERALS; finding fields are
+ * model-controlled, so:
+ *   - filename → inline code with backticks replaced by `'` (W6-4/W8-1) AND
+ *     angle brackets escaped via {@link sanitizeTextField} — a hostile
+ *     filename can never emit a raw structural tag that breaks out of the
+ *     collapsible section;
+ *   - title → {@link sanitizeTextField}.
+ *
+ * Returns `''` when `overflowFindings` is not a non-empty array so callers can
+ * append unconditionally (output stays byte-identical without overflow data).
+ *
+ * @param {unknown} overflowFindings
+ * @returns {string}
+ */
+function renderOverflowSection(overflowFindings) {
+  if (!Array.isArray(overflowFindings) || overflowFindings.length === 0) {
+    return '';
+  }
+
+  const total = overflowFindings.length;
+  const displayed = overflowFindings.slice(0, OVERFLOW_DISPLAY_CAP);
+  const hidden = total - displayed.length;
+
+  const lines = [];
+  lines.push('<details>');
+  lines.push(`<summary>➕ ${total} more findings (below the display cap)</summary>`);
+  lines.push('');
+  for (const f of displayed) {
+    const sev = f && typeof f.severity === 'string' ? f.severity : '';
+    // Unknown severity falls back to the info emoji (matches renderCommentBody
+    // in review.js — SEVERITY_EMOJI itself has no fallback entry).
+    const emoji = SEVERITY_EMOJI[sev] ?? '➖';
+    const file = f && typeof f.file === 'string' ? f.file : '';
+    // W6-4/W8-1: inline code neutralizes markdown metacharacters in the
+    // filename; backticks are replaced (escapes don't work in code spans).
+    // Angle brackets are escaped too (see JSDoc) so a hostile filename can
+    // never emit a raw </details>/<summary>/<script> sequence.
+    const safeFile = sanitizeTextField(file).replace(/`/g, "'");
+    const line = f && typeof f === 'object' ? f.line : undefined;
+    const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
+    const title = f && typeof f.title === 'string' ? f.title : '';
+    lines.push(`- ${emoji} \`${safeFile}\`${locSuffix} — ${sanitizeTextField(title)}`);
+  }
+  if (hidden > 0) {
+    lines.push(`_+${hidden} more not shown_`);
+  }
+  lines.push('');
+  lines.push('</details>');
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // formatFindingsAsSummary
 // ---------------------------------------------------------------------------
 
@@ -42718,6 +42821,9 @@ function mergeFindings(llmFindings, deterministicFindings) {
  *
  *   <if findings empty>:
  *   No issues found. The changes look good. ✅
+ *
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
  *
  *   <!-- zai-code-review -->  (byte-exact idempotency marker)
  *
@@ -42838,6 +42944,17 @@ function formatFindingsAsSummary(findings, options = {}) {
       }
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail
+  // (set by runStructuredReview when the ranked tail is non-empty). Rendered
+  // as a collapsed section AFTER the severity groups so the visible summary
+  // stays short while the tail stays discoverable. Additive: renders nothing
+  // (byte-identical output) when the key is absent or empty.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   // Trailing idempotency marker — byte-exact, required by comments.js.
@@ -43223,7 +43340,9 @@ function buildShaBlock(sha) {
 
 
 /* ------------------------------------------------------------------ *
- * Constants (exact values per the task brief — do not change)
+ * Constants — the shipped defaults. These mirror the validated defaults
+ * in loadConfig (src/lib/config.js), which tests/config.test.js pins;
+ * keep the two in sync when changing either side.
  * ------------------------------------------------------------------ */
 
 const HIGH_RISK_PATTERNS = [
@@ -43238,7 +43357,7 @@ const auto_review_DEFAULTS = {
   maxBatchChars: 120000,
   maxFilesPerBatch: 40,
   maxPatchChars: 18000,
-  maxFindings: 25,
+  maxFindings: 40,
   minSeverity: 'info',
 };
 
@@ -43743,19 +43862,20 @@ async function executeStructuredBatch(entries, state, deps = {}) {
  *      final batch's summary is the most complete picture).
  *   4. mergeFindings(allLLMFindings, deterministicFindings) — deterministic
  *      scanner findings supersede LLM findings at the same file:line+title.
- *   5. rankAndCapFindings(merged, {maxFindings, minSeverity}) → final capped.
+ *   5. rankAndSplitFindings(merged, {maxFindings, minSeverity}) → top-N kept
+ *      as findings; the ranked tail goes to metadata.overflowFindings.
  *   6. Return {findings, summary, metadata}.
  *
  * @param {Array} files - raw changed files (each {filename, status, patch?, ...})
  * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
- * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndCapFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
+ * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndSplitFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
  * @returns {Promise<{findings: Array, summary: string, metadata: Object}>}
  */
 async function runStructuredReview(files, config, deps = {}) {
   const callApi = deps.callApi || DEFAULT_CALL_API;
   const buildBatches = deps.createReviewBatches || createReviewBatches;
   const parseReview = deps.parseStructuredReview || parseStructuredReview;
-  const rankAndCap = deps.rankAndCapFindings || rankAndCapFindings;
+  const rankAndSplit = deps.rankAndSplitFindings || rankAndSplitFindings;
   const merge = deps.mergeFindings || mergeFindings;
   const executeBatch = deps.executeStructuredBatch || executeStructuredBatch;
   const core = deps.core;
@@ -43904,7 +44024,10 @@ async function runStructuredReview(files, config, deps = {}) {
       ? config.minSeverity
       : auto_review_DEFAULTS.minSeverity;
 
-  const findings = rankAndCap(merged, { maxFindings, minSeverity });
+  const { kept: findings, overflow: overflowFindings } = rankAndSplit(merged, {
+    maxFindings,
+    minSeverity,
+  });
 
   if (core?.info && findings.length < totalFindingsBeforeCap) {
     core.info(
@@ -43912,17 +44035,27 @@ async function runStructuredReview(files, config, deps = {}) {
     );
   }
 
+  const metadata = {
+    totalBatches: batches.length,
+    totalFindingsBeforeCap,
+    deterministicFindingsCount: deterministicFindings.length,
+    batchMetadata: batchMeta,
+    splitFileCount: batchMetadata.splitFileCount,
+    ...skippedMeta,
+  };
+
+  // Beyond-cap findings ride in metadata as a ranked tail. Informational
+  // only: unlike `findings`, they are NOT consumed by renderers, learnings,
+  // or incremental processing. Gated like skippedMeta — key present only
+  // when there is something to report.
+  if (Array.isArray(overflowFindings) && overflowFindings.length > 0) {
+    metadata.overflowFindings = overflowFindings;
+  }
+
   return {
     findings,
     summary,
-    metadata: {
-      totalBatches: batches.length,
-      totalFindingsBeforeCap,
-      deterministicFindingsCount: deterministicFindings.length,
-      batchMetadata: batchMeta,
-      splitFileCount: batchMetadata.splitFileCount,
-      ...skippedMeta,
-    },
+    metadata,
   };
 }
 
@@ -44240,6 +44373,8 @@ function severityRank(sev) {
  *     <💡 suggestion>
  *   </details>
  *   <if no findings>: No issues found. The changes look good. ✅
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
  *   <!-- zai-code-review -->
  *
  * The trailing marker is byte-exact (required by comments.js idempotency).
@@ -44356,6 +44491,19 @@ function formatWalkthroughSummary(findings, files, options = {}) {
       lines.push('</details>');
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail
+  // (set by runStructuredReview when the ranked tail is non-empty). Rendered
+  // via the shared helper as a collapsed section AFTER the last cohort block
+  // and BEFORE the byte-exact trailing marker — mirroring
+  // formatFindingsAsSummary/buildReviewBody so the walkthrough (the DEFAULT
+  // summary renderer) finally shows truncation info too. Additive: renders
+  // nothing (byte-identical output) when the key is absent or empty.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   lines.push(MARKER);
@@ -45056,6 +45204,9 @@ const review_SEVERITY_EMOJI = {
  *   - **file** — title           (one per summary-only finding)
  *     <endif>
  *   <endif>
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
+ *   <endif>
  *   <!-- zai-code-review -->     (byte-exact marker — REQUIRED for idempotency)
  *
  * The walkthrough path reuses formatWalkthroughSummary but strips its header +
@@ -45066,7 +45217,7 @@ const review_SEVERITY_EMOJI = {
  *
  * @param {string} summary - the model's prose summary
  * @param {Array<{file?:string, title?:string}>} summaryOnlyFindings - findings that couldn't map to lines
- * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string}} [metadata]
+ * @param {{reviewerName?:string, deterministicFindingsCount?:number, truncated?:number, walkthrough?:boolean, files?:Array, summary?:string, suggestedReviewersLine?:string, overflowFindings?:Array}} [metadata]
  * @returns {string}
  */
 function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
@@ -45154,6 +45305,19 @@ function buildReviewBody(summary, summaryOnlyFindings, metadata = {}) {
       }
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail (set
+  // by runStructuredReview). Rendered AFTER the summary-only content and BEFORE
+  // the marker via the shared findings.js helper — additive: renders nothing
+  // (byte-identical output) when the key is absent or empty. The literal
+  // <details> tags survive sanitizeCommentBody below exactly like the
+  // walkthrough's cohort blocks, and the fields inside are escaped by the
+  // helper itself.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   lines.push(MARKER);
@@ -47716,6 +47880,10 @@ async function reviewOnePr({
         // W17-C1-3: threaded alongside truncated/deterministic counts (same
         // metadata contract as index.js's reviewMetadata).
         skippedFiles: skippedFileCount,
+        // Beyond-cap findings: the ranked tail from the review run, passed
+        // RAW (possibly undefined) — buildReviewBody gates on a non-empty
+        // array. Same field name in all three renderers (index.js parity).
+        overflowFindings: result.metadata.overflowFindings,
       });
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
@@ -47811,6 +47979,11 @@ async function reviewOnePr({
       // W18-D1-3: the noted summary (never the raw prose) so the suppression
       // note is visible on the summary branch too.
       summary: finalSummary,
+      // Beyond-cap findings: passed RAW (possibly undefined) so BOTH summary
+      // renderers (walkthrough default / flat fallback) can render the
+      // collapsed section — they gate on a non-empty array themselves
+      // (index.js summaryMetadata parity).
+      overflowFindings: result.metadata.overflowFindings,
     };
     const content = useWalkthrough
       ? formatWalkthroughSummary(keptFindings, patchable, {
@@ -51405,7 +51578,7 @@ function mergeRepoConfig(actionConfig = {}, repoConfig = {}) {
 
   // maxFindings: repo can only LOWER the cap.
   const actionMaxFindings =
-    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 25;
+    typeof a.maxFindings === 'number' && a.maxFindings > 0 ? a.maxFindings : 40;
   const repoMaxFindings =
     Number.isInteger(reviews.max_findings) && reviews.max_findings > 0
       ? reviews.max_findings
@@ -53310,6 +53483,11 @@ async function run(context, deps = {}) {
       // Phase 8.1: pre-rendered "Suggested reviewers" line (empty string when
       // disabled/no CODEOWNERS/no matches → rendered as nothing).
       suggestedReviewersLine,
+      // Beyond-cap findings: the ranked tail from the review run, passed RAW
+      // (possibly undefined) — buildReviewBody gates on a non-empty array and
+      // renders the collapsed "more findings" section. Same field name in all
+      // three renderers (parity with summaryMetadata below).
+      overflowFindings: result.metadata.overflowFindings,
     };
 
     if (inline.length > 0) {
@@ -53412,6 +53590,10 @@ async function run(context, deps = {}) {
       summary: finalSummary,
       // Phase 8.1: pre-rendered "Suggested reviewers" line.
       suggestedReviewersLine,
+      // Beyond-cap findings: passed RAW (possibly undefined) so BOTH summary
+      // renderers (walkthrough default / flat fallback) can render the
+      // collapsed section — they gate on a non-empty array themselves.
+      overflowFindings: result.metadata.overflowFindings,
     };
     const content = useWalkthrough
       ? formatWalkthroughSummaryFn(keptFindings, patchable, {

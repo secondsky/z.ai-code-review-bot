@@ -943,6 +943,11 @@ export async function run(context, deps = {}) {
       // Phase 8.1: pre-rendered "Suggested reviewers" line (empty string when
       // disabled/no CODEOWNERS/no matches → rendered as nothing).
       suggestedReviewersLine,
+      // Beyond-cap findings: the ranked tail from the review run, passed RAW
+      // (possibly undefined) — buildReviewBody gates on a non-empty array and
+      // renders the collapsed "more findings" section. Same field name in all
+      // three renderers (parity with summaryMetadata below).
+      overflowFindings: result.metadata.overflowFindings,
     };
 
     if (inline.length > 0) {
@@ -1045,6 +1050,10 @@ export async function run(context, deps = {}) {
       summary: finalSummary,
       // Phase 8.1: pre-rendered "Suggested reviewers" line.
       suggestedReviewersLine,
+      // Beyond-cap findings: passed RAW (possibly undefined) so BOTH summary
+      // renderers (walkthrough default / flat fallback) can render the
+      // collapsed section — they gate on a non-empty array themselves.
+      overflowFindings: result.metadata.overflowFindings,
     };
     const content = useWalkthrough
       ? formatWalkthroughSummaryFn(keptFindings, patchable, {
