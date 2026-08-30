@@ -235,8 +235,9 @@ export function loadConfig(inputs = {}, options = {}) {
   // branch two-state (Number.isFinite = cap active; Infinity = unlimited)
   // instead of the former three-state `> 0` checks on a 0 sentinel. The
   // DEFAULT is a sane cap; operators who want unlimited set MAX_DIFF_CHARS=0
-  // (or a negative) explicitly. A positive integer is honored as the
-  // per-batch char cap.
+  // (or a negative) explicitly. A positive integer is honored as the TOTAL
+  // char cap across ALL batches; the per-batch budget is
+  // min(ZAI_MAX_BATCH_CHARS, MAX_DIFF_CHARS).
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null

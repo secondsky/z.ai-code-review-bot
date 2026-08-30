@@ -796,17 +796,20 @@ function findingComparator(a, b) {
 }
 
 /**
- * Filter, sort, and cap findings.
+ * Filter, sort, and split findings into kept and overflow buckets.
  *
  * Drops findings whose severity rank is GREATER than `SEVERITY_RANK[minSeverity]`,
- * sorts by (severity, confidence, file, line), and caps at `maxFindings`.
+ * sorts by (severity, confidence, file, line), then splits at `maxFindings`:
+ * `kept` is the first `maxFindings` entries and `overflow` is the remaining
+ * tail, both in the same ranked order. `overflow` is empty when nothing
+ * exceeds the cap. Non-array input yields `{ kept: [], overflow: [] }`.
  *
  * @param {Record<string, unknown>[]} findings
  * @param {{ maxFindings?: number, minSeverity?: string }} [options]
- * @returns {Record<string, unknown>[]}
+ * @returns {{ kept: Record<string, unknown>[], overflow: Record<string, unknown>[] }}
  */
-export function rankAndCapFindings(findings, options = {}) {
-  if (!Array.isArray(findings)) return [];
+export function rankAndSplitFindings(findings, options = {}) {
+  if (!Array.isArray(findings)) return { kept: [], overflow: [] };
 
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings >= 0
@@ -827,7 +830,26 @@ export function rankAndCapFindings(findings, options = {}) {
   // Copy before sort so we never mutate caller input.
   const sorted = [...filtered].sort(findingComparator);
 
-  return sorted.slice(0, maxFindings);
+  return {
+    kept: sorted.slice(0, maxFindings),
+    overflow: sorted.slice(maxFindings),
+  };
+}
+
+/**
+ * Filter, sort, and cap findings.
+ *
+ * Drops findings whose severity rank is GREATER than `SEVERITY_RANK[minSeverity]`,
+ * sorts by (severity, confidence, file, line), and caps at `maxFindings`.
+ * Thin wrapper over {@link rankAndSplitFindings}; the beyond-cap tail is
+ * discarded here — use the split directly when callers need it.
+ *
+ * @param {Record<string, unknown>[]} findings
+ * @param {{ maxFindings?: number, minSeverity?: string }} [options]
+ * @returns {Record<string, unknown>[]}
+ */
+export function rankAndCapFindings(findings, options = {}) {
+  return rankAndSplitFindings(findings, options).kept;
 }
 
 // ---------------------------------------------------------------------------

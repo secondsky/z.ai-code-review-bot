@@ -31,13 +31,14 @@
 import { buildStructuredReviewPrompt, escapeXmlAttribute } from './prompt.js';
 import {
   parseStructuredReview,
-  rankAndCapFindings,
+  rankAndSplitFindings,
   mergeFindings,
 } from './findings.js';
 
 /* ------------------------------------------------------------------ *
- * Constants — the shipped defaults, pinned by tests/config.test.js and
- * tests/auto-review.test.js. Keep in sync with src/lib/config.js.
+ * Constants — the shipped defaults. These mirror the validated defaults
+ * in loadConfig (src/lib/config.js), which tests/config.test.js pins;
+ * keep the two in sync when changing either side.
  * ------------------------------------------------------------------ */
 
 export const HIGH_RISK_PATTERNS = [
@@ -557,19 +558,20 @@ export async function executeStructuredBatch(entries, state, deps = {}) {
  *      final batch's summary is the most complete picture).
  *   4. mergeFindings(allLLMFindings, deterministicFindings) — deterministic
  *      scanner findings supersede LLM findings at the same file:line+title.
- *   5. rankAndCapFindings(merged, {maxFindings, minSeverity}) → final capped.
+ *   5. rankAndSplitFindings(merged, {maxFindings, minSeverity}) → top-N kept
+ *      as findings; the ranked tail goes to metadata.overflowFindings.
  *   6. Return {findings, summary, metadata}.
  *
  * @param {Array} files - raw changed files (each {filename, status, patch?, ...})
  * @param {Object} config - { apiKey, model, maxBatchChars, maxFilesPerBatch, maxPatchChars, maxFindings, minSeverity, deterministicFindings?, scannerContext?, pathInstructions?, toneInstructions?, maxDiffChars?, learningsContext? }
- * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndCapFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
+ * @param {Object} deps - { callApi, createReviewBatches, parseStructuredReview, rankAndSplitFindings, mergeFindings, buildStructuredReviewPrompt, executeStructuredBatch, core }
  * @returns {Promise<{findings: Array, summary: string, metadata: Object}>}
  */
 export async function runStructuredReview(files, config, deps = {}) {
   const callApi = deps.callApi || DEFAULT_CALL_API;
   const buildBatches = deps.createReviewBatches || createReviewBatches;
   const parseReview = deps.parseStructuredReview || parseStructuredReview;
-  const rankAndCap = deps.rankAndCapFindings || rankAndCapFindings;
+  const rankAndSplit = deps.rankAndSplitFindings || rankAndSplitFindings;
   const merge = deps.mergeFindings || mergeFindings;
   const executeBatch = deps.executeStructuredBatch || executeStructuredBatch;
   const core = deps.core;
@@ -718,7 +720,10 @@ export async function runStructuredReview(files, config, deps = {}) {
       ? config.minSeverity
       : DEFAULTS.minSeverity;
 
-  const findings = rankAndCap(merged, { maxFindings, minSeverity });
+  const { kept: findings, overflow: overflowFindings } = rankAndSplit(merged, {
+    maxFindings,
+    minSeverity,
+  });
 
   if (core?.info && findings.length < totalFindingsBeforeCap) {
     core.info(
@@ -726,16 +731,26 @@ export async function runStructuredReview(files, config, deps = {}) {
     );
   }
 
+  const metadata = {
+    totalBatches: batches.length,
+    totalFindingsBeforeCap,
+    deterministicFindingsCount: deterministicFindings.length,
+    batchMetadata: batchMeta,
+    splitFileCount: batchMetadata.splitFileCount,
+    ...skippedMeta,
+  };
+
+  // Beyond-cap findings ride in metadata as a ranked tail. Informational
+  // only: unlike `findings`, they are NOT consumed by renderers, learnings,
+  // or incremental processing. Gated like skippedMeta — key present only
+  // when there is something to report.
+  if (Array.isArray(overflowFindings) && overflowFindings.length > 0) {
+    metadata.overflowFindings = overflowFindings;
+  }
+
   return {
     findings,
     summary,
-    metadata: {
-      totalBatches: batches.length,
-      totalFindingsBeforeCap,
-      deterministicFindingsCount: deterministicFindings.length,
-      batchMetadata: batchMeta,
-      splitFileCount: batchMetadata.splitFileCount,
-      ...skippedMeta,
-    },
+    metadata,
   };
 }

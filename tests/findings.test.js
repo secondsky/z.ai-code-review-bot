@@ -22,6 +22,7 @@ import {
   parseFindings,
   parseStructuredReview,
   rankAndCapFindings,
+  rankAndSplitFindings,
   mergeFindings,
   formatFindingsAsSummary,
   sanitizeTextField,
@@ -1912,6 +1913,95 @@ describe('rankAndCapFindings — boundary options', () => {
     const snapshot = [...findings];
     rankAndCapFindings(findings);
     expect(findings).toEqual(snapshot);
+  });
+});
+
+describe('rankAndSplitFindings', () => {
+  const mixed = () => [
+    { ...validFinding(), severity: 'low', file: 'c.js', line: 1 },
+    { ...validFinding(), severity: 'critical', file: 'e.js', line: 1 },
+    { ...validFinding(), severity: 'info', file: 'b.js', line: 1 },
+    { ...validFinding(), severity: 'high', file: 'd.js', line: 1 },
+    { ...validFinding(), severity: 'medium', file: 'a.js', line: 1 },
+  ];
+
+  it('kept is the rankAndCapFindings prefix; overflow is the ranked tail', () => {
+    const findings = mixed();
+    const expected = rankAndCapFindings(findings, { maxFindings: 3 });
+    const { kept, overflow } = rankAndSplitFindings(findings, { maxFindings: 3 });
+    expect(kept).toEqual(expected);
+    // Same ranked order continues into the tail: medium, low, info after
+    // critical, high, and the first of medium.
+    expect(kept.map((f) => f.severity)).toEqual(['critical', 'high', 'medium']);
+    expect(overflow.map((f) => f.severity)).toEqual(['low', 'info']);
+    // Rejoining the split reproduces the full ranked list.
+    expect([...kept, ...overflow]).toEqual(
+      rankAndCapFindings(findings, { maxFindings: 40 }),
+    );
+  });
+
+  it('maxFindings 0 puts everything into overflow and keeps nothing', () => {
+    const { kept, overflow } = rankAndSplitFindings(mixed(), { maxFindings: 0 });
+    expect(kept).toEqual([]);
+    expect(overflow.map((f) => f.severity)).toEqual([
+      'critical',
+      'high',
+      'medium',
+      'low',
+      'info',
+    ]);
+  });
+
+  it('falls back to the default cap (40) for a negative or omitted maxFindings', () => {
+    const findings = Array.from({ length: 50 }, (_, i) => ({
+      ...validFinding(),
+      file: 'a.js',
+      line: i + 1,
+    }));
+    const negative = rankAndSplitFindings(findings, { maxFindings: -1 });
+    expect(negative.kept).toHaveLength(40);
+    expect(negative.overflow).toHaveLength(10);
+    const omitted = rankAndSplitFindings(findings);
+    expect(omitted.kept).toHaveLength(40);
+    expect(omitted.overflow).toHaveLength(10);
+  });
+
+  it('applies minSeverity filtering to BOTH kept and overflow', () => {
+    const findings = mixed();
+    const { kept, overflow } = rankAndSplitFindings(findings, {
+      maxFindings: 2,
+      minSeverity: 'medium',
+    });
+    expect(kept.map((f) => f.severity)).toEqual(['critical', 'high']);
+    expect(overflow.map((f) => f.severity)).toEqual(['medium']);
+    // low/info are filtered out entirely — they appear in neither bucket.
+    const all = [...kept, ...overflow].map((f) => f.severity);
+    expect(all).not.toContain('low');
+    expect(all).not.toContain('info');
+  });
+
+  it('respects null-lines-last ordering across the split boundary', () => {
+    const findings = [
+      { ...validFinding(), severity: 'high', confidence: 'high', file: 'a.js', line: null },
+      { ...validFinding(), severity: 'high', confidence: 'high', file: 'a.js', line: 5 },
+      { ...validFinding(), severity: 'high', confidence: 'high', file: 'a.js', line: 9 },
+    ];
+    const { kept, overflow } = rankAndSplitFindings(findings, { maxFindings: 2 });
+    expect(kept.map((f) => f.line)).toEqual([5, 9]);
+    expect(overflow.map((f) => f.line)).toEqual([null]);
+  });
+
+  it('does not mutate the input array', () => {
+    const findings = mixed();
+    const snapshot = [...findings];
+    rankAndSplitFindings(findings, { maxFindings: 2 });
+    expect(findings).toEqual(snapshot);
+  });
+
+  it('returns { kept: [], overflow: [] } for a non-array input', () => {
+    expect(rankAndSplitFindings(undefined)).toEqual({ kept: [], overflow: [] });
+    expect(rankAndSplitFindings(null)).toEqual({ kept: [], overflow: [] });
+    expect(rankAndSplitFindings('nope')).toEqual({ kept: [], overflow: [] });
   });
 });
 
