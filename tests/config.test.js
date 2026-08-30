@@ -53,6 +53,10 @@ describe('loadConfig — excludePatterns', () => {
       'package-lock.json',
       'yarn.lock',
       'pnpm-lock.yaml',
+      '*.min.js',
+      '*.min.css',
+      '*.map',
+      '*.snap',
     ]);
   });
   test('split on comma, trim, drop empties', () => {
@@ -63,18 +67,18 @@ describe('loadConfig — excludePatterns', () => {
 });
 
 describe('loadConfig — numeric fields & defaults', () => {
-  test('maxDiffChars: default 100000; 0 and negatives mean unlimited (Infinity); NaN -> default', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(100000);
+  test('maxDiffChars: default 500000; 0 and negatives mean unlimited (Infinity); NaN -> default', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxDiffChars).toBe(500000);
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '50000' }).maxDiffChars).toBe(50000);
     // D-4: "unlimited" is normalized to Infinity at this boundary — action.yml
     // still documents "0 or negative = unlimited"; only the internal
     // representation changed (formerly the 0 sentinel).
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '0' }).maxDiffChars).toBe(Infinity); // unlimited
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(100000); // NaN->default
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: 'abc' }).maxDiffChars).toBe(500000); // NaN->default
     // CFG-8: a non-integer numeric string (float) is now rejected by toInt's
     // strict validation and falls back to the default, rather than being
     // silently truncated to 12.
-    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(100000);
+    expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '12.9' }).maxDiffChars).toBe(500000);
     // Per action.yml + code comment, negatives mean unlimited (Infinity), NOT
     // the default cap. The old code returned 100000 here — a doc/code mismatch.
     expect(loadConfig({ ZAI_API_KEY: 'k', MAX_DIFF_CHARS: '-5' }).maxDiffChars).toBe(Infinity); // negative->unlimited
@@ -285,28 +289,28 @@ describe('loadConfig — works with Map inputs', () => {
 });
 
 describe('loadConfig — v2 structured-review knobs', () => {
-  test('maxFindings defaults to 25', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(25);
+  test('maxFindings defaults to 40', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxFindings).toBe(40);
   });
 
   test('maxFindings uses a provided positive value', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '5' }).maxFindings).toBe(5);
   });
 
-  test('maxFindings clamps to min 1 (0 → default 25)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(25);
+  test('maxFindings clamps to min 1 (0 → default 40)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '0' }).maxFindings).toBe(40);
   });
 
-  test('maxFindings clamps to min 1 (negative → default 25)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(25);
+  test('maxFindings clamps to min 1 (negative → default 40)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '-3' }).maxFindings).toBe(40);
   });
 
-  test('maxFindings caps at 50 (runaway noise guard)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '999' }).maxFindings).toBe(50);
+  test('maxFindings caps at 100 (runaway noise guard)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: '999' }).maxFindings).toBe(100);
   });
 
-  test('maxFindings NaN → default 25', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(25);
+  test('maxFindings NaN → default 40', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_FINDINGS: 'abc' }).maxFindings).toBe(40);
   });
 
   test('minSeverity defaults to "info"', () => {
@@ -358,24 +362,24 @@ describe('loadConfig — v2 structured-review knobs', () => {
     expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_TEMPERATURE: 'abc' }).temperature).toBeCloseTo(0.2);
   });
 
-  test('maxTokens defaults to 4096', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxTokens).toBe(4096);
+  test('maxTokens defaults to 8192', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k' }).maxTokens).toBe(8192);
   });
 
   test('maxTokens uses a provided positive value', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '8192' }).maxTokens).toBe(8192);
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '16384' }).maxTokens).toBe(16384);
   });
 
-  test('maxTokens clamps to min 1 (0 → default 4096)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '0' }).maxTokens).toBe(4096);
+  test('maxTokens clamps to min 1 (0 → default 8192)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '0' }).maxTokens).toBe(8192);
   });
 
-  test('maxTokens clamps to min 1 (negative → default 4096)', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '-5' }).maxTokens).toBe(4096);
+  test('maxTokens clamps to min 1 (negative → default 8192)', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: '-5' }).maxTokens).toBe(8192);
   });
 
-  test('maxTokens NaN → default 4096', () => {
-    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: 'xyz' }).maxTokens).toBe(4096);
+  test('maxTokens NaN → default 8192', () => {
+    expect(loadConfig({ ZAI_API_KEY: 'k', ZAI_MAX_TOKENS: 'xyz' }).maxTokens).toBe(8192);
   });
 });
 

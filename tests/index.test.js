@@ -101,7 +101,7 @@ function makeConfig(overrides = {}) {
     maxFindings: 8,
     minSeverity: 'info',
     temperature: 0.2,
-    maxTokens: 4096,
+    maxTokens: 8192,
     batchConcurrency: 3,
     fallbackPrompt: '',
     // Phase 4: scanner master switch OFF in tests by default so the real
@@ -2688,10 +2688,10 @@ describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
     expect(typeof arg.userPrompt).toBe('string');
   });
 
-  it('forwards default temperature (0.2) and maxTokens (4096) to client.call in the stock config', async () => {
-    // loadConfig ALWAYS produces numbers for these (default 0.2 / 4096). The
+  it('forwards default temperature (0.2) and maxTokens (8192) to client.call in the stock config', async () => {
+    // loadConfig ALWAYS produces numbers for these (default 0.2 / 8192). The
     // adapter forwards them whenever non-null, which is always for a real
-    // config — so a stock run actually sends temperature=0.2 & max_tokens=4096.
+    // config — so a stock run actually sends temperature=0.2 & max_tokens=8192.
     const core = makeCore();
     const octokit = makeOctokit({ files: [file('src/a.js')] });
     const callSpy = vi.fn(async () => ({
@@ -2700,14 +2700,14 @@ describe('buildCallApi — sampling + fallback knobs (Phase 6.2)', () => {
       usedFallback: false,
     }));
     await run(prContext(), {
-      config: makeConfig(), // default temperature 0.2, maxTokens 4096
+      config: makeConfig(), // default temperature 0.2, maxTokens 8192
       core,
       octokit,
       apiClient: { call: callSpy },
     });
     const arg = callSpy.mock.calls[0][0];
     expect(arg.temperature).toBe(0.2);
-    expect(arg.maxTokens).toBe(4096);
+    expect(arg.maxTokens).toBe(8192);
   });
 
   it('passes fallbackPrompt to createApiClient when config.fallbackPrompt is a non-empty string', async () => {

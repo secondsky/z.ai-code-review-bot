@@ -132,7 +132,7 @@ function makeConfig(overrides = {}) {
     model: 'm',
     reviewerName: 'Z.ai Code Review',
     excludePatterns: [],
-    maxDiffChars: 100000,
+    maxDiffChars: 500000,
     largePrFileThreshold: 50,
     ...overrides,
   };

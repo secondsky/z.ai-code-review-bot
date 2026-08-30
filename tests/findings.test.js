@@ -1871,12 +1871,12 @@ describe('rankAndCapFindings — boundary options', () => {
     expect(rankAndCapFindings(findings, { maxFindings: 0 })).toEqual([]);
   });
 
-  it('falls back to the default cap (25) for a negative maxFindings', () => {
-    // The guard is `maxFindings >= 0`; -1 fails it and falls back to 25, so
-    // the result is NOT empty — it is capped at the default of 25.
-    const findings = Array.from({ length: 30 }, () => ({ ...validFinding() }));
+  it('falls back to the default cap (40) for a negative maxFindings', () => {
+    // The guard is `maxFindings >= 0`; -1 fails it and falls back to 40, so
+    // the result is NOT empty — it is capped at the default of 40.
+    const findings = Array.from({ length: 50 }, () => ({ ...validFinding() }));
     const out = rankAndCapFindings(findings, { maxFindings: -1 });
-    expect(out).toHaveLength(25);
+    expect(out).toHaveLength(40);
   });
 
   it('minSeverity medium keeps critical/high/medium and drops low/info', () => {
@@ -1900,8 +1900,8 @@ describe('rankAndCapFindings — boundary options', () => {
   });
 
   it('falls back to the default cap when maxFindings is omitted', () => {
-    const findings = Array.from({ length: 30 }, () => ({ ...validFinding() }));
-    expect(rankAndCapFindings(findings)).toHaveLength(25);
+    const findings = Array.from({ length: 50 }, () => ({ ...validFinding() }));
+    expect(rankAndCapFindings(findings)).toHaveLength(40);
   });
 
   it('does not mutate the input array', () => {
