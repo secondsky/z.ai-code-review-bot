@@ -10,6 +10,7 @@
  *   - rankAndCapFindings: severity/confidence/file/line sort, minSeverity, cap
  *   - mergeFindings: deterministic-supersedes-LLM at same key
  *   - formatFindingsAsSummary: header, severity emojis, empty state, marker
+ *   - renderOverflowSection: collapsed beyond-cap findings section
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -25,6 +26,8 @@ import {
   rankAndSplitFindings,
   mergeFindings,
   formatFindingsAsSummary,
+  renderOverflowSection,
+  OVERFLOW_DISPLAY_CAP,
   sanitizeTextField,
   hashFinding,
   buildFindingsHashBlock,
@@ -1116,6 +1119,136 @@ describe('formatFindingsAsSummary', () => {
     });
     expect(out).toContain('This PR adds a users table.');
     expect(out).toContain('- `src/index.js`:L42 — Possible null dereference');
+  });
+
+  it('renders the collapsed overflow section after the severity groups, before the marker', () => {
+    const out = formatFindingsAsSummary([validFinding()], {
+      metadata: {
+        overflowFindings: [
+          { ...validFinding(), file: 'src/other.js', title: 'Overflow issue' },
+        ],
+      },
+    });
+    expect(out).toContain('➕ 1 more findings (below the display cap)');
+    expect(out).toContain('- 🟠 `src/other.js`:L42 — Overflow issue');
+    const groupIdx = out.indexOf('#### 🟠 High');
+    const sectionIdx = out.indexOf('<details>');
+    const markerIdx = out.indexOf('<!-- zai-code-review -->');
+    expect(groupIdx).toBeGreaterThan(-1);
+    expect(sectionIdx).toBeGreaterThan(groupIdx);
+    expect(markerIdx).toBeGreaterThan(sectionIdx);
+  });
+
+  it('is byte-identical when overflowFindings is absent or empty (additive only)', () => {
+    const base = formatFindingsAsSummary([validFinding()], {
+      metadata: { truncated: 2 },
+    });
+    // An empty overflow array renders nothing — output equals the no-key case.
+    expect(
+      formatFindingsAsSummary([validFinding()], {
+        metadata: { truncated: 2, overflowFindings: [] },
+      }),
+    ).toBe(base);
+    expect(base).not.toContain('<details>');
+    // The legacy truncated note still renders for callers without overflow data.
+    expect(base).toContain('_2 findings truncated to cap._');
+  });
+});
+
+describe('renderOverflowSection', () => {
+  it('returns an empty string for a non-array or empty input', () => {
+    expect(renderOverflowSection(undefined)).toBe('');
+    expect(renderOverflowSection(null)).toBe('');
+    expect(renderOverflowSection([])).toBe('');
+    expect(renderOverflowSection('nope')).toBe('');
+  });
+
+  it('renders a collapsed details section for two findings', () => {
+    const section = renderOverflowSection([
+      { ...validFinding(), file: 'src/a.js', line: 42, severity: 'critical', title: 'First issue' },
+      { file: 'src/b.js', line: 7, severity: 'low', title: 'Second issue' },
+    ]);
+    expect(section).toContain('<details>');
+    expect(section).toContain(
+      '<summary>➕ 2 more findings (below the display cap)</summary>',
+    );
+    expect(section).toContain('- 🔴 `src/a.js`:L42 — First issue');
+    expect(section).toContain('- 🔵 `src/b.js`:L7 — Second issue');
+    expect(section).toContain('</details>');
+    // Walkthrough-style cohort block: a blank line between the summary line
+    // and the bullets, and between the bullets and the closing tag.
+    expect(section).toBe(
+      [
+        '<details>',
+        '<summary>➕ 2 more findings (below the display cap)</summary>',
+        '',
+        '- 🔴 `src/a.js`:L42 — First issue',
+        '- 🔵 `src/b.js`:L7 — Second issue',
+        '',
+        '</details>',
+      ].join('\n'),
+    );
+  });
+
+  it('omits the :L suffix entirely when line is null', () => {
+    const section = renderOverflowSection([
+      { file: 'src/a.js', line: null, severity: 'info', title: 'File-level note' },
+    ]);
+    expect(section).toContain('- ➖ `src/a.js` — File-level note');
+    expect(section).not.toContain(':L');
+  });
+
+  it('caps the display at OVERFLOW_DISPLAY_CAP lines and reports the hidden count', () => {
+    const many = Array.from({ length: OVERFLOW_DISPLAY_CAP + 5 }, (_, i) => ({
+      ...validFinding(),
+      file: `src/f${i}.js`,
+      title: `Finding ${i}`,
+    }));
+    const section = renderOverflowSection(many);
+    // The summary count is the FULL count even though display is capped.
+    expect(section).toContain(`➕ ${OVERFLOW_DISPLAY_CAP + 5} more findings`);
+    const bulletCount = (section.match(/^- /gm) || []).length;
+    expect(bulletCount).toBe(OVERFLOW_DISPLAY_CAP);
+    expect(section).toContain('_+5 more not shown_');
+    // The first OVERFLOW_DISPLAY_CAP findings render; the last 5 do not.
+    expect(section).toContain('- 🟠 `src/f0.js`:L42 — Finding 0');
+    expect(section).toContain(
+      `- 🟠 \`src/f${OVERFLOW_DISPLAY_CAP - 1}.js\`:L42 — Finding ${OVERFLOW_DISPLAY_CAP - 1}`,
+    );
+    expect(section).not.toContain(`Finding ${OVERFLOW_DISPLAY_CAP}`);
+  });
+
+  it('replaces backticks in a filename so the code span cannot close early (W8-1)', () => {
+    const section = renderOverflowSection([
+      { file: 'evil`name.js', severity: 'high', title: 'Backtick file' },
+    ]);
+    // The rendered line has exactly ONE pair of backticks (the code span).
+    const line = section.split('\n').find((l) => l.includes('evil'));
+    expect((line.match(/`/g) || []).length).toBe(2);
+    expect(section).toContain("`evil'name.js`");
+  });
+
+  it('never emits a raw structural tag from hostile title or filename content', () => {
+    const section = renderOverflowSection([
+      {
+        file: 'evil`</details><script>alert(1)</script>.js',
+        line: 1,
+        severity: 'high',
+        title: '</details><script>alert(1)</script>',
+      },
+    ]);
+    // Exactly the helper's own literal tags appear — nothing raw from the fields.
+    expect((section.match(/<details>/g) || []).length).toBe(1);
+    expect((section.match(/<\/details>/g) || []).length).toBe(1);
+    expect((section.match(/<summary>/g) || []).length).toBe(1);
+    expect((section.match(/<\/summary>/g) || []).length).toBe(1);
+    expect(section).not.toContain('<script');
+    expect(section).not.toContain('</script');
+    // The hostile payloads survive, escaped and visible.
+    expect(section).toContain('&lt;/details&gt;');
+    expect(section).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    // Backticks in the hostile filename are still replaced.
+    expect(section).toContain("evil'&lt;/details&gt;");
   });
 });
 

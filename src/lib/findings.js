@@ -117,6 +117,16 @@ const SEVERITY_LABEL = {
   info: 'Info',
 };
 
+/**
+ * Maximum number of overflow finding LINES rendered inside the collapsed
+ * "more findings" section ({@link renderOverflowSection}). Beyond-cap findings
+ * exist to be visible at a glance, not to re-create the wall of text the cap
+ * exists to prevent; the section always reports the FULL count in its summary
+ * line and appends `_+N more not shown_` for the tail beyond this cap.
+ * @type {number}
+ */
+export const OVERFLOW_DISPLAY_CAP = 100;
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -929,6 +939,76 @@ export function mergeFindings(llmFindings, deterministicFindings) {
 }
 
 // ---------------------------------------------------------------------------
+// renderOverflowSection
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the beyond-cap (overflow) findings as a collapsed markdown section.
+ *
+ * Structure (mirrors how walkthrough.js emits its cohort blocks — blank line
+ * after the `<summary>` line and before the closing tag):
+ *   <details>
+ *   <summary>➕ N more findings (below the display cap)</summary>
+ *
+ *   - <emoji> `file`:L42 — title        (one line per DISPLAYED finding)
+ *   _+N more not shown_                  (only past OVERFLOW_DISPLAY_CAP)
+ *
+ *   </details>
+ *
+ * N in the summary line is the FULL `overflowFindings.length` even when the
+ * display is capped, so the count reviewers see is always the true one. The
+ * `<details>`/`<summary>` tags are TRUSTED LITERALS; finding fields are
+ * model-controlled, so:
+ *   - filename → inline code with backticks replaced by `'` (W6-4/W8-1) AND
+ *     angle brackets escaped via {@link sanitizeTextField} — a hostile
+ *     filename can never emit a raw structural tag that breaks out of the
+ *     collapsible section;
+ *   - title → {@link sanitizeTextField}.
+ *
+ * Returns `''` when `overflowFindings` is not a non-empty array so callers can
+ * append unconditionally (output stays byte-identical without overflow data).
+ *
+ * @param {unknown} overflowFindings
+ * @returns {string}
+ */
+export function renderOverflowSection(overflowFindings) {
+  if (!Array.isArray(overflowFindings) || overflowFindings.length === 0) {
+    return '';
+  }
+
+  const total = overflowFindings.length;
+  const displayed = overflowFindings.slice(0, OVERFLOW_DISPLAY_CAP);
+  const hidden = total - displayed.length;
+
+  const lines = [];
+  lines.push('<details>');
+  lines.push(`<summary>➕ ${total} more findings (below the display cap)</summary>`);
+  lines.push('');
+  for (const f of displayed) {
+    const sev = f && typeof f.severity === 'string' ? f.severity : '';
+    // Unknown severity falls back to the info emoji (matches renderCommentBody
+    // in review.js — SEVERITY_EMOJI itself has no fallback entry).
+    const emoji = SEVERITY_EMOJI[sev] ?? '➖';
+    const file = f && typeof f.file === 'string' ? f.file : '';
+    // W6-4/W8-1: inline code neutralizes markdown metacharacters in the
+    // filename; backticks are replaced (escapes don't work in code spans).
+    // Angle brackets are escaped too (see JSDoc) so a hostile filename can
+    // never emit a raw </details>/<summary>/<script> sequence.
+    const safeFile = sanitizeTextField(file).replace(/`/g, "'");
+    const line = f && typeof f === 'object' ? f.line : undefined;
+    const locSuffix = typeof line === 'number' && line > 0 ? `:L${line}` : '';
+    const title = f && typeof f.title === 'string' ? f.title : '';
+    lines.push(`- ${emoji} \`${safeFile}\`${locSuffix} — ${sanitizeTextField(title)}`);
+  }
+  if (hidden > 0) {
+    lines.push(`_+${hidden} more not shown_`);
+  }
+  lines.push('');
+  lines.push('</details>');
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // formatFindingsAsSummary
 // ---------------------------------------------------------------------------
 
@@ -953,6 +1033,9 @@ export function mergeFindings(llmFindings, deterministicFindings) {
  *
  *   <if findings empty>:
  *   No issues found. The changes look good. ✅
+ *
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
  *
  *   <!-- zai-code-review -->  (byte-exact idempotency marker)
  *
@@ -1073,6 +1156,17 @@ export function formatFindingsAsSummary(findings, options = {}) {
       }
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail
+  // (set by runStructuredReview when the ranked tail is non-empty). Rendered
+  // as a collapsed section AFTER the severity groups so the visible summary
+  // stays short while the tail stays discoverable. Additive: renders nothing
+  // (byte-identical output) when the key is absent or empty.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   // Trailing idempotency marker — byte-exact, required by comments.js.
