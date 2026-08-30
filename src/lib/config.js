@@ -189,7 +189,7 @@ function clampFloat(raw, fallback, min, max) {
 
 /**
  * Parse and clamp a positive-integer input, then cap at `cap`. Returns the
- * fallback on NaN/non-finite/below-min. Used for `ZAI_MAX_FINDINGS` (cap 50)
+ * fallback on NaN/non-finite/below-min. Used for `ZAI_MAX_FINDINGS` (cap 100)
  * and `ZAI_MAX_TOKENS` (no cap — pass Infinity).
  *
  * @param {string} raw
@@ -223,7 +223,7 @@ export function loadConfig(inputs = {}, options = {}) {
   const excludeRaw = read(inputs, 'EXCLUDE_PATTERNS');
   const excludePatterns =
     excludeRaw.trim() === ''
-      ? ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']
+      ? ['*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '*.min.js', '*.min.css', '*.map', '*.snap']
       : excludeRaw
           .split(',')
           .map((p) => p.trim())
@@ -240,7 +240,7 @@ export function loadConfig(inputs = {}, options = {}) {
   const maxDiffCharsRaw = toInt(read(inputs, 'MAX_DIFF_CHARS'));
   const maxDiffChars =
     maxDiffCharsRaw === null
-      ? 100000
+      ? 500000
       : maxDiffCharsRaw > 0
         ? maxDiffCharsRaw
         : Infinity;
@@ -286,8 +286,8 @@ export function loadConfig(inputs = {}, options = {}) {
   // v2 structured-review knobs.
   const maxFindings = clampPositiveCapped(
     read(inputs, 'ZAI_MAX_FINDINGS'),
-    25,
-    50,
+    40,
+    100,
   );
 
   // minSeverity: validate against the allowed set; invalid → 'info' + warning.
@@ -308,7 +308,7 @@ export function loadConfig(inputs = {}, options = {}) {
   }
 
   const temperature = clampFloat(read(inputs, 'ZAI_TEMPERATURE'), 0.2, 0, 2);
-  const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 4096);
+  const maxTokens = clampPositiveCapped(read(inputs, 'ZAI_MAX_TOKENS'), 8192);
 
   // Phase 6.1: bounded batch concurrency. Default 3, clamped to [1, 8].
   // Below-1 values are treated as invalid (defensive: a future caller cannot

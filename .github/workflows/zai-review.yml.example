@@ -61,4 +61,4 @@ jobs:
           # ZAI_MODEL: ${{ vars.ZAI_MODEL }}           # glm-5.3
           # ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
           # ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
-          # EXCLUDE_PATTERNS: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml'
+          # EXCLUDE_PATTERNS: '*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml,*.min.js,*.min.css,*.map,*.snap'

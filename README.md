@@ -115,14 +115,14 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 | `ZAI_SYSTEM_PROMPT` | *(built-in)* | System prompt; empty uses the built-in default. |
 | `ZAI_REVIEWER_NAME` | `Z.ai Code Review` | Header label on the review. |
 | `ZAI_TEMPERATURE` | `0.2` | Sampling temperature, clamped [0, 2]. Low = deterministic. |
-| `ZAI_MAX_TOKENS` | `4096` | Max tokens per model call. |
+| `ZAI_MAX_TOKENS` | `8192` | Max tokens per model call. |
 | `ZAI_TIMEOUT_MS` | `120000` | Per-attempt request timeout (ms). |
 | `ZAI_FALLBACK_PROMPT` | *(empty)* | Shorter prompt used on repeated timeout (activates retry fallback). |
 
 ### Findings & noise control
 | Input | Default | Description |
 |---|---|---|
-| `ZAI_MAX_FINDINGS` | `25` | Max findings after rank+cap (clamped [1, 50]). |
+| `ZAI_MAX_FINDINGS` | `40` | Max findings after rank+cap (clamped [1, 100]). |
 | `ZAI_MIN_SEVERITY` | `info` | Lowest severity to include. |
 | `ZAI_WALKTHROUGH` | `true` | Group findings into dependency-ordered cohort sections. |
 | `ZAI_INCREMENTAL_REVIEW` | `true` | Suppress previously-reported findings on re-push. |
@@ -131,8 +131,8 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 ### Batching & filtering
 | Input | Default | Description |
 |---|---|---|
-| `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,…` | Comma globs to exclude. |
-| `MAX_DIFF_CHARS` | `100000` | Hard cap on diff chars (0 = unlimited, discouraged). |
+| `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml,*.min.js,*.min.css,*.map,*.snap` | Comma globs to exclude. |
+| `MAX_DIFF_CHARS` | `500000` | Hard cap on total diff chars across all batches (0 = unlimited, discouraged). |
 | `ZAI_LARGE_PR_FILE_THRESHOLD` | `50` | Retained for reporting; batching handles all sizes. |
 | `ZAI_MAX_BATCH_CHARS` | `120000` | Character budget per batch. |
 | `ZAI_MAX_FILES_PER_BATCH` | `40` | Max distinct files per batch. |

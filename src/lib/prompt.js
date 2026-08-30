@@ -252,7 +252,7 @@ export function buildStructuredReviewPrompt(files, options = {}) {
   const maxFindings =
     typeof options.maxFindings === 'number' && options.maxFindings > 0
       ? Math.floor(options.maxFindings)
-      : 25;
+      : 40;
 
   // The instruction varies only by the maxFindings cap (interpolated) —
   // everything else is constant.

@@ -36,7 +36,8 @@ import {
 } from './findings.js';
 
 /* ------------------------------------------------------------------ *
- * Constants (exact values per the task brief — do not change)
+ * Constants — the shipped defaults, pinned by tests/config.test.js and
+ * tests/auto-review.test.js. Keep in sync with src/lib/config.js.
  * ------------------------------------------------------------------ */
 
 export const HIGH_RISK_PATTERNS = [
@@ -51,7 +52,7 @@ export const DEFAULTS = {
   maxBatchChars: 120000,
   maxFilesPerBatch: 40,
   maxPatchChars: 18000,
-  maxFindings: 25,
+  maxFindings: 40,
   minSeverity: 'info',
 };
 
