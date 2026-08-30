@@ -55,7 +55,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: secondsky/z.ai-code-review-bot@755511b788750a30ab0fb7b98649e8ab5b3d64eb # v2.0.0
+      - uses: secondsky/z.ai-code-review-bot@4f2657c6b07b16ce1ca61557b05d620ea93333db # v2.0.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -122,7 +122,7 @@ Commands let collaborators ask questions by commenting `/zai …` on a PR.
 ### Findings & noise control
 | Input | Default | Description |
 |---|---|---|
-| `ZAI_MAX_FINDINGS` | `40` | Max findings after rank+cap (clamped [1, 100]). |
+| `ZAI_MAX_FINDINGS` | `40` | Max findings after rank+cap (clamped [1, 100]). Findings beyond the cap are listed in a collapsed "more findings" section instead of being dropped. |
 | `ZAI_MIN_SEVERITY` | `info` | Lowest severity to include. |
 | `ZAI_WALKTHROUGH` | `true` | Group findings into dependency-ordered cohort sections. |
 | `ZAI_INCREMENTAL_REVIEW` | `true` | Suppress previously-reported findings on re-push. |
