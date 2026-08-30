@@ -483,4 +483,43 @@ describe('formatWalkthroughSummary', () => {
     expect(out).toContain('📚');
     expect(out).toContain('📦');
   });
+
+  // Task 4 (defaults-and-overflow): parity with formatFindingsAsSummary and
+  // buildReviewBody. The walkthrough renderer is the DEFAULT summary renderer,
+  // yet it never showed any truncation info — a run that hit the findings cap
+  // posted a walkthrough whose kept findings silently stopped with no hint of
+  // the tail. metadata.overflowFindings carries the ranked beyond-cap tail;
+  // render the shared collapsed section (renderOverflowSection) AFTER the
+  // last cohort block and BEFORE the byte-exact trailing MARKER.
+  it('renders the overflow section after the cohorts and before the marker when metadata.overflowFindings is non-empty', () => {
+    const overflow = [
+      baseFinding({ file: 'db/tail.sql', line: 7, severity: 'low', title: 'Tail issue' }),
+    ];
+    const out = formatWalkthroughSummary([baseFinding()], ['db/schema.sql'], {
+      metadata: { overflowFindings: overflow },
+    });
+    // Content comes from the shared renderOverflowSection helper.
+    expect(out).toContain('<summary>➕ 1 more findings (below the display cap)</summary>');
+    expect(out).toContain('🔵 `db/tail.sql`:L7 — Tail issue');
+    // Placement: the section opens AFTER the last cohort </details>…
+    const cohortClose = out.indexOf('</details>');
+    const overflowOpen = out.indexOf('<summary>➕ 1 more findings');
+    expect(cohortClose).toBeGreaterThan(-1);
+    expect(overflowOpen).toBeGreaterThan(cohortClose);
+    // …and the MARKER is still the byte-exact last line of the output.
+    const markerIdx = out.indexOf(MARKER);
+    expect(markerIdx).toBeGreaterThan(overflowOpen);
+    expect(out.endsWith(MARKER)).toBe(true);
+  });
+
+  it('leaves the output byte-identical when overflowFindings is absent or empty', () => {
+    const findings = [baseFinding()];
+    const files = [findings[0].file];
+    const baseline = formatWalkthroughSummary(findings, files, {});
+    expect(formatWalkthroughSummary(findings, files, { metadata: {} })).toBe(baseline);
+    expect(
+      formatWalkthroughSummary(findings, files, { metadata: { overflowFindings: [] } }),
+    ).toBe(baseline);
+    expect(baseline).not.toContain('more findings');
+  });
 });

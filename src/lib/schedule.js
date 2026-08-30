@@ -826,6 +826,10 @@ export async function reviewOnePr({
         // W17-C1-3: threaded alongside truncated/deterministic counts (same
         // metadata contract as index.js's reviewMetadata).
         skippedFiles: skippedFileCount,
+        // Beyond-cap findings: the ranked tail from the review run, passed
+        // RAW (possibly undefined) — buildReviewBody gates on a non-empty
+        // array. Same field name in all three renderers (index.js parity).
+        overflowFindings: result.metadata.overflowFindings,
       });
       // W17-C1-3: surface the skipped-files drop inside the review body
       // (before the trailers so the marker/SHA ordering is untouched).
@@ -921,6 +925,11 @@ export async function reviewOnePr({
       // W18-D1-3: the noted summary (never the raw prose) so the suppression
       // note is visible on the summary branch too.
       summary: finalSummary,
+      // Beyond-cap findings: passed RAW (possibly undefined) so BOTH summary
+      // renderers (walkthrough default / flat fallback) can render the
+      // collapsed section — they gate on a non-empty array themselves
+      // (index.js summaryMetadata parity).
+      overflowFindings: result.metadata.overflowFindings,
     };
     const content = useWalkthrough
       ? formatWalkthroughSummary(keptFindings, patchable, {

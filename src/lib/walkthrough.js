@@ -21,6 +21,7 @@
 import { MARKER } from './comments.js';
 import {
   sanitizeTextField,
+  renderOverflowSection,
   SEVERITY_EMOJI,
   SEVERITY_ORDER,
   SEVERITY_RANK,
@@ -316,6 +317,8 @@ function severityRank(sev) {
  *     <💡 suggestion>
  *   </details>
  *   <if no findings>: No issues found. The changes look good. ✅
+ *   <if metadata.overflowFindings is a non-empty array>:
+ *   Collapsed "more findings" section (renderOverflowSection)
  *   <!-- zai-code-review -->
  *
  * The trailing marker is byte-exact (required by comments.js idempotency).
@@ -432,6 +435,19 @@ export function formatWalkthroughSummary(findings, files, options = {}) {
       lines.push('</details>');
       lines.push('');
     }
+  }
+
+  // Beyond-cap findings: metadata.overflowFindings carries the ranked tail
+  // (set by runStructuredReview when the ranked tail is non-empty). Rendered
+  // via the shared helper as a collapsed section AFTER the last cohort block
+  // and BEFORE the byte-exact trailing marker — mirroring
+  // formatFindingsAsSummary/buildReviewBody so the walkthrough (the DEFAULT
+  // summary renderer) finally shows truncation info too. Additive: renders
+  // nothing (byte-identical output) when the key is absent or empty.
+  const overflowSection = renderOverflowSection(metadata.overflowFindings);
+  if (overflowSection.length > 0) {
+    lines.push(overflowSection);
+    lines.push('');
   }
 
   lines.push(MARKER);

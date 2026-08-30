@@ -2063,8 +2063,9 @@ describe('rankAndSplitFindings', () => {
     const expected = rankAndCapFindings(findings, { maxFindings: 3 });
     const { kept, overflow } = rankAndSplitFindings(findings, { maxFindings: 3 });
     expect(kept).toEqual(expected);
-    // Same ranked order continues into the tail: medium, low, info after
-    // critical, high, and the first of medium.
+    // The fixture ranks critical, high, medium, low, info (severity first),
+    // so kept is the 3-item ranked prefix and overflow is the remaining
+    // ranked tail — same order as the full ranked list.
     expect(kept.map((f) => f.severity)).toEqual(['critical', 'high', 'medium']);
     expect(overflow.map((f) => f.severity)).toEqual(['low', 'info']);
     // Rejoining the split reproduces the full ranked list.
@@ -2129,6 +2130,12 @@ describe('rankAndSplitFindings', () => {
     const snapshot = [...findings];
     rankAndSplitFindings(findings, { maxFindings: 2 });
     expect(findings).toEqual(snapshot);
+  });
+
+  it('returns { kept: [], overflow: [] } for an empty input array', () => {
+    // Explicit empty case (distinct from non-array inputs): nothing to rank,
+    // so nothing kept and nothing overflowing.
+    expect(rankAndSplitFindings([])).toEqual({ kept: [], overflow: [] });
   });
 
   it('returns { kept: [], overflow: [] } for a non-array input', () => {
