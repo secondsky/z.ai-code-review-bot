@@ -137,7 +137,7 @@ inputs:
   ZAI_MAX_FINDINGS:
     description: |-
       Maximum number of findings the review will emit (after ranking + capping).
-      Findings above this cap are dropped (highest-severity first). Clamped to
+      Findings above this cap are listed in a collapsed 'more findings' section (highest-severity first). Clamped to
       [1, 100] — values outside that range fall back to the default.
     required: false
     default: '40'
