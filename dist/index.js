@@ -54270,8 +54270,13 @@ async function run(context, deps = {}) {
     }
 
     // ---- dispatch ----
-    const handler = handlers[parsed.command];
-    if (!handler) {
+    // The table must own the name and the entry must be a function: a name
+    // that merely exists on Object.prototype (`constructor`, `__proto__`)
+    // would otherwise pass a truthiness check and then be called as a
+    // handler. parseCommand already rejects names outside ALLOWED_SET; this
+    // keeps the dispatch itself from depending on that.
+    const handler = Object.hasOwn(handlers, parsed.command) ? handlers[parsed.command] : undefined;
+    if (typeof handler !== 'function') {
       coreDep.warning('No handler for command: ' + parsed.command);
       return;
     }
