@@ -41372,6 +41372,22 @@ function isBotAuthor(item) {
 }
 
 /**
+ * Remove trailing spaces and tabs from `s` — what `/[ \t]+$/` did — in
+ * linear time. The regex form is polynomial on a long run of whitespace
+ * that is not at the end of the string (about 1 s at 40k tabs, 15 s at
+ * 160k on Node 24; CodeQL js/polynomial-redos), and the line it trims
+ * comes from model output, which PR content can influence.
+ *
+ * @param {string} s
+ * @returns {string} `s` itself when there is nothing to trim.
+ */
+function trimTrailingSpacesAndTabs(s) {
+  let end = s.length;
+  while (end > 0 && (s[end - 1] === ' ' || s[end - 1] === '\t')) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
+/**
  * Shared pagination loop (CORE-4) for the bot-marker enumeration (F-BOTGATE):
  * the single owner of the per_page-100/cap-100-pages loop that previously
  * existed as parallel copies in `findBotMarkerComments` (comments.js) and
@@ -41489,7 +41505,7 @@ function buildCommentBody({ title, content, marker }) {
   // trimmed string IS the first line.
   const nlIdx = trimmed.indexOf('\n');
   const firstLine = nlIdx === -1 ? trimmed : trimmed.slice(0, nlIdx);
-  const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
+  const hasHeading = !!title && trimTrailingSpacesAndTabs(firstLine) === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
     return trimmed;
