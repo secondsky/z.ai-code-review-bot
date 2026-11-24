@@ -41372,6 +41372,22 @@ function isBotAuthor(item) {
 }
 
 /**
+ * Remove trailing spaces and tabs from `s` — what `/[ \t]+$/` did — in
+ * linear time. The regex form is polynomial on a long run of whitespace
+ * that is not at the end of the string (about 1 s at 40k tabs, 15 s at
+ * 160k on Node 24; CodeQL js/polynomial-redos), and the line it trims
+ * comes from model output, which PR content can influence.
+ *
+ * @param {string} s
+ * @returns {string} `s` itself when there is nothing to trim.
+ */
+function trimTrailingSpacesAndTabs(s) {
+  let end = s.length;
+  while (end > 0 && (s[end - 1] === ' ' || s[end - 1] === '\t')) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
+/**
  * Shared pagination loop (CORE-4) for the bot-marker enumeration (F-BOTGATE):
  * the single owner of the per_page-100/cap-100-pages loop that previously
  * existed as parallel copies in `findBotMarkerComments` (comments.js) and
@@ -41489,7 +41505,7 @@ function buildCommentBody({ title, content, marker }) {
   // trimmed string IS the first line.
   const nlIdx = trimmed.indexOf('\n');
   const firstLine = nlIdx === -1 ? trimmed : trimmed.slice(0, nlIdx);
-  const hasHeading = !!title && firstLine.replace(/[ \t]+$/, '') === `## ${title}`;
+  const hasHeading = !!title && trimTrailingSpacesAndTabs(firstLine) === `## ${title}`;
   const hasMarker = trimmed.endsWith(marker);
   if (hasHeading && hasMarker) {
     return trimmed;
@@ -43771,6 +43787,8 @@ function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextS
  * re-append), so the wider acceptance here is safe; suppression must stay
  * strict so a model-forged no-space variant can never register as state.
  * First occurrence wins (oldest trailer), matching the old inline semantics.
+ * The two `[^>]*` forms are scanned by {@link matchLenientTrailer}: same
+ * grammar, linear time.
  *
  * @param {string} body  the review/comment body to scan.
  * @returns {{marker: string|null, hashBlock: string|null, shaBlock: string|null}}
@@ -43778,9 +43796,47 @@ function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, contextS
 function extractTrailers(body) {
   if (typeof body !== 'string') return { marker: null, hashBlock: null, shaBlock: null };
   const marker = body.match(/<!--\s*zai-code-review\s*-->/);
-  const hashBlock = body.match(/<!--\s*zai-hashes:[^>]*-->/);
-  const shaBlock = body.match(/<!--\s*zai-sha:[^>]*-->/);
-  return { marker: marker?.[0] ?? null, hashBlock: hashBlock?.[0] ?? null, shaBlock: shaBlock?.[0] ?? null };
+  const hashBlock = matchLenientTrailer(body, 'zai-hashes');
+  const shaBlock = matchLenientTrailer(body, 'zai-sha');
+  return { marker: marker?.[0] ?? null, hashBlock, shaBlock };
+}
+
+/**
+ * First match of `<!--\s*<key>:[^>]*-->` in `body`, or null — the LENIENT
+ * trailer grammar above, unchanged.
+ *
+ * A scan rather than that regex, which is polynomial (CodeQL
+ * js/polynomial-redos): `[^>]*` can swallow the `<!--zai-sha:` opening
+ * itself, so every opening in a body stuffed with them re-scanned the rest
+ * of the body (seconds at 240k chars). A review body is model output, which
+ * PR content can influence. Here each character is looked at a bounded
+ * number of times: the two delimiter searches are cached and only ever move
+ * forward, and a candidate that has no `-->` left ends the whole scan,
+ * because no later opening can match either.
+ *
+ * @param {string} body
+ * @param {string} key  `zai-hashes` or `zai-sha`, without the colon.
+ * @returns {string|null}
+ */
+function matchLenientTrailer(body, key) {
+  const lead = `${key}:`;
+  // First `-->` (and first `>`) at or after the previous body start; -1: none.
+  let close = -2;
+  let gt = -2;
+  for (let open = body.indexOf('<!--'); open !== -1; open = body.indexOf('<!--', open + 4)) {
+    let at = open + 4;
+    // `\s` and String.trim() accept the same characters.
+    while (at < body.length && body[at].trim() === '') at++;
+    if (!body.startsWith(lead, at)) continue;
+    at += lead.length;
+    if (close < at) close = body.indexOf('-->', at);
+    if (close === -1) return null;
+    if (gt < at) gt = body.indexOf('>', at);
+    // `[^>]*` stops at `>`: the block must close before the first one.
+    if (gt < close) continue;
+    return body.slice(open, close + 3);
+  }
+  return null;
 }
 
 /**
@@ -54214,8 +54270,13 @@ async function run(context, deps = {}) {
     }
 
     // ---- dispatch ----
-    const handler = handlers[parsed.command];
-    if (!handler) {
+    // The table must own the name and the entry must be a function: a name
+    // that merely exists on Object.prototype (`constructor`, `__proto__`)
+    // would otherwise pass a truthiness check and then be called as a
+    // handler. parseCommand already rejects names outside ALLOWED_SET; this
+    // keeps the dispatch itself from depending on that.
+    const handler = Object.hasOwn(handlers, parsed.command) ? handlers[parsed.command] : undefined;
+    if (typeof handler !== 'function') {
       coreDep.warning('No handler for command: ' + parsed.command);
       return;
     }

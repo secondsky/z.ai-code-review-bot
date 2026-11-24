@@ -2597,6 +2597,58 @@ describe('run — issue_comment routing', () => {
     );
   });
 
+  // CodeQL js/unvalidated-dynamic-method-call (alert #10): dispatch looked
+  // the handler up as `handlers[parsed.command]`. parseCommand only returns
+  // names from ALLOWED_SET, so no comment could reach this, but a name that
+  // merely exists on Object.prototype passed the "no handler" check and was
+  // then called as if it were a handler.
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'authorized + command name %s that is only an inherited property: no dispatch',
+    async (name) => {
+      const core = makeCore();
+      const octokit = makeOctokit();
+
+      await run(
+        commentContext({ body: '/zai ask hi', association: 'COLLABORATOR' }),
+        {
+          config: makeConfig(),
+          core,
+          octokit,
+          callApi: vi.fn(),
+          apiClient: { call: vi.fn() },
+          // A parser that hands back a name outside the allowed set.
+          parseCommand: () => ({ command: name, args: 'hi', raw: '/zai ask hi', error: null }),
+          handlers: { ask: vi.fn() },
+        },
+      );
+
+      expect(core.warning).toHaveBeenCalledWith(
+        expect.stringContaining(`No handler for command: ${name}`),
+      );
+    },
+  );
+
+  it('authorized + handler entry that is not a function: warns and does not throw', async () => {
+    const core = makeCore();
+    const octokit = makeOctokit();
+
+    await run(
+      commentContext({ body: '/zai ask hi', association: 'COLLABORATOR' }),
+      {
+        config: makeConfig(),
+        core,
+        octokit,
+        callApi: vi.fn(),
+        apiClient: { call: vi.fn() },
+        handlers: { ask: 'not a function' },
+      },
+    );
+
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('No handler for command: ask'),
+    );
+  });
+
   it('authThreshold none: NONE commenter is authorized (gate disabled)', async () => {
     const core = makeCore();
     const octokit = makeOctokit();

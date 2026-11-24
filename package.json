@@ -9,7 +9,7 @@
     "build": "ncc build src/index.js -o dist --license licenses.txt",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:unit": "vitest run --exclude tests/integration/**",
+    "test:unit": "vitest run --exclude \"tests/integration/**\"",
     "test:integration": "vitest run tests/integration",
     "test:coverage": "vitest run --coverage",
     "dist-check": "npm run build && git diff --exit-code dist"
@@ -26,7 +26,7 @@
     "yaml": "^2.9.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
   "overrides": {
     "@actions/http-client": "3.0.2",

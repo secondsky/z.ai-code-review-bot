@@ -158,6 +158,32 @@ describe('buildCommentBody', () => {
     expect(headingCount).toBe(1);
     expect(out.endsWith(marker)).toBe(true);
   });
+
+  // CodeQL js/polynomial-redos: the heading check ended the first line with
+  // `/[ \t]+$/`. On a long run of tabs followed by one other character that
+  // pattern is quadratic (about 1 s at 40k tabs, 15 s at 160k on Node 24),
+  // and the first line comes from model output, which PR content can
+  // influence.
+  test('does not stall on a very long run of tabs inside the first line', () => {
+    const marker = '<!-- m -->';
+    const content = `## T${'\t'.repeat(80000)}x\n\nbody`;
+    const started = performance.now();
+    const out = buildCommentBody({ title: 'T', content, marker });
+    expect(performance.now() - started).toBeLessThan(500);
+    // Something follows the tabs, so the first line is not the heading and
+    // the content is wrapped as usual.
+    const headingCount = (out.match(/^## /gm) || []).length;
+    expect(headingCount).toBe(2);
+    expect(out.endsWith(`\n\n${marker}`)).toBe(true);
+  });
+
+  test('still treats a heading followed by spaces and tabs as the heading', () => {
+    const marker = '<!-- m -->';
+    const out = buildCommentBody({ title: 'T', content: '## T \t\nbody', marker });
+    const headingCount = (out.match(/^## /gm) || []).length;
+    expect(headingCount).toBe(1);
+    expect(out.endsWith(marker)).toBe(true);
+  });
 });
 
 describe('upsertReviewComment', () => {

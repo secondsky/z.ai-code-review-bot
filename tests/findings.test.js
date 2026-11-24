@@ -2265,4 +2265,67 @@ describe('extractTrailers — lenient re-extraction of zai-* trailers (F-TRAILER
     const body = '<!-- zai-hashes:first -->\nprose\n<!-- zai-hashes:second -->';
     expect(extractTrailers(body).hashBlock).toBe('<!-- zai-hashes:first -->');
   });
+
+  // CodeQL js/polynomial-redos (alerts #8, #9): the lenient grammar was
+  // `/<!--\s*zai-…:[^>]*-->/`. `[^>]*` swallows the `<!--zai-sha:` opening
+  // itself, so every opening in a body stuffed with them re-scanned the rest
+  // of the body (about 2.8 s at 240k chars). The scan is linear now; these
+  // tests pin that it stays byte-identical to the regex it replaced.
+  const lenientRegex = (body, key) =>
+    body.match(new RegExp(`<!--\\s*${key}:[^>]*-->`))?.[0] ?? null;
+
+  it('stays fast on a body stuffed with repeated openings (polynomial ReDoS guard)', () => {
+    // 1) openings that nothing closes; 2) and 3) many openings that each
+    // fail on the same `>`, which re-scans unless that position is cached.
+    const body =
+      `${'<!--zai-sha:'.repeat(22000)}x` +
+      `${'<!--zai-sha:'.repeat(12000)}>x-->` +
+      `${'<!--zai-hashes:'.repeat(12000)}>x-->`;
+    const started = performance.now();
+    const out = extractTrailers(body);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(out).toEqual({ marker: null, hashBlock: null, shaBlock: null });
+  });
+
+  it('gives the same result as the lenient regex it replaced (tricky and random bodies)', () => {
+    // Small deterministic generator, so a mismatch is reproducible.
+    let seed = 0x5eed;
+    const rand = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed / 4294967296;
+    };
+    const alphabet = [
+      '<', '!', '-', '>', ' ', '\t', '\n', '\u00a0', 'z', 'a', 'i', 'h', 's', 'e', ':', 'x',
+      'zai-sha:', 'zai-hashes:', '<!--', '-->',
+    ];
+    const bodies = [
+      '',
+      '<!--',
+      '<!--zai-sha:',
+      '<!--zai-sha:-->',
+      '<!--zai-sha:-- >',
+      '<!--zai-sha:a>b-->',
+      '<!--zai-sha:a--->',
+      '<!--zai-sha:a-->-',
+      '<!--  zai-sha: abc -->',
+      '<!--\tzai-sha:abc-->',
+      '<!--zai-sha:a--><!--zai-sha:b-->',
+      '<!--zai-sha:>x--><!--zai-sha:b-->',
+      '<!--zai-sha:<!--zai-sha:b-->',
+      '<!-- zai-hashes:x-->y',
+      '<!--zai-shaX:-->',
+      '<!-<!--zai-sha:x-->',
+    ];
+    for (let n = 0; n < 4000; n++) {
+      let body = '';
+      const len = 1 + Math.floor(rand() * 14);
+      for (let k = 0; k < len; k++) body += alphabet[Math.floor(rand() * alphabet.length)];
+      bodies.push(body);
+    }
+    for (const body of bodies) {
+      const out = extractTrailers(body);
+      expect([body, out.shaBlock]).toEqual([body, lenientRegex(body, 'zai-sha')]);
+      expect([body, out.hashBlock]).toEqual([body, lenientRegex(body, 'zai-hashes')]);
+    }
+  });
 });

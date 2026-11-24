@@ -1,6 +1,6 @@
 # Architecture
 
-A Node 20 GitHub Action that reviews pull requests with Z.ai GLM models —
+A Node 24 GitHub Action that reviews pull requests with Z.ai GLM models —
 producing **structured findings** posted as **inline review comments** + a
 **walkthrough summary**, backed by **deterministic scanners**. Optionally
 answers interactive `/zai` commands. The runtime entry is the ncc bundle

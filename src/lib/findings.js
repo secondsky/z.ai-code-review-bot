@@ -1479,6 +1479,8 @@ export function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, c
  * re-append), so the wider acceptance here is safe; suppression must stay
  * strict so a model-forged no-space variant can never register as state.
  * First occurrence wins (oldest trailer), matching the old inline semantics.
+ * The two `[^>]*` forms are scanned by {@link matchLenientTrailer}: same
+ * grammar, linear time.
  *
  * @param {string} body  the review/comment body to scan.
  * @returns {{marker: string|null, hashBlock: string|null, shaBlock: string|null}}
@@ -1486,9 +1488,47 @@ export function insertSkippedFilesNote(body, skippedFiles, skippedEntries = 0, c
 export function extractTrailers(body) {
   if (typeof body !== 'string') return { marker: null, hashBlock: null, shaBlock: null };
   const marker = body.match(/<!--\s*zai-code-review\s*-->/);
-  const hashBlock = body.match(/<!--\s*zai-hashes:[^>]*-->/);
-  const shaBlock = body.match(/<!--\s*zai-sha:[^>]*-->/);
-  return { marker: marker?.[0] ?? null, hashBlock: hashBlock?.[0] ?? null, shaBlock: shaBlock?.[0] ?? null };
+  const hashBlock = matchLenientTrailer(body, 'zai-hashes');
+  const shaBlock = matchLenientTrailer(body, 'zai-sha');
+  return { marker: marker?.[0] ?? null, hashBlock, shaBlock };
+}
+
+/**
+ * First match of `<!--\s*<key>:[^>]*-->` in `body`, or null — the LENIENT
+ * trailer grammar above, unchanged.
+ *
+ * A scan rather than that regex, which is polynomial (CodeQL
+ * js/polynomial-redos): `[^>]*` can swallow the `<!--zai-sha:` opening
+ * itself, so every opening in a body stuffed with them re-scanned the rest
+ * of the body (seconds at 240k chars). A review body is model output, which
+ * PR content can influence. Here each character is looked at a bounded
+ * number of times: the two delimiter searches are cached and only ever move
+ * forward, and a candidate that has no `-->` left ends the whole scan,
+ * because no later opening can match either.
+ *
+ * @param {string} body
+ * @param {string} key  `zai-hashes` or `zai-sha`, without the colon.
+ * @returns {string|null}
+ */
+function matchLenientTrailer(body, key) {
+  const lead = `${key}:`;
+  // First `-->` (and first `>`) at or after the previous body start; -1: none.
+  let close = -2;
+  let gt = -2;
+  for (let open = body.indexOf('<!--'); open !== -1; open = body.indexOf('<!--', open + 4)) {
+    let at = open + 4;
+    // `\s` and String.trim() accept the same characters.
+    while (at < body.length && body[at].trim() === '') at++;
+    if (!body.startsWith(lead, at)) continue;
+    at += lead.length;
+    if (close < at) close = body.indexOf('-->', at);
+    if (close === -1) return null;
+    if (gt < at) gt = body.indexOf('>', at);
+    // `[^>]*` stops at `>`: the block must close before the first one.
+    if (gt < close) continue;
+    return body.slice(open, close + 3);
+  }
+  return null;
 }
 
 /**
